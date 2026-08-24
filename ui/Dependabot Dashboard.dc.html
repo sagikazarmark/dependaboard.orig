@@ -1,0 +1,1144 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" />
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0d0f; }
+  * { box-sizing: border-box; }
+  ::selection { background: #cbf04a; color: #0b0d0f; }
+  a { color: #cbf04a; text-decoration: none; }
+  a:hover { color: #e3ff7d; text-decoration: underline; }
+  input, button, select { font: inherit; color: inherit; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: #0b0d0f; }
+  ::-webkit-scrollbar-thumb { background: #24292e; border: 3px solid #0b0d0f; border-radius: 6px; }
+  ::-webkit-scrollbar-thumb:hover { background: #343b42; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes slidein { from { transform: translateX(24px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @keyframes riseup { from { transform: translate(-50%, 18px); opacity: 0; } to { transform: translate(-50%, 0); opacity: 1; } }
+  @keyframes pop { from { transform: scale(.96); opacity: 0; } to { transform: none; opacity: 1; } }
+  @keyframes throb { 0%,100% { opacity: .35; } 50% { opacity: 1; } }
+</style>
+</helmet>
+
+<div style="height: 100vh; display: flex; flex-direction: column; background: #0b0d0f; color: #e7eaec; font-family: 'IBM Plex Sans', system-ui, sans-serif; font-size: 13px; overflow: hidden; position: relative; letter-spacing: -0.005em;">
+
+  <header style="height: 52px; flex: 0 0 auto; border-bottom: 1px solid #1c2126; display: flex; align-items: center; gap: 18px; padding: 0 16px; background: #0e1114;">
+    <div style="display: flex; align-items: baseline; gap: 9px;">
+      <button onClick="{{ toggleAside }}" title="show/hide filters" style="border: 0; background: none; padding: 0 2px 0 0; cursor: pointer; font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: {{ asideToggleColor }};" style-hover="color: #ffffff;">☰</button>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 15px; color: {{ accent }};">◆</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; letter-spacing: -0.01em;">dependabot</span>
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #6b747c;">/ {{ accountsLabel }}</span>
+    </div>
+
+    <div style="display: flex; align-items: center; gap: 2px; padding: 2px; border: 1px solid #1c2126; border-radius: 6px; background: #0b0d0f;">
+      <button onClick="{{ setViewAll }}" style="padding: 4px 11px; border: 0; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500; background: {{ viewAllBg }}; color: {{ viewAllFg }};">All open</button>
+      <button onClick="{{ setViewAttn }}" style="padding: 4px 11px; border: 0; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 500; background: {{ viewAttnBg }}; color: {{ viewAttnFg }};">Needs attention <span style="font-family: 'IBM Plex Mono', monospace; opacity: .7;">{{ attentionCount }}</span></button>
+    </div>
+
+    <div style="flex: 1;"></div>
+
+    <sc-if value="{{ suspended }}" hint-placeholder-val="{{ false }}">
+      <div style="display: flex; align-items: center; gap: 8px; padding: 4px 10px; border: 1px solid #533a17; border-radius: 5px; background: #21170a; font-size: 12px; color: #e8b23a;">
+        <span style="font-family: 'IBM Plex Mono', monospace;">installation.suspend · {{ suspendedLogin }}</span>
+        <span style="color: #9c8556;">scheduler paused for that account; the others keep ticking</span>
+      </div>
+    </sc-if>
+
+    <sc-if value="{{ showBudget }}" hint-placeholder-val="{{ true }}">
+      <div style="display: flex; align-items: center; gap: 9px;">
+        <span style="font-size: 11px; color: #6b747c; text-transform: uppercase; letter-spacing: .07em;">rate</span>
+        <div style="width: 74px; height: 4px; border-radius: 2px; background: #1c2126; overflow: hidden;">
+          <div style="height: 100%; background: {{ rateColor }}; width: {{ ratePct }};"></div>
+        </div>
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #8b9298;">{{ rateLabel }}</span>
+      </div>
+    </sc-if>
+
+    <div style="display: flex; align-items: center; gap: 8px; padding-left: 14px; border-left: 1px solid #1c2126;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #6b747c;">sweep {{ sweepLabel }}</span>
+      <button onClick="{{ doRefresh }}" style="display: flex; align-items: center; gap: 6px; padding: 5px 10px; border: 1px solid #262c32; border-radius: 5px; background: #13171a; cursor: pointer; font-size: 12px; color: #cdd3d8;" style-hover="border-color: #3a424a; color: #ffffff;">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; display: inline-block; animation: {{ refreshAnim }};">⟳</span>
+        Sync
+      </button>
+    </div>
+  </header>
+
+  <div style="flex: 1; display: flex; min-height: 0;">
+
+    <aside style="width: 262px; flex: 0 0 262px; border-right: 1px solid #1c2126; overflow-y: auto; background: #0e1114; display: {{ asideDisplay }};">
+      <div style="padding: 14px 14px 10px;">
+        <div style="position: relative;">
+          <span style="position: absolute; left: 9px; top: 50%; transform: translateY(-50%); font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #565f66;">⌕</span>
+          <input ref="{{ searchRef }}" value="{{ q }}" onChange="{{ onQ }}" placeholder="dependency, repo, title…" style="width: 100%; padding: 7px 9px 7px 26px; border: 1px solid #262c32; border-radius: 5px; background: #0b0d0f; font-size: 12px; outline: none; font-family: 'IBM Plex Mono', monospace;" style-focus="border-color: #3f4952;" />
+        </div>
+      </div>
+
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 4px 14px 12px;">
+        <span style="font-size: 11px; color: #6b747c; font-family: 'IBM Plex Mono', monospace;">{{ filterSummary }}</span>
+        <button onClick="{{ clearFilters }}" style="border: 0; background: none; padding: 0; cursor: pointer; font-size: 11px; color: {{ clearColor }}; text-decoration: underline; text-underline-offset: 2px;">clear</button>
+      </div>
+
+      <div style="padding: 0 14px 6px; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #565f66;">Check rollup</div>
+      <div style="padding: 0 8px 16px; display: flex; flex-direction: column; gap: 1px;">
+        <sc-for list="{{ facetStatus }}" as="f" hint-placeholder-count="4">
+          <button onClick="{{ f.on }}" style="display: flex; align-items: center; gap: 8px; width: 100%; padding: 5px 6px; border: 0; border-radius: 4px; cursor: pointer; background: {{ f.bg }}; color: {{ f.fg }}; text-align: left; font-size: 12px;" style-hover="background: #171c21;">
+            <span style="width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; background: {{ f.dot }};"></span>
+            <span style="flex: 1;">{{ f.label }}</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #6b747c;">{{ f.count }}</span>
+          </button>
+        </sc-for>
+      </div>
+
+      <div style="padding: 0 14px 6px; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #565f66;">Update type</div>
+      <div style="padding: 0 8px 16px; display: flex; flex-direction: column; gap: 1px;">
+        <sc-for list="{{ facetType }}" as="f" hint-placeholder-count="4">
+          <button onClick="{{ f.on }}" style="display: flex; align-items: center; gap: 8px; width: 100%; padding: 5px 6px; border: 0; border-radius: 4px; cursor: pointer; background: {{ f.bg }}; color: {{ f.fg }}; text-align: left; font-size: 12px;" style-hover="background: #171c21;">
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; padding: 1px 5px; border-radius: 3px; background: {{ f.chipBg }}; color: {{ f.dot }};">{{ f.short }}</span>
+            <span style="flex: 1;">{{ f.label }}</span>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #6b747c;">{{ f.count }}</span>
+          </button>
+        </sc-for>
+      </div>
+
+      <div style="padding: 0 14px 6px; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #565f66;">Labels</div>
+      <div style="padding: 0 14px 16px; display: flex; flex-wrap: wrap; gap: 5px;">
+        <sc-for list="{{ facetLabels }}" as="f" hint-placeholder-count="7">
+          <button onClick="{{ f.on }}" style="padding: 3px 8px; border: 1px solid {{ f.border }}; border-radius: 20px; cursor: pointer; background: {{ f.bg }}; color: {{ f.fg }}; font-size: 11px; font-family: 'IBM Plex Mono', monospace;">{{ f.label }} <span style="opacity: .55;">{{ f.count }}</span></button>
+        </sc-for>
+      </div>
+
+      <div style="display: flex; align-items: baseline; justify-content: space-between; padding: 0 14px 6px;">
+        <span style="font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #565f66;">Accounts &amp; repositories</span>
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #444c53;">{{ repoSelLabel }}</span>
+      </div>
+      <div style="padding: 0 14px 8px;">
+        <input value="{{ repoQ }}" onChange="{{ onRepoQ }}" placeholder="filter repositories…" style="width: 100%; padding: 5px 8px; border: 1px solid #22272c; border-radius: 5px; background: #0b0d0f; font-size: 11px; outline: none; font-family: 'IBM Plex Mono', monospace;" style-focus="border-color: #3f4952;" />
+      </div>
+      <div style="padding: 0 8px 24px; display: flex; flex-direction: column; gap: 8px;">
+        <sc-for list="{{ repoTree }}" as="g" hint-placeholder-count="3">
+          <div style="display: flex; flex-direction: column; gap: 1px;">
+            <div style="display: flex; align-items: center; gap: 7px; padding: 3px 6px 4px; border-radius: 4px; background: {{ g.bg }};">
+              <button onClick="{{ g.toggle }}" style="width: 13px; height: 13px; flex: 0 0 auto; border-radius: 3px; cursor: pointer; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; line-height: 1; border: 1px solid {{ g.boxBorder }}; background: {{ g.boxBg }}; color: #0b0d0f;">{{ g.boxMark }}</button>
+              <button onClick="{{ g.collapse }}" style="display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0; border: 0; background: none; padding: 0; cursor: pointer; text-align: left;">
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #6b747c;">{{ g.caret }}</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: {{ g.color }}; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ g.login }}</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #444c53; white-space: nowrap;">{{ g.meta }}</span>
+              </button>
+            </div>
+            <sc-if value="{{ g.open }}" hint-placeholder-val="{{ true }}">
+              <div style="display: flex; flex-direction: column; gap: 1px;">
+                <sc-for list="{{ g.items }}" as="f" hint-placeholder-count="5">
+                  <button onClick="{{ f.on }}" style="display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 6px 4px 8px; border: 0; border-radius: 4px; cursor: pointer; background: {{ f.bg }}; color: {{ f.fg }}; text-align: left; font-size: 12px; font-family: 'IBM Plex Mono', monospace;" style-hover="background: #171c21;">
+                    <span style="width: 11px; height: 11px; flex: 0 0 auto; border-radius: 3px; display: flex; align-items: center; justify-content: center; font-size: 8px; line-height: 1; margin-left: 12px; border: 1px solid {{ f.boxBorder }}; background: {{ f.boxBg }}; color: #0b0d0f;">{{ f.boxMark }}</span>
+                    <span style="flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ f.label }}</span>
+                    <span style="font-size: 11px; color: #6b747c;">{{ f.count }}</span>
+                  </button>
+                </sc-for>
+              </div>
+            </sc-if>
+          </div>
+        </sc-for>
+      </div>
+    </aside>
+
+    <main style="flex: 1; display: flex; flex-direction: column; min-width: 0;">
+
+      <div style="height: 38px; flex: 0 0 auto; display: flex; align-items: center; gap: 14px; padding: 0 16px; border-bottom: 1px solid #1c2126;">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #cdd3d8; white-space: nowrap; flex: 0 0 auto;">{{ resultLabel }}</span>
+        <button onClick="{{ selectAllMatching }}" style="border: 0; background: none; padding: 0; cursor: pointer; font-size: 12px; white-space: nowrap; flex: 0 0 auto; color: {{ accent }}; text-decoration: underline; text-underline-offset: 2px;">{{ selectAllLabel }}</button>
+        <span style="flex: 1; min-width: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #444c53; text-align: right;">{{ orderLabel }}</span>
+        <span style="font-size: 11px; color: #565f66; text-transform: uppercase; letter-spacing: .07em; white-space: nowrap; flex: 0 0 auto;">group</span>
+        <div style="display: flex; gap: 2px; padding: 2px; border: 1px solid #1c2126; border-radius: 5px; flex: 0 0 auto;">
+          <sc-for list="{{ groupModes }}" as="g" hint-placeholder-count="3">
+            <button onClick="{{ g.on }}" style="padding: 3px 9px; border: 0; border-radius: 3px; cursor: pointer; white-space: nowrap; font-family: 'IBM Plex Mono', monospace; font-size: 11px; background: {{ g.bg }}; color: {{ g.fg }};">{{ g.label }}</button>
+          </sc-for>
+        </div>
+      </div>
+
+      <sc-if value="{{ hasChips }}" hint-placeholder-val="{{ false }}">
+        <div style="flex: 0 0 auto; height: 32px; display: flex; align-items: center; gap: 6px; padding: 0 16px; border-bottom: 1px solid #1c2126; background: #0c0f12; overflow-x: auto; overflow-y: hidden;">
+          <sc-for list="{{ activeChips }}" as="c" hint-placeholder-count="3">
+            <button onClick="{{ c.off }}" title="remove filter" style="display: flex; align-items: center; gap: 6px; flex: 0 0 auto; padding: 3px 7px 3px 8px; border: 1px solid #2a3137; border-radius: 4px; background: #14191d; cursor: pointer; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #cdd3d8; white-space: nowrap;" style-hover="border-color: #4a545d; color: #ffffff;">
+              <span style="color: #6b747c;">{{ c.kind }}</span>
+              <span>{{ c.label }}</span>
+              <span style="color: #6b747c;">✕</span>
+            </button>
+          </sc-for>
+          <button onClick="{{ clearFilters }}" style="flex: 0 0 auto; margin-left: 4px; border: 0; background: none; padding: 0; cursor: pointer; font-size: 11px; color: #6b747c; text-decoration: underline; text-underline-offset: 2px; white-space: nowrap;" style-hover="color: #ffffff;">clear all</button>
+        </div>
+      </sc-if>
+
+      <div ref="{{ listRef }}" style="flex: 1; overflow: auto; min-height: 0;">
+        <div style="display: grid; grid-template-columns: {{ gridCols }}; gap: 12px; align-items: center; padding: 0 16px; height: 30px; min-width: {{ gridMin }}; position: sticky; top: 0; z-index: 3; border-bottom: 1px solid #1c2126; background: #0e1114; font-size: 10px; letter-spacing: .09em; text-transform: uppercase; color: #565f66;">
+          <button onClick="{{ toggleAllVisible }}" style="width: 13px; height: 13px; border-radius: 3px; cursor: pointer; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; line-height: 1; border: 1px solid {{ hdrBoxBorder }}; background: {{ hdrBoxBg }}; color: #0b0d0f;">{{ hdrBoxMark }}</button>
+          <span>PR</span>
+          <span>Dependency</span>
+          <span>Repository</span>
+          <span>Checks</span>
+          <sc-if value="{{ showLabels }}" hint-placeholder-val="{{ true }}">
+            <span>Labels</span>
+          </sc-if>
+          <span style="text-align: right;">Updated</span>
+        </div>
+
+        <sc-for list="{{ rows }}" as="r" hint-placeholder-count="14">
+          <div onClick="{{ r.open }}" style="display: grid; grid-template-columns: {{ gridCols }}; gap: 12px; align-items: center; padding: 0 16px; cursor: pointer; border-bottom: 1px solid #14181c; height: {{ rowH }}; min-width: {{ gridMin }}; background: {{ r.bg }}; box-shadow: {{ r.ring }};" style-hover="background: #14181c;">
+            <button onClick="{{ r.check }}" style="width: 13px; height: 13px; border-radius: 3px; cursor: pointer; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; line-height: 1; border: 1px solid {{ r.boxBorder }}; background: {{ r.boxBg }}; color: #0b0d0f;">{{ r.boxMark }}</button>
+
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #6b747c;">{{ r.num }}</span>
+
+            <div style="min-width: 0; display: flex; flex-direction: column; gap: 2px; padding-left: {{ r.pad }};">
+              <div style="display: flex; align-items: baseline; gap: 7px; min-width: 0;">
+                <sc-if value="{{ r.chevron }}" hint-placeholder-val="">
+                  <span style="font-family: 'IBM Plex Mono', monospace; font-size: 9px; color: #6b747c; flex: 0 0 auto;">{{ r.chevron }}</span>
+                </sc-if>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 500; color: #eef1f3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ r.dep }}</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #6b747c; white-space: nowrap;">{{ r.ver }}</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; padding: 1px 5px; border-radius: 3px; flex: 0 0 auto; background: {{ r.typeBg }}; color: {{ r.typeFg }};">{{ r.type }}</span>
+              </div>
+              <sc-if value="{{ r.sub }}" hint-placeholder-val="">
+                <span style="font-size: 11px; color: {{ r.subColor }}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ r.sub }}</span>
+              </sc-if>
+            </div>
+
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #9aa2a9; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"><span style="color: #5c656c;">{{ r.owner }}</span>{{ r.repo }}</span>
+            <div style="display: flex; align-items: center; gap: 7px; min-width: 0;">
+              <span style="width: 6px; height: 6px; border-radius: 50%; flex: 0 0 auto; background: {{ r.checkDot }}; animation: {{ r.checkAnim }};"></span>
+              <span style="font-size: 12px; color: {{ r.checkFg }}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ r.checkLabel }}</span>
+            </div>
+
+            <sc-if value="{{ showLabels }}" hint-placeholder-val="{{ true }}">
+            <div style="display: flex; gap: 4px; overflow: hidden; align-items: center;">
+              <sc-for list="{{ r.labels }}" as="l" hint-placeholder-count="2">
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; padding: 1px 6px; border-radius: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; border: 1px solid {{ l.border }}; background: {{ l.bg }}; color: {{ l.fg }};">{{ l.name }}</span>
+              </sc-for>
+              <sc-if value="{{ r.moreLabels }}" hint-placeholder-val="">
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #6b747c; flex: 0 0 auto;">{{ r.moreLabels }}</span>
+              </sc-if>
+            </div>
+            </sc-if>
+
+            <div style="text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 1px;">
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #8b9298;">{{ r.updated }}</span>
+              <sc-if value="{{ r.stale }}" hint-placeholder-val="">
+                <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #b98a2e;" title="synced_at drift — this row may be out of date">{{ r.stale }}</span>
+              </sc-if>
+            </div>
+          </div>
+        </sc-for>
+
+        <sc-if value="{{ isEmpty }}" hint-placeholder-val="{{ false }}">
+          <div style="padding: 90px 24px; display: flex; flex-direction: column; align-items: center; gap: 10px;">
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 26px; color: {{ accent }};">{{ emptyGlyph }}</span>
+            <span style="font-size: 14px; color: #cdd3d8;">{{ emptyTitle }}</span>
+            <span style="font-size: 12px; color: #6b747c; max-width: 340px; text-align: center; text-wrap: pretty;">{{ emptyBody }}</span>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ hasMore }}" hint-placeholder-val="{{ true }}">
+          <div style="display: flex; align-items: center; justify-content: center; gap: 12px; padding: 18px 0 40px;">
+            <button onClick="{{ loadMore }}" style="padding: 6px 14px; border: 1px solid #262c32; border-radius: 5px; background: #13171a; cursor: pointer; font-size: 12px; font-family: 'IBM Plex Mono', monospace; color: #cdd3d8;" style-hover="border-color: #3a424a; color: #ffffff;">load next page</button>
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #565f66;">{{ cursorLabel }}</span>
+          </div>
+        </sc-if>
+      </div>
+
+      <div style="height: 26px; flex: 0 0 auto; border-top: 1px solid #1c2126; background: #0e1114; display: flex; align-items: center; gap: 16px; padding: 0 16px; overflow: hidden; white-space: nowrap; font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #565f66;">
+        <div style="display: flex; gap: 13px; white-space: nowrap; flex: 0 0 auto;">
+          <span style="white-space: nowrap;" title="move cursor">j/k</span>
+          <span style="white-space: nowrap;" title="select row">x</span>
+          <span style="white-space: nowrap;" title="open detail">⏎</span>
+          <span style="white-space: nowrap;" title="merge">m</span>
+          <span style="white-space: nowrap;" title="rebase">r</span>
+          <span style="white-space: nowrap;" title="focus search">/</span>
+        </div>
+        <span style="flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right;">{{ storeLabel }}</span>
+      </div>
+    </main>
+  </div>
+
+  <sc-if value="{{ selCount }}" hint-placeholder-val="{{ 0 }}">
+    <div style="position: absolute; left: 50%; bottom: 46px; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; padding: 8px 8px 8px 16px; border: 1px solid #2c333a; border-radius: 9px; background: #15191d; box-shadow: 0 18px 44px rgba(0,0,0,.62); animation: riseup .16s ease-out; z-index: 40;">
+      <span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #eef1f3;">{{ selCount }} selected</span>
+      <span style="font-size: 11px; color: #6b747c; margin-right: 8px;">{{ selBreakdown }}</span>
+      <button onClick="{{ askMerge }}" style="padding: 6px 13px; border: 0; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; background: {{ accent }}; color: #0b0d0f;" style-hover="filter: brightness(1.12);">Merge</button>
+      <button onClick="{{ askRebase }}" style="padding: 6px 13px; border: 1px solid #333b42; border-radius: 6px; cursor: pointer; font-size: 12px; background: #1b2024; color: #e7eaec;" style-hover="border-color: #4a545d;">Rebase</button>
+      <button onClick="{{ clearSel }}" style="padding: 6px 10px; border: 0; border-radius: 6px; cursor: pointer; font-size: 12px; background: none; color: #8b9298;" style-hover="color: #ffffff;">Clear</button>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ confirm }}" hint-placeholder-val="">
+    <div onClick="{{ closeConfirm }}" style="position: absolute; inset: 0; background: rgba(6,8,10,.66); z-index: 60; display: flex; align-items: center; justify-content: center;">
+      <div onClick="{{ stop }}" style="width: 470px; border: 1px solid #2c333a; border-radius: 10px; background: #12161a; box-shadow: 0 26px 70px rgba(0,0,0,.7); animation: pop .14s ease-out; overflow: hidden;">
+        <div style="padding: 16px 18px 12px; border-bottom: 1px solid #1c2126;">
+          <div style="font-size: 14px; font-weight: 600; margin-bottom: 4px;">{{ confirmTitle }}</div>
+          <div style="font-size: 12px; color: #8b9298; text-wrap: pretty;">{{ confirmBody }}</div>
+        </div>
+
+        <sc-if value="{{ confirmIsMerge }}" hint-placeholder-val="{{ true }}">
+          <div style="padding: 14px 18px; border-bottom: 1px solid #1c2126; display: flex; flex-direction: column; gap: 10px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #565f66; width: 96px;">merge_method</span>
+              <div style="display: flex; gap: 2px; padding: 2px; border: 1px solid #262c32; border-radius: 6px;">
+                <sc-for list="{{ methods }}" as="m" hint-placeholder-count="3">
+                  <button onClick="{{ m.on }}" style="padding: 4px 11px; border: 0; border-radius: 4px; cursor: pointer; font-family: 'IBM Plex Mono', monospace; font-size: 11px; background: {{ m.bg }}; color: {{ m.fg }};">{{ m.label }}</button>
+                </sc-for>
+              </div>
+            </div>
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #565f66; width: 96px;">guard</span>
+              <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #8b9298;">expected_sha == snapshot.sha, per target</span>
+            </div>
+          </div>
+        </sc-if>
+
+        <sc-if value="{{ confirmWarn }}" hint-placeholder-val="">
+          <div style="padding: 12px 18px; background: #1c1408; border-bottom: 1px solid #332510; font-size: 12px; color: #e0b45c; text-wrap: pretty;">{{ confirmWarn }}</div>
+        </sc-if>
+
+        <div style="padding: 13px 18px; display: flex; align-items: center; gap: 10px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #565f66; flex: 1;">MAX_CONCURRENT 3 · {{ confirmIdLabel }}</span>
+          <button onClick="{{ closeConfirm }}" style="padding: 6px 12px; border: 1px solid #2c333a; border-radius: 6px; cursor: pointer; font-size: 12px; background: none; color: #cdd3d8;" style-hover="border-color: #4a545d;">Cancel</button>
+          <button onClick="{{ runBatch }}" style="padding: 6px 15px; border: 0; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; background: {{ accent }}; color: #0b0d0f;" style-hover="filter: brightness(1.12);">{{ confirmCta }}</button>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ batch }}" hint-placeholder-val="">
+    <div style="position: absolute; right: 0; top: 52px; bottom: 26px; width: 400px; border-left: 1px solid #262c32; background: #0f1316; box-shadow: -22px 0 50px rgba(0,0,0,.5); z-index: 45; display: flex; flex-direction: column; animation: slidein .18s ease-out;">
+      <div style="padding: 14px 16px 12px; border-bottom: 1px solid #1c2126;">
+        <div style="display: flex; align-items: baseline; gap: 8px;">
+          <span style="font-size: 13px; font-weight: 600;">{{ batchTitle }}</span>
+          <div style="flex: 1;"></div>
+          <button onClick="{{ closeBatch }}" style="border: 0; background: none; cursor: pointer; color: #6b747c; font-size: 14px; padding: 0;" style-hover="color: #ffffff;">✕</button>
+        </div>
+        <div style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: #565f66; margin-top: 4px;">BulkAction/{{ batchId }}</div>
+        <div style="margin-top: 12px; height: 3px; border-radius: 2px; background: #1c2126; overflow: hidden;">
+          <div style="height: 100%; background: {{ accent }}; width: {{ batchPct }}; transition: width .3s ease;"></div>
+        </div>
+        <div style="display: flex; gap: 14px; margin-top: 9px; font-family: 'IBM Plex Mono', monospace; font-size: 11px;">
+          <span style="color: #5fd08a;">✓ {{ batchOk }}</span>
+          <span style="color: #ff6b60;">✕ {{ batchRejected }}</span>
+          <span style="color: #e8b23a;">↻ {{ batchRetry }}</span>
+          <span style="color: #6b747c;">· {{ batchRemaining }} queued</span>
+        </div>
+      </div>
+
+      <div style="flex: 1; overflow-y: auto;">
+        <sc-for list="{{ batchRows }}" as="t" hint-placeholder-count="6">
+          <div style="padding: 9px 16px; border-bottom: 1px solid #14181c; display: flex; align-items: flex-start; gap: 10px;">
+            <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; width: 12px; flex: 0 0 auto; color: {{ t.color }}; animation: {{ t.anim }};">{{ t.glyph }}</span>
+            <div style="min-width: 0; flex: 1;">
+              <div style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #cdd3d8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ t.title }}</div>
+              <div style="font-size: 11px; color: {{ t.color }}; margin-top: 2px; text-wrap: pretty;">{{ t.detail }}</div>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="padding: 12px 16px; border-top: 1px solid #1c2126; display: flex; align-items: center; gap: 10px;">
+        <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #565f66; flex: 1;">{{ batchFooter }}</span>
+        <sc-if value="{{ canRetry }}" hint-placeholder-val="{{ false }}">
+          <button onClick="{{ retryRejected }}" style="padding: 5px 11px; border: 1px solid #333b42; border-radius: 5px; cursor: pointer; font-size: 12px; background: #1b2024; color: #e7eaec;" style-hover="border-color: #4a545d;">Retry rejected</button>
+        </sc-if>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ detail }}" hint-placeholder-val="">
+    <div style="position: absolute; right: 0; top: 52px; bottom: 26px; width: 452px; border-left: 1px solid #262c32; background: #0f1316; box-shadow: -22px 0 50px rgba(0,0,0,.5); z-index: 50; display: flex; flex-direction: column; animation: slidein .18s ease-out;">
+      <div style="padding: 14px 16px; border-bottom: 1px solid #1c2126;">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #8b9298;">{{ dRepo }}</span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #565f66;">{{ dNum }}</span>
+          <div style="flex: 1;"></div>
+          <a href="#" style="font-size: 11px; font-family: 'IBM Plex Mono', monospace;">open on github ↗</a>
+          <button onClick="{{ closeDetail }}" style="border: 0; background: none; cursor: pointer; color: #6b747c; font-size: 14px; padding: 0;" style-hover="color: #ffffff;">✕</button>
+        </div>
+        <div style="font-size: 14px; font-weight: 500; line-height: 1.4; text-wrap: pretty;">{{ dTitle }}</div>
+        <div style="display: flex; align-items: center; gap: 8px; margin-top: 10px;">
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 10px; padding: 2px 6px; border-radius: 3px; background: {{ dTypeBg }}; color: {{ dTypeFg }};">{{ dType }}</span>
+          <span style="width: 6px; height: 6px; border-radius: 50%; background: {{ dCheckDot }};"></span>
+          <span style="font-size: 12px; color: {{ dCheckFg }};">{{ dCheckLabel }}</span>
+          <span style="font-size: 12px; color: #565f66;">·</span>
+          <span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #8b9298;">{{ dMergeable }}</span>
+        </div>
+      </div>
+
+      <div style="flex: 1; overflow-y: auto;">
+        <div style="padding: 14px 16px; border-bottom: 1px solid #1c2126;">
+          <div style="font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #565f66; margin-bottom: 9px;">updated-dependencies</div>
+          <div style="display: flex; flex-direction: column; gap: 6px;">
+            <sc-for list="{{ dDeps }}" as="d" hint-placeholder-count="1">
+              <div style="display: flex; align-items: baseline; gap: 8px; font-family: 'IBM Plex Mono', monospace; font-size: 11px;">
+                <span style="flex: 1; color: #cdd3d8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ d.name }}</span>
+                <span style="color: #8b9298;">{{ d.delta }}</span>
+                <span style="color: {{ d.color }}; width: 44px; text-align: right;">{{ d.type }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="padding: 14px 16px; border-bottom: 1px solid #1c2126;">
+          <div style="font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #565f66; margin-bottom: 9px;">check rollup · {{ dCheckSources }}</div>
+          <div style="display: flex; flex-direction: column; gap: 5px;">
+            <sc-for list="{{ dChecks }}" as="c" hint-placeholder-count="4">
+              <div style="display: flex; align-items: center; gap: 8px; font-size: 11px;">
+                <span style="font-family: 'IBM Plex Mono', monospace; width: 10px; color: {{ c.color }};">{{ c.glyph }}</span>
+                <span style="flex: 1; font-family: 'IBM Plex Mono', monospace; color: #cdd3d8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ c.name }}</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; color: {{ c.color }};">{{ c.state }}</span>
+                <span style="font-family: 'IBM Plex Mono', monospace; color: #565f66; width: 46px; text-align: right;">{{ c.src }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="padding: 14px 16px; border-bottom: 1px solid #1c2126;">
+          <div style="font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #565f66; margin-bottom: 9px;">snapshot</div>
+          <div style="display: flex; flex-direction: column; gap: 4px;">
+            <sc-for list="{{ dFields }}" as="f" hint-placeholder-count="5">
+              <div style="display: flex; gap: 10px; font-family: 'IBM Plex Mono', monospace; font-size: 11px;">
+                <span style="width: 108px; color: #565f66;">{{ f.k }}</span>
+                <span style="flex: 1; color: #cdd3d8; overflow: hidden; text-overflow: ellipsis;">{{ f.v }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+
+        <div style="padding: 14px 16px;">
+          <div style="font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #565f66; margin-bottom: 9px;">action log</div>
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+            <sc-for list="{{ dHistory }}" as="h" hint-placeholder-count="3">
+              <div style="display: flex; gap: 10px; font-size: 11px;">
+                <span style="font-family: 'IBM Plex Mono', monospace; color: #565f66; width: 52px; flex: 0 0 auto; text-align: right;">{{ h.when }}</span>
+                <span style="flex: 1; color: #9aa2a9; text-wrap: pretty;">{{ h.what }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </div>
+
+      <div style="padding: 12px 16px; border-top: 1px solid #1c2126; display: flex; gap: 8px;">
+        <button onClick="{{ dMerge }}" style="padding: 6px 13px; border: 0; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; background: {{ accent }}; color: #0b0d0f;" style-hover="filter: brightness(1.12);">Merge</button>
+        <button onClick="{{ dRebase }}" style="padding: 6px 13px; border: 1px solid #333b42; border-radius: 6px; cursor: pointer; font-size: 12px; background: #1b2024; color: #e7eaec;" style-hover="border-color: #4a545d;">Rebase</button>
+        <button onClick="{{ dUpdateBranch }}" style="padding: 6px 13px; border: 1px solid #333b42; border-radius: 6px; cursor: pointer; font-size: 12px; background: #1b2024; color: #cdd3d8;" style-hover="border-color: #4a545d;">Update branch</button>
+        <div style="flex: 1;"></div>
+        <button onClick="{{ dSync }}" style="padding: 6px 11px; border: 1px solid #262c32; border-radius: 6px; cursor: pointer; font-size: 12px; background: none; color: #8b9298;" style-hover="color: #ffffff;">Sync</button>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ toast }}" hint-placeholder-val="">
+    <div style="position: absolute; left: 16px; bottom: 40px; padding: 9px 14px; border: 1px solid #2c333a; border-radius: 7px; background: #15191d; box-shadow: 0 14px 34px rgba(0,0,0,.55); font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #cdd3d8; z-index: 70; animation: pop .14s ease-out;">{{ toast }}</div>
+  </sc-if>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;accent&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#7fb6e8&quot;,&quot;options&quot;:[&quot;#cbf04a&quot;,&quot;#7fb6e8&quot;,&quot;#e0b45c&quot;,&quot;#5fd08a&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Look&quot;},&quot;density&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;Compact&quot;,&quot;Comfortable&quot;],&quot;default&quot;:&quot;Comfortable&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Look&quot;},&quot;defaultView&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;All open&quot;,&quot;Needs attention&quot;],&quot;default&quot;:&quot;All open&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Behaviour&quot;},&quot;installationState&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;Active&quot;,&quot;Suspended&quot;],&quot;default&quot;:&quot;Active&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Behaviour&quot;},&quot;showRateBudget&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behaviour&quot;}}">
+class Component extends DCLogic {
+  state = {
+    q: "", statuses: {}, types: {}, labels: {}, repos: {}, owners: {},
+    view: null, sel: {}, visible: 50, cursor: 0,
+    openId: null, confirm: null, batch: null, removed: {},
+    repoQ: "", collapsed: {}, groupMode: "none", expanded: {},
+    asideOpen: true, winW: typeof window !== "undefined" ? window.innerWidth : 1440,
+    method: "squash", refreshing: false, toast: null, tickN: 0,
+    sweep: 12, rateUsed: 418
+  };
+
+  // ---------- data ----------
+  rng(seed) { let a = seed >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+
+  gen() {
+    const R = this.rng(20260821);
+    const pick = (arr) => arr[Math.floor(R() * arr.length)];
+    const names = ["api-gateway","billing-service","web-app","mobile-ios","mobile-android","auth-service","notifications","search-index","data-pipeline","etl-jobs","ml-serving","feature-flags","admin-console","docs-site","marketing-site","design-tokens","ui-kit","terraform-modules","helm-charts","k8s-operators","ci-actions","dev-cli","sdk-js","sdk-python","sdk-go","sdk-rust","event-bus","payments-core","invoicing","tax-engine","reporting","analytics-api","audit-log","scheduler","mailer","image-proxy","pdf-renderer","webhooks-relay","rate-limiter","status-page"];
+    const eco = {
+      javascript: ["react","next","vite","esbuild","typescript","eslint","prettier","axios","lodash","@types/node","tailwindcss","zod","vitest","rollup"],
+      rust: ["tokio","serde","reqwest","clap","uuid","chrono","tracing","hyper","sqlx","octocrab","anyhow","thiserror","axum","libsql"],
+      python: ["django","requests","urllib3","numpy","pandas","pytest","pydantic","boto3","fastapi","sqlalchemy"],
+      java: ["org.springframework.boot:spring-boot-starter-web","com.fasterxml.jackson.core:jackson-databind","org.jetbrains.kotlin:kotlin-reflect","junit:junit","com.google.guava:guava","org.slf4j:slf4j-api"],
+      go: ["golang.org/x/net","github.com/stretchr/testify","google.golang.org/grpc","github.com/spf13/cobra","golang.org/x/crypto"],
+      github_actions: ["actions/checkout","actions/setup-node","docker/build-push-action","aws-actions/configure-aws-credentials","actions/cache"]
+    };
+    const ecoOf = ["javascript","rust","python","java","go","github_actions"];
+    this.accounts = [
+      { login: "northwind", kind: "Organization", installation: 58211904, glyph: "▣" },
+      { login: "northwind-labs", kind: "Organization", installation: 58211917, glyph: "▣" },
+      { login: "mrk", kind: "User", installation: 58212066, glyph: "◍" }
+    ];
+    this.repos = names.map((n, i) => {
+      const a = i < 21 ? 0 : i < 33 ? 1 : 2;
+      return {
+        id: 41000 + i * 137, name: n, owner: this.accounts[a].login, installation: this.accounts[a].installation,
+        eco: ecoOf[Math.floor(R() * 6)],
+        allow: R() > 0.12 ? ["squash", "merge", "rebase"] : (R() > 0.5 ? ["merge"] : ["merge", "rebase"])
+      };
+    });
+
+    const now = Date.parse("2026-08-21T14:20:00Z");
+    // One canonical latest version per dependency, like real Dependabot — so a
+    // dependency group collapses to a single target, with the odd laggard behind.
+    this.latest = {};
+    const latestOf = (dep) => {
+      // every component >= 1 so a decrement can never clamp back onto itself
+      if (!this.latest[dep]) this.latest[dep] = [2 + Math.floor(R() * 7), 1 + Math.floor(R() * 11), 1 + Math.floor(R() * 8)];
+      return this.latest[dep];
+    };
+    const ver = (bump, dep) => {
+      const L = latestOf(dep);
+      const to = R() < 0.14 ? [L[0], L[1], Math.max(1, L[2] - 1)] : L.slice(); // laggard target
+      const back = (n) => 1 + Math.floor(R() * Math.min(2, n)); // strictly >= 1, <= n
+      let from;
+      if (bump === "major") from = [to[0] - back(to[0] - 1), 2 + Math.floor(R() * 8), Math.floor(R() * 7)];
+      else if (bump === "minor") from = [to[0], to[1] - back(to[1]), Math.floor(R() * 7)];
+      else if (bump === "patch") from = [to[0], to[1], to[2] - back(to[2])];
+      else from = [to[0], to[1], to[2] - back(to[2])];
+      return [from.join("."), to.join(".")];
+    };
+    const sha = () => { let s = ""; for (let i = 0; i < 40; i++) s += "0123456789abcdef"[Math.floor(R() * 16)]; return s; };
+
+    const prs = [];
+    let n = 0;
+    while (prs.length < 253) {
+      const repo = this.repos[Math.floor(R() * this.repos.length)];
+      const t = R();
+      const type = t < 0.52 ? "patch" : t < 0.82 ? "minor" : t < 0.95 ? "major" : "unknown";
+      const c = R();
+      const check = c < 0.6 ? "success" : c < 0.73 ? "failure" : c < 0.91 ? "pending" : "none";
+      const grouped = R() < 0.11;
+      const pool = eco[repo.eco];
+      const dep = pool[Math.floor(R() * pool.length)];
+      const [from, to] = ver(type, dep);
+      const groupN = 2 + Math.floor(R() * 5);
+      const deps = [];
+      if (grouped) {
+        const seen = {};
+        let guard = 0;
+        while (deps.length < Math.min(groupN, pool.length) && guard++ < 40) {
+          const d = pool[Math.floor(R() * pool.length)];
+          if (seen[d]) continue;
+          seen[d] = true;
+          const bump = deps.length === 0 ? type : "patch";
+          const [f2, t2] = ver(bump, d);
+          deps.push({ name: d, from: f2, to: t2, type: bump });
+        }
+      } else deps.push({ name: dep, from, to, type });
+      const labels = ["dependencies", repo.eco];
+      if (R() < 0.14) labels.push("security");
+      if (R() < 0.09) labels.push("blocked");
+      const ageMin = Math.floor(Math.pow(R(), 2.1) * 60 * 24 * 21) + 3;
+      const syncMin = R() < 0.07 ? 40 + Math.floor(R() * 190) : Math.floor(R() * 18);
+      prs.push({
+        key: repo.id + "#" + (120 + n),
+        repositoryId: repo.id, repo: repo.name, owner: repo.owner, installation: repo.installation, number: 120 + n,
+        title: grouped ? "Bump the " + repo.eco + " group with " + deps.length + " updates" : "Bump " + dep + " from " + from + " to " + to,
+        dep: grouped ? null : dep, from: grouped ? null : from, to: grouped ? null : to,
+        deps, grouped, type, check, labels,
+        headSha: sha(), mergeable: R() < 0.08 ? "conflicting" : "mergeable",
+        updatedAt: now - ageMin * 60000, syncedAt: now - syncMin * 60000,
+        shaMoved: R() < 0.06, rateFlag: R() < 0.09, forbidden: R() < 0.07
+      });
+      n++;
+    }
+    prs.sort((a, b) => b.updatedAt - a.updatedAt || (a.key < b.key ? 1 : -1));
+    this.prs = prs;
+    this.now = now;
+    this.checkCache = {};
+  }
+
+  ensure() { if (!this.prs) this.gen(); }
+
+  checksFor(pr) {
+    if (this.checkCache[pr.key]) return this.checkCache[pr.key];
+    const R = this.rng(pr.number * 7919 + pr.repositoryId);
+    const pool = ["build", "test (ubuntu-latest, 20)", "test (ubuntu-latest, 22)", "test (macos-14)", "lint", "typecheck", "audit", "coverage", "docker", "e2e (chromium)"];
+    const cnt = 3 + Math.floor(R() * 6);
+    const out = [];
+    for (let i = 0; i < cnt; i++) out.push({ name: pool[i % pool.length], src: R() < 0.22 ? "status" : "check_run", state: "success" });
+    if (pr.check === "failure") { out[Math.floor(R() * out.length)].state = R() < 0.3 ? "stale" : "failure"; }
+    if (pr.check === "pending") { out[0].state = "in_progress"; if (out[1]) out[1].state = "queued"; }
+    if (pr.check === "none") out.length = 0;
+    if (pr.check === "success" && R() < 0.4) out[out.length - 1].state = "skipped";
+    this.checkCache[pr.key] = out;
+    return out;
+  }
+
+  // ---------- lifecycle ----------
+  componentDidMount() {
+    this.timer = setInterval(() => { if (this.state.batch && !this.state.batch.done) this.advance(); }, 420);
+    this.clock = setInterval(() => this.setState(s => ({ sweep: (s.sweep + 1) % 60 })), 60000);
+    this.onKey = (e) => {
+      const tag = (e.target && e.target.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA") { if (e.key === "Escape") e.target.blur(); return; }
+      const rows = this.visibleRows();
+      if (e.key === "/") { e.preventDefault(); if (this.search) this.search.focus(); return; }
+      if (e.key === "Escape") { this.setState({ openId: null, confirm: null }); return; }
+      if (e.key === "j" || e.key === "k") {
+        e.preventDefault();
+        this.setState(s => {
+          const nx = Math.max(0, Math.min(rows.length - 1, s.cursor + (e.key === "j" ? 1 : -1)));
+          const el = this.list && this.list.children[nx];
+          if (el && el.scrollIntoView === undefined) {} else if (el && this.list) {
+            const top = el.offsetTop, h = el.offsetHeight;
+            if (top < this.list.scrollTop) this.list.scrollTop = top - 8;
+            else if (top + h > this.list.scrollTop + this.list.clientHeight) this.list.scrollTop = top + h - this.list.clientHeight + 8;
+          }
+          return { nx, cursor: nx };
+        });
+        return;
+      }
+      const cur = rows[this.state.cursor];
+      if (!cur) return;
+      if (e.key === "x") { e.preventDefault(); this.toggleSel(cur.key); }
+      if (e.key === "Enter") { e.preventDefault(); this.setState({ openId: cur.key }); }
+      if (e.key === "m") { e.preventDefault(); this.openConfirm("merge", Object.keys(this.state.sel).length ? null : [cur.key]); }
+      if (e.key === "r") { e.preventDefault(); this.openConfirm("rebase", Object.keys(this.state.sel).length ? null : [cur.key]); }
+    };
+    document.addEventListener("keydown", this.onKey);
+    this.onResize = () => this.setState({ winW: window.innerWidth });
+    window.addEventListener("resize", this.onResize);
+  }
+  componentWillUnmount() { clearInterval(this.timer); clearInterval(this.clock); document.removeEventListener("keydown", this.onKey); window.removeEventListener("resize", this.onResize); }
+
+  flash(msg) { this.setState({ toast: msg }); clearTimeout(this.tt); this.tt = setTimeout(() => this.setState({ toast: null }), 2600); }
+
+  // ---------- filtering ----------
+  activeKeys(obj) { return Object.keys(obj).filter(k => obj[k]); }
+
+  matches(pr, skip) {
+    const s = this.state;
+    if (s.removed[pr.key]) return false;
+    const q = s.q.trim().toLowerCase();
+    if (q) {
+      const hay = (pr.owner + "/" + pr.repo + " " + pr.title + " " + pr.deps.map(d => d.name).join(" ")).toLowerCase();
+      if (hay.indexOf(q) === -1) return false;
+    }
+    const view = s.view || (this.props.defaultView === "Needs attention" ? "attention" : "all");
+    if (view === "attention") {
+      const stale = this.now - pr.syncedAt > 45 * 60000;
+      if (!(pr.check === "failure" || pr.check === "none" || pr.mergeable === "conflicting" || stale || pr.type === "major")) return false;
+    }
+    const st = this.activeKeys(s.statuses), ty = this.activeKeys(s.types), lb = this.activeKeys(s.labels), rp = this.activeKeys(s.repos), ow = this.activeKeys(s.owners);
+    if (skip !== "owner" && ow.length && ow.indexOf(pr.owner) === -1) return false;
+    if (skip !== "status" && st.length && st.indexOf(pr.check) === -1) return false;
+    if (skip !== "type" && ty.length && ty.indexOf(pr.type) === -1) return false;
+    if (skip !== "label" && lb.length && !lb.every(l => pr.labels.indexOf(l) !== -1)) return false;
+    if (skip !== "repo" && rp.length && rp.indexOf(pr.repo) === -1) return false;
+    return true;
+  }
+
+  filtered() { this.ensure(); return this.prs.filter(p => this.matches(p)); }
+  visibleRows() { return this.filtered().slice(0, this.state.visible); }
+
+  // ---------- mutations ----------
+  toggleSel(key) { this.setState(s => { const sel = Object.assign({}, s.sel); if (sel[key]) delete sel[key]; else sel[key] = true; return { sel }; }); }
+  toggleKey(group, val) {
+    this.setState(s => { const g = Object.assign({}, s[group]); if (g[val]) delete g[val]; else g[val] = true; const o = {}; o[group] = g; o.visible = 50; o.cursor = 0; return o; });
+  }
+
+  openConfirm(action, keys) {
+    const targets = keys || Object.keys(this.state.sel);
+    if (!targets.length) return;
+    this.setState({ confirm: { action, targets, id: this.batchId() } });
+  }
+  batchId() {
+    const t = Date.now().toString(16).padStart(12, "0");
+    let r = ""; for (let i = 0; i < 20; i++) r += "0123456789abcdef"[Math.floor(Math.random() * 16)];
+    return t.slice(0, 8) + "-" + t.slice(8, 12) + "-7" + r.slice(0, 3) + "-" + r.slice(3, 7) + "-" + r.slice(7, 19);
+  }
+
+  start() {
+    const c = this.state.confirm;
+    if (!c) return;
+    const batch = {
+      id: c.id, action: c.action, method: this.state.method, done: false,
+      targets: c.targets.map(k => ({ key: k, st: "queued", attempts: 0, ts: 0, reason: "" }))
+    };
+    this.setState({ batch, confirm: null, sel: {}, openId: null });
+  }
+
+  advance() {
+    const b = this.state.batch;
+    const targets = b.targets.map(t => Object.assign({}, t));
+    const removed = Object.assign({}, this.state.removed);
+    const now = Date.now();
+    let running = targets.filter(t => t.st === "running" || t.st === "retrying").length;
+    // resolve
+    targets.forEach(t => {
+      if ((t.st === "running" || t.st === "retrying") && now - t.ts > 900) {
+        const pr = this.prs.find(p => p.key === t.key);
+        const repo = this.repos.find(r => r.id === pr.repositoryId);
+        if (b.action === "merge") {
+          if (pr.shaMoved) { t.st = "rejected"; t.reason = "StaleSha { expected " + pr.headSha.slice(0, 7) + ", actual " + pr.headSha.slice(7, 14) + " } — head moved after render"; }
+          else if (pr.mergeable === "conflicting") { t.st = "rejected"; t.reason = "NotMergeable — base/head conflict"; }
+          else if (repo.allow.indexOf(b.method) === -1) { t.st = "rejected"; t.reason = "MergeMethodDisallowed — repo allows " + repo.allow.join("/"); }
+          else if (pr.rateFlag && t.attempts < 1) { t.st = "retrying"; t.attempts++; t.ts = now; t.reason = "405 base branch was modified — retryable, attempt " + (t.attempts + 1); }
+          else { t.st = "ok"; t.reason = "merged via " + b.method + " · " + pr.headSha.slice(0, 7); removed[t.key] = true; }
+        } else {
+          if (pr.forbidden) { t.st = "rejected"; t.reason = "Forbidden — “only users with push access can use that command”"; }
+          else if (pr.rateFlag && t.attempts < 1) { t.st = "retrying"; t.attempts++; t.ts = now; t.reason = "403 secondary rate limit — backing off, attempt " + (t.attempts + 1); }
+          else { t.st = "ok"; t.reason = "@dependabot rebase posted · awaiting webhook"; }
+        }
+        running--;
+      }
+    });
+    // admit
+    const limit = b.action === "merge" ? 3 : 1;
+    const busyRepos = {};
+    targets.forEach(t => { if (t.st === "running" || t.st === "retrying") { const pr = this.prs.find(p => p.key === t.key); busyRepos[pr.repo] = true; } });
+    for (let i = 0; i < targets.length && running < limit; i++) {
+      const t = targets[i];
+      if (t.st !== "queued") continue;
+      const pr = this.prs.find(p => p.key === t.key);
+      if (b.action === "merge" && busyRepos[pr.repo]) continue; // same-repo merges serialised
+      busyRepos[pr.repo] = true;
+      t.st = "running"; t.ts = now; t.reason = b.action === "merge" ? "PUT /pulls/" + pr.number + "/merge" : "POST /issues/" + pr.number + "/comments";
+      running++;
+    }
+    const done = targets.every(t => t.st === "ok" || t.st === "rejected");
+    this.setState({ batch: Object.assign({}, b, { targets, done }), removed, rateUsed: Math.min(4900, this.state.rateUsed + 4) });
+  }
+
+  // ---------- render ----------
+  renderVals() {
+    this.ensure();
+    const s = this.state, p = this.props;
+    const accent = p.accent || "#cbf04a";
+    const dense = (p.density || "Compact") === "Compact";
+    const all = this.prs.filter(x => !s.removed[x.key]);
+    const rowsAll = this.filtered();
+    const rows = rowsAll.slice(0, s.visible);
+    const view = s.view || (p.defaultView === "Needs attention" ? "attention" : "all");
+    const suspended = (p.installationState || "Active") === "Suspended";
+
+    const rel = (t) => {
+      const m = Math.round((this.now - t) / 60000);
+      if (m < 60) return m + "m";
+      if (m < 1440) return Math.round(m / 60) + "h";
+      return Math.round(m / 1440) + "d";
+    };
+    const TYPE = { major: ["#ff8d7a", "#2b1512"], minor: ["#e0b45c", "#241c0d"], patch: ["#7fb6e8", "#101d29"], unknown: ["#8b9298", "#191d21"] };
+    const CHK = {
+      success: ["#5fd08a", "Success"], failure: ["#ff6b60", "Failure"],
+      pending: ["#e8b23a", "Pending"], none: ["#6b747c", "None reported"]
+    };
+    const LBL = {
+      dependencies: ["#8b9298", "#171b1f", "#242a2f"], security: ["#ff8d7a", "#241413", "#3a1e1a"],
+      blocked: ["#e0b45c", "#221a09", "#3a2c11"], javascript: ["#e8d44f", "#211f0d", "#332f12"],
+      rust: ["#e09a6a", "#211609", "#33230f"], python: ["#7fb6e8", "#0f1a24", "#16283a"],
+      java: ["#c98fe0", "#1c1224", "#2c1b38"], go: ["#6fd3d9", "#0d2022", "#143134"],
+      github_actions: ["#9aa2a9", "#171b1f", "#242a2f"]
+    };
+
+    const cnt = (skip, fn) => all.filter(x => this.matches(x, skip) && fn(x)).length;
+
+    const facetStatus = ["success", "failure", "pending", "none"].map(k => {
+      const on = !!s.statuses[k];
+      return { key: k, label: CHK[k][1], dot: CHK[k][0], count: cnt("status", x => x.check === k), bg: on ? "#1d2329" : "transparent", fg: on ? "#ffffff" : "#b7bec4", on: () => this.toggleKey("statuses", k) };
+    });
+    const facetType = ["major", "minor", "patch", "unknown"].map(k => {
+      const on = !!s.types[k];
+      return { key: k, label: k[0].toUpperCase() + k.slice(1), short: k.slice(0, 3), dot: TYPE[k][0], chipBg: TYPE[k][1], count: cnt("type", x => x.type === k), bg: on ? "#1d2329" : "transparent", fg: on ? "#ffffff" : "#b7bec4", on: () => this.toggleKey("types", k) };
+    });
+    const labelNames = ["dependencies", "security", "blocked", "javascript", "rust", "python", "java", "go", "github_actions"];
+    const facetLabels = labelNames.map(k => {
+      const on = !!s.labels[k];
+      const c = LBL[k];
+      return { key: k, label: k, count: cnt("label", x => x.labels.indexOf(k) !== -1), bg: on ? c[1] : "transparent", fg: on ? c[0] : "#7d858c", border: on ? c[2] : "#20252a", on: () => this.toggleKey("labels", k) };
+    });
+    const suspendedLogin = suspended ? this.accounts[1].login : null;
+    const facetAccounts = this.accounts.map(a => {
+      const on = !!s.owners[a.login];
+      const susp = a.login === suspendedLogin;
+      return {
+        key: a.login, label: a.login, glyph: a.glyph, count: cnt("owner", x => x.owner === a.login),
+        meta: susp ? "suspended" : (a.kind === "User" ? "user" : "org"),
+        metaColor: susp ? "#e8b23a" : "#565f66",
+        bg: on ? "#1d2329" : "transparent", fg: on ? "#ffffff" : "#b7bec4",
+        on: () => this.toggleKey("owners", a.login)
+      };
+    });
+    const repoRows = this.repos.map(r => ({ name: r.name, owner: r.owner, c: cnt("repo", x => x.repo === r.name) })).filter(r => r.c > 0).sort((a, b) => b.c - a.c);
+    const facetRepos = repoRows.map(r => {
+      const on = !!s.repos[r.name];
+      return { key: r.name, label: r.name, owner: r.owner + "/", ownerRaw: r.owner, count: r.c, bg: on ? "#1d2329" : "transparent", fg: on ? "#ffffff" : "#b7bec4", on: () => this.toggleKey("repos", r.name) };
+    });
+    const rq = s.repoQ.trim().toLowerCase();
+    const repoTree = this.accounts.map(a => {
+      const own = this.repos.filter(r => r.owner === a.login);
+      const items = facetRepos.filter(r => r.ownerRaw === a.login && (!rq || r.label.indexOf(rq) !== -1));
+      const total = items.reduce((n, r) => n + r.count, 0);
+      // the parent box acts on exactly what is on screen, so under an active
+      // repo search it scopes to the matching items, not the whole account
+      const names = rq ? items.map(i => i.key) : own.map(r => r.name);
+      const selN = names.filter(n => s.repos[n]).length;
+      const hiddenSel = rq ? own.filter(r => s.repos[r.name] && names.indexOf(r.name) === -1).length : 0;
+      const allSel = selN === names.length && names.length > 0;
+      const someSel = selN > 0 && !allSel;
+      const open = rq ? true : !s.collapsed[a.login];
+      return {
+        login: a.login, items, open, caret: open ? "▾" : "▸",
+        color: selN ? "#ffffff" : "#8b9298",
+        bg: selN ? "#161b20" : "transparent",
+        meta: (selN ? selN + "/" + names.length + " · " : items.length + " repos · ") + total + (hiddenSel ? "  +" + hiddenSel + " hidden" : ""),
+        boxBg: allSel ? accent : "transparent",
+        boxBorder: allSel || someSel ? accent : "#394148",
+        boxMark: allSel ? "✓" : someSel ? "–" : "",
+        toggle: (e) => {
+          e.stopPropagation();
+          this.setState(st => {
+            const rp = Object.assign({}, st.repos);
+            names.forEach(n => { if (allSel) delete rp[n]; else rp[n] = true; });
+            return { repos: rp, visible: 50, cursor: 0 };
+          });
+        },
+        collapse: () => this.setState(st => { const c = Object.assign({}, st.collapsed); if (c[a.login]) delete c[a.login]; else c[a.login] = true; return { collapsed: c }; })
+      };
+    }).filter(g => g.items.length > 0 || (!rq && this.repos.some(r => r.owner === g.login)));
+    repoTree.forEach(g => g.items.forEach(f => {
+      const on = !!s.repos[f.key];
+      f.boxBg = on ? accent : "transparent";
+      f.boxBorder = on ? accent : "#394148";
+      f.boxMark = on ? "✓" : "";
+    }));
+
+    const batchByKey = {};
+    if (s.batch) s.batch.targets.forEach(t => { batchByKey[t.key] = t; });
+
+    const mkRow = (pr, i) => {
+      const sel = !!s.sel[pr.key];
+      const cur = i === s.cursor;
+      const stale = this.now - pr.syncedAt > 45 * 60000;
+      const bt = batchByKey[pr.key];
+      let sub = "", subColor = "#6b747c";
+      if (bt && bt.st === "running") { sub = bt.reason; subColor = accent; }
+      else if (bt && bt.st === "retrying") { sub = bt.reason; subColor = "#e8b23a"; }
+      else if (bt && bt.st === "rejected") { sub = bt.reason; subColor = "#ff6b60"; }
+      else if (pr.grouped) { sub = "highest: " + pr.type + " · " + pr.deps.slice(0, 3).map(d => d.name.split(/[:/]/).pop()).join(", "); }
+      else if (pr.mergeable === "conflicting") { sub = "conflicting — base/head diverged"; subColor = "#b98a2e"; }
+      return {
+        key: pr.key, dep: pr.grouped ? pr.deps.length + " dependencies" : pr.dep,
+        ver: pr.grouped ? "group" : pr.from + " → " + pr.to,
+        repo: pr.repo, owner: pr.owner + "/", num: "#" + pr.number, type: pr.type,
+        typeBg: TYPE[pr.type][1], typeFg: TYPE[pr.type][0],
+        checkDot: CHK[pr.check][0], checkFg: pr.check === "none" ? "#6b747c" : "#b7bec4",
+        checkLabel: CHK[pr.check][1], checkAnim: pr.check === "pending" ? "throb 1.6s ease-in-out infinite" : "none",
+        labels: pr.labels.slice(0, 2).map(l => ({ name: l, fg: LBL[l][0], bg: LBL[l][1], border: LBL[l][2] })),
+        moreLabels: pr.labels.length > 2 ? "+" + (pr.labels.length - 2) : "",
+        updated: rel(pr.updatedAt), stale: stale ? "stale " + rel(pr.syncedAt) : "",
+        sub, subColor,
+        bg: sel ? "#171e17" : cur ? "#12161a" : "transparent",
+        ring: cur ? "inset 2px 0 0 " + accent : "none",
+        boxBg: sel ? accent : "transparent", boxBorder: sel ? accent : "#394148", boxMark: sel ? "✓" : "",
+        pad: "0px", chevron: "",
+        check: (e) => { e.stopPropagation(); this.toggleSel(pr.key); },
+        open: () => this.setState({ openId: pr.key, cursor: i })
+      };
+    };
+
+    const worst = (list) => list.some(x => x.check === "failure") ? "failure" : list.some(x => x.check === "pending") ? "pending" : list.some(x => x.check === "success") ? "success" : "none";
+    const rank = { patch: 0, unknown: 1, minor: 2, major: 3 };
+    const highest = (list) => list.reduce((a, x) => rank[x.type] > rank[a] ? x.type : a, "patch");
+    const chkSummary = (list) => {
+      const c = { success: 0, failure: 0, pending: 0, none: 0 };
+      list.forEach(x => { c[x.check]++; });
+      const parts = [];
+      if (c.success) parts.push(c.success + " ✓");
+      if (c.failure) parts.push(c.failure + " ✕");
+      if (c.pending) parts.push(c.pending + " ◐");
+      if (c.none) parts.push(c.none + " ·");
+      return parts.join("  ");
+    };
+
+    const mkGroup = (gkey, label, sublabel, members) => {
+      const idxs = members.map(m => rowsAll.indexOf(m));
+      const allSel = members.every(m => s.sel[m.key]);
+      const someSel = !allSel && members.some(m => s.sel[m.key]);
+      const w = worst(members);
+      const hi = highest(members);
+      const newest = members.reduce((a, m) => Math.max(a, m.updatedAt), 0);
+      const targets = {};
+      members.forEach(m => { targets[m.owner + "/" + m.repo] = true; });
+      const open = !!s.expanded[gkey];
+      return {
+        key: "g:" + gkey, num: "×" + members.length,
+        dep: label, ver: sublabel,
+        type: hi, typeBg: TYPE[hi][1], typeFg: TYPE[hi][0],
+        owner: "", repo: Object.keys(targets).length === 1 ? Object.keys(targets)[0] : Object.keys(targets).length + " repositories",
+        checkDot: CHK[w][0], checkFg: "#8b9298", checkLabel: chkSummary(members), checkAnim: "none",
+        labels: [], moreLabels: "", updated: rel(newest), stale: "", sub: "", subColor: "#6b747c",
+        bg: open ? "#101418" : "transparent", ring: "none",
+        boxBg: allSel ? accent : "transparent", boxBorder: allSel || someSel ? accent : "#394148", boxMark: allSel ? "✓" : someSel ? "–" : "",
+        pad: "0px", chevron: open ? "▾" : "▸",
+        check: (e) => {
+          e.stopPropagation();
+          this.setState(st => {
+            const sel = Object.assign({}, st.sel);
+            members.forEach(m => { if (allSel) delete sel[m.key]; else sel[m.key] = true; });
+            return { sel };
+          });
+        },
+        open: () => this.setState(st => { const ex = Object.assign({}, st.expanded); if (ex[gkey]) delete ex[gkey]; else ex[gkey] = true; return { expanded: ex }; }),
+        members, idxs
+      };
+    };
+
+    let rowVals;
+    if (s.groupMode === "none") {
+      rowVals = rows.map(mkRow);
+    } else {
+      const buckets = {};
+      const order = [];
+      rowsAll.forEach(pr => {
+        const k = s.groupMode === "dep"
+          ? (pr.grouped ? "grouped updates" : pr.dep)
+          : pr.owner + "/" + pr.repo;
+        if (!buckets[k]) { buckets[k] = []; order.push(k); }
+        buckets[k].push(pr);
+      });
+      order.sort((a, b) => buckets[b].length - buckets[a].length || (a < b ? -1 : 1));
+      rowVals = [];
+      order.forEach(k => {
+        const members = buckets[k];
+        let sub = "";
+        if (s.groupMode === "dep") {
+          if (k === "grouped updates") {
+            sub = "multi-package groups";
+          } else {
+            const tos = {}; members.forEach(m => { if (m.to) tos[m.to] = true; });
+            const t = Object.keys(tos);
+            sub = t.length === 1 ? "→ " + t[0] : "→ " + t.sort().reverse()[0] + " (" + (t.length - 1) + " behind)";
+          }
+        } else {
+          sub = members.length === 1 ? "1 open PR" : members.length + " open PRs";
+        }
+        const g = mkGroup(k, k, sub, members);
+        if (s.groupMode === "repo") g.repo = "";
+        rowVals.push(g);
+        if (s.expanded[k]) members.forEach(m => {
+          const r = mkRow(m, rowsAll.indexOf(m));
+          r.pad = "18px";
+          rowVals.push(r);
+        });
+      });
+    }
+
+    const selKeys = Object.keys(s.sel);
+    const selPrs = selKeys.map(k => this.prs.find(x => x.key === k)).filter(Boolean);
+    const notGreen = selPrs.filter(x => x.check !== "success").length;
+    const selRepos = {}; selPrs.forEach(x => { selRepos[x.repo] = true; });
+    const selOwners = {}; selPrs.forEach(x => { selOwners[x.owner] = true; });
+    const inView = {}; rowsAll.forEach(x => { inView[x.key] = true; });
+    const offView = selPrs.filter(x => !inView[x.key]).length;
+
+    // confirm
+    const c = s.confirm;
+    let confirmVals = {};
+    if (c) {
+      const targets = c.targets.map(k => this.prs.find(x => x.key === k)).filter(Boolean);
+      const ng = targets.filter(x => x.check !== "success").length;
+      const repos = {}, owners = {};
+      targets.forEach(x => { repos[x.repo] = true; owners[x.owner] = true; });
+      const nOwn = Object.keys(owners).length;
+      const acctPhrase = nOwn === 1 ? "one account" : nOwn + " accounts";
+      const nPr = targets.length + (targets.length === 1 ? " pull request" : " pull requests");
+      confirmVals = {
+        confirmTitle: c.action === "merge" ? "Merge " + nPr : "Post @dependabot rebase to " + nPr,
+        confirmBody: c.action === "merge"
+          ? "Across " + Object.keys(repos).length + " repositories in " + acctPhrase + ". Same-repo merges run sequentially; concurrency applies across repos, and each account has its own installation token and rate budget."
+          : "Posted with a user token — GitHub Apps cannot issue Dependabot commands. " + (nOwn > 1 ? "The user must have push access in all " + nOwn + " accounts, or those targets come back Forbidden. " : "") + "Each comment carries a hidden batch marker for idempotency.",
+        confirmIsMerge: c.action === "merge",
+        confirmWarn: c.action === "merge" && ng > 0 ? ng + " of these are not green. The read model is a rendering hint, not authorization — the handler re-fetches the rollup before merging." : "",
+        confirmCta: c.action === "merge" ? "Merge " + targets.length : "Post " + targets.length + (targets.length === 1 ? " comment" : " comments"),
+        confirmIdLabel: "workflow id " + c.id.slice(0, 13) + "…"
+      };
+    }
+
+    // batch
+    const b = s.batch;
+    let batchVals = {};
+    if (b) {
+      const ok = b.targets.filter(t => t.st === "ok").length;
+      const rej = b.targets.filter(t => t.st === "rejected").length;
+      const retry = b.targets.filter(t => t.st === "retrying").length;
+      const GL = { queued: ["·", "#565f66", "none"], running: ["◐", accent, "spin 1s linear infinite"], retrying: ["↻", "#e8b23a", "spin 1.4s linear infinite"], ok: ["✓", "#5fd08a", "none"], rejected: ["✕", "#ff6b60", "none"] };
+      batchVals = {
+        batchId: b.id,
+        batchTitle: (b.action === "merge" ? "Bulk merge" : "Bulk rebase") + (b.done ? " · completed" : " · running"),
+        batchPct: Math.round(((ok + rej) / b.targets.length) * 100) + "%",
+        batchOk: ok, batchRejected: rej, batchRetry: retry, batchRemaining: b.targets.length - ok - rej - retry,
+        batchFooter: b.done ? "Completed { succeeded: " + ok + ", rejected: " + rej + " }" : "progress() polled every 420ms",
+        canRetry: b.done && rej > 0,
+        batchRows: b.targets.map(t => {
+          const pr = this.prs.find(x => x.key === t.key);
+          return { glyph: GL[t.st][0], color: GL[t.st][1], anim: GL[t.st][2], title: pr.owner + "/" + pr.repo + " #" + pr.number, detail: t.reason || "queued" };
+        })
+      };
+    }
+
+    // detail
+    let d = {};
+    const pr = s.openId ? this.prs.find(x => x.key === s.openId) : null;
+    if (pr) {
+      const checks = this.checksFor(pr);
+      const CS = { success: ["✓", "#5fd08a"], skipped: ["✓", "#5fd08a"], neutral: ["✓", "#5fd08a"], failure: ["✕", "#ff6b60"], stale: ["✕", "#ff6b60"], in_progress: ["◐", "#e8b23a"], queued: ["·", "#e8b23a"] };
+      d = {
+        dRepo: pr.owner + "/" + pr.repo, dNum: "#" + pr.number, dTitle: pr.title,
+        dType: pr.type, dTypeBg: TYPE[pr.type][1], dTypeFg: TYPE[pr.type][0],
+        dCheckDot: CHK[pr.check][0], dCheckFg: "#b7bec4", dCheckLabel: CHK[pr.check][1],
+        dMergeable: "mergeable: " + pr.mergeable,
+        dCheckSources: checks.length ? checks.length + " runs · " + (checks.filter(x => x.src === "status").length) + " classic statuses" : "nothing reported",
+        dDeps: pr.deps.map(x => ({ name: x.name, delta: x.from + " → " + x.to, type: x.type, color: TYPE[x.type][0] })),
+        dChecks: checks.map(x => ({ name: x.name, state: x.state, src: x.src, glyph: (CS[x.state] || CS.queued)[0], color: (CS[x.state] || CS.queued)[1] })),
+        dFields: [
+          { k: "id", v: pr.key },
+          { k: "installation_id", v: pr.installation + "  (" + pr.owner + ")" },
+          { k: "head_sha", v: pr.headSha.slice(0, 12) },
+          { k: "update_type", v: pr.type + "  (display metadata — not an authorization predicate)" },
+          { k: "updated_at", v: rel(pr.updatedAt) + " ago" },
+          { k: "synced_at", v: rel(pr.syncedAt) + " ago" },
+          { k: "labels", v: pr.labels.join(", ") }
+        ],
+        dHistory: [
+          { when: rel(pr.syncedAt), what: "sync — canonical fetch, 4 calls, rollup " + pr.check },
+          { when: rel(pr.updatedAt), what: pr.grouped ? "opened by dependabot[bot] · grouped update" : "opened by dependabot[bot]" },
+          { when: rel(pr.updatedAt + 60000), what: "check_run storm collapsed by debounce (2 fetches)" }
+        ],
+        dMerge: () => this.openConfirm("merge", [pr.key]),
+        dRebase: () => this.openConfirm("rebase", [pr.key]),
+        dUpdateBranch: () => this.flash("PUT /pulls/" + pr.number + "/update-branch  expected_head_sha=" + pr.headSha.slice(0, 7)),
+        dSync: () => this.flash("PullRequest/" + pr.key + "/sync — debounced, 20s window")
+      };
+    }
+
+    const tableW = s.winW - (s.asideOpen ? 262 : 0);
+    const chips = [];
+    if (s.q) chips.push({ kind: "search", label: s.q, off: () => this.setState({ q: "", visible: 50 }) });
+    this.activeKeys(s.statuses).forEach(k => chips.push({ kind: "check", label: k, off: () => this.toggleKey("statuses", k) }));
+    this.activeKeys(s.types).forEach(k => chips.push({ kind: "type", label: k, off: () => this.toggleKey("types", k) }));
+    this.activeKeys(s.labels).forEach(k => chips.push({ kind: "label", label: k, off: () => this.toggleKey("labels", k) }));
+    const selRepoKeys = this.activeKeys(s.repos);
+    if (selRepoKeys.length > 3) {
+      chips.push({ kind: "repos", label: selRepoKeys.length + " selected", off: () => this.setState({ repos: {}, visible: 50 }) });
+    } else {
+      selRepoKeys.forEach(k => chips.push({ kind: "repo", label: k, off: () => this.toggleKey("repos", k) }));
+    }
+    const hdrSet = s.groupMode === "none" ? rows : rowsAll;
+    const hdrAll = hdrSet.length > 0 && hdrSet.every(x => s.sel[x.key]);
+    const rateMax = 5000, rateLeft = rateMax - s.rateUsed;
+
+    return Object.assign({
+      accent, suspended,
+      asideDisplay: s.asideOpen ? "block" : "none",
+      asideToggleColor: s.asideOpen ? "#8b9298" : accent,
+      toggleAside: () => this.setState({ asideOpen: !s.asideOpen }),
+      showLabels: tableW > 1020,
+      gridCols: tableW > 1020
+        ? "26px 56px minmax(260px, 2fr) 224px 118px minmax(110px, 1fr) 72px"
+        : "26px 52px minmax(210px, 2fr) 200px 112px 66px",
+      gridMin: tableW > 1020 ? "1000px" : "760px",
+      hasChips: chips.length > 0,
+      activeChips: chips,
+      accountsLabel: this.accounts.length + " accounts",
+      suspendedLogin: suspendedLogin || "",
+      facetAccounts,
+      rowH: dense ? "34px" : "44px",
+      q: s.q, onQ: (e) => this.setState({ q: e.target.value, visible: 50, cursor: 0 }),
+      searchRef: (el) => { this.search = el; }, listRef: (el) => { this.list = el; },
+      filterSummary: (this.activeKeys(s.statuses).length + this.activeKeys(s.types).length + this.activeKeys(s.labels).length + this.activeKeys(s.repos).length + this.activeKeys(s.owners).length) + " filters active",
+      clearColor: (s.q || this.activeKeys(s.statuses).length + this.activeKeys(s.types).length + this.activeKeys(s.labels).length + this.activeKeys(s.repos).length + this.activeKeys(s.owners).length) ? accent : "#3d4449",
+      clearFilters: () => this.setState({ q: "", repoQ: "", statuses: {}, types: {}, labels: {}, repos: {}, owners: {}, visible: 50, cursor: 0 }),
+      facetStatus, facetType, facetLabels, facetRepos, repoTree,
+      repoQ: s.repoQ, onRepoQ: (e) => this.setState({ repoQ: e.target.value }),
+      repoSelLabel: (() => { const n = this.activeKeys(s.repos).length; return n ? n + " selected" : this.repos.length + " repos"; })(),
+      groupModes: [
+        { key: "none", label: "none", mode: "none" },
+        { key: "dep", label: "dependency", mode: "dep" },
+        { key: "repo", label: "repo", mode: "repo" }
+      ].map(g => ({
+        label: g.label,
+        bg: s.groupMode === g.mode ? "#242b31" : "transparent",
+        fg: s.groupMode === g.mode ? "#ffffff" : "#8b9298",
+        on: () => this.setState({ groupMode: g.mode, expanded: {}, cursor: 0, visible: 50 })
+      })),
+      orderLabel: s.groupMode === "none" ? "ORDER BY updated_at DESC, id DESC" : "GROUP BY " + (s.groupMode === "dep" ? "dependency" : "repository"),
+      repoCountLabel: repoRows.length + "/" + this.repos.length,
+      rows: rowVals,
+      isEmpty: rowsAll.length === 0,
+      emptyGlyph: all.length === 0 ? "✓" : "⌀",
+      emptyTitle: all.length === 0 ? "Nothing open" : "No PRs match this filter",
+      emptyBody: all.length === 0 ? "Every Dependabot PR in the installation is merged or closed. The hourly sweep will repopulate the read model as new ones land." : "retain_prs only deletes rows synced before the last reconcile started — so an empty result here is a filter, not a missing row.",
+      hasMore: s.groupMode === "none" && rowsAll.length > rows.length,
+      cursorLabel: "cursor after (" + (rows.length ? rel(rows[rows.length - 1].updatedAt) : "—") + ", id) · keyset paging",
+      loadMore: () => this.setState(st => ({ visible: st.visible + 50 })),
+      resultLabel: s.groupMode === "none"
+        ? rowsAll.length + " open · " + rows.length + " loaded"
+        : rowsAll.length + " open · " + rowVals.filter(r => r.chevron).length + (s.groupMode === "dep" ? " dependencies" : " repositories"),
+      selectAllLabel: rowsAll.length > rows.length ? "select all " + rowsAll.length + " matching" : "select all " + rowsAll.length,
+      selectAllMatching: () => { const sel = {}; rowsAll.forEach(x => { sel[x.key] = true; }); this.setState({ sel }); },
+      toggleAllVisible: () => {
+        const set = s.groupMode === "none" ? rows : rowsAll;
+        const allSel = set.length && set.every(x => s.sel[x.key]);
+        const sel = Object.assign({}, s.sel);
+        set.forEach(x => { if (allSel) delete sel[x.key]; else sel[x.key] = true; });
+        this.setState({ sel });
+      },
+      hdrBoxBg: hdrAll ? accent : "transparent",
+      hdrBoxBorder: hdrAll ? accent : "#394148",
+      hdrBoxMark: hdrAll ? "✓" : "",
+      storeLabel: "libSQL · " + all.length + " rows · " + this.repos.length + " repos · " + this.accounts.length + " installations",
+      selCount: selKeys.length,
+      selBreakdown: selKeys.length
+        ? Object.keys(selRepos).length + (Object.keys(selRepos).length === 1 ? " repo, " : " repos, ")
+          + Object.keys(selOwners).length + (Object.keys(selOwners).length === 1 ? " account" : " accounts")
+          + (notGreen ? " · " + notGreen + " not green" : "")
+          + (offView ? " · " + offView + " outside this filter" : "")
+        : "",
+      askMerge: () => this.openConfirm("merge", null),
+      askRebase: () => this.openConfirm("rebase", null),
+      clearSel: () => this.setState({ sel: {} }),
+      confirm: c ? "1" : "", closeConfirm: () => this.setState({ confirm: null }), stop: (e) => e.stopPropagation(),
+      runBatch: () => this.start(),
+      methods: ["squash", "merge", "rebase"].map(m => ({ label: m, bg: s.method === m ? "#242b31" : "transparent", fg: s.method === m ? "#ffffff" : "#8b9298", on: () => this.setState({ method: m }) })),
+      batch: b ? "1" : "", closeBatch: () => this.setState({ batch: null }),
+      retryRejected: () => { const t = b.targets.filter(x => x.st === "rejected").map(x => x.key); this.setState({ confirm: { action: b.action, targets: t, id: this.batchId() } }); },
+      detail: pr ? "1" : "", closeDetail: () => this.setState({ openId: null }),
+      view, setViewAll: () => this.setState({ view: "all", visible: 50, cursor: 0 }), setViewAttn: () => this.setState({ view: "attention", visible: 50, cursor: 0 }),
+      viewAllBg: view === "all" ? "#242b31" : "transparent", viewAllFg: view === "all" ? "#ffffff" : "#8b9298",
+      viewAttnBg: view === "attention" ? "#242b31" : "transparent", viewAttnFg: view === "attention" ? "#ffffff" : "#8b9298",
+      attentionCount: all.filter(x => x.check === "failure" || x.check === "none" || x.mergeable === "conflicting" || x.type === "major" || this.now - x.syncedAt > 45 * 60000).length,
+      showBudget: p.showRateBudget !== false,
+      ratePct: Math.round((rateLeft / rateMax) * 100) + "%",
+      rateColor: rateLeft > 1500 ? "#5fd08a" : rateLeft > 500 ? "#e8b23a" : "#ff6b60",
+      rateLabel: rateLeft + "/" + rateMax,
+      sweepLabel: s.sweep + "m ago",
+      refreshAnim: s.refreshing ? "spin .8s linear infinite" : "none",
+      doRefresh: () => {
+        this.setState({ refreshing: true });
+        setTimeout(() => this.setState({ refreshing: false, sweep: 0, rateUsed: Math.min(4900, this.state.rateUsed + 86) }), 1100);
+        this.flash(suspended
+          ? "sync_now fanned out to 2 of 3 installations — " + suspendedLogin + " is suspended, so pause() skips it"
+          : "sync_now fanned out to " + this.accounts.length + " installations — repos before pull_requests, keyed per installation");
+      },
+      toast: s.toast || ""
+    }, confirmVals, batchVals, d);
+  }
+
+  get orgName() { return "northwind"; }
+}
+
+</script>
+</body>
+</html>
