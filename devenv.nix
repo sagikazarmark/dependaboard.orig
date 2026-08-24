@@ -13,6 +13,9 @@
     cargo-dist
     cargo-release
     cargo-watch
+
+    dioxus-cli
+    wasm-bindgen-cli_0_2_126
   ];
 
   languages = {
