@@ -1,0 +1,13 @@
+{
+  "name": "dependaboard",
+  "private": true,
+  "scripts": {
+    "css:build": "tailwindcss -i ./apps/web/styles/app.css -o ./apps/web/assets/main.css --minify",
+    "css:watch": "tailwindcss -i ./apps/web/styles/app.css -o ./apps/web/assets/main.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "4.3.3",
+    "daisyui": "5.7.22",
+    "tailwindcss": "4.3.3"
+  }
+}

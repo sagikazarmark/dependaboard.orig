@@ -12,4 +12,11 @@ devenv.local.yaml
 # Rust
 target/
 
+# Frontend
+node_modules/
+apps/web/dist/
+
+# Local state
+data/
+
 .env

@@ -1,0 +1,11 @@
+[application]
+name = "dependaboard"
+default_platform = "web"
+out_dir = "dist"
+asset_dir = "assets"
+
+[web.app]
+title = "Dependabot Dashboard"
+
+[web.watcher]
+watch_path = ["src", "styles", "assets"]

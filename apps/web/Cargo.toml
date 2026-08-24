@@ -1,0 +1,35 @@
+[package]
+name = "dependaboard-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dependaboard-core = { path = "../../crates/core" }
+dioxus = { workspace = true }
+serde.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { version = "0.3.0", features = ["futures"] }
+# Keep the library in lockstep with the CLI supplied by devenv.
+wasm-bindgen = "=0.2.126"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+axum.workspace = true
+base64.workspace = true
+dependaboard-store = { path = "../../crates/store" }
+hex.workspace = true
+hmac.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+default = ["web"]
+web = ["dioxus/web"]
+server = ["dioxus/server"]
