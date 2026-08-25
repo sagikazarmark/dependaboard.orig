@@ -560,6 +560,7 @@ fn App() -> Element {
     let mut refresh = use_signal(|| 0_u64);
     let mut selected = use_signal(BTreeSet::<String>::new);
     let mut detail = use_signal(|| None::<PrRecord>);
+    let mut detail_target = use_signal(|| None::<PrTarget>);
     let mut confirm = use_signal(|| None::<BulkActionKind>);
     let mut active_batch = use_signal(|| None::<BatchProgress>);
     let mut progress_open = use_signal(|| false);
@@ -892,6 +893,12 @@ fn App() -> Element {
                 DetailDrawer {
                     row,
                     onclose: move |_| detail.set(None),
+                    onaction: move |action| {
+                        if let Some(row) = detail() {
+                            detail_target.set(Some(pr_target(&row)));
+                            confirm.set(Some(action));
+                        }
+                    },
                     onsync: move |result: Result<Option<PrRecord>, String>| match result {
                         Ok(Some(row)) => {
                             detail.set(Some(row));
@@ -925,16 +932,23 @@ fn App() -> Element {
             if let Some(action) = confirm() {
                 ConfirmModal {
                     action,
-                    count: selected_count,
-                    oncancel: move |_| confirm.set(None),
+                    count: if detail_target().is_some() { 1 } else { selected_count },
+                    oncancel: move |_| {
+                        detail_target.set(None);
+                        confirm.set(None);
+                    },
                     onconfirm: {
                         let rows = rows.clone();
                         move |_| {
-                            let targets = rows
-                                .iter()
-                                .filter(|row| selected.read().contains(&row.id))
-                                .map(pr_target)
-                                .collect::<Vec<_>>();
+                            let targets = detail_target().map_or_else(
+                                || {
+                                    rows.iter()
+                                        .filter(|row| selected.read().contains(&row.id))
+                                        .map(pr_target)
+                                        .collect::<Vec<_>>()
+                                },
+                                |target| vec![target],
+                            );
                             let batch_id = new_batch_id();
                             active_batch.set(Some(BatchProgress::queued(
                                 &batch_id,
@@ -942,6 +956,7 @@ fn App() -> Element {
                                 &targets,
                             )));
                             progress_open.set(true);
+                            detail_target.set(None);
                             confirm.set(None);
                             selected.write().clear();
                             spawn(async move {
@@ -1123,6 +1138,7 @@ fn PrRow(
 fn DetailDrawer(
     row: PrRecord,
     onclose: EventHandler<MouseEvent>,
+    onaction: EventHandler<BulkActionKind>,
     onsync: EventHandler<Result<Option<PrRecord>, String>>,
 ) -> Element {
     let stale = unix_seconds().saturating_sub(row.synced_at) > 45 * 60;
@@ -1154,12 +1170,75 @@ fn DetailDrawer(
                     button { class: "close-button", onclick: move |event| onclose.call(event), "x" }
                 }
                 div { class: "drawer-body",
-                    h3 { "{row.title}" }
+                    h3 {
+                        a {
+                            class: "drawer-title-link",
+                            href: row.html_url.clone(),
+                            target: "_blank",
+                            rel: "noreferrer",
+                            "{row.title}"
+                        }
+                    }
                     div { class: "drawer-badges",
                         span { class: "update-chip {update_class(row.update_type)}", "{row.update_type}" }
                         span { class: "status-badge", span { class: "check-dot {status_class(row.check_status)}" } "{status_label(row.check_status)}" }
                         if let Some(mergeable) = &row.mergeable { span { class: "status-badge", "{mergeable}" } }
                         if stale { span { class: "status-badge stale-badge", "projection stale" } }
+                    }
+                    div { class: "drawer-actions",
+                        button {
+                            class: "btn btn-sm rebase-button",
+                            onclick: move |_| onaction.call(BulkActionKind::Rebase),
+                            "Rebase"
+                        }
+                        button {
+                            class: "btn btn-sm merge-button",
+                            onclick: move |_| onaction.call(BulkActionKind::Merge),
+                            "Merge"
+                        }
+                        button {
+                            class: "btn btn-sm drawer-sync",
+                            disabled: syncing() || sync_queued(),
+                            onclick: move |_| {
+                                syncing.set(true);
+                                spawn(async move {
+                                    match request_pr_sync(sync_repository_id, sync_number).await {
+                                        Ok(completion_id) => {
+                                            syncing.set(false);
+                                            sync_queued.set(true);
+                                            match wait_for_pr_sync_completion(
+                                                sync_repository_id,
+                                                sync_number,
+                                                completion_id,
+                                            ).await {
+                                                Ok(row) => {
+                                                    sync_queued.set(false);
+                                                    status.restart();
+                                                    onsync.call(Ok(row));
+                                                }
+                                                Err(error) => {
+                                                    sync_queued.set(false);
+                                                    onsync.call(Err(format!(
+                                                        "Sync was queued, but completion could not be confirmed: {error}"
+                                                    )));
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            syncing.set(false);
+                                            onsync.call(Err(format!("Could not queue sync: {error}")));
+                                        }
+                                    }
+                                });
+                            },
+                            if syncing() {
+                                "Queueing..."
+                            } else if sync_queued() {
+                                "Syncing..."
+                            } else {
+                                "Sync"
+                            }
+                        }
                     }
                     dl { class: "detail-list",
                         dt { "Head SHA" } dd { code { "{row.head_sha}" } }
@@ -1215,52 +1294,6 @@ fn DetailDrawer(
                             "Reading durable activity"
                         }
                     }
-                }
-                div { class: "drawer-actions",
-                    button {
-                        class: "drawer-action drawer-sync",
-                        disabled: syncing() || sync_queued(),
-                        onclick: move |_| {
-                            syncing.set(true);
-                            spawn(async move {
-                                match request_pr_sync(sync_repository_id, sync_number).await {
-                                    Ok(completion_id) => {
-                                        syncing.set(false);
-                                        sync_queued.set(true);
-                                        match wait_for_pr_sync_completion(
-                                            sync_repository_id,
-                                            sync_number,
-                                            completion_id,
-                                        ).await {
-                                            Ok(row) => {
-                                                sync_queued.set(false);
-                                                status.restart();
-                                                onsync.call(Ok(row));
-                                            }
-                                            Err(error) => {
-                                                sync_queued.set(false);
-                                                onsync.call(Err(format!(
-                                                    "Sync was queued, but completion could not be confirmed: {error}"
-                                                )));
-                                            }
-                                        }
-                                    }
-                                    Err(error) => {
-                                        syncing.set(false);
-                                        onsync.call(Err(format!("Could not queue sync: {error}")));
-                                    }
-                                }
-                            });
-                        },
-                        if syncing() {
-                            "Queueing sync..."
-                        } else if sync_queued() {
-                            "Syncing..."
-                        } else {
-                            "Sync PR"
-                        }
-                    }
-                    a { class: "drawer-action drawer-link", href: row.html_url, target: "_blank", rel: "noreferrer", "Open on GitHub" }
                 }
             }
         }

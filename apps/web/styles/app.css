@@ -739,6 +739,10 @@ code,
   gap: 4px;
 }
 
+.drawer-badges {
+  align-items: center;
+}
+
 .row-labels span,
 .drawer-labels span,
 .status-badge {
@@ -965,6 +969,17 @@ code,
   line-height: 1.45;
 }
 
+.drawer-title-link {
+  color: inherit;
+  text-decoration-color: color-mix(in srgb, currentColor 35%, transparent);
+  text-underline-offset: 3px;
+}
+
+.drawer-title-link:hover {
+  color: var(--color-primary);
+  text-decoration-color: currentColor;
+}
+
 .drawer-body h4 {
   margin: 24px 0 9px;
   color: var(--muted);
@@ -1034,28 +1049,22 @@ code,
 }
 
 .drawer-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  border-top: 1px solid var(--line);
-}
-
-.drawer-action {
-  display: block;
-  padding: 12px 18px;
-  border: 0;
-  cursor: pointer;
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 11px;
-  text-align: left;
-}
-
-.drawer-action + .drawer-action {
-  border-left: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 14px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft);
 }
 
 .drawer-sync {
+  min-height: 28px;
+  margin-left: auto;
+  border: 1px solid var(--line);
   color: var(--color-base-content);
   background: color-mix(in srgb, var(--color-primary) 8%, transparent);
+  font-size: 11px;
 }
 
 .drawer-sync:not(:disabled):hover {
@@ -1065,15 +1074,6 @@ code,
 .drawer-sync:disabled {
   color: var(--muted);
   cursor: default;
-}
-
-.drawer-link {
-  color: var(--color-primary);
-  text-decoration: none;
-}
-
-.drawer-link:hover {
-  text-decoration: underline;
 }
 
 .confirm-box {
