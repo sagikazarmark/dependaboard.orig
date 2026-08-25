@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc};
+use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use dependaboard_core::{
@@ -63,13 +63,14 @@ impl LibSqlPrStore {
     }
 
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        let connection = self.database.connect()?;
+        let connection = self.connection().await?;
         connection.execute_batch(MIGRATION).await?;
         Ok(())
     }
 
     async fn connection(&self) -> Result<libsql::Connection, StoreError> {
         let connection = self.database.connect()?;
+        connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute("PRAGMA foreign_keys = ON", ()).await?;
         Ok(connection)
     }
@@ -861,6 +862,23 @@ mod tests {
 
         assert_eq!(deleted, 1);
         assert!(store.get_pr(&PrKey::new(1, 1)).await.unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_local_writes_wait_for_the_writer() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+
+        let connection = store.connection().await.unwrap();
+        let transaction = connection.transaction().await.unwrap();
+        upsert_repo_on(&transaction, &repo(2, 10)).await.unwrap();
+
+        let concurrent_store = store.clone();
+        let write = tokio::spawn(async move { concurrent_store.upsert_pr(&pr(1, 1, 10)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        transaction.commit().await.unwrap();
+
+        write.await.unwrap().unwrap();
     }
 
     #[test]
