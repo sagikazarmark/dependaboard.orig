@@ -20,3 +20,5 @@ apps/web/dist/
 data/
 
 .env
+.env.restate
+.env.web

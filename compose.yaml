@@ -1,17 +1,24 @@
-name: dependaboard
-
 services:
   restate:
     image: docker.restate.dev/restatedev/restate:1.7.6
+    environment:
+      RESTATE_NODE_NAME: dependaboard
     ports:
       - "127.0.0.1:8080:8080"
       - "127.0.0.1:9070:9070"
-      - "127.0.0.1:9071:9071"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - restate-data:/restate-data
     restart: unless-stopped
+
+  restate-cli:
+    image: docker.restate.dev/restatedev/restate-cli:1.7.6
+    network_mode: "service:restate"
+    depends_on:
+      - restate
+    profiles:
+      - tools
 
 volumes:
   restate-data:

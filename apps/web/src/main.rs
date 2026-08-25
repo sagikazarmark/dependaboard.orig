@@ -171,9 +171,13 @@ fn restate_client() -> Result<(reqwest::Client, String, Option<String>), String>
         .trim_end_matches('/')
         .to_owned();
     let token = std::env::var("RESTATE_AUTH_TOKEN")
-        .or_else(|_| std::env::var("RESTATE_API_KEY"))
         .ok()
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("RESTATE_API_KEY")
+                .ok()
+                .filter(|value| !value.is_empty())
+        });
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(15))

@@ -1164,7 +1164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn(start_scheduler(installation_id));
     let address = env::var("RESTATE_SERVICE_ADDRESS")
-        .unwrap_or_else(|_| "0.0.0.0:9080".to_owned())
+        .unwrap_or_else(|_| "127.0.0.1:9080".to_owned())
         .parse()?;
     info!(%address, "starting Restate service endpoint");
     HttpServer::new(endpoint).listen_and_serve(address).await;
@@ -1177,8 +1177,13 @@ async fn start_scheduler(installation_id: u64) {
         .trim_end_matches('/')
         .to_owned();
     let api_key = env::var("RESTATE_AUTH_TOKEN")
-        .or_else(|_| env::var("RESTATE_API_KEY"))
-        .ok();
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            env::var("RESTATE_API_KEY")
+                .ok()
+                .filter(|value| !value.is_empty())
+        });
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
