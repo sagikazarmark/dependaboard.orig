@@ -361,12 +361,12 @@ impl GithubClient {
                 )
                 .await?;
             let count = response.check_suites.len();
-            signals.extend(response.check_suites.into_iter().filter_map(|suite| {
-                dependaboard_core::check_signal(
-                    suite.status.as_deref(),
-                    suite.conclusion.as_deref(),
-                )
-            }));
+            signals.extend(
+                response
+                    .check_suites
+                    .into_iter()
+                    .filter_map(|suite| check_suite_signal(&suite)),
+            );
             if count < 100 {
                 break;
             }
@@ -808,6 +808,12 @@ fn known_http(error: GithubError) -> GithubError {
     }
 }
 
+fn check_suite_signal(suite: &CheckRun) -> Option<CheckSignal> {
+    // Runs carry active/pass state; suites only add failures that can occur before a run exists.
+    dependaboard_core::check_signal(suite.status.as_deref(), suite.conclusion.as_deref())
+        .filter(|signal| matches!(signal, CheckSignal::Fail))
+}
+
 async fn parse_response<T: DeserializeOwned>(response: Response) -> Result<T, GithubError> {
     let status = response.status();
     if status.is_success() {
@@ -1016,6 +1022,27 @@ mod tests {
             highest_update_type(&dependencies),
             dependaboard_core::UpdateType::Minor
         );
+    }
+
+    #[test]
+    fn queued_suite_container_does_not_override_successful_checks() {
+        let queued_suite = CheckRun {
+            status: Some("queued".to_owned()),
+            conclusion: None,
+        };
+        let failed_suite = CheckRun {
+            status: Some("completed".to_owned()),
+            conclusion: Some("startup_failure".to_owned()),
+        };
+        let signals = [Some(CheckSignal::Pass), check_suite_signal(&queued_suite)]
+            .into_iter()
+            .flatten();
+
+        assert_eq!(
+            rollup_checks(signals),
+            dependaboard_core::CheckStatus::Success
+        );
+        assert_eq!(check_suite_signal(&failed_suite), Some(CheckSignal::Fail));
     }
 
     #[tokio::test]
