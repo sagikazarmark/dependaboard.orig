@@ -634,7 +634,7 @@ impl Execute for libsql::Connection {
 #[async_trait]
 impl Execute for Transaction {
     async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<u64, libsql::Error> {
-        Transaction::execute(self, sql, params).await
+        libsql::Connection::execute(self, sql, params).await
     }
 }
 
@@ -843,6 +843,24 @@ mod tests {
         assert!(store.get_pr(&PrKey::new(1, 2)).await.unwrap().is_some());
         store.purge_installation(9).await.unwrap();
         assert!(store.get_pr(&PrKey::new(1, 2)).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn replacing_installation_repos_removes_stale_repos_in_one_transaction() {
+        let (_directory, store) = test_store().await;
+        store
+            .replace_installation_repos(9, &[repo(1, 10), repo(2, 10)], 20)
+            .await
+            .unwrap();
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+
+        let deleted = store
+            .replace_installation_repos(9, &[repo(2, 30)], 20)
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 1);
+        assert!(store.get_pr(&PrKey::new(1, 1)).await.unwrap().is_none());
     }
 
     #[test]
