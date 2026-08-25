@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use dependaboard_core::{
     ActionLog, ActionOutcome, BatchProgress, BulkActionKind, BulkRequest, Classification,
     CommandRequest, DependabotCommand, GithubErrorResponse, MAX_BATCH_TARGETS, MergeRequest,
@@ -11,7 +12,7 @@ use dependaboard_core::{
     TargetProgressState, UpdateBranchRequest, WebhookEvent, classify_github_error, valid_batch_id,
 };
 use dependaboard_github::{GithubApi, GithubClient, GithubConfig, GithubError};
-use dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig};
+use dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig, StoreError, StoreErrorClass};
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -21,6 +22,8 @@ use tracing_subscriber::EnvFilter;
 const PR_STATE: &str = "pr_state";
 const BATCH_PROGRESS: &str = "progress";
 const SCHEDULER_STARTED: &str = "scheduler_started";
+const SCHEDULER_GENERATION: &str = "scheduler_generation";
+const SCHEDULER_TICK_PENDING: &str = "scheduler_tick_pending";
 const DEFAULT_DEBOUNCE_SECONDS: u64 = 20;
 const DEFAULT_RECONCILE_SECONDS: u64 = 60 * 60;
 const MAX_CONCURRENT: usize = 3;
@@ -108,7 +111,7 @@ impl PullRequest {
             let store = self.store.clone();
             let projected = snapshot.clone();
             ctx.run(move || async move {
-                store.upsert_pr(&projected).await?;
+                store.upsert_pr(&projected).await.map_err(store_failure)?;
                 Ok(())
             })
             .name("upsert-pr-projection")
@@ -125,7 +128,7 @@ impl PullRequest {
             let store = self.store.clone();
             let key = request_key(&request);
             ctx.run(move || async move {
-                store.delete_pr(&key).await?;
+                store.delete_pr(&key).await.map_err(store_failure)?;
                 Ok(())
             })
             .name("delete-ineligible-pr-projection")
@@ -143,7 +146,7 @@ impl PullRequest {
             .map_err(|error| TerminalError::new(error.to_string()))?;
         let store = self.store.clone();
         ctx.run(move || async move {
-            store.delete_pr(&key).await?;
+            store.delete_pr(&key).await.map_err(store_failure)?;
             Ok(())
         })
         .name("delete-closed-pr-projection")
@@ -194,7 +197,7 @@ impl PullRequest {
                 TerminalError::new(format!("invalid merge target key: {error}"))
             })?;
             ctx.run(move || async move {
-                store.delete_pr(&key).await?;
+                store.delete_pr(&key).await.map_err(store_failure)?;
                 Ok(())
             })
             .name("delete-merged-pr-projection")
@@ -333,7 +336,7 @@ impl PullRequest {
         Ok(Json::from(outcome))
     }
 
-    #[handler]
+    #[handler(ingress_private = false)]
     async fn status(&self, ctx: SharedObjectContext<'_>) -> HandlerResult<Json<Option<PrState>>> {
         Ok(Json::from(
             ctx.get::<Json<PrState>>(PR_STATE)
@@ -355,7 +358,7 @@ impl BulkAction {
     ) -> HandlerResult<Json<BatchProgress>> {
         let request = request.into_inner();
         validate_batch_request(ctx.key(), &request)?;
-        let mut progress = BatchProgress::queued(ctx.key(), &request);
+        let mut progress = BatchProgress::queued(ctx.key(), request.action, &request.targets);
         ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
         match request.action {
             BulkActionKind::Merge => {
@@ -440,7 +443,6 @@ async fn run_merge_batch(
                     .merge(Json::from(MergeRequest {
                         batch_id: ctx.key().to_owned(),
                         target: target.clone(),
-                        merge_method: request.merge_method,
                     }))
                     .call(),
             );
@@ -497,28 +499,90 @@ struct InstallationSync {
     interval: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SchedulerTick(Option<u64>);
+
+impl restate_sdk::serde::Serialize for SchedulerTick {
+    type Error = serde_json::Error;
+
+    fn serialize(&self) -> Result<Bytes, Self::Error> {
+        serde_json::to_vec(&self.0).map(Bytes::from)
+    }
+}
+
+impl restate_sdk::serde::Deserialize for SchedulerTick {
+    type Error = serde_json::Error;
+
+    fn deserialize(bytes: &mut Bytes) -> Result<Self, Self::Error> {
+        if bytes.is_empty() {
+            Ok(Self(None))
+        } else {
+            serde_json::from_slice(bytes).map(Self)
+        }
+    }
+}
+
+impl restate_sdk::serde::PayloadMetadata for SchedulerTick {
+    fn json_schema() -> Option<serde_json::Value> {
+        Some(serde_json::json!({ "type": ["integer", "null"], "minimum": 0 }))
+    }
+}
+
 #[restate_sdk::object(ingress_private)]
 impl InstallationSync {
     #[handler]
     async fn start(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
-        if ctx.get::<bool>(SCHEDULER_STARTED).await?.unwrap_or(false) {
+        let started = ctx.get::<bool>(SCHEDULER_STARTED).await?.unwrap_or(false);
+        let tick_pending = ctx
+            .get::<bool>(SCHEDULER_TICK_PENDING)
+            .await?
+            .unwrap_or(false);
+        if started && tick_pending {
             return Ok(());
         }
+        let current_generation = ctx.get::<u64>(SCHEDULER_GENERATION).await?.unwrap_or(0);
+        let generation = if started && current_generation > 0 {
+            current_generation
+        } else {
+            next_scheduler_generation(current_generation)?
+        };
+        ctx.set(SCHEDULER_GENERATION, generation);
         ctx.set(SCHEDULER_STARTED, true);
+        ctx.set(SCHEDULER_TICK_PENDING, true);
         ctx.object_client::<InstallationSyncClient>(ctx.key())
-            .tick()
+            .tick(SchedulerTick(Some(generation)))
             .send();
         Ok(())
     }
 
     #[handler]
-    async fn tick(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
-        if !ctx.get::<bool>(SCHEDULER_STARTED).await?.unwrap_or(false) {
+    async fn tick(&self, ctx: ObjectContext<'_>, generation: SchedulerTick) -> HandlerResult<()> {
+        let started = ctx.get::<bool>(SCHEDULER_STARTED).await?.unwrap_or(false);
+        let tick_pending = ctx
+            .get::<bool>(SCHEDULER_TICK_PENDING)
+            .await?
+            .unwrap_or(false);
+        let mut current_generation = ctx.get::<u64>(SCHEDULER_GENERATION).await?.unwrap_or(0);
+        if !started {
             return Ok(());
         }
+        let generation = match generation.0 {
+            Some(generation) => generation,
+            None if tick_pending => return Ok(()),
+            None => {
+                current_generation = next_scheduler_generation(current_generation)?;
+                ctx.set(SCHEDULER_GENERATION, current_generation);
+                current_generation
+            }
+        };
+        if !scheduler_tick_is_current(started, current_generation, generation) {
+            return Ok(());
+        }
+        ctx.clear(SCHEDULER_TICK_PENDING);
         perform_installation_sync(&ctx, self.github.clone(), self.store.clone()).await?;
+        ctx.set(SCHEDULER_TICK_PENDING, true);
         ctx.object_client::<InstallationSyncClient>(ctx.key())
-            .tick()
+            .tick(SchedulerTick(Some(generation)))
             .send_after(self.interval);
         Ok(())
     }
@@ -531,25 +595,49 @@ impl InstallationSync {
     #[handler]
     async fn pause(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
         ctx.clear(SCHEDULER_STARTED);
+        ctx.clear(SCHEDULER_TICK_PENDING);
+        invalidate_scheduler_generation(&ctx).await?;
         Ok(())
     }
 
     #[handler]
     async fn purge(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
         ctx.clear(SCHEDULER_STARTED);
+        ctx.clear(SCHEDULER_TICK_PENDING);
+        invalidate_scheduler_generation(&ctx).await?;
         let installation_id = ctx
             .key()
             .parse::<u64>()
             .map_err(|_| TerminalError::new("installation key must be an integer"))?;
         let store = self.store.clone();
         ctx.run(move || async move {
-            store.purge_installation(installation_id).await?;
+            store
+                .purge_installation(installation_id)
+                .await
+                .map_err(store_failure)?;
             Ok(())
         })
         .name("purge-installation")
         .await?;
         Ok(())
     }
+}
+
+fn next_scheduler_generation(current: u64) -> HandlerResult<u64> {
+    current
+        .checked_add(1)
+        .ok_or_else(|| TerminalError::new("scheduler generation overflow").into())
+}
+
+fn scheduler_tick_is_current(started: bool, current: u64, incoming: u64) -> bool {
+    started && current == incoming
+}
+
+async fn invalidate_scheduler_generation(ctx: &ObjectContext<'_>) -> HandlerResult<()> {
+    let generation =
+        next_scheduler_generation(ctx.get::<u64>(SCHEDULER_GENERATION).await?.unwrap_or(0))?;
+    ctx.set(SCHEDULER_GENERATION, generation);
+    Ok(())
 }
 
 async fn perform_installation_sync(
@@ -581,7 +669,8 @@ async fn perform_installation_sync(
     ctx.run(move || async move {
         store
             .replace_installation_repos(installation_id, &stored, reconcile_start)
-            .await?;
+            .await
+            .map_err(store_failure)?;
         Ok(())
     })
     .name("replace-installation-repositories")
@@ -647,7 +736,8 @@ impl RepoSync {
         ctx.run(move || async move {
             store
                 .retain_prs(repository_id, &live, reconcile_start)
-                .await?;
+                .await
+                .map_err(store_failure)?;
             Ok(())
         })
         .name("retain-live-pull-requests")
@@ -665,9 +755,14 @@ impl RepoSync {
         let store = self.store.clone();
         let repository_id = request.repository_id;
         let sha = request.sha.clone();
-        let matches =
-            ctx.run(move || async move {
-                Ok(Json::from(store.prs_for_sha(repository_id, &sha).await?))
+        let matches = ctx
+            .run(move || async move {
+                Ok(Json::from(
+                    store
+                        .prs_for_sha(repository_id, &sha)
+                        .await
+                        .map_err(store_failure)?,
+                ))
             })
             .name("resolve-prs-for-sha")
             .await?;
@@ -695,6 +790,21 @@ impl RepoSync {
 
 struct WebhookIngress {
     installation_id: u64,
+}
+
+struct SchedulerIngress {
+    installation_id: u64,
+}
+
+#[restate_sdk::service]
+impl SchedulerIngress {
+    #[handler]
+    async fn start(&self, ctx: Context<'_>) -> HandlerResult<()> {
+        ctx.object_client::<InstallationSyncClient>(self.installation_id.to_string())
+            .start()
+            .send();
+        Ok(())
+    }
 }
 
 #[restate_sdk::service]
@@ -789,19 +899,41 @@ fn dispatch_installation(ctx: &Context<'_>, event: &WebhookEvent) -> HandlerResu
         return Err(TerminalError::new("installation webhook is missing installation id").into());
     };
     let client = ctx.object_client::<InstallationSyncClient>(installation_id.to_string());
-    match event.action.as_deref() {
-        Some("created" | "unsuspend") => {
+    match installation_lifecycle_action(event.action.as_deref()) {
+        InstallationLifecycleAction::Start => {
             client.start().send();
         }
-        Some("suspend") => {
+        InstallationLifecycleAction::SyncNow => {
+            client.sync_now().send();
+        }
+        InstallationLifecycleAction::Pause => {
             client.pause().send();
         }
-        Some("deleted") => {
+        InstallationLifecycleAction::Purge => {
             client.purge().send();
         }
-        _ => {}
+        InstallationLifecycleAction::Ignore => {}
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallationLifecycleAction {
+    Start,
+    SyncNow,
+    Pause,
+    Purge,
+    Ignore,
+}
+
+fn installation_lifecycle_action(action: Option<&str>) -> InstallationLifecycleAction {
+    match action {
+        Some("created") => InstallationLifecycleAction::SyncNow,
+        Some("unsuspend") => InstallationLifecycleAction::Start,
+        Some("suspend") => InstallationLifecycleAction::Pause,
+        Some("deleted") => InstallationLifecycleAction::Purge,
+        _ => InstallationLifecycleAction::Ignore,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -875,6 +1007,13 @@ fn github_retry_policy() -> RunRetryPolicy {
         .initial_delay(Duration::from_secs(1))
         .exponentiation_factor(2.0)
         .max_delay(Duration::from_secs(5 * 60))
+}
+
+fn store_failure(error: StoreError) -> HandlerError {
+    match error.class() {
+        StoreErrorClass::Retryable => RetryableServiceError::Store(error.to_string()).into(),
+        StoreErrorClass::Terminal => TerminalError::new(error.to_string()).into(),
+    }
 }
 
 fn external_read<T>(result: External<T>) -> HandlerResult<T> {
@@ -984,6 +1123,8 @@ fn unix_seconds() -> u64 {
 enum RetryableServiceError {
     #[error("retryable GitHub failure: {0}")]
     Github(String),
+    #[error("retryable projection-store failure: {0}")]
+    Store(String),
 }
 
 #[tokio::main]
@@ -1016,6 +1157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind(pull_request)
         .bind(BulkAction)
         .bind(WebhookIngress { installation_id })
+        .bind(SchedulerIngress { installation_id })
         .bind(installation_sync)
         .bind(repo_sync)
         .build();
@@ -1048,21 +1190,10 @@ async fn start_scheduler(installation_id: u64) {
             return;
         }
     };
-    let url = format!("{ingress}/restate/send/WebhookIngress/dispatch");
-    let startup = WebhookEvent {
-        event: "installation".to_owned(),
-        action: Some("created".to_owned()),
-        installation_id: Some(installation_id),
-        repository_id: None,
-        owner: None,
-        repo: None,
-        number: None,
-        sha: None,
-        pull_requests: Vec::new(),
-    };
+    let url = format!("{ingress}/restate/send/SchedulerIngress/start");
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let mut request = client.post(&url).json(&startup);
+        let mut request = client.post(&url).json(&());
         if let Some(api_key) = &api_key {
             request = request.bearer_auth(api_key);
         }
@@ -1091,7 +1222,8 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use dependaboard_core::{CheckStatus, MergeMethod, PrRecord, PrTarget, UpdateType};
+    use bytes::Bytes;
+    use dependaboard_core::{CheckStatus, PrRecord, PrTarget, UpdateType, UserId};
 
     use super::*;
 
@@ -1112,8 +1244,7 @@ mod tests {
         let request = BulkRequest {
             action: BulkActionKind::Merge,
             targets: vec![target.clone(), target],
-            merge_method: MergeMethod::Squash,
-            user_id: "dashboard".to_owned(),
+            user_id: UserId::new("dashboard"),
         };
         assert!(validate_batch_request(&dependaboard_core::new_batch_id(), &request).is_err());
     }
@@ -1159,6 +1290,49 @@ mod tests {
             external::<()>(Err(GithubError::Http(response)), Operation::Read, false)
                 .await
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn installation_webhooks_map_to_distinct_lifecycle_actions() {
+        assert_eq!(
+            installation_lifecycle_action(Some("created")),
+            InstallationLifecycleAction::SyncNow
+        );
+        assert_eq!(
+            installation_lifecycle_action(Some("unsuspend")),
+            InstallationLifecycleAction::Start
+        );
+        assert_eq!(
+            installation_lifecycle_action(Some("suspend")),
+            InstallationLifecycleAction::Pause
+        );
+        assert_eq!(
+            installation_lifecycle_action(Some("deleted")),
+            InstallationLifecycleAction::Purge
+        );
+    }
+
+    #[test]
+    fn scheduler_generations_are_monotonic_and_cannot_wrap() {
+        assert_eq!(next_scheduler_generation(41).unwrap(), 42);
+        assert!(next_scheduler_generation(u64::MAX).is_err());
+        assert!(scheduler_tick_is_current(true, 42, 42));
+        assert!(!scheduler_tick_is_current(false, 42, 42));
+        assert!(!scheduler_tick_is_current(true, 43, 42));
+    }
+
+    #[test]
+    fn scheduler_tick_accepts_legacy_empty_and_generation_inputs() {
+        let mut legacy = Bytes::new();
+        assert_eq!(
+            <SchedulerTick as restate_sdk::serde::Deserialize>::deserialize(&mut legacy).unwrap(),
+            SchedulerTick(None)
+        );
+        let mut current = Bytes::from_static(b"42");
+        assert_eq!(
+            <SchedulerTick as restate_sdk::serde::Deserialize>::deserialize(&mut current).unwrap(),
+            SchedulerTick(Some(42))
         );
     }
 }

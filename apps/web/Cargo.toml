@@ -22,6 +22,7 @@ base64.workspace = true
 dependaboard-store = { path = "../../crates/store" }
 hex.workspace = true
 hmac.workspace = true
+octocrab.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

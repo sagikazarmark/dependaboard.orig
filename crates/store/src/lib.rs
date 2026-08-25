@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    CheckStatus, CursorError, DashboardPage, FacetCounts, MergeMethod, Page, PageCursor, PrFilter,
-    PrKey, PrRecord, RepoRecord, UpdateType,
+    CheckStatus, CursorError, DashboardPage, FacetCounts, Page, PageCursor, PrFilter, PrKey,
+    PrRecord, RepoRecord, UpdateType,
 };
 use libsql::{Builder, Database, Row, Transaction, Value};
 use thiserror::Error;
@@ -467,23 +467,18 @@ fn filter_sql(filter: &PrFilter) -> Result<(String, Vec<Value>), StoreError> {
 async fn list_repositories(connection: &libsql::Connection) -> Result<Vec<RepoRecord>, StoreError> {
     let mut rows = connection
         .query(
-            "SELECT repository_id, installation_id, owner, repo, merge_method, synced_at FROM repositories ORDER BY owner, repo",
+            "SELECT repository_id, installation_id, owner, repo, synced_at FROM repositories ORDER BY owner, repo",
             (),
         )
         .await?;
     let mut repositories = Vec::new();
     while let Some(row) = rows.next().await? {
-        let merge_method = row
-            .get::<Option<String>>(4)?
-            .map(|value| MergeMethod::from_str(&value).map_err(|_| StoreError::CorruptEnum(value)))
-            .transpose()?;
         repositories.push(RepoRecord {
             repository_id: unsigned(row.get::<i64>(0)?)?,
             installation_id: unsigned(row.get::<i64>(1)?)?,
             owner: row.get(2)?,
             repo: row.get(3)?,
-            merge_method,
-            synced_at: unsigned(row.get::<i64>(5)?)?,
+            synced_at: unsigned(row.get::<i64>(4)?)?,
         });
     }
     Ok(repositories)
@@ -545,20 +540,18 @@ async fn upsert_repo_on(connection: &impl Execute, repo: &RepoRecord) -> Result<
     connection
         .execute(
             r#"INSERT INTO repositories (
-                repository_id, installation_id, owner, repo, merge_method, synced_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                repository_id, installation_id, owner, repo, synced_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
             ON CONFLICT(repository_id) DO UPDATE SET
                 installation_id = excluded.installation_id,
                 owner = excluded.owner,
                 repo = excluded.repo,
-                merge_method = COALESCE(repositories.merge_method, excluded.merge_method),
                 synced_at = excluded.synced_at"#,
             vec![
                 integer(repo.repository_id)?,
                 integer(repo.installation_id)?,
                 Value::Text(repo.owner.clone()),
                 Value::Text(repo.repo.clone()),
-                option_text(repo.merge_method.map(|method| method.to_string())),
                 integer(repo.synced_at)?,
             ],
         )
@@ -684,6 +677,43 @@ pub enum StoreError {
     MissingScalar,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreErrorClass {
+    Retryable,
+    Terminal,
+}
+
+impl StoreError {
+    pub fn class(&self) -> StoreErrorClass {
+        match self {
+            Self::Database(error) if retryable_database_error(error) => StoreErrorClass::Retryable,
+            Self::Io(_)
+            | Self::Database(_)
+            | Self::Json(_)
+            | Self::Cursor(_)
+            | Self::CorruptEnum(_)
+            | Self::IntegerOverflow
+            | Self::MissingScalar => StoreErrorClass::Terminal,
+        }
+    }
+}
+
+fn retryable_database_error(error: &libsql::Error) -> bool {
+    match error {
+        libsql::Error::SqliteFailure(code, _) => retryable_sqlite_code(*code),
+        libsql::Error::RemoteSqliteFailure(code, extended_code, _) => {
+            retryable_sqlite_code(*code) || retryable_sqlite_code(*extended_code)
+        }
+        libsql::Error::ConnectionFailed(_) | libsql::Error::WalConflict => true,
+        _ => false,
+    }
+}
+
+fn retryable_sqlite_code(code: i32) -> bool {
+    // Extended SQLite result codes retain the primary result in the low byte.
+    matches!(code & 0xff, 5 | 6 | 10) || matches!(code, 787 | 1555 | 2067) // foreign key, primary key, unique
+}
+
 #[cfg(test)]
 mod tests {
     use dependaboard_core::{CheckStatus, DependencyUpdate, UpdateType};
@@ -705,7 +735,6 @@ mod tests {
             installation_id: 9,
             owner: "acme".to_owned(),
             repo: format!("repo-{id}"),
-            merge_method: None,
             synced_at,
         }
     }
@@ -814,5 +843,33 @@ mod tests {
         assert!(store.get_pr(&PrKey::new(1, 2)).await.unwrap().is_some());
         store.purge_installation(9).await.unwrap();
         assert!(store.get_pr(&PrKey::new(1, 2)).await.unwrap().is_none());
+    }
+
+    #[test]
+    fn classifies_structured_sqlite_contention_and_constraints_as_retryable() {
+        for code in [5, 6, 10, 5 | (2 << 8), 787, 1555, 2067] {
+            let error = StoreError::Database(libsql::Error::SqliteFailure(code, "busy".into()));
+            assert_eq!(error.class(), StoreErrorClass::Retryable);
+        }
+        let remote = StoreError::Database(libsql::Error::RemoteSqliteFailure(
+            1,
+            19 | (8 << 8),
+            "constraint".into(),
+        ));
+        assert_eq!(remote.class(), StoreErrorClass::Retryable);
+    }
+
+    #[test]
+    fn classifies_unknown_and_data_errors_as_terminal() {
+        let database = StoreError::Database(libsql::Error::Misuse("bad call".into()));
+        assert_eq!(database.class(), StoreErrorClass::Terminal);
+        let generic_constraint =
+            StoreError::Database(libsql::Error::SqliteFailure(19, "constraint".into()));
+        assert_eq!(generic_constraint.class(), StoreErrorClass::Terminal);
+        assert_eq!(
+            StoreError::IntegerOverflow.class(),
+            StoreErrorClass::Terminal
+        );
+        assert_eq!(StoreError::MissingScalar.class(), StoreErrorClass::Terminal);
     }
 }

@@ -13,6 +13,26 @@ pub const MAX_PAGE_SIZE: u32 = 100;
 pub const MAX_BATCH_TARGETS: usize = 100;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UserId(pub String);
+
+impl UserId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for UserId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PrKey {
     pub repository_id: u64,
     pub number: u64,
@@ -334,7 +354,6 @@ pub struct RepoRecord {
     pub installation_id: u64,
     pub owner: String,
     pub repo: String,
-    pub merge_method: Option<MergeMethod>,
     pub synced_at: u64,
 }
 
@@ -516,22 +535,20 @@ impl PrTarget {
 pub struct BulkRequest {
     pub action: BulkActionKind,
     pub targets: Vec<PrTarget>,
-    pub merge_method: MergeMethod,
-    pub user_id: String,
+    pub user_id: UserId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeRequest {
     pub batch_id: String,
     pub target: PrTarget,
-    pub merge_method: MergeMethod,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandRequest {
     pub batch_id: String,
     pub target: PrTarget,
-    pub user_id: String,
+    pub user_id: UserId,
     pub command: DependabotCommand,
 }
 
@@ -625,12 +642,15 @@ pub struct BatchProgress {
 }
 
 impl BatchProgress {
-    pub fn queued(batch_id: impl Into<String>, request: &BulkRequest) -> Self {
+    pub fn queued(
+        batch_id: impl Into<String>,
+        action: BulkActionKind,
+        targets: &[PrTarget],
+    ) -> Self {
         Self {
             batch_id: batch_id.into(),
-            action: request.action,
-            targets: request
-                .targets
+            action,
+            targets: targets
                 .iter()
                 .cloned()
                 .map(|target| TargetProgress {
@@ -823,6 +843,16 @@ mod tests {
     fn pr_key_round_trips() {
         let key = PrKey::new(42, 7);
         assert_eq!(key.to_string().parse::<PrKey>().unwrap(), key);
+    }
+
+    #[test]
+    fn user_id_is_a_transparent_string() {
+        let user_id = UserId::new("dashboard");
+        assert_eq!(serde_json::to_string(&user_id).unwrap(), r#""dashboard""#);
+        assert_eq!(
+            serde_json::from_str::<UserId>(r#""dashboard""#).unwrap(),
+            user_id
+        );
     }
 
     #[test]

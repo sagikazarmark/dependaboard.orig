@@ -1063,22 +1063,6 @@ code,
   line-height: 1.6;
 }
 
-.method-field {
-  display: grid;
-  grid-template-columns: 110px 1fr;
-  align-items: center;
-  gap: 12px;
-  margin-top: 18px;
-  color: var(--muted);
-  font-size: 11px;
-}
-
-.method-field select {
-  width: 100%;
-  border-color: var(--line);
-  background: var(--color-base-100);
-}
-
 .notice {
   margin-top: 18px;
   padding: 10px;

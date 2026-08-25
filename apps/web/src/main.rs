@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use dependaboard_core::{
-    BatchProgress, BulkActionKind, BulkRequest, CheckStatus, DashboardPage, MergeMethod, Page,
-    PrFilter, PrRecord, PrTarget, TargetProgressState, UpdateType, new_batch_id,
+    BatchProgress, BulkActionKind, CheckStatus, DashboardPage, Page, PrFilter, PrRecord, PrState,
+    PrTarget, TargetProgressState, UpdateType, new_batch_id,
 };
 use dioxus::prelude::*;
 
@@ -12,17 +12,21 @@ use dioxus::prelude::*;
 use {
     axum::{
         body::{Body, Bytes},
+        extract::Extension,
         http::{HeaderMap, Request, StatusCode, header},
         middleware::{self, Next},
         response::{IntoResponse, Response},
         routing::post,
     },
     base64::{Engine as _, engine::general_purpose::STANDARD},
-    dependaboard_core::WebhookEvent,
+    dependaboard_core::{BulkRequest, UserId, WebhookEvent},
     dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig},
     dioxus::server::{DioxusRouterExt, ServeConfig},
     hmac::{Hmac, Mac},
-    serde::{Serialize, de::DeserializeOwned},
+    octocrab::models::webhook_events::{
+        WebhookEvent as GithubWebhookEvent, payload::WebhookEventPayload,
+    },
+    serde::{Deserialize, Serialize, de::DeserializeOwned},
     serde_json::Value,
     sha2::Sha256,
 };
@@ -76,26 +80,30 @@ async fn load_dashboard(filter: PrFilter, page: Page) -> Result<DashboardPage, S
         .map_err(|error| ServerFnError::new(error.to_string()))
 }
 
-#[server]
-async fn submit_batch(batch_id: String, mut request: BulkRequest) -> Result<(), ServerFnError> {
+#[server(user: Extension<UserId>)]
+async fn submit_batch(
+    batch_id: String,
+    action: BulkActionKind,
+    targets: Vec<PrTarget>,
+) -> Result<(), ServerFnError> {
     if !dependaboard_core::valid_batch_id(&batch_id) {
         return Err(ServerFnError::new("batch id must be a UUIDv7"));
     }
-    if request.targets.is_empty() || request.targets.len() > dependaboard_core::MAX_BATCH_TARGETS {
+    if targets.is_empty() || targets.len() > dependaboard_core::MAX_BATCH_TARGETS {
         return Err(ServerFnError::new(format!(
             "batch must contain between 1 and {} targets",
             dependaboard_core::MAX_BATCH_TARGETS
         )));
     }
-    let unique = request
-        .targets
-        .iter()
-        .map(PrTarget::key)
-        .collect::<BTreeSet<_>>();
-    if unique.len() != request.targets.len() {
+    let unique = targets.iter().map(PrTarget::key).collect::<BTreeSet<_>>();
+    if unique.len() != targets.len() {
         return Err(ServerFnError::new("batch contains duplicate pull requests"));
     }
-    request.user_id = "dashboard".to_owned();
+    let request = BulkRequest {
+        action,
+        targets,
+        user_id: user.0,
+    };
     restate_send(&format!("BulkAction/{batch_id}/run"), &request)
         .await
         .map_err(ServerFnError::new)
@@ -109,6 +117,18 @@ async fn load_batch_progress(batch_id: String) -> Result<Option<BatchProgress>, 
     restate_call(&format!("BulkAction/{batch_id}/progress"), &())
         .await
         .map_err(ServerFnError::new)
+}
+
+#[server]
+async fn load_pr_status(repository_id: u64, number: u64) -> Result<Option<PrState>, ServerFnError> {
+    restate_call(&pr_status_path(repository_id, number), &())
+        .await
+        .map_err(ServerFnError::new)
+}
+
+#[cfg(feature = "server")]
+fn pr_status_path(repository_id: u64, number: u64) -> String {
+    format!("PullRequest/{repository_id}%23{number}/status")
 }
 
 #[server]
@@ -240,11 +260,13 @@ async fn github_webhook(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
     else {
         return (StatusCode::BAD_REQUEST, "missing GitHub event name").into_response();
     };
-    let payload: Value = match serde_json::from_slice(&body) {
-        Ok(payload) => payload,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON payload").into_response(),
+    let event = match parse_webhook(event_name, &body) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::warn!(%error, event = event_name, "GitHub webhook payload was rejected");
+            return (StatusCode::BAD_REQUEST, "invalid GitHub webhook payload").into_response();
+        }
     };
-    let event = normalize_webhook(event_name, &payload);
     match restate_send("WebhookIngress/dispatch", &event).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => {
@@ -255,12 +277,30 @@ async fn github_webhook(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
 }
 
 #[cfg(feature = "server")]
-async fn require_dashboard_auth(request: Request<Body>, next: Next) -> Response {
+async fn require_dashboard_auth(mut request: Request<Body>, next: Next) -> Response {
     let username =
         std::env::var("DASHBOARD_USERNAME").unwrap_or_else(|_| "dependaboard".to_owned());
     let password = std::env::var("DASHBOARD_PASSWORD").unwrap_or_default();
-    let authenticated = request
-        .headers()
+    let authenticated_user = authenticated_dashboard_user(request.headers(), &username, &password);
+    if let Some(user_id) = authenticated_user {
+        request.extensions_mut().insert(user_id);
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Basic realm=\"dependaboard\"")],
+        "authentication required",
+    )
+        .into_response()
+}
+
+#[cfg(feature = "server")]
+fn authenticated_dashboard_user(
+    headers: &HeaderMap,
+    username: &str,
+    password: &str,
+) -> Option<UserId> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Basic "))
@@ -271,19 +311,11 @@ async fn require_dashboard_auth(request: Request<Body>, next: Next) -> Response 
                 .split_once(':')
                 .map(|(user, pass)| (user.to_owned(), pass.to_owned()))
         })
-        .is_some_and(|(user, pass)| {
+        .filter(|(user, pass)| {
             constant_time_eq(user.as_bytes(), username.as_bytes())
                 && constant_time_eq(pass.as_bytes(), password.as_bytes())
-        });
-    if authenticated {
-        return next.run(request).await;
-    }
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Basic realm=\"dependaboard\"")],
-        "authentication required",
-    )
-        .into_response()
+        })
+        .map(|(user, _)| UserId::new(user))
 }
 
 #[cfg(feature = "server")]
@@ -315,51 +347,122 @@ fn valid_signature(secret: &str, signature: &str, body: &[u8]) -> bool {
 }
 
 #[cfg(feature = "server")]
-fn normalize_webhook(event: &str, payload: &Value) -> WebhookEvent {
-    let nested = |path: &[&str]| {
-        path.iter()
-            .fold(Some(payload), |value, key| value?.get(*key))
-    };
-    let sha = match event {
-        "pull_request" => nested(&["pull_request", "head", "sha"]),
-        "check_run" => nested(&["check_run", "head_sha"]),
-        "check_suite" => nested(&["check_suite", "head_sha"]),
-        "status" => payload.get("sha"),
-        _ => None,
-    }
-    .and_then(Value::as_str)
-    .map(ToOwned::to_owned);
-    let pull_requests = match event {
-        "check_run" => nested(&["check_run", "pull_requests"]),
-        "check_suite" => nested(&["check_suite", "pull_requests"]),
-        _ => None,
-    }
-    .and_then(Value::as_array)
-    .into_iter()
-    .flatten()
-    .filter_map(|pull| pull.get("number").and_then(Value::as_u64))
-    .collect();
+fn parse_webhook(event_name: &str, body: &[u8]) -> Result<WebhookEvent, String> {
+    let event = GithubWebhookEvent::try_from_header_and_body(event_name, body)
+        .map_err(|error| error.to_string())?;
+    normalize_webhook(event_name, &event)
+}
 
-    WebhookEvent {
-        event: event.to_owned(),
-        action: payload
-            .get("action")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        installation_id: nested(&["installation", "id"]).and_then(Value::as_u64),
-        repository_id: nested(&["repository", "id"]).and_then(Value::as_u64),
-        owner: nested(&["repository", "owner", "login"])
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        repo: nested(&["repository", "name"])
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        number: nested(&["pull_request", "number"])
-            .or_else(|| payload.get("number"))
-            .and_then(Value::as_u64),
+#[cfg(feature = "server")]
+fn normalize_webhook(event_name: &str, event: &GithubWebhookEvent) -> Result<WebhookEvent, String> {
+    let (action, number, sha, pull_requests) = match &event.specific {
+        WebhookEventPayload::Installation(payload) => {
+            (Some(action_name(&payload.action)?), None, None, Vec::new())
+        }
+        WebhookEventPayload::InstallationRepositories(payload) => {
+            (Some(action_name(&payload.action)?), None, None, Vec::new())
+        }
+        WebhookEventPayload::PullRequest(payload) => (
+            Some(action_name(&payload.action)?),
+            Some(payload.pull_request.number),
+            Some(payload.pull_request.head.sha.clone()),
+            Vec::new(),
+        ),
+        WebhookEventPayload::CheckRun(payload) => {
+            let routing: CheckRouting = serde_json::from_value(payload.check_run.clone())
+                .map_err(|error| error.to_string())?;
+            (
+                Some(action_name(&payload.action)?),
+                None,
+                Some(routing.head_sha),
+                routing
+                    .pull_requests
+                    .into_iter()
+                    .map(|pull| pull.number)
+                    .collect(),
+            )
+        }
+        WebhookEventPayload::CheckSuite(payload) => {
+            let routing: CheckRouting = serde_json::from_value(payload.check_suite.clone())
+                .map_err(|error| error.to_string())?;
+            (
+                Some(action_name(&payload.action)?),
+                None,
+                Some(routing.head_sha),
+                routing
+                    .pull_requests
+                    .into_iter()
+                    .map(|pull| pull.number)
+                    .collect(),
+            )
+        }
+        WebhookEventPayload::Status(payload) => (None, None, Some(payload.sha.clone()), Vec::new()),
+        _ => (None, None, None, Vec::new()),
+    };
+    let installation_id = event
+        .installation
+        .as_ref()
+        .map(|installation| installation.id().0);
+    let repository_id = event.repository.as_ref().map(|repository| repository.id.0);
+    let owner = event
+        .repository
+        .as_ref()
+        .and_then(|repository| repository.owner.as_ref())
+        .map(|owner| owner.login.clone());
+    let repo = event
+        .repository
+        .as_ref()
+        .map(|repository| repository.name.clone());
+    match &event.specific {
+        WebhookEventPayload::Installation(_) | WebhookEventPayload::InstallationRepositories(_)
+            if installation_id.is_none() =>
+        {
+            return Err("GitHub installation webhook is missing an installation id".to_owned());
+        }
+        WebhookEventPayload::PullRequest(_)
+        | WebhookEventPayload::CheckRun(_)
+        | WebhookEventPayload::CheckSuite(_)
+        | WebhookEventPayload::Status(_)
+            if repository_id.is_none() || owner.is_none() || repo.is_none() =>
+        {
+            return Err("GitHub repository webhook is missing routing fields".to_owned());
+        }
+        _ => {}
+    }
+    Ok(WebhookEvent {
+        event: event_name.to_owned(),
+        action,
+        installation_id,
+        repository_id,
+        owner,
+        repo,
+        number,
         sha,
         pull_requests,
-    }
+    })
+}
+
+#[cfg(feature = "server")]
+fn action_name(action: &impl Serialize) -> Result<String, String> {
+    serde_json::to_value(action)
+        .map_err(|error| error.to_string())?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "GitHub webhook action was not a string".to_owned())
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+struct CheckRouting {
+    head_sha: String,
+    #[serde(default)]
+    pull_requests: Vec<CheckPullRequest>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+struct CheckPullRequest {
+    number: u64,
 }
 
 fn App() -> Element {
@@ -371,7 +474,6 @@ fn App() -> Element {
     let mut selected = use_signal(BTreeSet::<String>::new);
     let mut detail = use_signal(|| None::<PrRecord>);
     let mut confirm = use_signal(|| None::<BulkActionKind>);
-    let mut merge_method = use_signal(MergeMethod::default);
     let mut active_batch = use_signal(|| None::<BatchProgress>);
     let mut progress_open = use_signal(|| false);
     let mut toast = use_signal(|| None::<String>);
@@ -719,8 +821,6 @@ fn App() -> Element {
                 ConfirmModal {
                     action,
                     count: selected_count,
-                    merge_method: merge_method(),
-                    onmethod: move |method| merge_method.set(method),
                     oncancel: move |_| confirm.set(None),
                     onconfirm: {
                         let rows = rows.clone();
@@ -731,19 +831,17 @@ fn App() -> Element {
                                 .map(pr_target)
                                 .collect::<Vec<_>>();
                             let batch_id = new_batch_id();
-                            let request = BulkRequest {
+                            active_batch.set(Some(BatchProgress::queued(
+                                &batch_id,
                                 action,
-                                targets,
-                                merge_method: merge_method(),
-                                user_id: "dashboard".to_owned(),
-                            };
-                            active_batch.set(Some(BatchProgress::queued(&batch_id, &request)));
+                                &targets,
+                            )));
                             progress_open.set(true);
                             confirm.set(None);
                             selected.write().clear();
                             spawn(async move {
                                 loop {
-                                    match submit_batch(batch_id.clone(), request.clone()).await {
+                                    match submit_batch(batch_id.clone(), action, targets.clone()).await {
                                         Ok(()) => break,
                                         Err(error) => {
                                             if let Ok(Some(progress)) = load_batch_progress(batch_id.clone()).await {
@@ -919,6 +1017,22 @@ fn PrRow(
 #[component]
 fn DetailDrawer(row: PrRecord, onclose: EventHandler<MouseEvent>) -> Element {
     let stale = unix_seconds().saturating_sub(row.synced_at) > 45 * 60;
+    let status = use_resource({
+        let repository_id = row.repository_id;
+        let number = row.number;
+        move || load_pr_status(repository_id, number)
+    });
+    let durable_state = status
+        .read()
+        .as_ref()
+        .and_then(|result| result.as_ref().ok())
+        .cloned()
+        .flatten();
+    let status_error = status
+        .read()
+        .as_ref()
+        .and_then(|result| result.as_ref().err())
+        .map(ToString::to_string);
     rsx! {
         div { class: "drawer-scrim", onclick: move |event| onclose.call(event),
             section { class: "side-drawer detail-drawer", onclick: move |event| event.stop_propagation(),
@@ -953,6 +1067,41 @@ fn DetailDrawer(row: PrRecord, onclose: EventHandler<MouseEvent>) -> Element {
                     div { class: "drawer-labels",
                         for label in &row.labels { span { "{label}" } }
                     }
+                    h4 { "Durable state" }
+                    if let Some(error) = status_error {
+                        p { class: "batch-failure", "Could not load activity: {error}" }
+                    } else if let Some(state) = durable_state {
+                        dl { class: "detail-list",
+                            dt { "Last canonical sync" }
+                            dd {
+                                if let Some(last_synced_at) = state.last_synced_at {
+                                    "{relative_time(last_synced_at)}"
+                                } else {
+                                    "not yet"
+                                }
+                            }
+                            dt { "Debounced sync" }
+                            dd { if state.sync_pending { "pending" } else { "idle" } }
+                        }
+                        div { class: "dependency-list",
+                            if state.history.is_empty() {
+                                div { "No durable activity recorded." }
+                            } else {
+                                for entry in state.history.iter().rev() {
+                                    div {
+                                        strong { "{entry.action}" }
+                                        code { "{relative_time(entry.at)}" }
+                                        span { "{entry.detail}" }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        div { class: "loading-state",
+                            span { class: "loading loading-spinner loading-sm" }
+                            "Reading durable activity"
+                        }
+                    }
                 }
                 a { class: "drawer-link", href: row.html_url, target: "_blank", rel: "noreferrer", "Open on GitHub" }
             }
@@ -964,8 +1113,6 @@ fn DetailDrawer(row: PrRecord, onclose: EventHandler<MouseEvent>) -> Element {
 fn ConfirmModal(
     action: BulkActionKind,
     count: usize,
-    merge_method: MergeMethod,
-    onmethod: EventHandler<MergeMethod>,
     oncancel: EventHandler<MouseEvent>,
     onconfirm: EventHandler<MouseEvent>,
 ) -> Element {
@@ -976,24 +1123,7 @@ fn ConfirmModal(
                 h2 { "{action} {count} pull requests?" }
                 p { "The selected head SHAs are captured now. Moved or ineligible pull requests will be rejected, not silently retried against new code." }
                 if action == BulkActionKind::Merge {
-                    label { class: "method-field",
-                        span { "Merge method" }
-                        select {
-                            class: "select select-sm",
-                            value: merge_method.to_string(),
-                            onchange: move |event| {
-                                let method = match event.value().as_str() {
-                                    "merge" => MergeMethod::Merge,
-                                    "rebase" => MergeMethod::Rebase,
-                                    _ => MergeMethod::Squash,
-                                };
-                                onmethod.call(method);
-                            },
-                            option { value: "squash", "Squash" }
-                            option { value: "merge", "Merge commit" }
-                            option { value: "rebase", "Rebase and merge" }
-                        }
-                    }
+                    div { class: "notice", "Uses the globally configured merge method." }
                 } else {
                     div { class: "notice", "Rebase is requested by an idempotent @dependabot comment using the configured user token." }
                 }
@@ -1187,34 +1317,176 @@ mod tests {
     }
 
     #[test]
-    fn check_run_payload_is_reduced_to_routing_fields() {
-        let payload = serde_json::json!({
-            "action": "completed",
-            "installation": { "id": 42 },
-            "repository": {
-                "id": 7,
-                "name": "api",
-                "owner": { "login": "acme" }
-            },
-            "check_run": {
+    fn authenticated_user_comes_from_validated_basic_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Basic {}", STANDARD.encode("dependaboard:secret"))
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            authenticated_dashboard_user(&headers, "dependaboard", "secret"),
+            Some(UserId::new("dependaboard"))
+        );
+        assert_eq!(
+            authenticated_dashboard_user(&headers, "dependaboard", "wrong"),
+            None
+        );
+    }
+
+    #[test]
+    fn typed_webhooks_are_reduced_to_routing_fields() {
+        let installation = parsed_webhook(
+            "installation",
+            serde_json::json!({
+                "action": "created",
+                "installation": installation(),
+                "repositories": []
+            }),
+        );
+        assert_eq!(installation.action.as_deref(), Some("created"));
+        assert_eq!(installation.installation_id, Some(42));
+
+        let repositories = parsed_webhook(
+            "installation_repositories",
+            with_common(serde_json::json!({
+                "action": "removed",
+                "repositories_added": [],
+                "repositories_removed": [],
+                "repository_selection": "all"
+            })),
+        );
+        assert_eq!(repositories.action.as_deref(), Some("removed"));
+
+        let pull_request = parsed_webhook(
+            "pull_request",
+            with_common(serde_json::json!({
+                "action": "synchronize",
+                "number": 9,
+                "pull_request": {
+                    "id": 900,
+                    "number": 9,
+                    "url": "https://api.github.test/repos/acme/api/pulls/9",
+                    "head": { "ref": "dependabot/update", "sha": "abc123" },
+                    "base": { "ref": "main", "sha": "base123" }
+                }
+            })),
+        );
+        assert_eq!(pull_request.number, Some(9));
+        assert_eq!(pull_request.sha.as_deref(), Some("abc123"));
+
+        for (event_name, object_name) in
+            [("check_run", "check_run"), ("check_suite", "check_suite")]
+        {
+            let mut payload = with_common(serde_json::json!({ "action": "completed" }));
+            payload[object_name] = serde_json::json!({
                 "head_sha": "abc123",
                 "pull_requests": [{ "number": 9 }, { "number": 10 }]
-            }
-        });
+            });
+            let event = parsed_webhook(event_name, payload);
+            assert_eq!(event.action.as_deref(), Some("completed"));
+            assert_eq!(event.sha.as_deref(), Some("abc123"));
+            assert_eq!(event.pull_requests, vec![9, 10]);
+        }
 
-        assert_eq!(
-            normalize_webhook("check_run", &payload),
-            WebhookEvent {
-                event: "check_run".to_owned(),
-                action: Some("completed".to_owned()),
-                installation_id: Some(42),
-                repository_id: Some(7),
-                owner: Some("acme".to_owned()),
-                repo: Some("api".to_owned()),
-                number: None,
-                sha: Some("abc123".to_owned()),
-                pull_requests: vec![9, 10],
-            }
+        let status = parsed_webhook(
+            "status",
+            with_common(serde_json::json!({
+                "avatar_url": null,
+                "branches": [],
+                "commit": {},
+                "context": "ci/test",
+                "created_at": "2026-01-01T00:00:00Z",
+                "description": null,
+                "id": 1,
+                "name": "ci/test",
+                "sha": "abc123",
+                "state": "success",
+                "target_url": null,
+                "updated_at": "2026-01-01T00:00:00Z"
+            })),
         );
+        assert_eq!(status.sha.as_deref(), Some("abc123"));
+        assert_eq!(status.action, None);
+
+        for event in [repositories, pull_request, status] {
+            assert_eq!(event.installation_id, Some(42));
+            assert_eq!(event.repository_id, Some(7));
+            assert_eq!(event.owner.as_deref(), Some("acme"));
+            assert_eq!(event.repo.as_deref(), Some("api"));
+        }
+    }
+
+    #[test]
+    fn malformed_known_webhook_is_rejected() {
+        assert!(parse_webhook("pull_request", br#"{"action":"opened"}"#).is_err());
+        let mut check_run = with_common(serde_json::json!({
+            "action": "completed",
+            "check_run": {
+                "head_sha": "abc123",
+                "pull_requests": [{}]
+            }
+        }));
+        assert!(parse_webhook("check_run", &serde_json::to_vec(&check_run).unwrap()).is_err());
+        check_run["check_run"]["pull_requests"] = serde_json::json!([]);
+        check_run["check_run"]
+            .as_object_mut()
+            .unwrap()
+            .remove("head_sha");
+        assert!(parse_webhook("check_run", &serde_json::to_vec(&check_run).unwrap()).is_err());
+    }
+
+    #[test]
+    fn pull_request_status_path_encodes_the_object_key_separator() {
+        assert_eq!(pr_status_path(7, 9), "PullRequest/7%239/status");
+    }
+
+    fn parsed_webhook(event_name: &str, payload: Value) -> WebhookEvent {
+        parse_webhook(event_name, &serde_json::to_vec(&payload).unwrap()).unwrap()
+    }
+
+    fn with_common(mut payload: Value) -> Value {
+        payload["installation"] = installation();
+        payload["repository"] = repository();
+        payload
+    }
+
+    fn installation() -> Value {
+        serde_json::json!({ "id": 42, "node_id": "I_42" })
+    }
+
+    fn repository() -> Value {
+        serde_json::json!({
+            "id": 7,
+            "name": "api",
+            "url": "https://api.github.test/repos/acme/api",
+            "owner": author("acme")
+        })
+    }
+
+    fn author(login: &str) -> Value {
+        serde_json::json!({
+            "login": login,
+            "id": 1,
+            "node_id": "U_1",
+            "avatar_url": "https://github.test/avatar",
+            "gravatar_id": "",
+            "url": "https://api.github.test/users/acme",
+            "html_url": "https://github.test/acme",
+            "followers_url": "https://api.github.test/users/acme/followers",
+            "following_url": "https://api.github.test/users/acme/following{/other_user}",
+            "gists_url": "https://api.github.test/users/acme/gists{/gist_id}",
+            "starred_url": "https://api.github.test/users/acme/starred{/owner}{/repo}",
+            "subscriptions_url": "https://api.github.test/users/acme/subscriptions",
+            "organizations_url": "https://api.github.test/users/acme/orgs",
+            "repos_url": "https://api.github.test/users/acme/repos",
+            "events_url": "https://api.github.test/users/acme/events{/privacy}",
+            "received_events_url": "https://api.github.test/users/acme/received_events",
+            "type": "User",
+            "site_admin": false,
+            "name": null,
+            "patch_url": null
+        })
     }
 }

@@ -31,7 +31,7 @@ Create a GitHub App with these repository permissions:
 
 Subscribe it to `pull_request`, `check_suite`, `check_run`, and `status`. Configure its webhook URL as `https://your-host/api/webhooks/github` and use the same secret as `GITHUB_WEBHOOK_SECRET`.
 
-Dependabot ignores commands posted by a GitHub App. `GITHUB_USER_PAT` must therefore be a fine-grained token for a real user with permission to post pull-request comments. Installation tokens are still used for reads and merges.
+Dependabot ignores commands posted by a GitHub App. `GITHUB_USER_PAT` must therefore be a fine-grained token for the `DASHBOARD_USERNAME` identity with permission to post pull-request comments. Installation tokens are used for reads and merges; the PAT is resolved only inside the journaled comment side effect and is never placed in Restate inputs or state.
 
 ## Local Development
 
@@ -76,7 +76,7 @@ Dependabot ignores commands posted by a GitHub App. `GITHUB_USER_PAT` must there
    dx serve --package dependaboard-web
    ```
 
-The service retries scheduler startup until Restate has discovered `WebhookIngress`. The first reconciliation then populates `data/dependaboard.db`.
+The service retries its authenticated `SchedulerIngress/start` request until Restate has discovered the endpoint. The first reconciliation then populates `data/dependaboard.db`.
 
 The browser prompts for the single-user credentials configured by `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD`. The webhook route is outside this Basic Auth layer and is protected independently by its GitHub HMAC signature.
 
@@ -90,8 +90,9 @@ For live CSS changes, run `npm run css:watch` alongside `dx serve`.
 | `GITHUB_INSTALLATION_ID` | Both | Installation to reconcile and target for manual sync |
 | `GITHUB_PRIVATE_KEY` / `GITHUB_PRIVATE_KEY_PATH` | Restate service | RS256 App private key |
 | `GITHUB_USER_PAT` | Restate service | User identity for `@dependabot rebase` comments |
+| `GITHUB_MERGE_METHOD` | Restate service | Explicit global merge method: `merge`, `squash` (default), or `rebase` |
 | `GITHUB_WEBHOOK_SECRET` | Web app | HMAC-SHA256 webhook verification |
-| `DASHBOARD_USERNAME` | Web app | Single-user HTTP Basic Auth username |
+| `DASHBOARD_USERNAME` | Both | Single-user HTTP Basic Auth username and PAT identity |
 | `DASHBOARD_PASSWORD` | Web app | Required single-user HTTP Basic Auth password |
 | `LIBSQL_URL` | Both | Local path or remote `libsql://` URL |
 | `LIBSQL_AUTH_TOKEN` | Both | Remote libSQL/Turso token; empty locally |
@@ -109,9 +110,24 @@ For production, point both binaries at the same remote libSQL database, expose o
 cargo fmt --all -- --check
 cargo test --workspace
 cargo check -p dependaboard-web --features server --no-default-features
-cargo check -p dependaboard-web
+cargo check -p dependaboard-web --target wasm32-unknown-unknown
+cargo clippy --workspace --all-targets -- -D warnings
 npm run css:build
+docker compose config --quiet
 ```
+
+### Live Acceptance
+
+The automated suite does not possess GitHub or Restate Cloud credentials, so it cannot claim these checks passed. Before production deployment, run this checklist against a disposable repository covered by the configured GitHub App installation:
+
+1. Protect the default branch, enable only the method selected by `GITHUB_MERGE_METHOD`, and open a Dependabot pull request with required checks.
+2. Start Restate, register the service endpoint, start the web app, and confirm the dashboard populates without manually sending an installation webhook.
+3. Deliver signed `pull_request`, `check_run`, `check_suite`, and `status` webhooks from GitHub; confirm malformed or incorrectly signed deliveries return `400` or `401` and valid deliveries update the projection.
+4. Suspend and unsuspend the installation, wait beyond `RECONCILE_INTERVAL_SECONDS`, and confirm only one reconciliation chain remains active. Delete the installation and confirm its projected repositories and pull requests are purged.
+5. Open a pull-request drawer and confirm durable sync/activity state loads through the authenticated web app without exposing the Restate URL or token to the browser.
+6. Queue a merge and confirm GitHub records the App installation as the actor and uses the configured explicit merge method. A disallowed method must be reported as a rejection rather than retried forever.
+7. Queue a rebase and confirm the comment is authored by the `GITHUB_USER_PAT` user, includes the attribution footer and batch marker, and is not duplicated after retrying an ambiguous response.
+8. Restart the Restate service during an in-flight batch and confirm target progress resumes. Inspect the invocation inputs, journal, and object state to verify the PAT value is absent.
 
 ## License
 

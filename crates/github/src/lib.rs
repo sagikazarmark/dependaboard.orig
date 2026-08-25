@@ -7,8 +7,8 @@ use std::{
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    CheckSignal, CommandRequest, DEPENDABOT_LOGIN, GithubErrorResponse, MergeRequest, PrKey,
-    PrRecord, RepoRecord, SyncRequest, UpdateBranchRequest, combined_status_signal,
+    CheckSignal, CommandRequest, DEPENDABOT_LOGIN, GithubErrorResponse, MergeMethod, MergeRequest,
+    PrKey, PrRecord, RepoRecord, SyncRequest, UpdateBranchRequest, UserId, combined_status_signal,
     highest_update_type, parse_dependabot_metadata, rollup_checks,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -29,6 +29,8 @@ pub struct GithubConfig {
     pub installation_id: u64,
     pub private_key: SecretString,
     pub user_pat: SecretString,
+    pub dashboard_user: UserId,
+    pub merge_method: MergeMethod,
 }
 
 impl GithubConfig {
@@ -46,6 +48,21 @@ impl GithubConfig {
                 })?
             }
         };
+        let dashboard_user =
+            env::var("DASHBOARD_USERNAME").unwrap_or_else(|_| "dependaboard".to_owned());
+        if dashboard_user.trim().is_empty() {
+            return Err(GithubError::Config(
+                "DASHBOARD_USERNAME must not be empty".to_owned(),
+            ));
+        }
+        let merge_method = env::var("GITHUB_MERGE_METHOD")
+            .unwrap_or_else(|_| MergeMethod::default().to_string())
+            .parse()
+            .map_err(|_| {
+                GithubError::Config(
+                    "GITHUB_MERGE_METHOD must be merge, squash, or rebase".to_owned(),
+                )
+            })?;
         Ok(Self {
             api_url: env::var("GITHUB_API_URL")
                 .unwrap_or_else(|_| "https://api.github.com".to_owned())
@@ -57,23 +74,32 @@ impl GithubConfig {
             user_pat: SecretString::from(env::var("GITHUB_USER_PAT").map_err(|_| {
                 GithubError::Config("set GITHUB_USER_PAT for Dependabot rebase commands".to_owned())
             })?),
+            dashboard_user: UserId::new(dashboard_user),
+            merge_method,
         })
     }
 }
 
 #[async_trait]
 pub trait TokenProvider: Send + Sync {
-    async fn token(&self) -> Result<SecretString, GithubError>;
+    async fn user_token(&self, user: &UserId) -> Result<SecretString, GithubError>;
 }
 
 struct StaticTokenProvider {
+    user: UserId,
     token: SecretString,
 }
 
 #[async_trait]
 impl TokenProvider for StaticTokenProvider {
-    async fn token(&self) -> Result<SecretString, GithubError> {
-        Ok(self.token.clone())
+    async fn user_token(&self, user: &UserId) -> Result<SecretString, GithubError> {
+        if user == &self.user {
+            Ok(self.token.clone())
+        } else {
+            Err(GithubError::Config(format!(
+                "no GitHub user token is configured for {user}"
+            )))
+        }
     }
 }
 
@@ -101,6 +127,7 @@ struct CachedToken {
 impl GithubClient {
     pub fn new(config: GithubConfig) -> Result<Self, GithubError> {
         let user_tokens = Arc::new(StaticTokenProvider {
+            user: config.dashboard_user.clone(),
             token: config.user_pat.clone(),
         });
         Self::with_token_provider(config, user_tokens)
@@ -223,11 +250,12 @@ impl GithubClient {
 
     async fn user_request(
         &self,
+        user: &UserId,
         method: Method,
         path: &str,
         body: Option<&Value>,
     ) -> Result<Response, GithubError> {
-        let token = self.user_tokens.token().await?;
+        let token = self.user_tokens.user_token(user).await?;
         let mut request = self
             .http
             .request(method, format!("{}{}", self.config.api_url, path))
@@ -366,7 +394,8 @@ impl GithubClient {
         let mut page = 1;
         loop {
             let comments: Vec<IssueComment> = parse_response(
-                self.user_request(
+                self.installation_request(
+                    self.config.installation_id,
                     Method::GET,
                     &format!("{path}?per_page=100&page={page}"),
                     None,
@@ -495,7 +524,6 @@ impl GithubApi for GithubClient {
                 installation_id: self.config.installation_id,
                 owner: repo.owner.login,
                 repo: repo.name,
-                merge_method: None,
                 synced_at,
             }));
             if count < 100 {
@@ -573,7 +601,7 @@ impl GithubApi for GithubClient {
         );
         let body = json!({
             "sha": request.target.expected_sha,
-            "merge_method": request.merge_method.to_string(),
+            "merge_method": self.config.merge_method.to_string(),
         });
         let response = match self
             .installation_request(self.config.installation_id, Method::PUT, &path, Some(&body))
@@ -663,7 +691,10 @@ impl GithubApi for GithubClient {
                 request.command, request.user_id, marker
             )
         });
-        let response = match self.user_request(Method::POST, &path, Some(&body)).await {
+        let response = match self
+            .user_request(&request.user_id, Method::POST, &path, Some(&body))
+            .await
+        {
             Ok(response) => response,
             Err(original) => {
                 if let Some(comment_id) = self.find_comment_with_marker(&path, &marker).await? {
@@ -984,6 +1015,26 @@ mod tests {
         assert_eq!(
             highest_update_type(&dependencies),
             dependaboard_core::UpdateType::Minor
+        );
+    }
+
+    #[tokio::test]
+    async fn static_token_provider_is_scoped_to_the_configured_user() {
+        let provider = StaticTokenProvider {
+            user: UserId::new("dependaboard"),
+            token: SecretString::from("secret"),
+        };
+        assert!(
+            provider
+                .user_token(&UserId::new("dependaboard"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            provider
+                .user_token(&UserId::new("someone-else"))
+                .await
+                .is_err()
         );
     }
 }

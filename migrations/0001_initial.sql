@@ -5,7 +5,6 @@ CREATE TABLE IF NOT EXISTS repositories (
   installation_id INTEGER NOT NULL,
   owner           TEXT NOT NULL,
   repo            TEXT NOT NULL,
-  merge_method    TEXT,
   synced_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_repo_install ON repositories(installation_id);
