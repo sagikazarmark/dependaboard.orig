@@ -1093,10 +1093,7 @@ fn PrRow(
         .dependency
         .clone()
         .unwrap_or_else(|| format!("{} dependencies", row.dependencies.len()));
-    let versions = match (&row.from_version, &row.to_version) {
-        (Some(from), Some(to)) => format!("{from} -> {to}"),
-        _ => row.title.clone(),
-    };
+    let versions = version_label(row.from_version.as_deref(), row.to_version.as_deref());
     let stale = unix_seconds().saturating_sub(row.synced_at) > 45 * 60;
     let row_class = match (checked, stale) {
         (true, true) => "pr-grid pr-row selected stale",
@@ -1558,6 +1555,60 @@ mod wasm_tests {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    const GROUPED_ROW_TITLE: &str =
+        "build(deps): bump the github-actions group across 1 directory with 3 updates";
+
+    fn GroupedRowFixture() -> Element {
+        let row = PrRecord {
+            id: "7#9".to_owned(),
+            repository_id: 7,
+            installation_id: 1,
+            owner: "acme".to_owned(),
+            repo: "api".to_owned(),
+            number: 9,
+            title: GROUPED_ROW_TITLE.to_owned(),
+            html_url: "https://github.example/acme/api/pull/9".to_owned(),
+            dependency: None,
+            from_version: None,
+            to_version: None,
+            dependencies: ["actions/checkout", "actions/cache", "actions/setup-rust"]
+                .into_iter()
+                .map(|name| dependaboard_core::DependencyUpdate {
+                    name: name.to_owned(),
+                    from_version: None,
+                    to_version: None,
+                    update_type: UpdateType::Minor,
+                })
+                .collect(),
+            update_type: UpdateType::Minor,
+            head_sha: "abc123".to_owned(),
+            check_status: CheckStatus::Failure,
+            mergeable: Some("clean".to_owned()),
+            labels: vec!["dependencies".to_owned(), "github_actions".to_owned()],
+            created_at: 1,
+            updated_at: 1,
+            synced_at: unix_seconds(),
+        };
+        rsx! {
+            PrRow {
+                row,
+                checked: false,
+                oncheck: move |_| {},
+                onopen: move |_| {},
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_row_does_not_repeat_a_long_title_as_its_version() {
+        let mut dom = VirtualDom::new(GroupedRowFixture);
+        dom.rebuild_in_place();
+        let html = dioxus::ssr::render(&dom);
+
+        assert_eq!(html.matches(GROUPED_ROW_TITLE).count(), 1, "{html}");
+        assert!(html.contains("<strong>3 dependencies</strong><span>group update</span>"));
+    }
 
     #[test]
     fn batch_progress_uses_the_canonical_pull_request_url() {
