@@ -35,9 +35,9 @@ struct PullRequest {
     debounce: Duration,
 }
 
-#[restate_sdk::object(ingress_private)]
+#[restate_sdk::object]
 impl PullRequest {
-    #[handler]
+    #[handler(ingress_private)]
     async fn sync(&self, ctx: ObjectContext<'_>, request: Json<SyncRequest>) -> HandlerResult<()> {
         let request = request.into_inner();
         let now = ctx
@@ -138,7 +138,7 @@ impl PullRequest {
         Ok(())
     }
 
-    #[handler]
+    #[handler(ingress_private)]
     async fn closed(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
         let key = ctx
             .key()
@@ -155,7 +155,7 @@ impl PullRequest {
         Ok(())
     }
 
-    #[handler]
+    #[handler(ingress_private)]
     async fn merge(
         &self,
         ctx: ObjectContext<'_>,
@@ -217,7 +217,7 @@ impl PullRequest {
         Ok(Json::from(outcome))
     }
 
-    #[handler]
+    #[handler(ingress_private)]
     async fn command(
         &self,
         ctx: ObjectContext<'_>,
@@ -271,7 +271,7 @@ impl PullRequest {
         Ok(Json::from(outcome))
     }
 
-    #[handler]
+    #[handler(ingress_private)]
     async fn update_branch(
         &self,
         ctx: ObjectContext<'_>,
@@ -336,7 +336,7 @@ impl PullRequest {
         Ok(Json::from(outcome))
     }
 
-    #[handler(ingress_private = false)]
+    #[handler]
     async fn status(&self, ctx: SharedObjectContext<'_>) -> HandlerResult<Json<Option<PrState>>> {
         Ok(Json::from(
             ctx.get::<Json<PrState>>(PR_STATE)
@@ -1229,6 +1229,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 mod tests {
     use bytes::Bytes;
     use dependaboard_core::{CheckStatus, PrRecord, PrTarget, UpdateType, UserId};
+    use restate_sdk::service::Discoverable;
 
     use super::*;
 
@@ -1241,6 +1242,28 @@ mod tests {
             expected_sha: "abc123".to_owned(),
             title: "Bump serde".to_owned(),
         }
+    }
+
+    #[test]
+    fn pull_request_exposes_only_status_through_ingress() {
+        let discovery = <PullRequest as Discoverable>::discover();
+        assert_ne!(discovery.ingress_private, Some(true));
+
+        for handler_name in ["sync", "closed", "merge", "command", "update_branch"] {
+            let handler = discovery
+                .handlers
+                .iter()
+                .find(|handler| handler.name.as_str() == handler_name)
+                .unwrap_or_else(|| panic!("missing PullRequest/{handler_name}"));
+            assert_eq!(handler.ingress_private, Some(true));
+        }
+
+        let status = discovery
+            .handlers
+            .iter()
+            .find(|handler| handler.name.as_str() == "status")
+            .expect("missing PullRequest/status");
+        assert_ne!(status.ingress_private, Some(true));
     }
 
     #[test]
