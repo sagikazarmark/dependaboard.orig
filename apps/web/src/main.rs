@@ -114,14 +114,14 @@ async fn load_batch_progress(batch_id: String) -> Result<Option<BatchProgress>, 
     if !dependaboard_core::valid_batch_id(&batch_id) {
         return Err(ServerFnError::new("batch id must be a UUIDv7"));
     }
-    restate_call(&format!("BulkAction/{batch_id}/progress"), &())
+    restate_call(&format!("BulkAction/{batch_id}/progress"))
         .await
         .map_err(ServerFnError::new)
 }
 
 #[server]
 async fn load_pr_status(repository_id: u64, number: u64) -> Result<Option<PrState>, ServerFnError> {
-    restate_call(&pr_status_path(repository_id, number), &())
+    restate_call(&pr_status_path(repository_id, number))
         .await
         .map_err(ServerFnError::new)
 }
@@ -211,15 +211,25 @@ async fn restate_send<T: Serialize + ?Sized>(path: &str, input: &T) -> Result<()
 }
 
 #[cfg(feature = "server")]
-async fn restate_call<T, R>(path: &str, input: &T) -> Result<R, String>
+async fn restate_call<R>(path: &str) -> Result<R, String>
 where
-    T: Serialize + ?Sized,
     R: DeserializeOwned,
 {
     let (client, base, token) = restate_client()?;
-    let mut request = client
-        .post(format!("{base}/restate/call/{path}"))
-        .json(input);
+    restate_call_with_client(&client, &base, token.as_deref(), path).await
+}
+
+#[cfg(feature = "server")]
+async fn restate_call_with_client<R>(
+    client: &reqwest::Client,
+    base: &str,
+    token: Option<&str>,
+    path: &str,
+) -> Result<R, String>
+where
+    R: DeserializeOwned,
+{
+    let mut request = client.post(format!("{base}/restate/call/{path}"));
     if let Some(token) = token {
         request = request.bearer_auth(token);
     }
@@ -1313,6 +1323,51 @@ mod wasm_tests {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn empty_input_restate_call_has_no_body_or_content_type() {
+        async fn restate_ingress(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+            if headers.contains_key(header::CONTENT_TYPE) || !body.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "code": 400,
+                        "message": "input validation error: Expected body and content-type to be empty, but wasn't",
+                        "source": "ingress"
+                    })),
+                );
+            }
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "output": null })),
+            )
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/restate/call/PullRequest/7%239/status",
+                    post(restate_ingress),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let result = restate_call_with_client::<Option<PrState>>(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
+            None,
+            "PullRequest/7%239/status",
+        )
+        .await;
+
+        server.abort();
+        assert_eq!(result.unwrap(), None);
+    }
 
     #[test]
     fn webhook_signature_is_verified_in_constant_time() {
