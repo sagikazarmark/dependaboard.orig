@@ -1284,8 +1284,8 @@ fn relative_time(timestamp: u64) -> String {
 }
 
 fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
@@ -1295,6 +1295,19 @@ async fn wait_one_second() {
     gloo_timers::future::TimeoutFuture::new(1_000).await;
     #[cfg(not(target_arch = "wasm32"))]
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn relative_time_uses_a_supported_browser_clock() {
+        let now = unix_seconds();
+        assert!(now > 1_577_836_800);
+        assert_eq!(relative_time(now), "now");
+    }
 }
 
 #[cfg(all(test, feature = "server"))]
