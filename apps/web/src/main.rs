@@ -1166,19 +1166,23 @@ fn DetailDrawer(
         div { class: "drawer-scrim", onclick: move |event| onclose.call(event),
             section { class: "side-drawer detail-drawer", onclick: move |event| event.stop_propagation(),
                 div { class: "drawer-head",
-                    div { span { class: "eyebrow", "Pull request" } h2 { "{row.owner}/{row.repo} #{row.number}" } }
+                    div {
+                        span { class: "eyebrow", "Pull request" }
+                        h2 {
+                            a {
+                                class: "github-pr-link",
+                                href: row.html_url.clone(),
+                                target: "_blank",
+                                rel: "noreferrer",
+                                "{row.owner}/{row.repo}#{row.number}"
+                                span { class: "external-link-glyph", "↗" }
+                            }
+                        }
+                    }
                     button { class: "close-button", onclick: move |event| onclose.call(event), "x" }
                 }
                 div { class: "drawer-body",
-                    h3 {
-                        a {
-                            class: "drawer-title-link",
-                            href: row.html_url.clone(),
-                            target: "_blank",
-                            rel: "noreferrer",
-                            "{row.title}"
-                        }
-                    }
+                    h3 { "{row.title}" }
                     div { class: "drawer-badges",
                         span { class: "update-chip {update_class(row.update_type)}", "{row.update_type}" }
                         span { class: "status-badge", span { class: "check-dot {status_class(row.check_status)}" } "{status_label(row.check_status)}" }
@@ -1358,14 +1362,15 @@ fn ProgressDrawer(progress: BatchProgress, onclose: EventHandler<MouseEvent>) ->
                             div {
                                 if let Some(html_url) = progress_target_url(&item.target) {
                                     a {
-                                        class: "progress-pr-link",
+                                        class: "github-pr-link",
                                         href: html_url,
                                         target: "_blank",
                                         rel: "noreferrer",
-                                        strong { "{item.target.owner}/{item.target.repo} #{item.target.number}" }
+                                        strong { "{item.target.owner}/{item.target.repo}#{item.target.number}" }
+                                        span { class: "external-link-glyph", "↗" }
                                     }
                                 } else {
-                                    strong { "{item.target.owner}/{item.target.repo} #{item.target.number}" }
+                                    strong { "{item.target.owner}/{item.target.repo}#{item.target.number}" }
                                 }
                                 small { "{progress_detail(&item.state)}" }
                             }

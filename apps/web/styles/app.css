@@ -953,6 +953,28 @@ code,
   font-weight: 600;
 }
 
+.github-pr-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.github-pr-link:hover {
+  color: var(--color-primary);
+}
+
+.external-link-glyph {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.github-pr-link:hover .external-link-glyph {
+  color: currentColor;
+}
+
 .close-button {
   font-size: 14px;
 }
@@ -967,17 +989,6 @@ code,
   margin: 0 0 13px;
   font-size: 15px;
   line-height: 1.45;
-}
-
-.drawer-title-link {
-  color: inherit;
-  text-decoration-color: color-mix(in srgb, currentColor 35%, transparent);
-  text-underline-offset: 3px;
-}
-
-.drawer-title-link:hover {
-  color: var(--color-primary);
-  text-decoration-color: currentColor;
 }
 
 .drawer-body h4 {
@@ -1172,14 +1183,12 @@ code,
   min-width: 0;
 }
 
-.progress-pr-link {
-  color: var(--color-primary);
-  text-decoration: underline;
-  text-underline-offset: 2px;
+.progress-row .github-pr-link {
+  max-width: 100%;
 }
 
-.progress-pr-link:hover {
-  color: var(--color-base-content);
+.progress-row .github-pr-link strong {
+  min-width: 0;
 }
 
 .progress-row strong,
