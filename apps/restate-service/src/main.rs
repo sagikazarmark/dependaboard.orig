@@ -1198,10 +1198,7 @@ async fn start_scheduler(installation_id: u64) {
     let url = format!("{ingress}/restate/send/SchedulerIngress/start");
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let mut request = client.post(&url).json(&());
-        if let Some(api_key) = &api_key {
-            request = request.bearer_auth(api_key);
-        }
+        let request = scheduler_start_request(&client, &url, api_key.as_deref());
         match request.send().await {
             Ok(response) if response.status().is_success() => {
                 info!(
@@ -1216,6 +1213,18 @@ async fn start_scheduler(installation_id: u64) {
             Err(error) => warn!(%error, "Restate ingress is not ready for scheduler startup"),
         }
     }
+}
+
+fn scheduler_start_request(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut request = client.post(url);
+    if let Some(api_key) = api_key {
+        request = request.bearer_auth(api_key);
+    }
+    request
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -1264,6 +1273,24 @@ mod tests {
             .find(|handler| handler.name.as_str() == "status")
             .expect("missing PullRequest/status");
         assert_ne!(status.ingress_private, Some(true));
+    }
+
+    #[test]
+    fn scheduler_start_request_has_no_input_payload() {
+        let request = scheduler_start_request(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:8080/restate/send/SchedulerIngress/start",
+            None,
+        )
+        .build()
+        .expect("scheduler request should build");
+
+        assert!(request.body().is_none());
+        assert!(
+            !request
+                .headers()
+                .contains_key(reqwest::header::CONTENT_TYPE)
+        );
     }
 
     #[test]
