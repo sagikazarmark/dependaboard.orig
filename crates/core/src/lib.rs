@@ -707,6 +707,11 @@ pub struct SyncRequest {
     pub repo: String,
     pub number: u64,
     pub observed_sha: Option<String>,
+    /// Manual refreshes should not wait behind webhook storm coalescing.
+    #[serde(default)]
+    pub bypass_debounce: bool,
+    #[serde(default)]
+    pub completion_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -732,6 +737,8 @@ pub struct PrState {
     pub history: Vec<ActionLog>,
     pub last_synced_at: Option<u64>,
     pub sync_pending: bool,
+    #[serde(default)]
+    pub completed_sync_ids: Vec<String>,
 }
 
 impl PrState {
@@ -739,6 +746,16 @@ impl PrState {
         self.history.push(entry);
         if self.history.len() > 20 {
             self.history.drain(..self.history.len() - 20);
+        }
+    }
+
+    pub fn complete_sync(&mut self, completion_id: String) {
+        if !self.completed_sync_ids.contains(&completion_id) {
+            self.completed_sync_ids.push(completion_id);
+        }
+        if self.completed_sync_ids.len() > 20 {
+            self.completed_sync_ids
+                .drain(..self.completed_sync_ids.len() - 20);
         }
     }
 }
@@ -755,7 +772,11 @@ pub struct WebhookEvent {
     pub sha: Option<String>,
     #[serde(default)]
     pub pull_requests: Vec<u64>,
+    #[serde(default)]
+    pub sync_completion_id: Option<String>,
 }
+
+pub const DASHBOARD_SYNC_ACTION: &str = "dashboard_sync";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
@@ -971,6 +992,43 @@ updated-dependencies:
         assert!(valid_batch_id(&id));
         assert!(!valid_batch_id("550e8400-e29b-41d4-a716-446655440000"));
         assert!(!valid_batch_id("not-a-uuid"));
+    }
+
+    #[test]
+    fn manual_sync_fields_default_for_existing_restate_data() {
+        let request: SyncRequest = serde_json::from_value(serde_json::json!({
+            "repository_id": 7,
+            "owner": "acme",
+            "repo": "api",
+            "number": 9,
+            "observed_sha": "abc123"
+        }))
+        .unwrap();
+        assert!(!request.bypass_debounce);
+        assert_eq!(request.completion_id, None);
+
+        let state: PrState = serde_json::from_value(serde_json::json!({
+            "snapshot": null,
+            "history": [],
+            "last_synced_at": 100,
+            "sync_pending": false
+        }))
+        .unwrap();
+        assert!(state.completed_sync_ids.is_empty());
+
+        let event: WebhookEvent = serde_json::from_value(serde_json::json!({
+            "event": "pull_request",
+            "action": "synchronize",
+            "installation_id": 42,
+            "repository_id": 7,
+            "owner": "acme",
+            "repo": "api",
+            "number": 9,
+            "sha": "abc123",
+            "pull_requests": []
+        }))
+        .unwrap();
+        assert_eq!(event.sync_completion_id, None);
     }
 
     #[test]

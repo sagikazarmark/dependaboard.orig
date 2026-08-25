@@ -562,6 +562,8 @@ impl GithubApi for GithubClient {
                         repo: repo.to_owned(),
                         number: pull.number,
                         observed_sha: Some(pull.head.sha),
+                        bypass_debounce: false,
+                        completion_id: None,
                     }),
             );
             if count < 100 {

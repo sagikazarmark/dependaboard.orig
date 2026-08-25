@@ -19,7 +19,7 @@ use {
         routing::post,
     },
     base64::{Engine as _, engine::general_purpose::STANDARD},
-    dependaboard_core::{BulkRequest, UserId, WebhookEvent},
+    dependaboard_core::{BulkRequest, DASHBOARD_SYNC_ACTION, PrKey, UserId, WebhookEvent},
     dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig},
     dioxus::server::{DioxusRouterExt, ServeConfig},
     hmac::{Hmac, Mac},
@@ -126,6 +126,18 @@ async fn load_pr_status(repository_id: u64, number: u64) -> Result<Option<PrStat
         .map_err(ServerFnError::new)
 }
 
+#[server]
+async fn load_pr_projection(
+    repository_id: u64,
+    number: u64,
+) -> Result<Option<PrRecord>, ServerFnError> {
+    store()
+        .await?
+        .get_pr(&PrKey::new(repository_id, number))
+        .await
+        .map_err(|error| ServerFnError::new(error.to_string()))
+}
+
 #[cfg(feature = "server")]
 fn pr_status_path(repository_id: u64, number: u64) -> String {
     format!("PullRequest/{repository_id}%23{number}/status")
@@ -133,13 +145,10 @@ fn pr_status_path(repository_id: u64, number: u64) -> String {
 
 #[server]
 async fn request_sync() -> Result<(), ServerFnError> {
-    let installation_id = std::env::var("GITHUB_INSTALLATION_ID")
-        .map_err(|_| ServerFnError::new("GITHUB_INSTALLATION_ID is not configured"))?
-        .parse::<u64>()
-        .map_err(|_| ServerFnError::new("GITHUB_INSTALLATION_ID must be an integer"))?;
+    let installation_id = github_installation_id()?;
     let event = WebhookEvent {
         event: "installation_repositories".to_owned(),
-        action: Some("dashboard_sync".to_owned()),
+        action: Some(DASHBOARD_SYNC_ACTION.to_owned()),
         installation_id: Some(installation_id),
         repository_id: None,
         owner: None,
@@ -147,10 +156,73 @@ async fn request_sync() -> Result<(), ServerFnError> {
         number: None,
         sha: None,
         pull_requests: Vec::new(),
+        sync_completion_id: None,
     };
     restate_send("WebhookIngress/dispatch", &event)
         .await
         .map_err(ServerFnError::new)
+}
+
+#[server]
+async fn request_pr_sync(repository_id: u64, number: u64) -> Result<String, ServerFnError> {
+    let installation_id = github_installation_id()?;
+    let row = store()
+        .await?
+        .get_pr(&PrKey::new(repository_id, number))
+        .await
+        .map_err(|error| ServerFnError::new(error.to_string()))?
+        .ok_or_else(|| ServerFnError::new("pull request is no longer in the dashboard"))?;
+    if row.installation_id != installation_id {
+        return Err(ServerFnError::new(
+            "pull request does not belong to the configured installation",
+        ));
+    }
+    let completion_id = new_batch_id();
+    let event = manual_pr_sync_event(
+        installation_id,
+        row.repository_id,
+        row.owner,
+        row.repo,
+        row.number,
+        row.head_sha,
+        completion_id.clone(),
+    );
+    restate_send("WebhookIngress/dispatch", &event)
+        .await
+        .map_err(ServerFnError::new)?;
+    Ok(completion_id)
+}
+
+#[cfg(feature = "server")]
+fn github_installation_id() -> Result<u64, ServerFnError> {
+    std::env::var("GITHUB_INSTALLATION_ID")
+        .map_err(|_| ServerFnError::new("GITHUB_INSTALLATION_ID is not configured"))?
+        .parse::<u64>()
+        .map_err(|_| ServerFnError::new("GITHUB_INSTALLATION_ID must be an integer"))
+}
+
+#[cfg(feature = "server")]
+fn manual_pr_sync_event(
+    installation_id: u64,
+    repository_id: u64,
+    owner: String,
+    repo: String,
+    number: u64,
+    observed_sha: String,
+    completion_id: String,
+) -> WebhookEvent {
+    WebhookEvent {
+        event: "pull_request".to_owned(),
+        action: Some(DASHBOARD_SYNC_ACTION.to_owned()),
+        installation_id: Some(installation_id),
+        repository_id: Some(repository_id),
+        owner: Some(owner),
+        repo: Some(repo),
+        number: Some(number),
+        sha: Some(observed_sha),
+        pull_requests: Vec::new(),
+        sync_completion_id: Some(completion_id),
+    }
 }
 
 #[cfg(feature = "server")]
@@ -453,6 +525,7 @@ fn normalize_webhook(event_name: &str, event: &GithubWebhookEvent) -> Result<Web
         number,
         sha,
         pull_requests,
+        sync_completion_id: None,
     })
 }
 
@@ -816,7 +889,25 @@ fn App() -> Element {
             }
 
             if let Some(row) = detail() {
-                DetailDrawer { row, onclose: move |_| detail.set(None) }
+                DetailDrawer {
+                    row,
+                    onclose: move |_| detail.set(None),
+                    onsync: move |result: Result<Option<PrRecord>, String>| match result {
+                        Ok(Some(row)) => {
+                            detail.set(Some(row));
+                            toast.set(Some("Pull request synced".to_owned()));
+                            refresh += 1;
+                            dashboard.restart();
+                        }
+                        Ok(None) => {
+                            detail.set(None);
+                            toast.set(Some("Pull request is no longer open".to_owned()));
+                            refresh += 1;
+                            dashboard.restart();
+                        }
+                        Err(error) => toast.set(Some(error)),
+                    }
+                }
             }
 
             if let Some(progress) = active_batch() {
@@ -1029,9 +1120,15 @@ fn PrRow(
 }
 
 #[component]
-fn DetailDrawer(row: PrRecord, onclose: EventHandler<MouseEvent>) -> Element {
+fn DetailDrawer(
+    row: PrRecord,
+    onclose: EventHandler<MouseEvent>,
+    onsync: EventHandler<Result<Option<PrRecord>, String>>,
+) -> Element {
     let stale = unix_seconds().saturating_sub(row.synced_at) > 45 * 60;
-    let status = use_resource({
+    let mut syncing = use_signal(|| false);
+    let mut sync_queued = use_signal(|| false);
+    let mut status = use_resource({
         let repository_id = row.repository_id;
         let number = row.number;
         move || load_pr_status(repository_id, number)
@@ -1047,6 +1144,8 @@ fn DetailDrawer(row: PrRecord, onclose: EventHandler<MouseEvent>) -> Element {
         .as_ref()
         .and_then(|result| result.as_ref().err())
         .map(ToString::to_string);
+    let sync_repository_id = row.repository_id;
+    let sync_number = row.number;
     rsx! {
         div { class: "drawer-scrim", onclick: move |event| onclose.call(event),
             section { class: "side-drawer detail-drawer", onclick: move |event| event.stop_propagation(),
@@ -1117,7 +1216,52 @@ fn DetailDrawer(row: PrRecord, onclose: EventHandler<MouseEvent>) -> Element {
                         }
                     }
                 }
-                a { class: "drawer-link", href: row.html_url, target: "_blank", rel: "noreferrer", "Open on GitHub" }
+                div { class: "drawer-actions",
+                    button {
+                        class: "drawer-action drawer-sync",
+                        disabled: syncing() || sync_queued(),
+                        onclick: move |_| {
+                            syncing.set(true);
+                            spawn(async move {
+                                match request_pr_sync(sync_repository_id, sync_number).await {
+                                    Ok(completion_id) => {
+                                        syncing.set(false);
+                                        sync_queued.set(true);
+                                        match wait_for_pr_sync_completion(
+                                            sync_repository_id,
+                                            sync_number,
+                                            completion_id,
+                                        ).await {
+                                            Ok(row) => {
+                                                sync_queued.set(false);
+                                                status.restart();
+                                                onsync.call(Ok(row));
+                                            }
+                                            Err(error) => {
+                                                sync_queued.set(false);
+                                                onsync.call(Err(format!(
+                                                    "Sync was queued, but completion could not be confirmed: {error}"
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        syncing.set(false);
+                                        onsync.call(Err(format!("Could not queue sync: {error}")));
+                                    }
+                                }
+                            });
+                        },
+                        if syncing() {
+                            "Queueing sync..."
+                        } else if sync_queued() {
+                            "Syncing..."
+                        } else {
+                            "Sync PR"
+                        }
+                    }
+                    a { class: "drawer-action drawer-link", href: row.html_url, target: "_blank", rel: "noreferrer", "Open on GitHub" }
+                }
             }
         }
     }
@@ -1305,6 +1449,41 @@ async fn wait_one_second() {
     gloo_timers::future::TimeoutFuture::new(1_000).await;
     #[cfg(not(target_arch = "wasm32"))]
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+}
+
+async fn wait_for_pr_sync_completion(
+    repository_id: u64,
+    number: u64,
+    completion_id: String,
+) -> Result<Option<PrRecord>, String> {
+    let mut last_error = None;
+    for _ in 0..60 {
+        wait_one_second().await;
+        match load_pr_status(repository_id, number).await {
+            Ok(state) if sync_id_completed(state.as_ref(), &completion_id) => {
+                match load_pr_projection(repository_id, number).await {
+                    Ok(row) => return Ok(row),
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+            }
+            Ok(_) => match load_pr_projection(repository_id, number).await {
+                Ok(None) => return Ok(None),
+                Ok(Some(_)) => last_error = None,
+                Err(error) => last_error = Some(error.to_string()),
+            },
+            Err(error) => last_error = Some(error.to_string()),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "the sync did not complete within 60 seconds".to_owned()))
+}
+
+fn sync_id_completed(state: Option<&PrState>, completion_id: &str) -> bool {
+    state.is_some_and(|state| {
+        state
+            .completed_sync_ids
+            .iter()
+            .any(|completed| completed == completion_id)
+    })
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -1512,6 +1691,39 @@ mod tests {
     #[test]
     fn pull_request_status_path_encodes_the_object_key_separator() {
         assert_eq!(pr_status_path(7, 9), "PullRequest/7%239/status");
+    }
+
+    #[test]
+    fn manual_pull_request_sync_uses_the_dashboard_ingress_action() {
+        let event = manual_pr_sync_event(
+            42,
+            7,
+            "acme".to_owned(),
+            "api".to_owned(),
+            9,
+            "abc123".to_owned(),
+            "sync-123".to_owned(),
+        );
+
+        assert_eq!(event.event, "pull_request");
+        assert_eq!(event.action.as_deref(), Some(DASHBOARD_SYNC_ACTION));
+        assert_eq!(event.installation_id, Some(42));
+        assert_eq!(event.repository_id, Some(7));
+        assert_eq!(event.owner.as_deref(), Some("acme"));
+        assert_eq!(event.repo.as_deref(), Some("api"));
+        assert_eq!(event.number, Some(9));
+        assert_eq!(event.sha.as_deref(), Some("abc123"));
+        assert_eq!(event.sync_completion_id.as_deref(), Some("sync-123"));
+    }
+
+    #[test]
+    fn pull_request_sync_completes_only_for_its_request_id() {
+        let mut state = PrState::default();
+        assert!(!sync_id_completed(Some(&state), "sync-123"));
+        state.complete_sync("sync-456".to_owned());
+        assert!(!sync_id_completed(Some(&state), "sync-123"));
+        state.complete_sync("sync-123".to_owned());
+        assert!(sync_id_completed(Some(&state), "sync-123"));
     }
 
     fn parsed_webhook(event_name: &str, payload: Value) -> WebhookEvent {

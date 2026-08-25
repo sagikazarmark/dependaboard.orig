@@ -7,9 +7,10 @@ use std::{
 use bytes::Bytes;
 use dependaboard_core::{
     ActionLog, ActionOutcome, BatchProgress, BulkActionKind, BulkRequest, Classification,
-    CommandRequest, DependabotCommand, GithubErrorResponse, MAX_BATCH_TARGETS, MergeRequest,
-    Operation, PrKey, PrState, RejectReason, RepoRecord, SyncRequest, SyncShaRequest,
-    TargetProgressState, UpdateBranchRequest, WebhookEvent, classify_github_error, valid_batch_id,
+    CommandRequest, DASHBOARD_SYNC_ACTION, DependabotCommand, GithubErrorResponse,
+    MAX_BATCH_TARGETS, MergeRequest, Operation, PrKey, PrState, RejectReason, RepoRecord,
+    SyncRequest, SyncShaRequest, TargetProgressState, UpdateBranchRequest, WebhookEvent,
+    classify_github_error, valid_batch_id,
 };
 use dependaboard_github::{GithubApi, GithubClient, GithubConfig, GithubError};
 use dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig, StoreError, StoreErrorClass};
@@ -49,10 +50,12 @@ impl PullRequest {
             .await?
             .map(Json::into_inner)
             .unwrap_or_default();
-        if state
-            .last_synced_at
-            .is_some_and(|last| now.saturating_sub(last) < self.debounce.as_secs())
-        {
+        if should_debounce_sync(
+            request.bypass_debounce,
+            state.last_synced_at,
+            now,
+            self.debounce,
+        ) {
             if !state.sync_pending {
                 state.sync_pending = true;
                 ctx.set(PR_STATE, Json::from(state));
@@ -123,6 +126,9 @@ impl PullRequest {
                 action: "sync".to_owned(),
                 detail: format!("canonical snapshot at {}", short_sha(&snapshot.head_sha)),
             });
+            if let Some(completion_id) = request.completion_id {
+                state.complete_sync(completion_id);
+            }
             ctx.set(PR_STATE, Json::from(state));
         } else {
             let store = self.store.clone();
@@ -330,6 +336,8 @@ impl PullRequest {
                     repo: request.target.repo,
                     number: request.target.number,
                     observed_sha: None,
+                    bypass_debounce: false,
+                    completion_id: None,
                 }))
                 .send();
         }
@@ -779,6 +787,8 @@ impl RepoSync {
                 repo: request.repo.clone(),
                 number,
                 observed_sha: Some(request.sha.clone()),
+                bypass_debounce: false,
+                completion_id: None,
             };
             ctx.object_client::<PullRequestClient>(request_key(&sync).to_string())
                 .sync(Json::from(sync))
@@ -857,7 +867,7 @@ fn dispatch_pull_request(ctx: &Context<'_>, event: &WebhookEvent) -> HandlerResu
         Some("closed") => {
             ctx.object_client::<PullRequestClient>(key).closed().send();
         }
-        Some("opened" | "reopened" | "synchronize" | "edited" | "labeled" | "unlabeled") => {
+        action if pull_request_action_requests_sync(action) => {
             ctx.object_client::<PullRequestClient>(key)
                 .sync(Json::from(SyncRequest {
                     repository_id,
@@ -865,12 +875,39 @@ fn dispatch_pull_request(ctx: &Context<'_>, event: &WebhookEvent) -> HandlerResu
                     repo: repo.clone(),
                     number,
                     observed_sha: event.sha.clone(),
+                    bypass_debounce: event.action.as_deref() == Some(DASHBOARD_SYNC_ACTION),
+                    completion_id: event.sync_completion_id.clone(),
                 }))
                 .send();
         }
         _ => {}
     }
     Ok(())
+}
+
+fn pull_request_action_requests_sync(action: Option<&str>) -> bool {
+    matches!(
+        action,
+        Some(
+            "opened"
+                | "reopened"
+                | "synchronize"
+                | "edited"
+                | "labeled"
+                | "unlabeled"
+                | DASHBOARD_SYNC_ACTION
+        )
+    )
+}
+
+fn should_debounce_sync(
+    bypass_debounce: bool,
+    last_synced_at: Option<u64>,
+    now: u64,
+    debounce: Duration,
+) -> bool {
+    !bypass_debounce
+        && last_synced_at.is_some_and(|last| now.saturating_sub(last) < debounce.as_secs())
 }
 
 fn dispatch_sha(ctx: &Context<'_>, event: &WebhookEvent) -> HandlerResult<()> {
@@ -1366,6 +1403,22 @@ mod tests {
             installation_lifecycle_action(Some("deleted")),
             InstallationLifecycleAction::Purge
         );
+    }
+
+    #[test]
+    fn dashboard_action_requests_a_pull_request_sync() {
+        assert!(pull_request_action_requests_sync(Some(
+            DASHBOARD_SYNC_ACTION
+        )));
+        assert!(!pull_request_action_requests_sync(Some("closed")));
+        assert!(!pull_request_action_requests_sync(None));
+    }
+
+    #[test]
+    fn dashboard_sync_bypasses_the_event_debounce() {
+        let debounce = Duration::from_secs(20);
+        assert!(should_debounce_sync(false, Some(100), 101, debounce));
+        assert!(!should_debounce_sync(true, Some(100), 101, debounce));
     }
 
     #[test]
