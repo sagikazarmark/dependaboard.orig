@@ -1287,6 +1287,7 @@ mod tests {
             number: 9,
             expected_sha: "abc123".to_owned(),
             title: "Bump serde".to_owned(),
+            html_url: "https://github.com/acme/api/pull/9".to_owned(),
         }
     }
 

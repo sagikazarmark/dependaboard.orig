@@ -523,6 +523,8 @@ pub struct PrTarget {
     pub number: u64,
     pub expected_sha: String,
     pub title: String,
+    #[serde(default)]
+    pub html_url: String,
 }
 
 impl PrTarget {
@@ -992,6 +994,21 @@ updated-dependencies:
         assert!(valid_batch_id(&id));
         assert!(!valid_batch_id("550e8400-e29b-41d4-a716-446655440000"));
         assert!(!valid_batch_id("not-a-uuid"));
+    }
+
+    #[test]
+    fn pr_target_url_defaults_for_existing_restate_data() {
+        let target: PrTarget = serde_json::from_value(serde_json::json!({
+            "repository_id": 7,
+            "owner": "acme",
+            "repo": "api",
+            "number": 9,
+            "expected_sha": "abc123",
+            "title": "Bump serde"
+        }))
+        .unwrap();
+
+        assert!(target.html_url.is_empty());
     }
 
     #[test]

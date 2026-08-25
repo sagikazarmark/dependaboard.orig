@@ -1172,6 +1172,16 @@ code,
   min-width: 0;
 }
 
+.progress-pr-link {
+  color: var(--color-primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.progress-pr-link:hover {
+  color: var(--color-base-content);
+}
+
 .progress-row strong,
 .progress-row small {
   display: block;

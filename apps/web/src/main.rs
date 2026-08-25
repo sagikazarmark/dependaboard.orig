@@ -1322,7 +1322,20 @@ fn ProgressDrawer(progress: BatchProgress, onclose: EventHandler<MouseEvent>) ->
                     for item in &progress.targets {
                         div { class: "progress-row",
                             span { class: "progress-state {progress_class(&item.state)}" }
-                            div { strong { "{item.target.owner}/{item.target.repo} #{item.target.number}" } small { "{progress_detail(&item.state)}" } }
+                            div {
+                                if let Some(html_url) = progress_target_url(&item.target) {
+                                    a {
+                                        class: "progress-pr-link",
+                                        href: html_url,
+                                        target: "_blank",
+                                        rel: "noreferrer",
+                                        strong { "{item.target.owner}/{item.target.repo} #{item.target.number}" }
+                                    }
+                                } else {
+                                    strong { "{item.target.owner}/{item.target.repo} #{item.target.number}" }
+                                }
+                                small { "{progress_detail(&item.state)}" }
+                            }
                         }
                     }
                 }
@@ -1339,7 +1352,12 @@ fn pr_target(row: &PrRecord) -> PrTarget {
         number: row.number,
         expected_sha: row.head_sha.clone(),
         title: row.title.clone(),
+        html_url: row.html_url.clone(),
     }
+}
+
+fn progress_target_url(target: &PrTarget) -> Option<&str> {
+    (!target.html_url.is_empty()).then_some(target.html_url.as_str())
 }
 
 fn filter_count(filter: &PrFilter) -> usize {
@@ -1502,6 +1520,26 @@ mod wasm_tests {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_progress_uses_the_canonical_pull_request_url() {
+        let mut target = PrTarget {
+            repository_id: 7,
+            owner: "acme".to_owned(),
+            repo: "api".to_owned(),
+            number: 9,
+            expected_sha: "abc123".to_owned(),
+            title: "Bump serde".to_owned(),
+            html_url: "https://github.example/acme/api/pull/9".to_owned(),
+        };
+        assert_eq!(
+            progress_target_url(&target),
+            Some("https://github.example/acme/api/pull/9")
+        );
+
+        target.html_url.clear();
+        assert_eq!(progress_target_url(&target), None);
+    }
 
     #[tokio::test]
     async fn empty_input_restate_call_has_no_body_or_content_type() {
