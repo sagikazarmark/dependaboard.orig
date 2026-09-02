@@ -885,26 +885,33 @@ Retrofitting an audit trail into already-merged PRs isn't possible.
 
 ## 6b. Crate choices
 
-**`octocrab` for webhook payload types.** It provides deserializable datatypes for GitHub
-App webhook payloads and lets you pattern-match on event kind via
-`WebhookEvent::try_from_header_and_body`. Webhook support is explicitly beta and not every
-event is strongly typed. `pull_request` and `check_suite` are well covered; verify the
-typing for `check_run`, `status`, `installation` and `installation_repositories` before
-relying on it, and fall back to hand-rolled serde structs for any that aren't — the
-fields you need from those four are shallow.
+**`octoevents` for the receiving edge.** It turns an untrusted request into a verified
+`Envelope`: constant-time HMAC over `X-Hub-Signature-256`, the `X-GitHub-Delivery` and
+content-type checks GitHub's contract requires, a body cap, and the status mapping to
+answer with (`ResponseStatus::for_receive_error`). It stops there, which is the right
+shape — routing stays in `WebhookIngress`, not in the transport.
 
-**Hand-roll HMAC verification.** ~15 lines with `hmac` + `sha2` + a constant-time compare
-against `X-Hub-Signature-256`. Not worth a dependency.
+The `Envelope` already carries the installation and repository probe every event shares,
+so the handler only parses the per-event routing fields — PR number, head SHA, and the PRs
+a check belongs to — with shallow serde structs of its own. That is `Envelope::parse`, not
+the crate's optional `octocrab` feature: those four fields are shallow, and depending on
+octocrab's beta webhook models to read them buys nothing.
+
+**Do not hand-roll HMAC verification.** The comparison is the easy part; the delivery
+contract around it (which failure is a `400` and which a `401`, refusing an unsigned
+request before it occupies `body_limit` bytes, rejecting a form-encoded body, leaving
+`ping` unrouted) is where a hand-rolled handler drifts from GitHub's expectations.
 
 **Skip the App frameworks.** `octofer` and `octoapp` are Probot-shaped — octofer bundles
 JWT generation, installation-token management, a built-in HTTP server with HMAC
 verification, and event routing. Wrong shape here: they want to own the HTTP server and
 the event loop, which collides with Restate owning orchestration. Both are also young and
-thin. Take octocrab's types and its API client; write the ~50 lines of glue yourself.
+thin. Take a receiving-edge crate and a plain API client; write the ~50 lines of glue
+yourself.
 
-**Wasm caveat.** octocrab pulls hyper/tokio. Fine in the Restate binary; check before
-assuming it compiles for a `wasm32` Worker. If the webhook Worker fights it, that handler
-only needs serde structs + HMAC + an outbound fetch — trivially hand-written.
+**Wasm caveat.** `octoevents` is sans-I/O over `http` types and pulls no runtime, so the
+receiving edge is not what would block a `wasm32` Worker. Check the API client instead:
+that side is what pulls hyper/tokio.
 
 ---
 

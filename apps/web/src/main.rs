@@ -12,7 +12,7 @@ use dioxus::prelude::*;
 use {
     axum::{
         body::{Body, Bytes},
-        extract::Extension,
+        extract::{Extension, State},
         http::{HeaderMap, Request, StatusCode, header},
         middleware::{self, Next},
         response::{IntoResponse, Response},
@@ -22,13 +22,9 @@ use {
     dependaboard_core::{BulkRequest, DASHBOARD_SYNC_ACTION, PrKey, UserId, WebhookEvent},
     dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig},
     dioxus::server::{DioxusRouterExt, ServeConfig},
-    hmac::{Hmac, Mac},
-    octocrab::models::webhook_events::{
-        WebhookEvent as GithubWebhookEvent, payload::WebhookEventPayload,
-    },
+    octoevents::{Envelope, EventKind, ResponseStatus, Secret, Verifier},
     serde::{Deserialize, Serialize, de::DeserializeOwned},
     serde_json::Value,
-    sha2::Sha256,
 };
 
 #[cfg(feature = "server")]
@@ -56,6 +52,7 @@ async fn main() {
         .layer(middleware::from_fn(require_dashboard_auth));
     let router = axum::Router::new()
         .route("/api/webhooks/github", post(github_webhook))
+        .with_state(webhook_verifier())
         .merge(dashboard);
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -318,45 +315,48 @@ where
     serde_json::from_value(output).map_err(|error| error.to_string())
 }
 
+/// Builds the webhook verifier once, so a missing secret fails at startup
+/// rather than at the first delivery.
 #[cfg(feature = "server")]
-async fn github_webhook(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
-    let Some(signature) = headers
-        .get("x-hub-signature-256")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return (StatusCode::UNAUTHORIZED, "missing webhook signature").into_response();
-    };
-    let secret = match std::env::var("GITHUB_WEBHOOK_SECRET") {
-        Ok(secret) if !secret.is_empty() => secret,
-        _ => {
-            tracing::error!("GITHUB_WEBHOOK_SECRET is not configured");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "webhook is not configured",
-            )
-                .into_response();
+fn webhook_verifier() -> Verifier {
+    let secret =
+        std::env::var("GITHUB_WEBHOOK_SECRET").expect("GITHUB_WEBHOOK_SECRET must be configured");
+    assert!(
+        !secret.trim().is_empty(),
+        "GITHUB_WEBHOOK_SECRET must not be empty"
+    );
+    Verifier::new(Secret::new(secret))
+}
+
+#[cfg(feature = "server")]
+async fn github_webhook(
+    State(verifier): State<Verifier>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let envelope = match Envelope::from_signed_parts(&verifier, &headers, body) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            tracing::warn!(%error, "GitHub webhook delivery was rejected");
+            let status = StatusCode::from(ResponseStatus::for_receive_error(&error));
+            return (status, "webhook delivery was rejected").into_response();
         }
     };
-    if !valid_signature(&secret, signature, &body) {
-        return (StatusCode::UNAUTHORIZED, "invalid webhook signature").into_response();
+    // GitHub pings a new App before any real delivery; nothing downstream routes it.
+    if envelope.kind == EventKind::Ping {
+        return StatusCode::NO_CONTENT.into_response();
     }
-    let Some(event_name) = headers
-        .get("x-github-event")
-        .and_then(|value| value.to_str().ok())
-    else {
-        return (StatusCode::BAD_REQUEST, "missing GitHub event name").into_response();
-    };
-    let event = match parse_webhook(event_name, &body) {
+    let event = match routed_event(&envelope) {
         Ok(event) => event,
         Err(error) => {
-            tracing::warn!(%error, event = event_name, "GitHub webhook payload was rejected");
+            tracing::warn!(%error, event = %envelope.kind, "GitHub webhook payload was rejected");
             return (StatusCode::BAD_REQUEST, "invalid GitHub webhook payload").into_response();
         }
     };
     match restate_send("WebhookIngress/dispatch", &event).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => {
-            tracing::error!(%error, event = event_name, "Restate rejected webhook");
+            tracing::error!(%error, event = %envelope.kind, "Restate rejected webhook");
             (StatusCode::BAD_GATEWAY, "could not enqueue webhook").into_response()
         }
     }
@@ -417,111 +417,67 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+/// Reduces a verified envelope to the routing fields `WebhookIngress` dispatches on.
+///
+/// The envelope already carries the installation and repository probe, so only
+/// the per-event fields — PR number, head SHA, and the PRs a check belongs to —
+/// need parsing out of the payload.
 #[cfg(feature = "server")]
-fn valid_signature(secret: &str, signature: &str, body: &[u8]) -> bool {
-    let Some(encoded) = signature.strip_prefix("sha256=") else {
-        return false;
-    };
-    let Ok(expected) = hex::decode(encoded) else {
-        return false;
-    };
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
-        return false;
-    };
-    mac.update(body);
-    mac.verify_slice(&expected).is_ok()
-}
-
-#[cfg(feature = "server")]
-fn parse_webhook(event_name: &str, body: &[u8]) -> Result<WebhookEvent, String> {
-    let event = GithubWebhookEvent::try_from_header_and_body(event_name, body)
-        .map_err(|error| error.to_string())?;
-    normalize_webhook(event_name, &event)
-}
-
-#[cfg(feature = "server")]
-fn normalize_webhook(event_name: &str, event: &GithubWebhookEvent) -> Result<WebhookEvent, String> {
-    let (action, number, sha, pull_requests) = match &event.specific {
-        WebhookEventPayload::Installation(payload) => {
-            (Some(action_name(&payload.action)?), None, None, Vec::new())
+fn routed_event(envelope: &Envelope) -> Result<WebhookEvent, String> {
+    let (number, sha, pull_requests) = match envelope.kind {
+        EventKind::Installation | EventKind::InstallationRepositories => {
+            if envelope.common.installation_id.is_none() {
+                return Err("GitHub installation webhook is missing an installation id".to_owned());
+            }
+            (None, None, Vec::new())
         }
-        WebhookEventPayload::InstallationRepositories(payload) => {
-            (Some(action_name(&payload.action)?), None, None, Vec::new())
+        EventKind::PullRequest => {
+            let payload: PullRequestRouting = parse_payload(envelope)?;
+            (
+                Some(payload.pull_request.number),
+                Some(payload.pull_request.head.sha),
+                Vec::new(),
+            )
         }
-        WebhookEventPayload::PullRequest(payload) => (
-            Some(action_name(&payload.action)?),
-            Some(payload.pull_request.number),
-            Some(payload.pull_request.head.sha.clone()),
-            Vec::new(),
+        EventKind::CheckRun => {
+            let payload: CheckRunRouting = parse_payload(envelope)?;
+            let (sha, numbers) = payload.check_run.into_routing();
+            (None, Some(sha), numbers)
+        }
+        EventKind::CheckSuite => {
+            let payload: CheckSuiteRouting = parse_payload(envelope)?;
+            let (sha, numbers) = payload.check_suite.into_routing();
+            (None, Some(sha), numbers)
+        }
+        EventKind::Status => {
+            let payload: StatusRouting = parse_payload(envelope)?;
+            (None, Some(payload.sha), Vec::new())
+        }
+        _ => (None, None, Vec::new()),
+    };
+    let repository = match envelope.kind {
+        EventKind::PullRequest
+        | EventKind::CheckRun
+        | EventKind::CheckSuite
+        | EventKind::Status => Some(
+            envelope
+                .common
+                .repository
+                .as_ref()
+                .ok_or("GitHub repository webhook is missing routing fields")?,
         ),
-        WebhookEventPayload::CheckRun(payload) => {
-            let routing: CheckRouting = serde_json::from_value(payload.check_run.clone())
-                .map_err(|error| error.to_string())?;
-            (
-                Some(action_name(&payload.action)?),
-                None,
-                Some(routing.head_sha),
-                routing
-                    .pull_requests
-                    .into_iter()
-                    .map(|pull| pull.number)
-                    .collect(),
-            )
-        }
-        WebhookEventPayload::CheckSuite(payload) => {
-            let routing: CheckRouting = serde_json::from_value(payload.check_suite.clone())
-                .map_err(|error| error.to_string())?;
-            (
-                Some(action_name(&payload.action)?),
-                None,
-                Some(routing.head_sha),
-                routing
-                    .pull_requests
-                    .into_iter()
-                    .map(|pull| pull.number)
-                    .collect(),
-            )
-        }
-        WebhookEventPayload::Status(payload) => (None, None, Some(payload.sha.clone()), Vec::new()),
-        _ => (None, None, None, Vec::new()),
+        _ => envelope.common.repository.as_ref(),
     };
-    let installation_id = event
-        .installation
-        .as_ref()
-        .map(|installation| installation.id().0);
-    let repository_id = event.repository.as_ref().map(|repository| repository.id.0);
-    let owner = event
-        .repository
-        .as_ref()
-        .and_then(|repository| repository.owner.as_ref())
-        .map(|owner| owner.login.clone());
-    let repo = event
-        .repository
-        .as_ref()
-        .map(|repository| repository.name.clone());
-    match &event.specific {
-        WebhookEventPayload::Installation(_) | WebhookEventPayload::InstallationRepositories(_)
-            if installation_id.is_none() =>
-        {
-            return Err("GitHub installation webhook is missing an installation id".to_owned());
-        }
-        WebhookEventPayload::PullRequest(_)
-        | WebhookEventPayload::CheckRun(_)
-        | WebhookEventPayload::CheckSuite(_)
-        | WebhookEventPayload::Status(_)
-            if repository_id.is_none() || owner.is_none() || repo.is_none() =>
-        {
-            return Err("GitHub repository webhook is missing routing fields".to_owned());
-        }
-        _ => {}
-    }
     Ok(WebhookEvent {
-        event: event_name.to_owned(),
-        action,
-        installation_id,
-        repository_id,
-        owner,
-        repo,
+        event: envelope.kind.as_str().to_owned(),
+        action: envelope
+            .action
+            .as_ref()
+            .map(|action| action.as_str().to_owned()),
+        installation_id: envelope.common.installation_id,
+        repository_id: repository.map(|repository| repository.id),
+        owner: repository.map(|repository| repository.owner.clone()),
+        repo: repository.map(|repository| repository.name.clone()),
         number,
         sha,
         pull_requests,
@@ -530,12 +486,45 @@ fn normalize_webhook(event_name: &str, event: &GithubWebhookEvent) -> Result<Web
 }
 
 #[cfg(feature = "server")]
-fn action_name(action: &impl Serialize) -> Result<String, String> {
-    serde_json::to_value(action)
-        .map_err(|error| error.to_string())?
-        .as_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| "GitHub webhook action was not a string".to_owned())
+fn parse_payload<T: DeserializeOwned>(envelope: &Envelope) -> Result<T, String> {
+    envelope.parse::<T>().map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+struct PullRequestRouting {
+    pull_request: PullRequestRef,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+struct PullRequestRef {
+    number: u64,
+    head: CommitRef,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+struct CommitRef {
+    sha: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+struct CheckRunRouting {
+    check_run: CheckRouting,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+struct CheckSuiteRouting {
+    check_suite: CheckRouting,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+struct StatusRouting {
+    sha: String,
 }
 
 #[cfg(feature = "server")]
@@ -544,6 +533,18 @@ struct CheckRouting {
     head_sha: String,
     #[serde(default)]
     pull_requests: Vec<CheckPullRequest>,
+}
+
+#[cfg(feature = "server")]
+impl CheckRouting {
+    fn into_routing(self) -> (String, Vec<u64>) {
+        let numbers = self
+            .pull_requests
+            .into_iter()
+            .map(|pull| pull.number)
+            .collect();
+        (self.head_sha, numbers)
+    }
 }
 
 #[cfg(feature = "server")]
@@ -1676,15 +1677,52 @@ mod tests {
     }
 
     #[test]
-    fn webhook_signature_is_verified_in_constant_time() {
-        let body = br#"{"action":"opened"}"#;
-        let mut mac = Hmac::<Sha256>::new_from_slice(b"secret").unwrap();
-        mac.update(body);
-        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    fn webhook_deliveries_are_authenticated_before_they_are_routed() {
+        // openssl dgst -sha256 -hmac secret, over exactly the bytes below.
+        const BODY: &[u8] = br#"{"action":"opened","installation":{"id":42}}"#;
+        const SIGNATURE: &str =
+            "sha256=015a17fc63d8f4eb2ffd3f3f70444a66af82856c318e854607c77d1747a3d3c9";
 
-        assert!(valid_signature("secret", &signature, body));
-        assert!(!valid_signature("wrong", &signature, body));
-        assert!(!valid_signature("secret", "sha1=abcd", body));
+        let body = Bytes::from_static(BODY);
+        let headers = |signature: &'static str| {
+            octoevents::HeaderView::new()
+                .signature(signature)
+                .delivery_id("72d3162e-cc78-11e3-81ab-4c9367dc0958")
+                .event_name("installation")
+                .content_type("application/json")
+        };
+
+        let envelope = Envelope::from_signed(
+            &Verifier::new(Secret::new("secret")),
+            &headers(SIGNATURE),
+            body.clone(),
+        )
+        .expect("a correctly signed delivery is accepted");
+        assert_eq!(envelope.kind, EventKind::Installation);
+        assert_eq!(envelope.common.installation_id, Some(42));
+        assert_eq!(routed_event(&envelope).unwrap().installation_id, Some(42));
+
+        let mismatched = Envelope::from_signed(
+            &Verifier::new(Secret::new("wrong")),
+            &headers(SIGNATURE),
+            body.clone(),
+        )
+        .expect_err("a delivery signed with another secret is refused");
+        assert_eq!(
+            ResponseStatus::for_receive_error(&mismatched),
+            ResponseStatus::Unauthorized
+        );
+
+        let malformed = Envelope::from_signed(
+            &Verifier::new(Secret::new("secret")),
+            &headers("sha1=abcd"),
+            body,
+        )
+        .expect_err("a signature that is not sha256 hexadecimal is refused");
+        assert_eq!(
+            ResponseStatus::for_receive_error(&malformed),
+            ResponseStatus::BadRequest
+        );
     }
 
     #[test]
@@ -1714,76 +1752,70 @@ mod tests {
     }
 
     #[test]
-    fn typed_webhooks_are_reduced_to_routing_fields() {
-        let installation = parsed_webhook(
+    fn verified_envelopes_are_reduced_to_routing_fields() {
+        let installation = routed(
             "installation",
-            serde_json::json!({
-                "action": "created",
-                "installation": installation(),
-                "repositories": []
-            }),
+            Some("created"),
+            false,
+            serde_json::json!({ "action": "created", "repositories": [] }),
         );
         assert_eq!(installation.action.as_deref(), Some("created"));
         assert_eq!(installation.installation_id, Some(42));
+        assert_eq!(installation.repository_id, None);
 
-        let repositories = parsed_webhook(
+        let repositories = routed(
             "installation_repositories",
-            with_common(serde_json::json!({
+            Some("removed"),
+            true,
+            serde_json::json!({
                 "action": "removed",
                 "repositories_added": [],
                 "repositories_removed": [],
                 "repository_selection": "all"
-            })),
+            }),
         );
         assert_eq!(repositories.action.as_deref(), Some("removed"));
 
-        let pull_request = parsed_webhook(
+        let pull_request = routed(
             "pull_request",
-            with_common(serde_json::json!({
+            Some("synchronize"),
+            true,
+            serde_json::json!({
                 "action": "synchronize",
                 "number": 9,
                 "pull_request": {
-                    "id": 900,
                     "number": 9,
-                    "url": "https://api.github.test/repos/acme/api/pulls/9",
                     "head": { "ref": "dependabot/update", "sha": "abc123" },
                     "base": { "ref": "main", "sha": "base123" }
                 }
-            })),
+            }),
         );
         assert_eq!(pull_request.number, Some(9));
         assert_eq!(pull_request.sha.as_deref(), Some("abc123"));
 
-        for (event_name, object_name) in
-            [("check_run", "check_run"), ("check_suite", "check_suite")]
-        {
-            let mut payload = with_common(serde_json::json!({ "action": "completed" }));
+        for object_name in ["check_run", "check_suite"] {
+            let mut payload = serde_json::json!({ "action": "completed" });
             payload[object_name] = serde_json::json!({
                 "head_sha": "abc123",
                 "pull_requests": [{ "number": 9 }, { "number": 10 }]
             });
-            let event = parsed_webhook(event_name, payload);
+            let event = routed(object_name, Some("completed"), true, payload);
             assert_eq!(event.action.as_deref(), Some("completed"));
             assert_eq!(event.sha.as_deref(), Some("abc123"));
             assert_eq!(event.pull_requests, vec![9, 10]);
         }
 
-        let status = parsed_webhook(
+        let status = routed(
             "status",
-            with_common(serde_json::json!({
-                "avatar_url": null,
-                "branches": [],
-                "commit": {},
+            None,
+            true,
+            serde_json::json!({
                 "context": "ci/test",
-                "created_at": "2026-01-01T00:00:00Z",
-                "description": null,
                 "id": 1,
                 "name": "ci/test",
                 "sha": "abc123",
-                "state": "success",
-                "target_url": null,
-                "updated_at": "2026-01-01T00:00:00Z"
-            })),
+                "state": "success"
+            }),
         );
         assert_eq!(status.sha.as_deref(), Some("abc123"));
         assert_eq!(status.action, None);
@@ -1797,22 +1829,53 @@ mod tests {
     }
 
     #[test]
-    fn malformed_known_webhook_is_rejected() {
-        assert!(parse_webhook("pull_request", br#"{"action":"opened"}"#).is_err());
-        let mut check_run = with_common(serde_json::json!({
+    fn envelope_missing_routing_fields_is_rejected() {
+        // Authenticated but unroutable: the payload verified, yet nothing
+        // downstream can address a pull request or repository with it.
+        assert!(
+            routed_event(&envelope(
+                "pull_request",
+                Some("opened"),
+                true,
+                &serde_json::json!({ "action": "opened" })
+            ))
+            .is_err()
+        );
+        let mut anonymous = envelope(
+            "installation",
+            Some("created"),
+            false,
+            &serde_json::json!({ "action": "created" }),
+        );
+        anonymous.common.installation_id = None;
+        assert!(routed_event(&anonymous).is_err());
+
+        let mut check_run = serde_json::json!({
             "action": "completed",
-            "check_run": {
-                "head_sha": "abc123",
-                "pull_requests": [{}]
-            }
-        }));
-        assert!(parse_webhook("check_run", &serde_json::to_vec(&check_run).unwrap()).is_err());
+            "check_run": { "head_sha": "abc123", "pull_requests": [{}] }
+        });
+        assert!(routed_event(&envelope("check_run", Some("completed"), true, &check_run)).is_err());
         check_run["check_run"]["pull_requests"] = serde_json::json!([]);
         check_run["check_run"]
             .as_object_mut()
             .unwrap()
             .remove("head_sha");
-        assert!(parse_webhook("check_run", &serde_json::to_vec(&check_run).unwrap()).is_err());
+        assert!(routed_event(&envelope("check_run", Some("completed"), true, &check_run)).is_err());
+
+        let pull_request = serde_json::json!({
+            "action": "opened",
+            "number": 9,
+            "pull_request": { "number": 9, "head": { "sha": "abc123" } }
+        });
+        assert!(
+            routed_event(&envelope(
+                "pull_request",
+                Some("opened"),
+                false,
+                &pull_request
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1853,51 +1916,44 @@ mod tests {
         assert!(sync_id_completed(Some(&state), "sync-123"));
     }
 
-    fn parsed_webhook(event_name: &str, payload: Value) -> WebhookEvent {
-        parse_webhook(event_name, &serde_json::to_vec(&payload).unwrap()).unwrap()
+    fn routed(
+        event_name: &str,
+        action: Option<&str>,
+        repository: bool,
+        payload: Value,
+    ) -> WebhookEvent {
+        routed_event(&envelope(event_name, action, repository, &payload)).unwrap()
     }
 
-    fn with_common(mut payload: Value) -> Value {
-        payload["installation"] = installation();
-        payload["repository"] = repository();
-        payload
-    }
-
-    fn installation() -> Value {
-        serde_json::json!({ "id": 42, "node_id": "I_42" })
-    }
-
-    fn repository() -> Value {
-        serde_json::json!({
-            "id": 7,
-            "name": "api",
-            "url": "https://api.github.test/repos/acme/api",
-            "owner": author("acme")
-        })
-    }
-
-    fn author(login: &str) -> Value {
-        serde_json::json!({
-            "login": login,
-            "id": 1,
-            "node_id": "U_1",
-            "avatar_url": "https://github.test/avatar",
-            "gravatar_id": "",
-            "url": "https://api.github.test/users/acme",
-            "html_url": "https://github.test/acme",
-            "followers_url": "https://api.github.test/users/acme/followers",
-            "following_url": "https://api.github.test/users/acme/following{/other_user}",
-            "gists_url": "https://api.github.test/users/acme/gists{/gist_id}",
-            "starred_url": "https://api.github.test/users/acme/starred{/owner}{/repo}",
-            "subscriptions_url": "https://api.github.test/users/acme/subscriptions",
-            "organizations_url": "https://api.github.test/users/acme/orgs",
-            "repos_url": "https://api.github.test/users/acme/repos",
-            "events_url": "https://api.github.test/users/acme/events{/privacy}",
-            "received_events_url": "https://api.github.test/users/acme/received_events",
-            "type": "User",
-            "site_admin": false,
-            "name": null,
-            "patch_url": null
-        })
+    /// Builds the synthetic envelope a verified delivery would produce.
+    ///
+    /// `octoevents` extracts `common` from the payload itself, so the probe is
+    /// mirrored here rather than re-derived: these tests cover this crate's
+    /// routing, not the crate's extraction.
+    fn envelope(
+        event_name: &str,
+        action: Option<&str>,
+        repository: bool,
+        payload: &Value,
+    ) -> Envelope {
+        let mut common = octoevents::Common::default();
+        common.installation_id = Some(42);
+        if repository {
+            let mut reference = octoevents::RepositoryRef::default();
+            reference.id = 7;
+            reference.name = "api".to_owned();
+            reference.full_name = "acme/api".to_owned();
+            reference.owner = "acme".to_owned();
+            common.repository = Some(reference);
+        }
+        Envelope {
+            delivery_id: "72d3162e-cc78-11e3-81ab-4c9367dc0958".to_owned(),
+            kind: event_name.parse().unwrap(),
+            action: action.map(|action| action.parse().unwrap()),
+            common,
+            target_type: None,
+            target_id: None,
+            raw: Bytes::from(serde_json::to_vec(payload).unwrap()),
+        }
     }
 }

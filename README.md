@@ -133,6 +133,7 @@ Set the basic fields:
 - **Homepage URL:** the public tunnel origin.
 - **Webhook:** active.
 - **Webhook URL:** the tunnel origin plus `/api/webhooks/github`.
+- **Webhook content type:** `application/json`. GitHub defaults to `application/x-www-form-urlencoded`, which the receiver rejects with `400`.
 - **Webhook secret:** a new random secret. Generate one with `openssl rand -hex 32` or a password manager and retain it for `GITHUB_WEBHOOK_SECRET`.
 - **Callback URL, setup URL, device flow:** leave disabled or empty; the MVP does not use OAuth.
 - **Where can this GitHub App be installed?:** choose the account scope appropriate for the repositories you will monitor. For local testing, limiting it to your own account is simplest.
@@ -303,7 +304,7 @@ In the Restate UI, confirm the deployment lists `PullRequest`, `BulkAction`, `In
 
 Use the dashboard's **Sync** button to request another reconciliation. The repository filter should list the repositories selected during App installation, even if none has an open Dependabot PR. Open a pull-request drawer to verify durable status history, then test merge or rebase only on a disposable repository where those actions are safe.
 
-In the GitHub App settings, open **Advanced > Recent deliveries**. Redeliver an `installation`, `installation_repositories`, or subscribed repository event and confirm it receives HTTP `200`. Dependaboard does not handle GitHub's `ping` event. A `401` indicates a webhook-secret mismatch; a `502` indicates the web app could not enqueue the event into Restate.
+In the GitHub App settings, open **Advanced > Recent deliveries**. Redeliver an `installation`, `installation_repositories`, or subscribed repository event and confirm it receives HTTP `200`. Dependaboard acknowledges GitHub's `ping` event with `204` without routing it. A `401` indicates a webhook-secret mismatch; a `400` indicates a malformed signature, a missing delivery header, or a content type other than `application/json`; a `502` indicates the web app could not enqueue the event into Restate.
 
 Finally, repeat the dashboard curl against the public HTTPS tunnel origin. This confirms the tunnel reaches the web process; do not use `-k` to bypass TLS verification:
 
@@ -347,7 +348,11 @@ For a deliberate local handler change, repeat the registration command with `--f
 
 **The GitHub webhook returns 401**
 
-Ensure the GitHub App's webhook secret exactly matches `GITHUB_WEBHOOK_SECRET`, then restart `dx serve` after changing `.env.web`.
+Ensure the GitHub App's webhook secret exactly matches `GITHUB_WEBHOOK_SECRET`, then restart `dx serve` after changing `.env.web`. The web app refuses to start when that variable is missing or empty, so a running process always has a secret configured.
+
+**The GitHub webhook returns 400**
+
+Confirm the GitHub App's webhook content type is `application/json`, not GitHub's `application/x-www-form-urlencoded` default. A `400` also covers a signature header that is not `sha256=` plus 64 hexadecimal characters, and a delivery missing `X-GitHub-Delivery` or `X-GitHub-Event`.
 
 **The GitHub webhook cannot connect**
 
@@ -388,7 +393,7 @@ Restate owns in-flight truth and retries. libSQL is the cross-PR query model use
 | `GITHUB_PRIVATE_KEY` / `GITHUB_PRIVATE_KEY_PATH` | Restate service | RS256 App private key value or absolute PEM path |
 | `GITHUB_USER_PAT` | Restate service | User identity for `@dependabot rebase` comments |
 | `GITHUB_MERGE_METHOD` | Restate service | Explicit global method: `merge`, `squash` (default), or `rebase` |
-| `GITHUB_WEBHOOK_SECRET` | Web app | HMAC-SHA256 webhook verification |
+| `GITHUB_WEBHOOK_SECRET` | Web app | HMAC-SHA256 webhook verification; required at startup |
 | `GITHUB_API_URL` | Restate service | GitHub API root, default `https://api.github.com` |
 | `DASHBOARD_USERNAME` | Both | Basic Auth username and PAT identity |
 | `DASHBOARD_PASSWORD` | Web app | Required Basic Auth password |

@@ -21,12 +21,9 @@ wasm-bindgen = "=0.2.126"
 axum.workspace = true
 base64.workspace = true
 dependaboard-store = { path = "../../crates/store" }
-hex.workspace = true
-hmac.workspace = true
-octocrab.workspace = true
+octoevents.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
