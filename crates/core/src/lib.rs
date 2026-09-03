@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::{cmp::Ordering, collections::BTreeMap, fmt, str::FromStr};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use regex::Regex;
@@ -75,9 +75,10 @@ impl FromStr for PrKey {
     }
 }
 
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+/// Ordered by severity: `Unknown < Patch < Minor < Major`. `Ord` is derived
+/// from a severity rank rather than declaration order so that `.max()`,
+/// sorting and [`highest_update_type`] all agree on the "worst" update.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateType {
     Major,
@@ -90,13 +91,27 @@ pub enum UpdateType {
 impl UpdateType {
     pub const ALL: [Self; 4] = [Self::Major, Self::Minor, Self::Patch, Self::Unknown];
 
-    pub fn rank(self) -> u8 {
+    /// The single source of truth for `Ord`; compare values instead of
+    /// calling this directly.
+    fn rank(self) -> u8 {
         match self {
             Self::Unknown => 0,
             Self::Patch => 1,
             Self::Minor => 2,
             Self::Major => 3,
         }
+    }
+}
+
+impl Ord for UpdateType {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+impl PartialOrd for UpdateType {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -427,7 +442,7 @@ pub fn highest_update_type(updates: &[DependencyUpdate]) -> UpdateType {
     updates
         .iter()
         .map(|dependency| dependency.update_type)
-        .max_by_key(|update_type| update_type.rank())
+        .max()
         .unwrap_or(UpdateType::Unknown)
 }
 
@@ -991,6 +1006,32 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<UserId>(r#""dashboard""#).unwrap(),
             user_id
+        );
+    }
+
+    #[test]
+    fn major_is_the_maximum_update_type_of_a_mixed_collection() {
+        // `Ord` must agree with severity so that sorting, `.max()` and
+        // `highest_update_type` all pick the same "worst" update.
+        let mixed = [
+            UpdateType::Minor,
+            UpdateType::Unknown,
+            UpdateType::Major,
+            UpdateType::Patch,
+        ];
+        assert_eq!(mixed.into_iter().max(), Some(UpdateType::Major));
+        assert_eq!(mixed.into_iter().min(), Some(UpdateType::Unknown));
+
+        let mut sorted = mixed;
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            [
+                UpdateType::Unknown,
+                UpdateType::Patch,
+                UpdateType::Minor,
+                UpdateType::Major,
+            ]
         );
     }
 
