@@ -867,7 +867,6 @@ pub struct SyncRequest {
     pub owner: String,
     pub repo: String,
     pub number: u64,
-    pub observed_sha: Option<String>,
     /// Manual refreshes should not wait behind webhook storm coalescing.
     #[serde(default)]
     pub bypass_debounce: bool,
@@ -1416,6 +1415,33 @@ updated-dependencies:
         }))
         .unwrap();
         assert_eq!(event.sync_completion_id, None);
+    }
+
+    #[test]
+    fn sync_requests_journaled_with_the_retired_sha_hint_still_deserialize() {
+        // `observed_sha` was never read; journal entries written before its removal must
+        // still replay, and a request built today must not carry it.
+        let request: SyncRequest = serde_json::from_value(serde_json::json!({
+            "repository_id": 7,
+            "owner": "acme",
+            "repo": "api",
+            "number": 9,
+            "observed_sha": "abc123"
+        }))
+        .unwrap();
+        assert_eq!(
+            request,
+            SyncRequest {
+                repository_id: 7,
+                owner: "acme".to_owned(),
+                repo: "api".to_owned(),
+                number: 9,
+                bypass_debounce: false,
+                completion_id: None,
+            }
+        );
+        let serialized = serde_json::to_value(&request).unwrap();
+        assert!(serialized.get("observed_sha").is_none());
     }
 
     #[test]

@@ -560,7 +560,6 @@ impl GithubApi for GithubClient {
                         owner: owner.to_owned(),
                         repo: repo.to_owned(),
                         number: pull.number,
-                        observed_sha: Some(pull.head.sha),
                         bypass_debounce: false,
                         completion_id: None,
                     }),
@@ -962,7 +961,6 @@ struct GithubRepository {
 struct PullListItem {
     number: u64,
     user: GithubUser,
-    head: GithubHead,
 }
 
 #[derive(Debug, Deserialize)]

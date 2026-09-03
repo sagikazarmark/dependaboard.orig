@@ -70,7 +70,6 @@ sync(SyncRequest {
     owner: String,
     repo: String,
     number: u64,
-    observed_sha: Option<Sha>,   // hint only; the fetch is authoritative
 })
 ```
 

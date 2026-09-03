@@ -384,6 +384,8 @@ The Compose file fixes `RESTATE_NODE_NAME=dependaboard` so the current project's
 
 Restate owns in-flight truth and retries. libSQL is the cross-PR query model used by the dashboard. The browser never calls Restate directly.
 
+The Restate service stops on `SIGINT` or `SIGTERM`: it closes its listener, gives in-flight invocations up to ten seconds to finish, and leaves anything still running for Restate to retry against the next instance.
+
 `apps/web/src/components` is installed from the [dioxus-daisyui-components](https://github.com/sagikazarmark/dioxus-daisyui-components) registry and is not edited by hand. To update a component, re-run the install against a checkout of the registry:
 
 ```sh
@@ -411,9 +413,9 @@ The components emit daisyUI class names only; `apps/web/styles/app.css` scans th
 | `RESTATE_INGRESS_URL` | Both | Restate HTTP ingress root |
 | `RESTATE_AUTH_TOKEN` / `RESTATE_API_KEY` | Both | Optional bearer token for Restate Cloud ingress |
 | `RESTATE_SERVICE_ADDRESS` | Restate service | SDK endpoint bind address; quickstart uses loopback or Docker's host gateway |
-| `SYNC_DEBOUNCE_SECONDS` | Restate service | Leading/trailing per-PR webhook debounce, default 20 |
-| `RECONCILE_INTERVAL_SECONDS` | Restate service | Installation sweep interval, default 3600 |
-| `RUST_LOG` | Both | Rust tracing filter |
+| `SYNC_DEBOUNCE_SECONDS` | Restate service | Leading/trailing per-PR webhook debounce, default 20; an unparsable value is warned about at startup and the default used |
+| `RECONCILE_INTERVAL_SECONDS` | Restate service | Installation sweep interval, default 3600; an unparsable value is warned about at startup and the default used |
+| `RUST_LOG` | Both | Rust tracing filter; the Restate service logs one line per handler invocation at `info` (`debug` for the polled `status`/`progress` reads) |
 
 For production, point both binaries at the same remote libSQL database, expose only the web application publicly, deploy the Restate endpoint where Restate can reach it, and use authenticated Restate Cloud ingress.
 

@@ -900,7 +900,6 @@ dependencies = [
  "dependaboard-core",
  "dependaboard-github",
  "dependaboard-store",
- "futures",
  "reqwest 0.13.4",
  "restate-sdk",
  "serde",

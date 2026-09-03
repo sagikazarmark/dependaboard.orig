@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env,
-    time::Duration,
+    net::SocketAddr,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -14,11 +15,12 @@ use dependaboard_core::{
 };
 use dependaboard_github::{GithubApi, GithubClient, GithubConfig, GithubError};
 use dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig, StoreError, StoreErrorClass};
-use restate_sdk::prelude::*;
+use restate_sdk::{filter::ReplayAwareFilter, prelude::*};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{info, warn};
-use tracing_subscriber::EnvFilter;
+use tokio::{net::TcpListener, signal};
+use tracing::{debug, info, warn};
+use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 const PR_STATE: &str = "pr_state";
 const BATCH_PROGRESS: &str = "progress";
@@ -42,61 +44,96 @@ struct PullRequest {
     debounce: Duration,
 }
 
+/// What one `PullRequest.sync` attempt did, for its log line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SyncOutcome {
+    /// Coalesced behind the trailing sync that is (now) scheduled.
+    Debounced,
+    Synced {
+        head_sha: String,
+    },
+    /// GitHub no longer serves the pull request; its row and state are gone.
+    Deleted,
+}
+
+impl HandlerOutcome for SyncOutcome {
+    fn outcome(&self) -> String {
+        match self {
+            Self::Debounced => "debounced".to_owned(),
+            Self::Synced { head_sha } => format!("synced at {}", short_sha(head_sha)),
+            Self::Deleted => "deleted; no longer an open Dependabot pull request".to_owned(),
+        }
+    }
+}
+
 #[restate_sdk::object]
 impl PullRequest {
     #[handler(ingress_private)]
     async fn sync(&self, ctx: ObjectContext<'_>, request: Json<SyncRequest>) -> HandlerResult<()> {
-        let request = request.into_inner();
-        let now = ctx
-            .run(|| async { Ok(unix_seconds()) })
-            .name("sync-clock")
-            .await?;
-        let mut state = ctx
-            .get::<Json<PrState>>(PR_STATE)
-            .await?
-            .map(Json::into_inner)
-            .unwrap_or_default();
-        if should_debounce_sync(
-            request.bypass_debounce,
-            state.last_synced_at,
-            now,
-            self.debounce,
-        ) {
-            if !state.sync_pending {
-                state.sync_pending = true;
-                ctx.set(PR_STATE, Json::from(state));
-                ctx.object_client::<PullRequestClient>(ctx.key())
-                    .sync(Json::from(request))
-                    .send_after(self.debounce);
+        traced("PullRequest/sync", ctx.key(), async {
+            let request = request.into_inner();
+            let now = ctx
+                .run(|| async { Ok(unix_seconds()) })
+                .name("sync-clock")
+                .await?;
+            let mut state = ctx
+                .get::<Json<PrState>>(PR_STATE)
+                .await?
+                .map(Json::into_inner)
+                .unwrap_or_default();
+            if should_debounce_sync(
+                request.bypass_debounce,
+                state.last_synced_at,
+                now,
+                self.debounce,
+            ) {
+                if !state.sync_pending {
+                    state.sync_pending = true;
+                    ctx.set(PR_STATE, Json::from(state));
+                    ctx.object_client::<PullRequestClient>(ctx.key())
+                        .sync(Json::from(request))
+                        .send_after(self.debounce);
+                }
+                return Ok(SyncOutcome::Debounced);
             }
-            return Ok(());
-        }
-        state.sync_pending = false;
-        ctx.set(PR_STATE, Json::from(state.clone()));
+            state.sync_pending = false;
+            ctx.set(PR_STATE, Json::from(state.clone()));
 
-        let github = self.github.clone();
-        let sync_request = request.clone();
-        let fetched = run_github_step(&mut RestateGithubStep {
-            ctx: &ctx,
-            name: "fetch-canonical-pr-snapshot",
-            operation: Operation::Read,
-            known_resource: state.snapshot.is_some(),
-            call: move || {
-                let github = github.clone();
-                let sync_request = sync_request.clone();
-                async move { github.fetch_snapshot(&sync_request).await }
-            },
-        })
-        .await?;
-        let snapshot = match fetched {
-            Settled::Rejected {
-                reason: RejectReason::NotFound,
-                ..
-            } => None,
-            fetched => read_result(fetched)?,
-        };
+            let github = self.github.clone();
+            let sync_request = request.clone();
+            let fetched = run_github_step(&mut RestateGithubStep {
+                ctx: &ctx,
+                name: "fetch-canonical-pr-snapshot",
+                operation: Operation::Read,
+                known_resource: state.snapshot.is_some(),
+                call: move || {
+                    let github = github.clone();
+                    let sync_request = sync_request.clone();
+                    async move { github.fetch_snapshot(&sync_request).await }
+                },
+            })
+            .await?;
+            let snapshot = match fetched {
+                Settled::Rejected {
+                    reason: RejectReason::NotFound,
+                    ..
+                } => None,
+                fetched => read_result(fetched)?,
+            };
 
-        if let Some(snapshot) = snapshot {
+            let Some(snapshot) = snapshot else {
+                let store = self.store.clone();
+                let key = request_key(&request);
+                ctx.run(move || async move {
+                    store.delete_pr(&key).await.map_err(store_failure)?;
+                    Ok(())
+                })
+                .retry_policy(store_retry_policy())
+                .name("delete-ineligible-pr-projection")
+                .await?;
+                ctx.clear_all();
+                return Ok(SyncOutcome::Deleted);
+            };
             let store = self.store.clone();
             let projected = snapshot.clone();
             ctx.run(move || async move {
@@ -117,37 +154,33 @@ impl PullRequest {
                 state.complete_sync(completion_id);
             }
             ctx.set(PR_STATE, Json::from(state));
-        } else {
+            Ok(SyncOutcome::Synced {
+                head_sha: snapshot.head_sha,
+            })
+        })
+        .await
+        .map(|_| ())
+    }
+
+    #[handler(ingress_private)]
+    async fn closed(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
+        traced("PullRequest/closed", ctx.key(), async {
+            let key = ctx
+                .key()
+                .parse::<PrKey>()
+                .map_err(|error| TerminalError::new(error.to_string()))?;
             let store = self.store.clone();
-            let key = request_key(&request);
             ctx.run(move || async move {
                 store.delete_pr(&key).await.map_err(store_failure)?;
                 Ok(())
             })
             .retry_policy(store_retry_policy())
-            .name("delete-ineligible-pr-projection")
+            .name("delete-closed-pr-projection")
             .await?;
             ctx.clear_all();
-        }
-        Ok(())
-    }
-
-    #[handler(ingress_private)]
-    async fn closed(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
-        let key = ctx
-            .key()
-            .parse::<PrKey>()
-            .map_err(|error| TerminalError::new(error.to_string()))?;
-        let store = self.store.clone();
-        ctx.run(move || async move {
-            store.delete_pr(&key).await.map_err(store_failure)?;
             Ok(())
         })
-        .retry_policy(store_retry_policy())
-        .name("delete-closed-pr-projection")
-        .await?;
-        ctx.clear_all();
-        Ok(())
+        .await
     }
 
     #[handler(ingress_private)]
@@ -156,65 +189,68 @@ impl PullRequest {
         ctx: ObjectContext<'_>,
         request: Json<MergeRequest>,
     ) -> HandlerResult<Json<ActionOutcome>> {
-        let request = request.into_inner();
-        let mut state = ctx
-            .get::<Json<PrState>>(PR_STATE)
-            .await?
-            .map(Json::into_inner)
-            .unwrap_or_default();
-        let Some(snapshot) = state.snapshot.as_ref() else {
-            return Ok(Json::from(rejected(RejectReason::NotFound)));
-        };
-        if !target_matches_snapshot(&request.target, snapshot) {
-            return Ok(Json::from(rejected(RejectReason::NotFound)));
-        }
-        if snapshot.head_sha != request.target.expected_sha {
-            return Ok(Json::from(rejected(RejectReason::StaleSha {
-                expected: request.target.expected_sha,
-                actual: snapshot.head_sha.clone(),
-            })));
-        }
+        traced("PullRequest/merge", ctx.key(), async {
+            let request = request.into_inner();
+            let mut state = ctx
+                .get::<Json<PrState>>(PR_STATE)
+                .await?
+                .map(Json::into_inner)
+                .unwrap_or_default();
+            let Some(snapshot) = state.snapshot.as_ref() else {
+                return Ok(Json::from(rejected(RejectReason::NotFound)));
+            };
+            if !target_matches_snapshot(&request.target, snapshot) {
+                return Ok(Json::from(rejected(RejectReason::NotFound)));
+            }
+            if snapshot.head_sha != request.target.expected_sha {
+                return Ok(Json::from(rejected(RejectReason::StaleSha {
+                    expected: request.target.expected_sha,
+                    actual: snapshot.head_sha.clone(),
+                })));
+            }
 
-        let github = self.github.clone();
-        let merge_request = request.clone();
-        let result = run_github_step(&mut RestateGithubStep {
-            ctx: &ctx,
-            name: "merge-pull-request",
-            operation: Operation::Merge,
-            known_resource: false,
-            call: move || {
-                let github = github.clone();
-                let merge_request = merge_request.clone();
-                async move { github.merge(&merge_request).await }
-            },
-        })
-        .await?;
-        let outcome = action_result(result)?;
-        if matches!(outcome, ActionOutcome::Succeeded { .. }) {
-            let store = self.store.clone();
-            let key = request.target.key().parse::<PrKey>().map_err(|error| {
-                TerminalError::new(format!("invalid merge target key: {error}"))
-            })?;
-            ctx.run(move || async move {
-                store.delete_pr(&key).await.map_err(store_failure)?;
-                Ok(())
+            let github = self.github.clone();
+            let merge_request = request.clone();
+            let result = run_github_step(&mut RestateGithubStep {
+                ctx: &ctx,
+                name: "merge-pull-request",
+                operation: Operation::Merge,
+                known_resource: false,
+                call: move || {
+                    let github = github.clone();
+                    let merge_request = merge_request.clone();
+                    async move { github.merge(&merge_request).await }
+                },
             })
-            .retry_policy(store_retry_policy())
-            .name("delete-merged-pr-projection")
             .await?;
-            state.snapshot = None;
-        }
-        let log_at = ctx
-            .run(|| async { Ok(unix_seconds()) })
-            .name("merge-log-clock")
-            .await?;
-        state.push_history(ActionLog {
-            at: log_at,
-            action: "merge".to_owned(),
-            detail: outcome_detail(&outcome),
-        });
-        ctx.set(PR_STATE, Json::from(state));
-        Ok(Json::from(outcome))
+            let outcome = action_result(result)?;
+            if matches!(outcome, ActionOutcome::Succeeded { .. }) {
+                let store = self.store.clone();
+                let key = request.target.key().parse::<PrKey>().map_err(|error| {
+                    TerminalError::new(format!("invalid merge target key: {error}"))
+                })?;
+                ctx.run(move || async move {
+                    store.delete_pr(&key).await.map_err(store_failure)?;
+                    Ok(())
+                })
+                .retry_policy(store_retry_policy())
+                .name("delete-merged-pr-projection")
+                .await?;
+                state.snapshot = None;
+            }
+            let log_at = ctx
+                .run(|| async { Ok(unix_seconds()) })
+                .name("merge-log-clock")
+                .await?;
+            state.push_history(ActionLog {
+                at: log_at,
+                action: "merge".to_owned(),
+                detail: outcome_detail(&outcome),
+            });
+            ctx.set(PR_STATE, Json::from(state));
+            Ok(Json::from(outcome))
+        })
+        .await
     }
 
     #[handler(ingress_private)]
@@ -223,51 +259,54 @@ impl PullRequest {
         ctx: ObjectContext<'_>,
         request: Json<CommandRequest>,
     ) -> HandlerResult<Json<ActionOutcome>> {
-        let request = request.into_inner();
-        let mut state = ctx
-            .get::<Json<PrState>>(PR_STATE)
-            .await?
-            .map(Json::into_inner)
-            .unwrap_or_default();
-        let Some(snapshot) = state.snapshot.as_ref() else {
-            return Ok(Json::from(rejected(RejectReason::NotFound)));
-        };
-        if !target_matches_snapshot(&request.target, snapshot) {
-            return Ok(Json::from(rejected(RejectReason::NotFound)));
-        }
-        if snapshot.head_sha != request.target.expected_sha {
-            return Ok(Json::from(rejected(RejectReason::StaleSha {
-                expected: request.target.expected_sha,
-                actual: snapshot.head_sha.clone(),
-            })));
-        }
+        traced("PullRequest/command", ctx.key(), async {
+            let request = request.into_inner();
+            let mut state = ctx
+                .get::<Json<PrState>>(PR_STATE)
+                .await?
+                .map(Json::into_inner)
+                .unwrap_or_default();
+            let Some(snapshot) = state.snapshot.as_ref() else {
+                return Ok(Json::from(rejected(RejectReason::NotFound)));
+            };
+            if !target_matches_snapshot(&request.target, snapshot) {
+                return Ok(Json::from(rejected(RejectReason::NotFound)));
+            }
+            if snapshot.head_sha != request.target.expected_sha {
+                return Ok(Json::from(rejected(RejectReason::StaleSha {
+                    expected: request.target.expected_sha,
+                    actual: snapshot.head_sha.clone(),
+                })));
+            }
 
-        let github = self.github.clone();
-        let command_request = request.clone();
-        let result = run_github_step(&mut RestateGithubStep {
-            ctx: &ctx,
-            name: "post-dependabot-command",
-            operation: Operation::Comment,
-            known_resource: false,
-            call: move || {
-                let github = github.clone();
-                let command_request = command_request.clone();
-                async move { github.post_command(&command_request).await }
-            },
-        })
-        .await?;
-        let outcome = action_result(result)?;
-        let log_at = ctx
-            .run(|| async { Ok(unix_seconds()) })
-            .name("command-log-clock")
+            let github = self.github.clone();
+            let command_request = request.clone();
+            let result = run_github_step(&mut RestateGithubStep {
+                ctx: &ctx,
+                name: "post-dependabot-command",
+                operation: Operation::Comment,
+                known_resource: false,
+                call: move || {
+                    let github = github.clone();
+                    let command_request = command_request.clone();
+                    async move { github.post_command(&command_request).await }
+                },
+            })
             .await?;
-        state.push_history(ActionLog {
-            at: log_at,
-            action: request.command.to_string(),
-            detail: outcome_detail(&outcome),
-        });
-        ctx.set(PR_STATE, Json::from(state));
-        Ok(Json::from(outcome))
+            let outcome = action_result(result)?;
+            let log_at = ctx
+                .run(|| async { Ok(unix_seconds()) })
+                .name("command-log-clock")
+                .await?;
+            state.push_history(ActionLog {
+                at: log_at,
+                action: request.command.to_string(),
+                detail: outcome_detail(&outcome),
+            });
+            ctx.set(PR_STATE, Json::from(state));
+            Ok(Json::from(outcome))
+        })
+        .await
     }
 
     #[handler(ingress_private)]
@@ -276,77 +315,94 @@ impl PullRequest {
         ctx: ObjectContext<'_>,
         request: Json<UpdateBranchRequest>,
     ) -> HandlerResult<Json<ActionOutcome>> {
-        let request = request.into_inner();
-        let mut state = ctx
-            .get::<Json<PrState>>(PR_STATE)
-            .await?
-            .map(Json::into_inner)
-            .unwrap_or_default();
-        let Some(snapshot) = state.snapshot.as_ref() else {
-            return Ok(Json::from(rejected(RejectReason::NotFound)));
-        };
-        if !target_matches_snapshot(&request.target, snapshot) {
-            return Ok(Json::from(rejected(RejectReason::NotFound)));
-        }
-        if snapshot.head_sha != request.target.expected_sha {
-            return Ok(Json::from(rejected(RejectReason::StaleSha {
-                expected: request.target.expected_sha,
-                actual: snapshot.head_sha.clone(),
-            })));
-        }
+        traced("PullRequest/update_branch", ctx.key(), async {
+            let request = request.into_inner();
+            let mut state = ctx
+                .get::<Json<PrState>>(PR_STATE)
+                .await?
+                .map(Json::into_inner)
+                .unwrap_or_default();
+            let Some(snapshot) = state.snapshot.as_ref() else {
+                return Ok(Json::from(rejected(RejectReason::NotFound)));
+            };
+            if !target_matches_snapshot(&request.target, snapshot) {
+                return Ok(Json::from(rejected(RejectReason::NotFound)));
+            }
+            if snapshot.head_sha != request.target.expected_sha {
+                return Ok(Json::from(rejected(RejectReason::StaleSha {
+                    expected: request.target.expected_sha,
+                    actual: snapshot.head_sha.clone(),
+                })));
+            }
 
-        let github = self.github.clone();
-        let update_request = request.clone();
-        let result = run_github_step(&mut RestateGithubStep {
-            ctx: &ctx,
-            name: "update-pull-request-branch",
-            operation: Operation::UpdateBranch,
-            known_resource: false,
-            call: move || {
-                let github = github.clone();
-                let update_request = update_request.clone();
-                async move { github.update_branch(&update_request).await }
-            },
-        })
-        .await?;
-        let outcome = action_result(result)?;
-        let log_at = ctx
-            .run(|| async { Ok(unix_seconds()) })
-            .name("update-branch-log-clock")
+            let github = self.github.clone();
+            let update_request = request.clone();
+            let result = run_github_step(&mut RestateGithubStep {
+                ctx: &ctx,
+                name: "update-pull-request-branch",
+                operation: Operation::UpdateBranch,
+                known_resource: false,
+                call: move || {
+                    let github = github.clone();
+                    let update_request = update_request.clone();
+                    async move { github.update_branch(&update_request).await }
+                },
+            })
             .await?;
-        state.push_history(ActionLog {
-            at: log_at,
-            action: "update_branch".to_owned(),
-            detail: outcome_detail(&outcome),
-        });
-        ctx.set(PR_STATE, Json::from(state));
-        if matches!(outcome, ActionOutcome::Succeeded { .. }) {
-            ctx.object_client::<PullRequestClient>(request.target.key())
-                .sync(Json::from(SyncRequest {
-                    repository_id: request.target.repository_id,
-                    owner: request.target.owner,
-                    repo: request.target.repo,
-                    number: request.target.number,
-                    observed_sha: None,
-                    bypass_debounce: false,
-                    completion_id: None,
-                }))
-                .send();
-        }
-        Ok(Json::from(outcome))
+            let outcome = action_result(result)?;
+            let log_at = ctx
+                .run(|| async { Ok(unix_seconds()) })
+                .name("update-branch-log-clock")
+                .await?;
+            state.push_history(ActionLog {
+                at: log_at,
+                action: "update_branch".to_owned(),
+                detail: outcome_detail(&outcome),
+            });
+            ctx.set(PR_STATE, Json::from(state));
+            if matches!(outcome, ActionOutcome::Succeeded { .. }) {
+                ctx.object_client::<PullRequestClient>(request.target.key())
+                    .sync(Json::from(SyncRequest {
+                        repository_id: request.target.repository_id,
+                        owner: request.target.owner,
+                        repo: request.target.repo,
+                        number: request.target.number,
+                        bypass_debounce: false,
+                        completion_id: None,
+                    }))
+                    .send();
+            }
+            Ok(Json::from(outcome))
+        })
+        .await
     }
 
     #[handler]
     async fn status(&self, ctx: SharedObjectContext<'_>) -> HandlerResult<Json<Option<PrState>>> {
-        Ok(Json::from(
-            ctx.get::<Json<PrState>>(PR_STATE)
-                .await?
-                .map(Json::into_inner),
-        ))
+        traced_read("PullRequest/status", ctx.key(), async {
+            Ok(Json::from(
+                ctx.get::<Json<PrState>>(PR_STATE)
+                    .await?
+                    .map(Json::into_inner),
+            ))
+        })
+        .await
     }
 }
 
 struct BulkAction;
+
+impl HandlerOutcome for Json<BatchProgress> {
+    fn outcome(&self) -> String {
+        let progress = &self.0;
+        format!(
+            "{} succeeded, {} rejected of {} targets",
+            progress.succeeded,
+            progress.rejected,
+            progress.targets.len()
+        )
+    }
+}
 
 #[restate_sdk::workflow(workflow_completion_retention = "7 days")]
 impl BulkAction {
@@ -356,49 +412,52 @@ impl BulkAction {
         ctx: WorkflowContext<'_>,
         request: Json<BulkRequest>,
     ) -> HandlerResult<Json<BatchProgress>> {
-        let request = request.into_inner();
-        validate_batch_request(ctx.key(), &request)?;
-        let mut progress = BatchProgress::queued(ctx.key(), request.action, &request.targets);
-        ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-        match request.action {
-            BulkActionKind::Merge => {
-                run_merge_batch(&ctx, &request, &mut progress).await?;
-            }
-            BulkActionKind::Rebase => {
-                for target in &request.targets {
-                    mark_running(&mut progress, &target.key());
-                    ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-                    let outcome = match ctx
-                        .object_client::<PullRequestClient>(target.key())
-                        .command(Json::from(CommandRequest {
-                            batch_id: ctx.key().to_owned(),
-                            target: target.clone(),
-                            user_id: request.user_id.clone(),
-                            command: DependabotCommand::Rebase,
-                        }))
-                        .call()
-                        .await
-                    {
-                        Ok(outcome) => outcome.into_inner(),
-                        Err(error) => {
-                            let detail = error.to_string();
-                            mark_failed(&mut progress, &target.key(), detail.clone());
-                            progress.fail(detail);
-                            ctx.set(BATCH_PROGRESS, Json::from(progress));
-                            return Err(error.into());
+        traced("BulkAction/run", ctx.key(), async {
+            let request = request.into_inner();
+            validate_batch_request(ctx.key(), &request)?;
+            let mut progress = BatchProgress::queued(ctx.key(), request.action, &request.targets);
+            ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
+            match request.action {
+                BulkActionKind::Merge => {
+                    run_merge_batch(&ctx, &request, &mut progress).await?;
+                }
+                BulkActionKind::Rebase => {
+                    for target in &request.targets {
+                        mark_running(&mut progress, &target.key());
+                        ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
+                        let outcome = match ctx
+                            .object_client::<PullRequestClient>(target.key())
+                            .command(Json::from(CommandRequest {
+                                batch_id: ctx.key().to_owned(),
+                                target: target.clone(),
+                                user_id: request.user_id.clone(),
+                                command: DependabotCommand::Rebase,
+                            }))
+                            .call()
+                            .await
+                        {
+                            Ok(outcome) => outcome.into_inner(),
+                            Err(error) => {
+                                let detail = error.to_string();
+                                mark_failed(&mut progress, &target.key(), detail.clone());
+                                progress.fail(detail);
+                                ctx.set(BATCH_PROGRESS, Json::from(progress));
+                                return Err(error.into());
+                            }
+                        };
+                        progress.record(&target.key(), outcome);
+                        ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
+                        if !progress.completed {
+                            ctx.sleep(Duration::from_millis(350)).await?;
                         }
-                    };
-                    progress.record(&target.key(), outcome);
-                    ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-                    if !progress.completed {
-                        ctx.sleep(Duration::from_millis(350)).await?;
                     }
                 }
             }
-        }
-        progress.completed = true;
-        ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-        Ok(Json::from(progress))
+            progress.completed = true;
+            ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
+            Ok(Json::from(progress))
+        })
+        .await
     }
 
     #[handler]
@@ -406,11 +465,14 @@ impl BulkAction {
         &self,
         ctx: SharedWorkflowContext<'_>,
     ) -> HandlerResult<Json<Option<BatchProgress>>> {
-        Ok(Json::from(
-            ctx.get::<Json<BatchProgress>>(BATCH_PROGRESS)
-                .await?
-                .map(Json::into_inner),
-        ))
+        traced_read("BulkAction/progress", ctx.key(), async {
+            Ok(Json::from(
+                ctx.get::<Json<BatchProgress>>(BATCH_PROGRESS)
+                    .await?
+                    .map(Json::into_inner),
+            ))
+        })
+        .await
     }
 }
 
@@ -528,67 +590,127 @@ impl restate_sdk::serde::PayloadMetadata for SchedulerTick {
     }
 }
 
+/// What `InstallationSync.start` did, for its log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchedulerStartOutcome {
+    /// A tick for the current generation is already queued or delayed inside Restate.
+    AlreadyArmed,
+    Armed {
+        generation: u64,
+    },
+}
+
+impl HandlerOutcome for SchedulerStartOutcome {
+    fn outcome(&self) -> String {
+        match self {
+            Self::AlreadyArmed => "already armed".to_owned(),
+            Self::Armed { generation } => format!("armed generation {generation}"),
+        }
+    }
+}
+
+/// What `InstallationSync.tick` did, for its log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SchedulerTickOutcome {
+    /// The chain is paused or the tick is stale; nothing was touched.
+    Dropped,
+    Swept {
+        repositories: usize,
+    },
+}
+
+impl HandlerOutcome for SchedulerTickOutcome {
+    fn outcome(&self) -> String {
+        match self {
+            Self::Dropped => "dropped".to_owned(),
+            Self::Swept { repositories } => format!("swept {repositories} repositories"),
+        }
+    }
+}
+
 #[restate_sdk::object(ingress_private)]
 impl InstallationSync {
     #[handler]
     async fn start(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
-        let state = read_scheduler_state(&ctx).await?;
-        let Some(next) = scheduler_start_transition(state)? else {
-            return Ok(());
-        };
-        write_scheduler_state(&ctx, next);
-        ctx.object_client::<InstallationSyncClient>(ctx.key())
-            .tick(SchedulerTick(Some(next.generation)))
-            .send();
-        Ok(())
+        traced("InstallationSync/start", ctx.key(), async {
+            let state = read_scheduler_state(&ctx).await?;
+            let Some(next) = scheduler_start_transition(state)? else {
+                return Ok(SchedulerStartOutcome::AlreadyArmed);
+            };
+            write_scheduler_state(&ctx, next);
+            ctx.object_client::<InstallationSyncClient>(ctx.key())
+                .tick(SchedulerTick(Some(next.generation)))
+                .send();
+            Ok(SchedulerStartOutcome::Armed {
+                generation: next.generation,
+            })
+        })
+        .await
+        .map(|_| ())
     }
 
     #[handler]
     async fn tick(&self, ctx: ObjectContext<'_>, generation: SchedulerTick) -> HandlerResult<()> {
-        let state = read_scheduler_state(&ctx).await?;
-        let mut restate = RestateTickEffects {
-            ctx: &ctx,
-            github: &self.github,
-            store: &self.store,
-            interval: self.interval,
-        };
-        run_scheduler_tick(&mut restate, state, generation).await
+        traced("InstallationSync/tick", ctx.key(), async {
+            let state = read_scheduler_state(&ctx).await?;
+            let mut restate = RestateTickEffects {
+                ctx: &ctx,
+                github: &self.github,
+                store: &self.store,
+                interval: self.interval,
+            };
+            run_scheduler_tick(&mut restate, state, generation).await
+        })
+        .await
+        .map(|_| ())
     }
 
     #[handler]
     async fn sync_now(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
-        perform_installation_sync(&ctx, self.github.clone(), self.store.clone()).await
+        traced("InstallationSync/sync_now", ctx.key(), async {
+            let repositories =
+                perform_installation_sync(&ctx, self.github.clone(), self.store.clone()).await?;
+            Ok(format!("fanned out to {repositories} repositories"))
+        })
+        .await
+        .map(|_| ())
     }
 
     #[handler]
     async fn pause(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
-        ctx.clear(SCHEDULER_STARTED);
-        ctx.clear(SCHEDULER_TICK_PENDING);
-        invalidate_scheduler_generation(&ctx).await?;
-        Ok(())
+        traced("InstallationSync/pause", ctx.key(), async {
+            ctx.clear(SCHEDULER_STARTED);
+            ctx.clear(SCHEDULER_TICK_PENDING);
+            invalidate_scheduler_generation(&ctx).await?;
+            Ok(())
+        })
+        .await
     }
 
     #[handler]
     async fn purge(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
-        ctx.clear(SCHEDULER_STARTED);
-        ctx.clear(SCHEDULER_TICK_PENDING);
-        invalidate_scheduler_generation(&ctx).await?;
-        let installation_id = ctx
-            .key()
-            .parse::<u64>()
-            .map_err(|_| TerminalError::new("installation key must be an integer"))?;
-        let store = self.store.clone();
-        ctx.run(move || async move {
-            store
-                .purge_installation(installation_id)
-                .await
-                .map_err(store_failure)?;
+        traced("InstallationSync/purge", ctx.key(), async {
+            ctx.clear(SCHEDULER_STARTED);
+            ctx.clear(SCHEDULER_TICK_PENDING);
+            invalidate_scheduler_generation(&ctx).await?;
+            let installation_id = ctx
+                .key()
+                .parse::<u64>()
+                .map_err(|_| TerminalError::new("installation key must be an integer"))?;
+            let store = self.store.clone();
+            ctx.run(move || async move {
+                store
+                    .purge_installation(installation_id)
+                    .await
+                    .map_err(store_failure)?;
+                Ok(())
+            })
+            .retry_policy(store_retry_policy())
+            .name("purge-installation")
+            .await?;
             Ok(())
         })
-        .retry_policy(store_retry_policy())
-        .name("purge-installation")
-        .await?;
-        Ok(())
+        .await
     }
 }
 
@@ -678,10 +800,10 @@ fn scheduler_tick_transition(
 /// Side effects a tick asks of Restate, abstracted so `run_scheduler_tick` can be
 /// exercised against a recording fake without a runtime.
 trait SchedulerTickEffects {
-    fn installation_id(&self) -> &str;
     fn persist(&mut self, state: SchedulerState);
     fn schedule_tick(&mut self, generation: u64);
-    fn sweep(&mut self) -> impl Future<Output = HandlerResult<()>> + Send;
+    /// Sweeps the installation; resolves to how many repositories were fanned out to.
+    fn sweep(&mut self) -> impl Future<Output = HandlerResult<usize>> + Send;
 }
 
 struct RestateTickEffects<'a, 'ctx> {
@@ -692,10 +814,6 @@ struct RestateTickEffects<'a, 'ctx> {
 }
 
 impl SchedulerTickEffects for RestateTickEffects<'_, '_> {
-    fn installation_id(&self) -> &str {
-        self.ctx.key()
-    }
-
     fn persist(&mut self, state: SchedulerState) {
         write_scheduler_state(self.ctx, state);
     }
@@ -707,7 +825,7 @@ impl SchedulerTickEffects for RestateTickEffects<'_, '_> {
             .send_after(self.interval);
     }
 
-    async fn sweep(&mut self) -> HandlerResult<()> {
+    async fn sweep(&mut self) -> HandlerResult<usize> {
         perform_installation_sync(self.ctx, self.github.clone(), self.store.clone()).await
     }
 }
@@ -716,26 +834,17 @@ async fn run_scheduler_tick<E: SchedulerTickEffects>(
     restate: &mut E,
     state: SchedulerState,
     incoming: SchedulerTick,
-) -> HandlerResult<()> {
+) -> HandlerResult<SchedulerTickOutcome> {
     let Some(next) = scheduler_tick_transition(state, incoming)? else {
-        return Ok(());
+        return Ok(SchedulerTickOutcome::Dropped);
     };
     // Re-arm before sweeping. Restate never rolls back journaled state or sends, so the
-    // chain survives a terminal or aborted sweep instead of dying silently.
+    // chain survives a terminal or aborted sweep instead of dying silently; the failure
+    // itself surfaces as the handler's, logged by `traced` with the installation id.
     restate.persist(next);
     restate.schedule_tick(next.generation);
-    if let Err(error) = restate.sweep().await {
-        // `HandlerError` only renders through `AsRef<dyn Error>`; its message already says
-        // whether Restate treated the failure as terminal or retryable.
-        let cause: &dyn std::error::Error = error.as_ref();
-        warn!(
-            installation_id = restate.installation_id(),
-            %cause,
-            "installation reconcile failed; the next tick is already scheduled"
-        );
-        return Err(error);
-    }
-    Ok(())
+    let repositories = restate.sweep().await?;
+    Ok(SchedulerTickOutcome::Swept { repositories })
 }
 
 async fn invalidate_scheduler_generation(ctx: &ObjectContext<'_>) -> HandlerResult<()> {
@@ -745,11 +854,13 @@ async fn invalidate_scheduler_generation(ctx: &ObjectContext<'_>) -> HandlerResu
     Ok(())
 }
 
+/// Re-enumerates the installation's repositories and fans a reconcile out to each; resolves
+/// to how many.
 async fn perform_installation_sync(
     ctx: &ObjectContext<'_>,
     github: GithubClient,
     store: LibSqlPrStore,
-) -> HandlerResult<()> {
+) -> HandlerResult<usize> {
     let reconcile_start = ctx
         .run(|| async { Ok(unix_seconds()) })
         .name("installation-reconcile-clock")
@@ -779,12 +890,13 @@ async fn perform_installation_sync(
     .retry_policy(store_retry_policy())
     .name("replace-installation-repositories")
     .await?;
+    let count = repositories.len();
     for repository in repositories {
         ctx.object_client::<RepoSyncClient>(repository.repository_id.to_string())
             .reconcile(Json::from(repository))
             .send();
     }
-    Ok(())
+    Ok(count)
 }
 
 /// Side effects a repository reconcile asks of Restate, GitHub and the store, abstracted
@@ -877,8 +989,8 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
 /// A pull request that fails terminally is logged and remembered rather than propagated,
 /// so one unsyncable pull request can neither starve the rest of the repository nor skip
 /// stale-row cleanup. Retention still requires a complete listing: if listing fails, the
-/// live set is unknown and nothing is deleted.
-async fn run_repo_reconcile<E: RepoReconcileEffects>(restate: &mut E) -> HandlerResult<()> {
+/// live set is unknown and nothing is deleted. Resolves to how many pull requests synced.
+async fn run_repo_reconcile<E: RepoReconcileEffects>(restate: &mut E) -> HandlerResult<usize> {
     let pulls = restate.list_pull_requests().await?;
     let mut failed = Vec::new();
     for request in &pulls {
@@ -899,7 +1011,7 @@ async fn run_repo_reconcile<E: RepoReconcileEffects>(restate: &mut E) -> Handler
         .collect::<Vec<_>>();
     restate.retain_pull_requests(&live).await?;
     if failed.is_empty() {
-        return Ok(());
+        return Ok(pulls.len());
     }
     let keys = failed
         .iter()
@@ -929,19 +1041,24 @@ impl RepoSync {
         ctx: ObjectContext<'_>,
         repository: Json<RepoRecord>,
     ) -> HandlerResult<()> {
-        let repository = repository.into_inner();
-        let reconcile_start = ctx
-            .run(|| async { Ok(unix_seconds()) })
-            .name("repo-reconcile-clock")
-            .await?;
-        let mut restate = RestateReconcileEffects {
-            ctx: &ctx,
-            github: &self.github,
-            store: &self.store,
-            repository,
-            reconcile_start,
-        };
-        run_repo_reconcile(&mut restate).await
+        traced("RepoSync/reconcile", ctx.key(), async {
+            let repository = repository.into_inner();
+            let reconcile_start = ctx
+                .run(|| async { Ok(unix_seconds()) })
+                .name("repo-reconcile-clock")
+                .await?;
+            let mut restate = RestateReconcileEffects {
+                ctx: &ctx,
+                github: &self.github,
+                store: &self.store,
+                repository,
+                reconcile_start,
+            };
+            let pull_requests = run_repo_reconcile(&mut restate).await?;
+            Ok(format!("synced {pull_requests} pull requests"))
+        })
+        .await
+        .map(|_| ())
     }
 
     #[handler]
@@ -950,43 +1067,50 @@ impl RepoSync {
         ctx: ObjectContext<'_>,
         request: Json<SyncShaRequest>,
     ) -> HandlerResult<()> {
-        let request = request.into_inner();
-        let store = self.store.clone();
-        let repository_id = request.repository_id;
-        let sha = request.sha.clone();
-        let matches = ctx
-            .run(move || async move {
-                Ok(Json::from(
-                    store
-                        .prs_for_sha(repository_id, &sha)
-                        .await
-                        .map_err(store_failure)?,
-                ))
-            })
-            .retry_policy(store_retry_policy())
-            .name("resolve-prs-for-sha")
-            .await?;
-        let mut numbers = request
-            .pull_requests
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        numbers.extend(matches.into_inner().into_iter().map(|pull| pull.number));
-        for number in numbers {
-            let sync = SyncRequest {
-                repository_id: request.repository_id,
-                owner: request.owner.clone(),
-                repo: request.repo.clone(),
-                number,
-                observed_sha: Some(request.sha.clone()),
-                bypass_debounce: false,
-                completion_id: None,
-            };
-            ctx.object_client::<PullRequestClient>(request_key(&sync).to_string())
-                .sync(Json::from(sync))
-                .send();
-        }
-        Ok(())
+        traced("RepoSync/sync_sha", ctx.key(), async {
+            let request = request.into_inner();
+            let store = self.store.clone();
+            let repository_id = request.repository_id;
+            let sha = request.sha.clone();
+            let matches = ctx
+                .run(move || async move {
+                    Ok(Json::from(
+                        store
+                            .prs_for_sha(repository_id, &sha)
+                            .await
+                            .map_err(store_failure)?,
+                    ))
+                })
+                .retry_policy(store_retry_policy())
+                .name("resolve-prs-for-sha")
+                .await?;
+            let mut numbers = request
+                .pull_requests
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            numbers.extend(matches.into_inner().into_iter().map(|pull| pull.number));
+            let count = numbers.len();
+            for number in numbers {
+                let sync = SyncRequest {
+                    repository_id: request.repository_id,
+                    owner: request.owner.clone(),
+                    repo: request.repo.clone(),
+                    number,
+                    bypass_debounce: false,
+                    completion_id: None,
+                };
+                ctx.object_client::<PullRequestClient>(request_key(&sync).to_string())
+                    .sync(Json::from(sync))
+                    .send();
+            }
+            Ok(format!(
+                "fanned out to {count} pull requests at {}",
+                short_sha(&request.sha)
+            ))
+        })
+        .await
+        .map(|_| ())
     }
 }
 
@@ -1002,10 +1126,14 @@ struct SchedulerIngress {
 impl SchedulerIngress {
     #[handler]
     async fn start(&self, ctx: Context<'_>) -> HandlerResult<()> {
-        ctx.object_client::<InstallationSyncClient>(self.installation_id.to_string())
-            .start()
-            .send();
-        Ok(())
+        let installation_id = self.installation_id.to_string();
+        traced("SchedulerIngress/start", &installation_id, async {
+            ctx.object_client::<InstallationSyncClient>(installation_id.clone())
+                .start()
+                .send();
+            Ok(())
+        })
+        .await
     }
 }
 
@@ -1013,77 +1141,245 @@ impl SchedulerIngress {
 impl WebhookIngress {
     /// Routes a verified GitHub delivery to the object that owns it.
     ///
-    /// The web edge acknowledges kinds with no arm here before they reach
+    /// The web edge acknowledges kinds with no arm in `route_webhook` before they reach
     /// Restate, and its copy of this table (`route_delivery` in the web app)
-    /// must be kept in step: adding a kind below without adding it there
+    /// must be kept in step: adding a kind to `route_webhook` without adding it there
     /// means the edge silently swallows it.
     #[handler]
     async fn dispatch(&self, ctx: Context<'_>, event: Json<WebhookEvent>) -> HandlerResult<()> {
         let event = event.into_inner();
-        if event
-            .installation_id
-            .is_some_and(|installation_id| installation_id != self.installation_id)
-        {
-            return Err(
-                TerminalError::new("webhook installation does not match configuration").into(),
-            );
-        }
-        match event.event.as_str() {
-            "pull_request" => dispatch_pull_request(&ctx, &event)?,
-            "check_suite" if event.action.as_deref() == Some("completed") => {
-                dispatch_sha(&ctx, &event)?
-            }
-            "check_run" if matches!(event.action.as_deref(), Some("created" | "completed")) => {
-                dispatch_sha(&ctx, &event)?
-            }
-            "status" => dispatch_sha(&ctx, &event)?,
-            "installation" => dispatch_installation(&ctx, &event)?,
-            "installation_repositories" => {
-                if let Some(installation_id) = event.installation_id {
-                    ctx.object_client::<InstallationSyncClient>(installation_id.to_string())
-                        .sync_now()
-                        .send();
-                }
-            }
-            // Kinds the edge acknowledges never get here. What does is a routed
-            // kind whose action has no arm above: `check_suite.requested`,
-            // `check_run.rerequested`, `pull_request.assigned`, and the like.
-            _ => {}
-        }
-        Ok(())
+        // A service has no object key; the delivery kind is what identifies this invocation.
+        let delivery = format!("{}.{}", event.event, event.action.as_deref().unwrap_or("-"));
+        traced("WebhookIngress/dispatch", &delivery, async {
+            // A rejection is the handler's failure, so `traced` logs it with its reason;
+            // the message carries the ids needed to find the delivery in GitHub.
+            let route = route_webhook(self.installation_id, &event)
+                .map_err(|rejection| TerminalError::new(rejection.to_string()))?;
+            send_webhook_route(&ctx, &route);
+            Ok(route)
+        })
+        .await
+        .map(|_| ())
     }
 }
 
-fn dispatch_pull_request(ctx: &Context<'_>, event: &WebhookEvent) -> HandlerResult<()> {
+/// Where a webhook delivery goes, decided before anything is sent so the decision can be
+/// tested and logged without a Restate context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WebhookRoute {
+    ClosePullRequest(PrKey),
+    SyncPullRequest(SyncRequest),
+    SyncSha(SyncShaRequest),
+    Installation {
+        installation_id: u64,
+        action: InstallationLifecycleAction,
+    },
+    /// A routed kind whose action has no arm: `check_suite.requested`,
+    /// `check_run.rerequested`, `pull_request.assigned`, and the like. Kinds the edge
+    /// acknowledges never get this far.
+    Ignore,
+}
+
+impl HandlerOutcome for WebhookRoute {
+    fn outcome(&self) -> String {
+        match self {
+            Self::ClosePullRequest(key) => format!("sent PullRequest/{key}.closed"),
+            Self::SyncPullRequest(request) => {
+                format!("sent PullRequest/{}.sync", request_key(request))
+            }
+            Self::SyncSha(request) => {
+                format!("sent RepoSync/{}.sync_sha", request.repository_id)
+            }
+            Self::Installation {
+                installation_id,
+                action,
+            } => {
+                let handler = match action {
+                    InstallationLifecycleAction::Start => "start",
+                    InstallationLifecycleAction::SyncNow => "sync_now",
+                    InstallationLifecycleAction::Pause => "pause",
+                    InstallationLifecycleAction::Purge => "purge",
+                };
+                format!("sent InstallationSync/{installation_id}.{handler}")
+            }
+            Self::Ignore => "ignored".to_owned(),
+        }
+    }
+}
+
+/// Why a delivery can never be routed, however often Restate retried it.
+///
+/// Rendered into the terminal failure and the handler's log line, so it must carry the ids
+/// an operator needs to find the offending delivery in GitHub.
+#[derive(Debug, Error, PartialEq, Eq)]
+enum WebhookRejection {
+    #[error("webhook installation {actual} does not match configured installation {expected}")]
+    ForeignInstallation { expected: u64, actual: u64 },
+    #[error("{kind} webhook is missing {}", fields.join(", "))]
+    MissingFields {
+        kind: &'static str,
+        fields: Vec<&'static str>,
+    },
+}
+
+fn route_webhook(
+    installation_id: u64,
+    event: &WebhookEvent,
+) -> Result<WebhookRoute, WebhookRejection> {
+    if let Some(actual) = event
+        .installation_id
+        .filter(|actual| *actual != installation_id)
+    {
+        return Err(WebhookRejection::ForeignInstallation {
+            expected: installation_id,
+            actual,
+        });
+    }
+    match event.event.as_str() {
+        "pull_request" => route_pull_request(event),
+        "check_suite" if event.action.as_deref() == Some("completed") => route_sha(event),
+        "check_run" if matches!(event.action.as_deref(), Some("created" | "completed")) => {
+            route_sha(event)
+        }
+        "status" => route_sha(event),
+        "installation" => route_installation(event),
+        "installation_repositories" => Ok(match event.installation_id {
+            Some(installation_id) => WebhookRoute::Installation {
+                installation_id,
+                action: InstallationLifecycleAction::SyncNow,
+            },
+            None => WebhookRoute::Ignore,
+        }),
+        _ => Ok(WebhookRoute::Ignore),
+    }
+}
+
+fn route_pull_request(event: &WebhookEvent) -> Result<WebhookRoute, WebhookRejection> {
     let (Some(repository_id), Some(owner), Some(repo), Some(number)) = (
         event.repository_id,
         event.owner.as_ref(),
         event.repo.as_ref(),
         event.number,
     ) else {
-        return Err(TerminalError::new("pull_request webhook is missing routing fields").into());
+        return Err(missing_fields(
+            "pull_request",
+            [
+                ("repository_id", event.repository_id.is_none()),
+                ("owner", event.owner.is_none()),
+                ("repo", event.repo.is_none()),
+                ("number", event.number.is_none()),
+            ],
+        ));
     };
-    let key = PrKey::new(repository_id, number).to_string();
-    match event.action.as_deref() {
-        Some("closed") => {
-            ctx.object_client::<PullRequestClient>(key).closed().send();
-        }
+    Ok(match event.action.as_deref() {
+        Some("closed") => WebhookRoute::ClosePullRequest(PrKey::new(repository_id, number)),
         action if pull_request_action_requests_sync(action) => {
-            ctx.object_client::<PullRequestClient>(key)
-                .sync(Json::from(SyncRequest {
-                    repository_id,
-                    owner: owner.clone(),
-                    repo: repo.clone(),
-                    number,
-                    observed_sha: event.sha.clone(),
-                    bypass_debounce: event.action.as_deref() == Some(DASHBOARD_SYNC_ACTION),
-                    completion_id: event.sync_completion_id.clone(),
-                }))
+            WebhookRoute::SyncPullRequest(SyncRequest {
+                repository_id,
+                owner: owner.clone(),
+                repo: repo.clone(),
+                number,
+                bypass_debounce: action == Some(DASHBOARD_SYNC_ACTION),
+                completion_id: event.sync_completion_id.clone(),
+            })
+        }
+        _ => WebhookRoute::Ignore,
+    })
+}
+
+fn route_sha(event: &WebhookEvent) -> Result<WebhookRoute, WebhookRejection> {
+    let (Some(repository_id), Some(owner), Some(repo), Some(sha)) = (
+        event.repository_id,
+        event.owner.as_ref(),
+        event.repo.as_ref(),
+        event.sha.as_ref(),
+    ) else {
+        return Err(missing_fields(
+            "commit",
+            [
+                ("repository_id", event.repository_id.is_none()),
+                ("owner", event.owner.is_none()),
+                ("repo", event.repo.is_none()),
+                ("sha", event.sha.is_none()),
+            ],
+        ));
+    };
+    Ok(WebhookRoute::SyncSha(SyncShaRequest {
+        repository_id,
+        owner: owner.clone(),
+        repo: repo.clone(),
+        sha: sha.clone(),
+        pull_requests: event.pull_requests.clone(),
+    }))
+}
+
+fn route_installation(event: &WebhookEvent) -> Result<WebhookRoute, WebhookRejection> {
+    let Some(installation_id) = event.installation_id else {
+        return Err(missing_fields("installation", [("installation_id", true)]));
+    };
+    Ok(
+        match installation_lifecycle_action(event.action.as_deref()) {
+            Some(action) => WebhookRoute::Installation {
+                installation_id,
+                action,
+            },
+            None => WebhookRoute::Ignore,
+        },
+    )
+}
+
+fn missing_fields(
+    kind: &'static str,
+    fields: impl IntoIterator<Item = (&'static str, bool)>,
+) -> WebhookRejection {
+    WebhookRejection::MissingFields {
+        kind,
+        fields: fields
+            .into_iter()
+            .filter_map(|(field, missing)| missing.then_some(field))
+            .collect(),
+    }
+}
+
+fn send_webhook_route(ctx: &Context<'_>, route: &WebhookRoute) {
+    match route {
+        WebhookRoute::ClosePullRequest(key) => {
+            ctx.object_client::<PullRequestClient>(key.to_string())
+                .closed()
                 .send();
         }
-        _ => {}
+        WebhookRoute::SyncPullRequest(request) => {
+            ctx.object_client::<PullRequestClient>(request_key(request).to_string())
+                .sync(Json::from(request.clone()))
+                .send();
+        }
+        WebhookRoute::SyncSha(request) => {
+            ctx.object_client::<RepoSyncClient>(request.repository_id.to_string())
+                .sync_sha(Json::from(request.clone()))
+                .send();
+        }
+        WebhookRoute::Installation {
+            installation_id,
+            action,
+        } => {
+            let client = ctx.object_client::<InstallationSyncClient>(installation_id.to_string());
+            match action {
+                InstallationLifecycleAction::Start => {
+                    client.start().send();
+                }
+                InstallationLifecycleAction::SyncNow => {
+                    client.sync_now().send();
+                }
+                InstallationLifecycleAction::Pause => {
+                    client.pause().send();
+                }
+                InstallationLifecycleAction::Purge => {
+                    client.purge().send();
+                }
+            }
+        }
+        WebhookRoute::Ignore => {}
     }
-    Ok(())
 }
 
 fn pull_request_action_requests_sync(action: Option<&str>) -> bool {
@@ -1111,66 +1407,21 @@ fn should_debounce_sync(
         && last_synced_at.is_some_and(|last| now.saturating_sub(last) < debounce.as_secs())
 }
 
-fn dispatch_sha(ctx: &Context<'_>, event: &WebhookEvent) -> HandlerResult<()> {
-    let (Some(repository_id), Some(owner), Some(repo), Some(sha)) = (
-        event.repository_id,
-        event.owner.as_ref(),
-        event.repo.as_ref(),
-        event.sha.as_ref(),
-    ) else {
-        return Err(TerminalError::new("commit webhook is missing routing fields").into());
-    };
-    ctx.object_client::<RepoSyncClient>(repository_id.to_string())
-        .sync_sha(Json::from(SyncShaRequest {
-            repository_id,
-            owner: owner.clone(),
-            repo: repo.clone(),
-            sha: sha.clone(),
-            pull_requests: event.pull_requests.clone(),
-        }))
-        .send();
-    Ok(())
-}
-
-fn dispatch_installation(ctx: &Context<'_>, event: &WebhookEvent) -> HandlerResult<()> {
-    let Some(installation_id) = event.installation_id else {
-        return Err(TerminalError::new("installation webhook is missing installation id").into());
-    };
-    let client = ctx.object_client::<InstallationSyncClient>(installation_id.to_string());
-    match installation_lifecycle_action(event.action.as_deref()) {
-        InstallationLifecycleAction::Start => {
-            client.start().send();
-        }
-        InstallationLifecycleAction::SyncNow => {
-            client.sync_now().send();
-        }
-        InstallationLifecycleAction::Pause => {
-            client.pause().send();
-        }
-        InstallationLifecycleAction::Purge => {
-            client.purge().send();
-        }
-        InstallationLifecycleAction::Ignore => {}
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InstallationLifecycleAction {
     Start,
     SyncNow,
     Pause,
     Purge,
-    Ignore,
 }
 
-fn installation_lifecycle_action(action: Option<&str>) -> InstallationLifecycleAction {
+fn installation_lifecycle_action(action: Option<&str>) -> Option<InstallationLifecycleAction> {
     match action {
-        Some("created") => InstallationLifecycleAction::SyncNow,
-        Some("unsuspend") => InstallationLifecycleAction::Start,
-        Some("suspend") => InstallationLifecycleAction::Pause,
-        Some("deleted") => InstallationLifecycleAction::Purge,
-        _ => InstallationLifecycleAction::Ignore,
+        Some("created") => Some(InstallationLifecycleAction::SyncNow),
+        Some("unsuspend") => Some(InstallationLifecycleAction::Start),
+        Some("suspend") => Some(InstallationLifecycleAction::Pause),
+        Some("deleted") => Some(InstallationLifecycleAction::Purge),
+        _ => None,
     }
 }
 
@@ -1462,20 +1713,141 @@ enum RetryableServiceError {
     Store(String),
 }
 
+/// How a handler's successful result reads in its completion log line.
+trait HandlerOutcome {
+    fn outcome(&self) -> String;
+}
+
+impl HandlerOutcome for () {
+    fn outcome(&self) -> String {
+        "ok".to_owned()
+    }
+}
+
+/// For handlers whose only interesting result is a count, e.g. how many objects they
+/// fanned out to; the handler phrases it.
+impl HandlerOutcome for String {
+    fn outcome(&self) -> String {
+        self.clone()
+    }
+}
+
+impl HandlerOutcome for Json<ActionOutcome> {
+    fn outcome(&self) -> String {
+        match &self.0 {
+            ActionOutcome::Succeeded { .. } => "succeeded".to_owned(),
+            ActionOutcome::Rejected { reason } => format!("rejected: {reason}"),
+        }
+    }
+}
+
+impl<T> HandlerOutcome for Json<Option<T>> {
+    fn outcome(&self) -> String {
+        match &self.0 {
+            Some(_) => "found".to_owned(),
+            None => "absent".to_owned(),
+        }
+    }
+}
+
+/// Runs one handler attempt and logs how it ended, with the object key and elapsed time.
+///
+/// Called from inside the handler so the line carries the key; the SDK's span already names
+/// the service and method. An attempt that suspends and replays logs once, when it really
+/// finishes; an attempt that fails retryably logs each failure. `elapsed_ms` is this
+/// attempt's wall time, not the invocation's age.
+async fn traced<T: HandlerOutcome>(
+    handler: &'static str,
+    key: &str,
+    attempt: impl Future<Output = HandlerResult<T>>,
+) -> HandlerResult<T> {
+    let (result, elapsed_ms) = timed(attempt).await;
+    match &result {
+        Ok(value) => info!(
+            handler,
+            key,
+            outcome = value.outcome().as_str(),
+            elapsed_ms,
+            "handler completed"
+        ),
+        Err(error) => log_handler_failure(handler, key, error, elapsed_ms),
+    }
+    result
+}
+
+/// `traced` for the read-only handlers the dashboard polls: success is `debug`, so a busy
+/// dashboard cannot drown the write path in the log.
+async fn traced_read<T: HandlerOutcome>(
+    handler: &'static str,
+    key: &str,
+    attempt: impl Future<Output = HandlerResult<T>>,
+) -> HandlerResult<T> {
+    let (result, elapsed_ms) = timed(attempt).await;
+    match &result {
+        Ok(value) => debug!(
+            handler,
+            key,
+            outcome = value.outcome().as_str(),
+            elapsed_ms,
+            "handler completed"
+        ),
+        Err(error) => log_handler_failure(handler, key, error, elapsed_ms),
+    }
+    result
+}
+
+async fn timed<T>(attempt: impl Future<Output = T>) -> (T, u128) {
+    let started = Instant::now();
+    let result = attempt.await;
+    (result, started.elapsed().as_millis())
+}
+
+fn log_handler_failure(handler: &'static str, key: &str, error: &HandlerError, elapsed_ms: u128) {
+    warn!(
+        handler,
+        key,
+        outcome = "failed",
+        cause = %handler_cause(error),
+        elapsed_ms,
+        "handler failed"
+    );
+}
+
+/// `HandlerError` only renders through `AsRef<dyn Error>`; its message already says whether
+/// Restate will treat the failure as terminal or retry it.
+fn handler_cause(error: &HandlerError) -> &dyn std::error::Error {
+    error.as_ref()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+    // Restate re-runs handler code while replaying a journal, so without the replay filter
+    // every line a handler logged before it suspended would be logged again on resume.
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+                .with_filter(ReplayAwareFilter),
+        )
         .init();
 
     let store = LibSqlPrStore::connect(&StoreConfig::from_env()).await?;
     let github = GithubClient::new(GithubConfig::from_env()?)?;
-    let debounce = Duration::from_secs(env_u64("SYNC_DEBOUNCE_SECONDS", DEFAULT_DEBOUNCE_SECONDS));
-    let interval = Duration::from_secs(env_u64(
+    let debounce = Duration::from_secs(env_seconds(
+        "SYNC_DEBOUNCE_SECONDS",
+        DEFAULT_DEBOUNCE_SECONDS,
+    ));
+    let interval = Duration::from_secs(env_seconds(
         "RECONCILE_INTERVAL_SECONDS",
         DEFAULT_RECONCILE_SECONDS,
     ));
     let installation_id = github.installation_id();
+    info!(
+        installation_id,
+        debounce_seconds = debounce.as_secs(),
+        reconcile_interval_seconds = interval.as_secs(),
+        "resolved service settings"
+    );
 
     let pull_request = PullRequest {
         github: github.clone(),
@@ -1498,12 +1870,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     tokio::spawn(start_scheduler(installation_id));
-    let address = env::var("RESTATE_SERVICE_ADDRESS")
+    let address: SocketAddr = env::var("RESTATE_SERVICE_ADDRESS")
         .unwrap_or_else(|_| "127.0.0.1:9080".to_owned())
         .parse()?;
+    let listener = TcpListener::bind(address).await?;
     info!(%address, "starting Restate service endpoint");
-    HttpServer::new(endpoint).listen_and_serve(address).await;
+    HttpServer::new(endpoint)
+        .serve_with_cancel(listener, shutdown_signal())
+        .await;
+    info!("Restate service endpoint stopped");
     Ok(())
+}
+
+/// Resolves once the process is asked to stop, by Ctrl-C or by its supervisor.
+///
+/// The SDK only listens for SIGINT, but containers stop with SIGTERM; without this arm a
+/// `docker stop` kills the process mid-step and every in-flight invocation has to be
+/// replayed. Either signal starts the SDK's graceful drain: the listener closes, open
+/// invocations get up to ten seconds to finish, and Restate retries whatever is left.
+async fn shutdown_signal() {
+    let interrupt = async {
+        if let Err(error) = signal::ctrl_c().await {
+            warn!(%error, "cannot listen for SIGINT");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(error) => {
+                warn!(%error, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    let signal = tokio::select! {
+        () = interrupt => "SIGINT",
+        () = terminate => "SIGTERM",
+    };
+    info!(signal, "shutdown requested; draining in-flight invocations");
 }
 
 async fn start_scheduler(installation_id: u64) {
@@ -1562,18 +1973,49 @@ fn scheduler_start_request(
     request
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+/// Reads a whole-seconds setting from the environment.
+fn env_seconds(name: &str, default: u64) -> u64 {
+    let raw = match env::var(name) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        // Not UTF-8 cannot be a number either; surface it as the typo it is.
+        Err(env::VarError::NotUnicode(raw)) => Some(raw.to_string_lossy().into_owned()),
+    };
+    resolve_seconds(name, raw.as_deref(), default)
+}
+
+/// Resolves a whole-seconds setting from its raw environment value.
+///
+/// A typo must not silently become the default: an unparsable value still falls back, but
+/// says so and names the variable, so the operator learns at startup rather than from the
+/// service's behaviour. Unset or empty means "use the default" and is not worth a line.
+fn resolve_seconds(name: &str, raw: Option<&str>, default: u64) -> u64 {
+    let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
+        return default;
+    };
+    match raw.parse::<u64>() {
+        Ok(seconds) => seconds,
+        Err(error) => {
+            warn!(
+                variable = name,
+                value = raw,
+                default,
+                %error,
+                "environment setting is not a whole number of seconds; using the default"
+            );
+            default
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use bytes::Bytes;
     use dependaboard_core::{CheckStatus, Mergeable, PrRecord, PrTarget, UpdateType, UserId};
     use restate_sdk::service::Discoverable;
+    use tracing::instrument::WithSubscriber;
 
     use super::*;
 
@@ -1956,19 +2398,23 @@ mod tests {
     fn installation_webhooks_map_to_distinct_lifecycle_actions() {
         assert_eq!(
             installation_lifecycle_action(Some("created")),
-            InstallationLifecycleAction::SyncNow
+            Some(InstallationLifecycleAction::SyncNow)
         );
         assert_eq!(
             installation_lifecycle_action(Some("unsuspend")),
-            InstallationLifecycleAction::Start
+            Some(InstallationLifecycleAction::Start)
         );
         assert_eq!(
             installation_lifecycle_action(Some("suspend")),
-            InstallationLifecycleAction::Pause
+            Some(InstallationLifecycleAction::Pause)
         );
         assert_eq!(
             installation_lifecycle_action(Some("deleted")),
-            InstallationLifecycleAction::Purge
+            Some(InstallationLifecycleAction::Purge)
+        );
+        assert_eq!(
+            installation_lifecycle_action(Some("new_permissions_accepted")),
+            None
         );
     }
 
@@ -2052,10 +2498,6 @@ mod tests {
     }
 
     impl SchedulerTickEffects for RecordedRestate {
-        fn installation_id(&self) -> &str {
-            "1"
-        }
-
         fn persist(&mut self, state: SchedulerState) {
             self.persisted = Some(state);
         }
@@ -2064,11 +2506,11 @@ mod tests {
             self.scheduled.push(generation);
         }
 
-        async fn sweep(&mut self) -> HandlerResult<()> {
+        async fn sweep(&mut self) -> HandlerResult<usize> {
             self.swept = true;
             match self.sweep_failure.take() {
                 Some(error) => Err(error),
-                None => Ok(()),
+                None => Ok(3),
             }
         }
     }
@@ -2101,7 +2543,7 @@ mod tests {
     async fn a_successful_tick_sweeps_and_schedules_exactly_one_successor() {
         let mut restate = RecordedRestate::default();
 
-        run_scheduler_tick(
+        let outcome = run_scheduler_tick(
             &mut restate,
             SchedulerState::armed(42),
             SchedulerTick(Some(42)),
@@ -2109,6 +2551,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(outcome, SchedulerTickOutcome::Swept { repositories: 3 });
         assert!(restate.swept);
         assert_eq!(restate.scheduled, vec![42]);
         assert_eq!(restate.persisted, Some(SchedulerState::armed(42)));
@@ -2118,7 +2561,7 @@ mod tests {
     async fn a_stale_tick_neither_sweeps_nor_schedules() {
         let mut restate = RecordedRestate::default();
 
-        run_scheduler_tick(
+        let outcome = run_scheduler_tick(
             &mut restate,
             SchedulerState::armed(43),
             SchedulerTick(Some(42)),
@@ -2126,6 +2569,7 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(outcome, SchedulerTickOutcome::Dropped);
         assert!(!restate.swept);
         assert!(restate.scheduled.is_empty());
         assert_eq!(restate.persisted, None);
@@ -2180,7 +2624,6 @@ mod tests {
             owner: "acme".to_owned(),
             repo: "api".to_owned(),
             number,
-            observed_sha: None,
             bypass_debounce: false,
             completion_id: None,
         }
@@ -2306,8 +2749,9 @@ mod tests {
             ..Default::default()
         };
 
-        run_repo_reconcile(&mut restate).await.unwrap();
+        let synced = run_repo_reconcile(&mut restate).await.unwrap();
 
+        assert_eq!(synced, 2);
         assert_eq!(restate.synced, vec![12, 19]);
         assert_eq!(restate.retained, Some(vec![12, 19]));
     }
@@ -2337,5 +2781,274 @@ mod tests {
             <SchedulerTick as restate_sdk::serde::Deserialize>::deserialize(&mut current).unwrap(),
             SchedulerTick(Some(42))
         );
+    }
+
+    /// An `io::Write` the test subscriber can hand out repeatedly.
+    #[derive(Clone, Default)]
+    struct LogSink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogSink {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            let sink = self.clone();
+            tracing_subscriber::fmt()
+                .with_writer(move || sink.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish()
+        }
+
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// Everything the service logs while `run` executes, as the operator would see it.
+    fn captured_logs(run: impl FnOnce()) -> String {
+        let sink = LogSink::default();
+        tracing::subscriber::with_default(sink.subscriber(), run);
+        sink.contents()
+    }
+
+    #[tokio::test]
+    async fn a_completed_handler_logs_its_key_outcome_and_duration() {
+        let sink = LogSink::default();
+
+        let outcome = traced("PullRequest/merge", "7#9", async {
+            Ok(Json::from(ActionOutcome::Rejected {
+                reason: RejectReason::NotMergeable,
+            }))
+        })
+        .with_subscriber(sink.subscriber())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            outcome.into_inner(),
+            ActionOutcome::Rejected { .. }
+        ));
+        let logs = sink.contents();
+        assert!(logs.contains("INFO"), "{logs}");
+        assert!(logs.contains(r#"handler="PullRequest/merge""#), "{logs}");
+        assert!(logs.contains(r#"key="7#9""#), "{logs}");
+        assert!(
+            logs.contains(
+                r#"outcome="rejected: GitHub reports this pull request is not mergeable""#
+            ),
+            "{logs}"
+        );
+        assert!(logs.contains("elapsed_ms="), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_handler_logs_the_cause_at_warn() {
+        let sink = LogSink::default();
+
+        let result = traced::<()>("WebhookIngress/dispatch", "pull_request.opened", async {
+            Err(TerminalError::new("pull_request webhook is missing number").into())
+        })
+        .with_subscriber(sink.subscriber())
+        .await;
+
+        assert!(result.is_err());
+        let logs = sink.contents();
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains(r#"key="pull_request.opened""#), "{logs}");
+        assert!(logs.contains(r#"outcome="failed""#), "{logs}");
+        assert!(
+            logs.contains("Terminal error [500]: pull_request webhook is missing number"),
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn polled_reads_complete_quietly_at_debug() {
+        let sink = LogSink::default();
+
+        traced_read("PullRequest/status", "7#9", async {
+            Ok(Json::from(Option::<PrState>::None))
+        })
+        .with_subscriber(sink.subscriber())
+        .await
+        .unwrap();
+
+        let logs = sink.contents();
+        assert!(logs.contains("DEBUG"), "{logs}");
+        assert!(logs.contains(r#"outcome="absent""#), "{logs}");
+    }
+
+    #[test]
+    fn an_unparsable_seconds_setting_falls_back_and_warns_naming_the_variable() {
+        let mut resolved = None;
+        let logs = captured_logs(|| {
+            resolved = Some(resolve_seconds("SYNC_DEBOUNCE_SECONDS", Some("20s"), 20));
+        });
+
+        assert_eq!(resolved, Some(20));
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("SYNC_DEBOUNCE_SECONDS"), "{logs}");
+        assert!(logs.contains("20s"), "{logs}");
+    }
+
+    #[test]
+    fn configured_and_unset_seconds_settings_resolve_silently() {
+        let mut resolved = Vec::new();
+        let logs = captured_logs(|| {
+            resolved.push(resolve_seconds(
+                "RECONCILE_INTERVAL_SECONDS",
+                Some("900"),
+                3600,
+            ));
+            resolved.push(resolve_seconds("RECONCILE_INTERVAL_SECONDS", None, 3600));
+            resolved.push(resolve_seconds(
+                "RECONCILE_INTERVAL_SECONDS",
+                Some(""),
+                3600,
+            ));
+        });
+
+        assert_eq!(resolved, vec![900, 3600, 3600]);
+        assert!(logs.is_empty(), "{logs}");
+    }
+
+    /// A delivery as the web edge forwards it, for installation 1 and repository 7.
+    fn delivery(event: &str, action: Option<&str>) -> WebhookEvent {
+        WebhookEvent {
+            event: event.to_owned(),
+            action: action.map(str::to_owned),
+            installation_id: Some(1),
+            repository_id: Some(7),
+            owner: Some("acme".to_owned()),
+            repo: Some("api".to_owned()),
+            number: Some(9),
+            sha: Some("abc123".to_owned()),
+            pull_requests: Vec::new(),
+            sync_completion_id: None,
+        }
+    }
+
+    #[test]
+    fn deliveries_for_another_installation_are_rejected_naming_both_ids() {
+        let mut event = delivery("pull_request", Some("opened"));
+        event.installation_id = Some(5);
+
+        let rejection = route_webhook(1, &event).unwrap_err();
+
+        assert_eq!(
+            rejection.to_string(),
+            "webhook installation 5 does not match configured installation 1"
+        );
+    }
+
+    #[test]
+    fn deliveries_without_routing_fields_are_rejected_naming_the_missing_ones() {
+        let mut pull = delivery("pull_request", Some("opened"));
+        pull.repository_id = None;
+        pull.number = None;
+        assert_eq!(
+            route_webhook(1, &pull).unwrap_err().to_string(),
+            "pull_request webhook is missing repository_id, number"
+        );
+
+        let mut check = delivery("check_run", Some("completed"));
+        check.sha = None;
+        assert_eq!(
+            route_webhook(1, &check).unwrap_err().to_string(),
+            "commit webhook is missing sha"
+        );
+
+        let mut installation = delivery("installation", Some("suspend"));
+        installation.installation_id = None;
+        assert_eq!(
+            route_webhook(1, &installation).unwrap_err().to_string(),
+            "installation webhook is missing installation_id"
+        );
+    }
+
+    #[test]
+    fn a_dashboard_sync_routes_to_the_pull_request_bypassing_the_debounce() {
+        let mut event = delivery("pull_request", Some(DASHBOARD_SYNC_ACTION));
+        event.sync_completion_id = Some("completion-1".to_owned());
+
+        assert_eq!(
+            route_webhook(1, &event).unwrap(),
+            WebhookRoute::SyncPullRequest(SyncRequest {
+                repository_id: 7,
+                owner: "acme".to_owned(),
+                repo: "api".to_owned(),
+                number: 9,
+                bypass_debounce: true,
+                completion_id: Some("completion-1".to_owned()),
+            })
+        );
+        assert!(matches!(
+            route_webhook(1, &delivery("pull_request", Some("synchronize"))).unwrap(),
+            WebhookRoute::SyncPullRequest(request) if !request.bypass_debounce
+        ));
+        assert_eq!(
+            route_webhook(1, &delivery("pull_request", Some("closed"))).unwrap(),
+            WebhookRoute::ClosePullRequest(PrKey::new(7, 9))
+        );
+    }
+
+    #[test]
+    fn commit_deliveries_route_to_the_repository_with_the_pull_requests_github_named() {
+        let mut event = delivery("check_run", Some("completed"));
+        event.pull_requests = vec![9, 12];
+
+        assert_eq!(
+            route_webhook(1, &event).unwrap(),
+            WebhookRoute::SyncSha(SyncShaRequest {
+                repository_id: 7,
+                owner: "acme".to_owned(),
+                repo: "api".to_owned(),
+                sha: "abc123".to_owned(),
+                pull_requests: vec![9, 12],
+            })
+        );
+    }
+
+    #[test]
+    fn installation_deliveries_route_to_the_installation_object() {
+        assert_eq!(
+            route_webhook(1, &delivery("installation", Some("suspend"))).unwrap(),
+            WebhookRoute::Installation {
+                installation_id: 1,
+                action: InstallationLifecycleAction::Pause,
+            }
+        );
+        assert_eq!(
+            route_webhook(1, &delivery("installation_repositories", Some("added"))).unwrap(),
+            WebhookRoute::Installation {
+                installation_id: 1,
+                action: InstallationLifecycleAction::SyncNow,
+            }
+        );
+    }
+
+    #[test]
+    fn routed_kinds_with_unhandled_actions_are_ignored_not_rejected() {
+        for (event, action) in [
+            ("pull_request", "assigned"),
+            ("check_suite", "requested"),
+            ("check_run", "rerequested"),
+            ("installation", "new_permissions_accepted"),
+        ] {
+            assert_eq!(
+                route_webhook(1, &delivery(event, Some(action))).unwrap(),
+                WebhookRoute::Ignore,
+                "{event}.{action}"
+            );
+        }
     }
 }

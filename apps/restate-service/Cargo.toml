@@ -10,7 +10,6 @@ bytes.workspace = true
 dependaboard-core = { path = "../../crates/core" }
 dependaboard-github = { path = "../../crates/github" }
 dependaboard-store = { path = "../../crates/store" }
-futures.workspace = true
 reqwest.workspace = true
 restate-sdk.workspace = true
 serde.workspace = true
