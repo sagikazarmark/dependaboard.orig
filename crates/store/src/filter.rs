@@ -76,9 +76,15 @@ pub(crate) fn filter_sql(
         .as_ref()
         .filter(|dependency| !dependency.trim().is_empty())
     {
-        let binding = bind(Value::Text(dependency.trim().to_ascii_lowercase()));
+        // `dependency` is COLLATE NOCASE, so the plain comparison is both
+        // case-insensitive and served by idx_pr_dependency. A PR either
+        // names its single dependency there or, for a grouped update, is
+        // NULL there and lists them all in `dependencies`; scoping the JSON
+        // branch to `IS NULL` keeps that branch on the index as well, so
+        // SQLite runs the OR as two index searches instead of a scan.
+        let binding = bind(Value::Text(dependency.trim().to_owned()));
         clauses.push(format!(
-            "(LOWER(p.dependency) = {binding} OR EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE LOWER(json_extract(d.value, '$.name')) = {binding}))"
+            "(p.dependency = {binding} OR (p.dependency IS NULL AND EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE json_extract(d.value, '$.name') = {binding} COLLATE NOCASE)))"
         ));
     }
     if filter.needs_attention {
@@ -264,9 +270,9 @@ mod tests {
 
         assert_eq!(
             sql,
-            "WHERE (LOWER(p.dependency) = ?1 OR EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE LOWER(json_extract(d.value, '$.name')) = ?1))"
+            "WHERE (p.dependency = ?1 OR (p.dependency IS NULL AND EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE json_extract(d.value, '$.name') = ?1 COLLATE NOCASE)))"
         );
-        assert_eq!(params, [text("tokio")]);
+        assert_eq!(params, [text("Tokio")]);
     }
 
     #[test]
@@ -326,7 +332,7 @@ mod tests {
                 "p.update_type IN (?4)",
                 "p.check_status IN (?5)",
                 "EXISTS (SELECT 1 FROM json_each(p.labels) l WHERE l.value = ?6)",
-                "(LOWER(p.dependency) = ?7 OR EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE LOWER(json_extract(d.value, '$.name')) = ?7))",
+                "(p.dependency = ?7 OR (p.dependency IS NULL AND EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE json_extract(d.value, '$.name') = ?7 COLLATE NOCASE)))",
                 "(p.check_status IN ('failure', 'none') OR p.mergeable IN (?8) OR p.update_type = 'major' OR p.synced_at < ?9)",
                 "(p.updated_at < ?10 OR (p.updated_at = ?10 AND p.id < ?11))",
             ]

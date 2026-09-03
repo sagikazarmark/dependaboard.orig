@@ -395,6 +395,27 @@ dx components add <name> --path /path/to/dioxus-daisyui-components --force
 
 The components emit daisyUI class names only; `apps/web/styles/app.css` scans that directory, so `npm run css:build` picks up new classes.
 
+### Schema migrations
+
+The libSQL schema is versioned. `migrations/` holds one SQL file per version, `crates/store/src/migrations.rs` embeds them at compile time, and every process applies the pending ones when it connects. Each migration runs exactly once, in order, inside its own `BEGIN IMMEDIATE` transaction, and is recorded in the `schema_migrations` table; a current database is only read, and re-running is a no-op. Starting the web app and the Restate service together against a new version is safe: the second waits for the first's write lock (SQLite's busy timeout locally, the server's serialisation on a remote database), then finds the version already recorded.
+
+To add a migration:
+
+1. Create `migrations/NNNN_name.sql` with the next four-digit version. Use plain statements only: no `BEGIN`/`COMMIT`, and no connection settings such as `PRAGMA foreign_keys` (a no-op inside the transaction; `connect` already enables it). SQLite cannot add a constraint or change a collation in place; rebuild the table as `0002_pull_request_constraints.sql` does.
+2. Append the entry to `MIGRATIONS` in `crates/store/src/migrations.rs`:
+
+   ```rust
+   Migration {
+       version: N,
+       name: "name",
+       sql: include_str!("../../../migrations/NNNN_name.sql"),
+   },
+   ```
+
+3. Run `cargo test -p dependaboard-store`. A test fails if the files in `migrations/` and the registry disagree or versions are not contiguous, and the runner tests apply the whole registry to a fresh database and to one that predates versioning.
+
+Never edit a migration that has shipped; add a new one instead. `0001_initial.sql` alone must stay idempotent, because databases created before versioning already contain its tables and adopt it as a no-op on their first start.
+
 ## Configuration Reference
 
 | Variable | Used by | Purpose |

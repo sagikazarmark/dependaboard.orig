@@ -1,4 +1,7 @@
-PRAGMA foreign_keys = ON;
+-- Keep this migration idempotent (IF NOT EXISTS). Databases created before
+-- schema versioning already have these tables and no schema_migrations; the
+-- runner adopts them by applying this file as a no-op and recording it.
+-- Later migrations need no such care: they run exactly once.
 
 CREATE TABLE IF NOT EXISTS repositories (
   repository_id   INTEGER PRIMARY KEY,

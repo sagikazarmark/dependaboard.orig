@@ -11,10 +11,9 @@ use thiserror::Error;
 use tokio::sync::{Mutex, MutexGuard};
 
 mod filter;
+mod migrations;
 
 use filter::filter_sql;
-
-const MIGRATION: &str = include_str!("../../../migrations/0001_initial.sql");
 
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
@@ -81,9 +80,10 @@ impl LibSqlPrStore {
         Ok(store)
     }
 
+    /// Applies any schema migrations the database has not seen yet.
     pub async fn migrate(&self) -> Result<(), StoreError> {
         let connection = self.connection().await;
-        connection.execute_batch(MIGRATION).await?;
+        migrations::apply(&connection).await?;
         Ok(())
     }
 
@@ -221,25 +221,16 @@ impl PrStore for LibSqlPrStore {
         let connection = self.connection().await;
         let now = unix_seconds();
         let (where_sql, params) = filter_sql(filter, None, now)?;
-        let total = scalar_u64(
-            &connection,
-            &format!("SELECT COUNT(*) FROM pull_requests p {where_sql}"),
-            params,
-        )
-        .await?;
+        let total = scalar_u64(&connection, &count_sql(&where_sql), params).await?;
 
         let cursor = page.after.as_deref().map(PageCursor::decode).transpose()?;
         let (page_where, mut page_params) = filter_sql(filter, cursor.as_ref(), now)?;
         let limit = page.normalized_limit() as usize;
         let limit_index = page_params.len() + 1;
         page_params.push(integer((limit + 1) as u64)?);
-        let sql = format!(
-            "{} {} ORDER BY p.updated_at DESC, p.id DESC LIMIT ?{}",
-            select_pr_sql(),
-            page_where,
-            limit_index
-        );
-        let mut query_rows = connection.query(&sql, page_params).await?;
+        let mut query_rows = connection
+            .query(&page_sql(&page_where, limit_index), page_params)
+            .await?;
         let mut rows = Vec::with_capacity(limit + 1);
         while let Some(row) = query_rows.next().await? {
             rows.push(pr_from_row(row)?);
@@ -349,6 +340,20 @@ fn select_pr_sql() -> &'static str {
         p.labels, p.created_at, p.updated_at, p.synced_at
        FROM pull_requests p
        JOIN repositories r ON r.repository_id = p.repository_id"#
+}
+
+/// The dashboard's total for a `WHERE` clause from [`filter_sql`].
+fn count_sql(where_sql: &str) -> String {
+    format!("SELECT COUNT(*) FROM pull_requests p {where_sql}")
+}
+
+/// One keyset page for a `WHERE` clause from [`filter_sql`]; the limit binds
+/// as parameter `limit_index`.
+fn page_sql(where_sql: &str, limit_index: usize) -> String {
+    format!(
+        "{} {where_sql} ORDER BY p.updated_at DESC, p.id DESC LIMIT ?{limit_index}",
+        select_pr_sql()
+    )
 }
 
 fn pr_from_row(row: Row) -> Result<PrRecord, StoreError> {
@@ -877,6 +882,93 @@ mod tests {
         assert_eq!(result.total, 1);
     }
 
+    fn grouped(repository_id: u64, number: u64, names: &[&str]) -> PrRecord {
+        let mut record = pr(repository_id, number, 10);
+        record.dependency = None;
+        record.dependencies = names
+            .iter()
+            .map(|name| DependencyUpdate {
+                name: (*name).to_owned(),
+                from_version: None,
+                to_version: None,
+                update_type: UpdateType::Patch,
+            })
+            .collect();
+        record
+    }
+
+    #[tokio::test]
+    async fn dependency_filter_ignores_case_for_single_and_grouped_updates() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        let mut single = pr(1, 1, 10);
+        single.dependency = Some("Serde".to_owned());
+        store.upsert_pr(&single).await.unwrap();
+        store
+            .upsert_pr(&grouped(1, 2, &["Tokio", "hyper"]))
+            .await
+            .unwrap();
+        let mut other = pr(1, 3, 10);
+        other.dependency = Some("HYPER".to_owned());
+        store.upsert_pr(&other).await.unwrap();
+
+        for (dependency, expected) in [
+            ("serde", vec![1]),
+            ("TOKIO", vec![2]),
+            ("Hyper", vec![3, 2]),
+        ] {
+            let result = store
+                .list_prs(
+                    &PrFilter {
+                        dependency: Some(dependency.to_owned()),
+                        ..Default::default()
+                    },
+                    Page::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+                expected,
+                "dependency {dependency:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_dependency_filter_is_served_by_its_index() {
+        let (_directory, store) = test_store().await;
+        let filter = PrFilter {
+            dependency: Some("serde".to_owned()),
+            ..Default::default()
+        };
+        let (where_sql, _) = filter_sql(&filter, None, unix_seconds()).unwrap();
+        let connection = store.connection().await;
+
+        for sql in [count_sql(&where_sql), page_sql(&where_sql, 2)] {
+            let mut rows = connection
+                .query(&format!("EXPLAIN QUERY PLAN {sql}"), ())
+                .await
+                .unwrap();
+            let mut plan = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                plan.push(row.get::<String>(3).unwrap());
+            }
+
+            // Both OR branches are index searches, so no step reads every
+            // pull request.
+            assert!(
+                plan.iter()
+                    .any(|step| step.contains("USING INDEX idx_pr_dependency")),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN p")),
+                "{plan:#?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn label_facets_are_ranked_by_count_then_name() {
         let (_directory, store) = test_store().await;
@@ -1104,6 +1196,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_second_row_for_the_same_repository_and_number_is_rejected() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 7, 10)).await.unwrap();
+        // The id is derived from (repository_id, number), so a row that
+        // disagrees with its own id would be a second row for the same PR.
+        let mut rogue = pr(1, 7, 10);
+        rogue.id = "rogue".to_owned();
+
+        let error = store.upsert_pr(&rogue).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "UNIQUE constraint failed: pull_requests.repository_id, pull_requests.number"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            store.get_pr(&PrKey::new(1, 7)).await.unwrap(),
+            Some(pr(1, 7, 10))
+        );
+    }
+
+    #[tokio::test]
     async fn retain_guards_concurrent_rows_and_repo_delete_cascades() {
         let (_directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
@@ -1148,6 +1264,30 @@ mod tests {
         transaction.commit().await.unwrap();
 
         write.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connecting_to_a_current_database_does_not_wait_for_another_writer() {
+        let (directory, _store) = test_store().await;
+        // The other process is mid-write for longer than the busy timeout.
+        // A start-up that only needs to read the schema version must not
+        // queue behind it, let alone fail with SQLITE_BUSY.
+        let other_process = sidecar(&directory).await;
+        let _transaction = other_process
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        LibSqlPrStore::connect(&StoreConfig::local(database_path(&directory)))
+            .await
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "connect waited {:?} for the other writer",
+            started.elapsed()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
