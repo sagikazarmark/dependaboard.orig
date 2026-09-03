@@ -66,10 +66,11 @@ async fn main() {
     let dashboard = axum::Router::new()
         .serve_dioxus_application(ServeConfig::new(), App)
         .layer(middleware::from_fn(require_dashboard_auth));
-    let router = axum::Router::new()
-        .route("/api/webhooks/github", post(github_webhook))
-        .with_state(webhook_verifier())
-        .merge(dashboard);
+    let webhooks = webhook_router(WebhookState {
+        verifier: webhook_verifier(),
+        ingress: RestateIngress::from_env().expect("Restate ingress client should build"),
+    });
+    let router = webhooks.merge(dashboard);
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .expect("web listener should bind");
@@ -249,50 +250,109 @@ async fn store() -> Result<&'static LibSqlPrStore, ServerFnError> {
         .await
 }
 
+/// The Restate ingress this deployment enqueues work on.
+///
+/// Built once at startup and shared through router state, so the webhook
+/// route can be exercised against a stand-in ingress. The `#[server]`
+/// functions have no router state and go through [`RestateIngress::from_env`]
+/// on each call instead.
 #[cfg(feature = "server")]
-fn restate_client() -> Result<(reqwest::Client, String, Option<String>), String> {
-    let base = std::env::var("RESTATE_INGRESS_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned())
-        .trim_end_matches('/')
-        .to_owned();
-    let token = std::env::var("RESTATE_AUTH_TOKEN")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var("RESTATE_API_KEY")
-                .ok()
-                .filter(|value| !value.is_empty())
-        });
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|error| error.to_string())?;
-    Ok((client, base, token))
+#[derive(Clone)]
+struct RestateIngress {
+    client: reqwest::Client,
+    base: String,
+    token: Option<String>,
+}
+
+#[cfg(feature = "server")]
+impl RestateIngress {
+    fn from_env() -> Result<Self, String> {
+        let base = std::env::var("RESTATE_INGRESS_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned())
+            .trim_end_matches('/')
+            .to_owned();
+        let token = std::env::var("RESTATE_AUTH_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var("RESTATE_API_KEY")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            });
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            client,
+            base,
+            token,
+        })
+    }
+
+    /// Enqueues a one-way invocation, returning once Restate has accepted it.
+    ///
+    /// With an `idempotency_key`, Restate collapses repeats of the same key
+    /// into the original invocation instead of running the handler again.
+    async fn send<T: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        input: &T,
+        idempotency_key: Option<&str>,
+    ) -> Result<(), String> {
+        let mut request = self
+            .client
+            .post(format!("{}/restate/send/{path}", self.base))
+            .json(input);
+        if let Some(key) = idempotency_key {
+            request = request.header("idempotency-key", key);
+        }
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|error| error.to_string())?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        if status.as_u16() == 409
+            && path.starts_with("BulkAction/")
+            && detail.to_ascii_lowercase().contains("previously accepted")
+        {
+            return Ok(());
+        }
+        Err(format!("Restate returned {status}: {detail}"))
+    }
+
+    async fn call<R>(&self, path: &str) -> Result<R, String>
+    where
+        R: DeserializeOwned,
+    {
+        let mut request = self
+            .client
+            .post(format!("{}/restate/call/{path}", self.base));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|error| error.to_string())?;
+        let status = response.status();
+        let value = response
+            .json::<Value>()
+            .await
+            .map_err(|error| format!("Restate returned an invalid response: {error}"))?;
+        if !status.is_success() {
+            return Err(format!("Restate returned {status}: {value}"));
+        }
+        let output = value.get("output").cloned().unwrap_or(value);
+        serde_json::from_value(output).map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(feature = "server")]
 async fn restate_send<T: Serialize + ?Sized>(path: &str, input: &T) -> Result<(), String> {
-    let (client, base, token) = restate_client()?;
-    let mut request = client
-        .post(format!("{base}/restate/send/{path}"))
-        .json(input);
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
-    let response = request.send().await.map_err(|error| error.to_string())?;
-    if response.status().is_success() {
-        return Ok(());
-    }
-    let status = response.status();
-    let detail = response.text().await.unwrap_or_default();
-    if status.as_u16() == 409
-        && path.starts_with("BulkAction/")
-        && detail.to_ascii_lowercase().contains("previously accepted")
-    {
-        return Ok(());
-    }
-    Err(format!("Restate returned {status}: {detail}"))
+    RestateIngress::from_env()?.send(path, input, None).await
 }
 
 #[cfg(feature = "server")]
@@ -300,35 +360,7 @@ async fn restate_call<R>(path: &str) -> Result<R, String>
 where
     R: DeserializeOwned,
 {
-    let (client, base, token) = restate_client()?;
-    restate_call_with_client(&client, &base, token.as_deref(), path).await
-}
-
-#[cfg(feature = "server")]
-async fn restate_call_with_client<R>(
-    client: &reqwest::Client,
-    base: &str,
-    token: Option<&str>,
-    path: &str,
-) -> Result<R, String>
-where
-    R: DeserializeOwned,
-{
-    let mut request = client.post(format!("{base}/restate/call/{path}"));
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
-    let response = request.send().await.map_err(|error| error.to_string())?;
-    let status = response.status();
-    let value = response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("Restate returned an invalid response: {error}"))?;
-    if !status.is_success() {
-        return Err(format!("Restate returned {status}: {value}"));
-    }
-    let output = value.get("output").cloned().unwrap_or(value);
-    serde_json::from_value(output).map_err(|error| error.to_string())
+    RestateIngress::from_env()?.call(path).await
 }
 
 /// Builds the webhook verifier once, so a missing secret fails at startup
@@ -345,12 +377,26 @@ fn webhook_verifier() -> Verifier {
 }
 
 #[cfg(feature = "server")]
+#[derive(Clone)]
+struct WebhookState {
+    verifier: Verifier,
+    ingress: RestateIngress,
+}
+
+#[cfg(feature = "server")]
+fn webhook_router(state: WebhookState) -> axum::Router {
+    axum::Router::new()
+        .route("/api/webhooks/github", post(github_webhook))
+        .with_state(state)
+}
+
+#[cfg(feature = "server")]
 async fn github_webhook(
-    State(verifier): State<Verifier>,
+    State(state): State<WebhookState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let envelope = match Envelope::from_signed_parts(&verifier, &headers, body) {
+    let envelope = match Envelope::from_signed_parts(&state.verifier, &headers, body) {
         Ok(envelope) => envelope,
         Err(error) => {
             tracing::warn!(%error, "GitHub webhook delivery was rejected");
@@ -358,18 +404,26 @@ async fn github_webhook(
             return (status, "webhook delivery was rejected").into_response();
         }
     };
-    // GitHub pings a new App before any real delivery; nothing downstream routes it.
-    if envelope.kind == EventKind::Ping {
-        return StatusCode::NO_CONTENT.into_response();
-    }
-    let event = match routed_event(&envelope) {
-        Ok(event) => event,
+    let event = match route_delivery(&envelope) {
+        Ok(Disposition::Forward(event)) => event,
+        Ok(Disposition::Acknowledge) => return StatusCode::NO_CONTENT.into_response(),
         Err(error) => {
             tracing::warn!(%error, event = %envelope.kind, "GitHub webhook payload was rejected");
             return (StatusCode::BAD_REQUEST, "invalid GitHub webhook payload").into_response();
         }
     };
-    match restate_send("WebhookIngress/dispatch", &event).await {
+    // A redelivery from the App's delivery log replays the request under the
+    // same delivery id, so it is the key that lets Restate fold the replay
+    // into the dispatch it already accepted.
+    match state
+        .ingress
+        .send(
+            "WebhookIngress/dispatch",
+            &event,
+            Some(&envelope.delivery_id),
+        )
+        .await
+    {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => {
             tracing::error!(%error, event = %envelope.kind, "Restate rejected webhook");
@@ -433,13 +487,31 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
-/// Reduces a verified envelope to the routing fields `WebhookIngress` dispatches on.
+/// What the edge does with a verified delivery.
+#[cfg(feature = "server")]
+#[derive(Debug)]
+enum Disposition {
+    /// `WebhookIngress::dispatch` has an arm for this kind; forward it.
+    ///
+    /// Boxed so the whole enum is not sized by this one large variant.
+    Forward(Box<WebhookEvent>),
+    /// Nothing downstream routes this kind, so a forward would only buy an
+    /// invocation that drops the event. Acknowledge it to GitHub and stop.
+    Acknowledge,
+}
+
+/// Decides what the edge does with a verified delivery: forward it, reduced
+/// to the routing fields `WebhookIngress` dispatches on, or acknowledge it.
+///
+/// The kinds matched here are the edge's copy of the dispatcher's routing
+/// table and must stay in step with `WebhookIngress::dispatch`: a kind added
+/// there but not here is acknowledged at the edge and never reaches Restate.
 ///
 /// The envelope already carries the installation and repository probe, so only
 /// the per-event fields — PR number, head SHA, and the PRs a check belongs to —
 /// need parsing out of the payload.
 #[cfg(feature = "server")]
-fn routed_event(envelope: &Envelope) -> Result<WebhookEvent, String> {
+fn route_delivery(envelope: &Envelope) -> Result<Disposition, String> {
     let (number, sha, pull_requests) = match envelope.kind {
         EventKind::Installation | EventKind::InstallationRepositories => {
             if envelope.common.installation_id.is_none() {
@@ -469,7 +541,7 @@ fn routed_event(envelope: &Envelope) -> Result<WebhookEvent, String> {
             let payload: StatusRouting = parse_payload(envelope)?;
             (None, Some(payload.sha), Vec::new())
         }
-        _ => (None, None, Vec::new()),
+        _ => return Ok(Disposition::Acknowledge),
     };
     let repository = match envelope.kind {
         EventKind::PullRequest
@@ -484,7 +556,7 @@ fn routed_event(envelope: &Envelope) -> Result<WebhookEvent, String> {
         ),
         _ => envelope.common.repository.as_ref(),
     };
-    Ok(WebhookEvent {
+    Ok(Disposition::Forward(Box::new(WebhookEvent {
         event: envelope.kind.as_str().to_owned(),
         action: envelope
             .action
@@ -498,7 +570,7 @@ fn routed_event(envelope: &Envelope) -> Result<WebhookEvent, String> {
         sha,
         pull_requests,
         sync_completion_id: None,
-    })
+    })))
 }
 
 #[cfg(feature = "server")]
@@ -1686,6 +1758,9 @@ mod wasm_tests {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
     use dependaboard_core::Mergeable;
 
     use super::*;
@@ -1871,29 +1946,16 @@ mod tests {
             )
         }
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                axum::Router::new().route(
-                    "/restate/call/PullRequest/7%239/status",
-                    post(restate_ingress),
-                ),
-            )
-            .await
-            .unwrap();
-        });
-
-        let result = restate_call_with_client::<Option<PrState>>(
-            &reqwest::Client::new(),
-            &format!("http://{address}"),
-            None,
-            "PullRequest/7%239/status",
-        )
+        let address = serve(axum::Router::new().route(
+            "/restate/call/PullRequest/7%239/status",
+            post(restate_ingress),
+        ))
         .await;
 
-        server.abort();
+        let result = ingress_at(address)
+            .call::<Option<PrState>>("PullRequest/7%239/status")
+            .await;
+
         assert_eq!(result.unwrap(), None);
     }
 
@@ -1921,7 +1983,10 @@ mod tests {
         .expect("a correctly signed delivery is accepted");
         assert_eq!(envelope.kind, EventKind::Installation);
         assert_eq!(envelope.common.installation_id, Some(42));
-        assert_eq!(routed_event(&envelope).unwrap().installation_id, Some(42));
+        let Ok(Disposition::Forward(event)) = route_delivery(&envelope) else {
+            panic!("a verified installation delivery is forwarded");
+        };
+        assert_eq!(event.installation_id, Some(42));
 
         let mismatched = Envelope::from_signed(
             &Verifier::new(Secret::new("wrong")),
@@ -1944,6 +2009,148 @@ mod tests {
             ResponseStatus::for_receive_error(&malformed),
             ResponseStatus::BadRequest
         );
+    }
+
+    #[tokio::test]
+    async fn webhook_forwards_carry_the_delivery_id_as_the_idempotency_key() {
+        // openssl dgst -sha256 -hmac secret, over exactly the bytes below.
+        const BODY: &[u8] = br#"{"action":"synchronize","number":9,"pull_request":{"number":9,"head":{"sha":"abc123"}},"repository":{"id":7,"name":"api","full_name":"acme/api","owner":{"login":"acme"}},"installation":{"id":42}}"#;
+        const SIGNATURE: &str =
+            "sha256=842b71b366f883f03823c869358f15ebccdafeb019fe56b98e5b68824c83617e";
+        const DELIVERY_ID: &str = "72d3162e-cc78-11e3-81ab-4c9367dc0958";
+
+        let (ingress, forwarded) = fake_restate_ingress().await;
+        let webhook = serve(webhook_router(WebhookState {
+            verifier: Verifier::new(Secret::new("secret")),
+            ingress,
+        }))
+        .await;
+
+        // A delivery that timed out at GitHub's 10 s is marked failed even if
+        // the forward was accepted, and redelivering it replays the request
+        // under the same delivery id. Both forwards must reach Restate under
+        // that key so Restate can collapse them into one dispatch invocation.
+        for _ in 0..2 {
+            let response = deliver(webhook, "pull_request", DELIVERY_ID, SIGNATURE, BODY).await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+
+        let forwarded = forwarded.lock().unwrap();
+        assert_eq!(forwarded.len(), 2);
+        for forward in forwarded.iter() {
+            assert_eq!(forward.path, "/restate/send/WebhookIngress/dispatch");
+            assert_eq!(forward.idempotency_key.as_deref(), Some(DELIVERY_ID));
+            let event: WebhookEvent = serde_json::from_slice(&forward.body).unwrap();
+            assert_eq!(event.event, "pull_request");
+            assert_eq!(event.action.as_deref(), Some("synchronize"));
+            assert_eq!(event.installation_id, Some(42));
+            assert_eq!(event.repository_id, Some(7));
+            assert_eq!(event.number, Some(9));
+            assert_eq!(event.sha.as_deref(), Some("abc123"));
+        }
+    }
+
+    #[tokio::test]
+    async fn unroutable_webhook_kinds_are_acknowledged_without_reaching_restate() {
+        // openssl dgst -sha256 -hmac secret, over exactly the bytes below.
+        const BODY: &[u8] = br#"{"ref":"refs/heads/main","repository":{"id":7,"name":"api","full_name":"acme/api","owner":{"login":"acme"}},"installation":{"id":42}}"#;
+        const SIGNATURE: &str =
+            "sha256=a95cdd79c4af2a80adfd8e387959a62f14bb707da7ee6c1172137bf2d0e397c4";
+
+        let (ingress, forwarded) = fake_restate_ingress().await;
+        let webhook = serve(webhook_router(WebhookState {
+            verifier: Verifier::new(Secret::new("secret")),
+            ingress,
+        }))
+        .await;
+
+        let response = deliver(
+            webhook,
+            "push",
+            "9b6c1f52-6e2a-4a0e-9d0f-2c4b8a1e7f30",
+            SIGNATURE,
+            BODY,
+        )
+        .await;
+
+        // GitHub only wants a 2xx so the delivery does not show up as failed;
+        // Restate should never hear about it.
+        assert!(response.status().is_success(), "{}", response.status());
+        assert!(forwarded.lock().unwrap().is_empty());
+    }
+
+    /// What the fake Restate ingress saw for one `/restate/send` request.
+    struct ForwardedSend {
+        path: String,
+        idempotency_key: Option<String>,
+        body: Bytes,
+    }
+
+    /// Serves a stand-in for the Restate ingress that accepts every send and
+    /// records what it was asked to enqueue.
+    async fn fake_restate_ingress() -> (RestateIngress, Arc<Mutex<Vec<ForwardedSend>>>) {
+        let forwarded = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&forwarded);
+        let router = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+                let recorder = Arc::clone(&recorder);
+                async move {
+                    recorder.lock().unwrap().push(ForwardedSend {
+                        path: uri.path().to_owned(),
+                        idempotency_key: headers
+                            .get("idempotency-key")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned),
+                        body,
+                    });
+                    axum::Json(serde_json::json!({
+                        "invocationId": "inv_1aiqX0vFEFNH1Umgre58JiCLgHfTtztYK5",
+                        "status": "Accepted"
+                    }))
+                }
+            },
+        );
+        let address = serve(router).await;
+        (ingress_at(address), forwarded)
+    }
+
+    fn ingress_at(address: SocketAddr) -> RestateIngress {
+        RestateIngress {
+            client: reqwest::Client::new(),
+            base: format!("http://{address}"),
+            token: None,
+        }
+    }
+
+    /// Serves `router` on a loopback port for the rest of the test; the task
+    /// is dropped with the test runtime.
+    async fn serve(router: axum::Router) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        address
+    }
+
+    /// Posts a delivery the way GitHub does: signed, typed, and identified.
+    async fn deliver(
+        webhook: SocketAddr,
+        event_name: &str,
+        delivery_id: &str,
+        signature: &str,
+        body: &'static [u8],
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("http://{webhook}/api/webhooks/github"))
+            .header("x-hub-signature-256", signature)
+            .header("x-github-delivery", delivery_id)
+            .header("x-github-event", event_name)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -2054,7 +2261,7 @@ mod tests {
         // Authenticated but unroutable: the payload verified, yet nothing
         // downstream can address a pull request or repository with it.
         assert!(
-            routed_event(&envelope(
+            route_delivery(&envelope(
                 "pull_request",
                 Some("opened"),
                 true,
@@ -2069,19 +2276,23 @@ mod tests {
             &serde_json::json!({ "action": "created" }),
         );
         anonymous.common.installation_id = None;
-        assert!(routed_event(&anonymous).is_err());
+        assert!(route_delivery(&anonymous).is_err());
 
         let mut check_run = serde_json::json!({
             "action": "completed",
             "check_run": { "head_sha": "abc123", "pull_requests": [{}] }
         });
-        assert!(routed_event(&envelope("check_run", Some("completed"), true, &check_run)).is_err());
+        assert!(
+            route_delivery(&envelope("check_run", Some("completed"), true, &check_run)).is_err()
+        );
         check_run["check_run"]["pull_requests"] = serde_json::json!([]);
         check_run["check_run"]
             .as_object_mut()
             .unwrap()
             .remove("head_sha");
-        assert!(routed_event(&envelope("check_run", Some("completed"), true, &check_run)).is_err());
+        assert!(
+            route_delivery(&envelope("check_run", Some("completed"), true, &check_run)).is_err()
+        );
 
         let pull_request = serde_json::json!({
             "action": "opened",
@@ -2089,7 +2300,7 @@ mod tests {
             "pull_request": { "number": 9, "head": { "sha": "abc123" } }
         });
         assert!(
-            routed_event(&envelope(
+            route_delivery(&envelope(
                 "pull_request",
                 Some("opened"),
                 false,
@@ -2097,6 +2308,36 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn kinds_the_dispatcher_does_not_route_are_acknowledged_at_the_edge() {
+        // Verified deliveries whose kind has no arm in `WebhookIngress::dispatch`
+        // are acknowledged here instead of costing a Restate invocation that
+        // would only drop them. `ping` is the everyday case: GitHub sends it
+        // when the App is installed, before any real delivery.
+        for (event_name, payload) in [
+            (
+                "ping",
+                serde_json::json!({ "zen": "Keep it logically awesome." }),
+            ),
+            ("push", serde_json::json!({ "ref": "refs/heads/main" })),
+            (
+                "issue_comment",
+                serde_json::json!({ "action": "created", "issue": { "number": 9 } }),
+            ),
+            (
+                "some_future_event",
+                serde_json::json!({ "action": "created" }),
+            ),
+        ] {
+            let disposition = route_delivery(&envelope(event_name, None, true, &payload))
+                .unwrap_or_else(|error| panic!("{event_name}: {error}"));
+            assert!(
+                matches!(disposition, Disposition::Acknowledge),
+                "{event_name} should be acknowledged without a forward"
+            );
+        }
     }
 
     #[test]
@@ -2143,7 +2384,10 @@ mod tests {
         repository: bool,
         payload: Value,
     ) -> WebhookEvent {
-        routed_event(&envelope(event_name, action, repository, &payload)).unwrap()
+        match route_delivery(&envelope(event_name, action, repository, &payload)).unwrap() {
+            Disposition::Forward(event) => *event,
+            Disposition::Acknowledge => panic!("{event_name} should be forwarded"),
+        }
     }
 
     /// Builds the synthetic envelope a verified delivery would produce.

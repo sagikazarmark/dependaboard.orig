@@ -1011,6 +1011,12 @@ impl SchedulerIngress {
 
 #[restate_sdk::service]
 impl WebhookIngress {
+    /// Routes a verified GitHub delivery to the object that owns it.
+    ///
+    /// The web edge acknowledges kinds with no arm here before they reach
+    /// Restate, and its copy of this table (`route_delivery` in the web app)
+    /// must be kept in step: adding a kind below without adding it there
+    /// means the edge silently swallows it.
     #[handler]
     async fn dispatch(&self, ctx: Context<'_>, event: Json<WebhookEvent>) -> HandlerResult<()> {
         let event = event.into_inner();
@@ -1039,6 +1045,9 @@ impl WebhookIngress {
                         .send();
                 }
             }
+            // Kinds the edge acknowledges never get here. What does is a routed
+            // kind whose action has no arm above: `check_suite.requested`,
+            // `check_run.rerequested`, `pull_request.assigned`, and the like.
             _ => {}
         }
         Ok(())

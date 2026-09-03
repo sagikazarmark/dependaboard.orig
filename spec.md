@@ -518,6 +518,25 @@ sweep, an hour later. If the forward fails, return non-2xx and let it show up in
 App's delivery log. (This is a further argument for keeping reconciliation authoritative:
 webhook delivery is best-effort by design.)
 
+**The delivery id is the idempotency key.** GitHub never redelivers on its own, but a
+delivery that timed out at 10 s is marked failed even when the forward had already been
+accepted by Restate, and the fix for a failed delivery — **Redeliver** in the App's
+delivery log, or a script driving the redelivery API — replays the request under the
+same `X-GitHub-Delivery`. Every forward to `WebhookIngress.dispatch` sends that id as
+Restate's `idempotency-key` header, so the replay attaches to the dispatch Restate
+already accepted instead of creating a second one. Most downstream handlers would absorb
+a duplicate anyway, but a duplicated `installation.created` re-enumerates every
+repository, which is what this prevents. Dashboard-originated sends are not GitHub
+deliveries and carry no key; they are minted fresh per click and dedup by other means
+(the batch id as workflow key, the debounce in `PullRequest.sync`).
+
+**Unroutable kinds stop at the edge.** The edge keeps a copy of dispatch's routing table
+— the six event kinds above — and answers anything else (`ping`, `push`,
+`issue_comment`, kinds GitHub adds later) with a 2xx before Restate is involved, since
+the only thing the invocation would do is drop the event. The cost of the copy is that
+the two tables can drift: a kind added to dispatch without being added to the edge is
+acknowledged and never forwarded. Both sites carry a comment pointing at the other.
+
 **One Restate entry point, not four.** An earlier draft had the webhook Worker calling
 `PullRequest.sync` and `PullRequest.closed` directly — which contradicted §3b, where
 those same handlers were marked private. Routing everything through a single
