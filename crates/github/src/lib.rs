@@ -1,15 +1,11 @@
-use std::{
-    collections::HashMap,
-    env, fs,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, env, fs, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use dependaboard_core::{
     CheckSignal, CommandRequest, DEPENDABOT_LOGIN, GithubErrorResponse, MergeMethod, MergeRequest,
     Mergeable, PrKey, PrRecord, RepoRecord, SyncRequest, UpdateBranchRequest, UserId,
     combined_status_signal, highest_update_type, parse_dependabot_metadata, rollup_checks,
+    unix_seconds,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::{Method, Response, StatusCode};
@@ -856,13 +852,6 @@ fn parse_timestamp(value: &str) -> Result<u64, GithubError> {
         .timestamp();
     u64::try_from(timestamp)
         .map_err(|_| GithubError::Protocol("GitHub returned a timestamp before 1970".to_owned()))
-}
-
-fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[derive(Debug, Error)]

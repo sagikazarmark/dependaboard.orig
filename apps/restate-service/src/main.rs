@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -10,7 +10,7 @@ use dependaboard_core::{
     CommandRequest, DASHBOARD_SYNC_ACTION, DependabotCommand, GithubErrorResponse,
     MAX_BATCH_TARGETS, MergeRequest, Operation, PrKey, PrState, RejectReason, RepoRecord,
     SyncRequest, SyncShaRequest, TargetProgressState, UpdateBranchRequest, WebhookEvent,
-    classify_github_error, valid_batch_id,
+    classify_github_error, unix_seconds, valid_batch_id,
 };
 use dependaboard_github::{GithubApi, GithubClient, GithubConfig, GithubError};
 use dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig, StoreError, StoreErrorClass};
@@ -1344,13 +1344,6 @@ fn validate_batch_request(batch_id: &str, request: &BulkRequest) -> HandlerResul
 
 fn short_sha(value: &str) -> &str {
     value.get(..7).unwrap_or(value)
-}
-
-fn unix_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[derive(Debug, Error)]

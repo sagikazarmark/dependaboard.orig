@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use dependaboard_core::{
     BatchProgress, BulkActionKind, CheckStatus, DashboardPage, LabelFacet, Page, PrFilter,
-    PrRecord, PrState, PrTarget, TargetProgressState, UpdateType, new_batch_id,
+    PrRecord, PrState, PrTarget, TargetProgressState, UpdateType, new_batch_id, unix_seconds,
 };
 use dioxus::prelude::*;
 
@@ -1177,7 +1177,7 @@ fn PrRow(
         .clone()
         .unwrap_or_else(|| format!("{} dependencies", row.dependencies.len()));
     let versions = version_label(row.from_version.as_deref(), row.to_version.as_deref());
-    let stale = unix_seconds().saturating_sub(row.synced_at) > 45 * 60;
+    let stale = row.is_stale(unix_seconds());
     let row_class = match (checked, stale) {
         (true, true) => "pr-grid pr-row selected stale",
         (true, false) => "pr-grid pr-row selected",
@@ -1247,7 +1247,7 @@ fn DetailDrawer(
     onaction: EventHandler<PendingAction>,
     onsync: EventHandler<Result<Option<PrRecord>, String>>,
 ) -> Element {
-    let stale = unix_seconds().saturating_sub(row.synced_at) > 45 * 60;
+    let stale = row.is_stale(unix_seconds());
     let mut syncing = use_signal(|| false);
     let mut sync_queued = use_signal(|| false);
     let mut status = use_resource({
@@ -1627,13 +1627,6 @@ fn relative_time(timestamp: u64) -> String {
         86_400..=604_799 => format!("{}d", seconds / 86_400),
         _ => format!("{}w", seconds / 604_800),
     }
-}
-
-fn unix_seconds() -> u64 {
-    web_time::SystemTime::now()
-        .duration_since(web_time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 async fn wait_one_second() {

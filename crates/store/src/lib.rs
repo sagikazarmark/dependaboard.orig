@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time:
 use async_trait::async_trait;
 use dependaboard_core::{
     CheckStatus, CursorError, DashboardPage, FacetCounts, LabelFacet, Mergeable, Page, PageCursor,
-    PrFilter, PrKey, PrRecord, RepoRecord, UpdateType,
+    PrFilter, PrKey, PrRecord, RepoRecord, STALE_AFTER, UpdateType, unix_seconds,
 };
 use libsql::{Builder, Database, Row, Transaction, Value};
 use thiserror::Error;
@@ -457,7 +457,7 @@ fn filter_sql(filter: &PrFilter) -> Result<(String, Vec<Value>), StoreError> {
         ));
     }
     if filter.needs_attention {
-        let stale_before = unix_seconds().saturating_sub(45 * 60);
+        let stale_before = unix_seconds().saturating_sub(STALE_AFTER.as_secs());
         let stale_binding = bind(integer(stale_before)?);
         let conflicting = Mergeable::ALL
             .into_iter()
@@ -691,13 +691,6 @@ fn integer(value: u64) -> Result<Value, StoreError> {
 
 fn unsigned(value: i64) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_| StoreError::IntegerOverflow)
-}
-
-fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 #[derive(Debug, Error)]

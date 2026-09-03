@@ -1,4 +1,6 @@
-use std::{cmp::Ordering, collections::BTreeMap, fmt, str::FromStr, sync::LazyLock};
+use std::{
+    cmp::Ordering, collections::BTreeMap, fmt, str::FromStr, sync::LazyLock, time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use regex::Regex;
@@ -11,6 +13,19 @@ pub const DEPENDABOT_LOGIN: &str = "dependabot[bot]";
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
 pub const MAX_PAGE_SIZE: u32 = 100;
 pub const MAX_BATCH_TARGETS: usize = 100;
+/// How long a projected row is trusted after we last fetched it (`synced_at`).
+/// Older rows are flagged stale in the UI and count as "needs attention".
+/// Shorter than the hourly reconcile sweep so a missed sweep is visible.
+pub const STALE_AFTER: Duration = Duration::from_secs(45 * 60);
+
+/// Seconds since the Unix epoch on the host clock. Uses `web_time` so the same
+/// helper compiles for the browser (wasm32) and native targets.
+pub fn unix_seconds() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -492,6 +507,12 @@ pub struct PrRecord {
 impl PrRecord {
     pub fn key(&self) -> PrKey {
         PrKey::new(self.repository_id, self.number)
+    }
+
+    /// Whether this projection was last fetched more than [`STALE_AFTER`]
+    /// before `now` (Unix seconds). A `now` earlier than `synced_at` is fresh.
+    pub fn is_stale(&self, now: u64) -> bool {
+        now.saturating_sub(self.synced_at) > STALE_AFTER.as_secs()
     }
 }
 
@@ -989,13 +1010,6 @@ pub fn classify_github_error(
     }
 }
 
-fn unix_seconds() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,6 +1197,41 @@ mod tests {
                 "{state:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_projection_is_stale_once_it_is_more_than_forty_five_minutes_old() {
+        // The dashboard only trusts a row for 45 minutes after we last fetched
+        // it (`synced_at`); the boundary itself is still fresh, one second
+        // past it is stale, and a clock that runs behind never reports stale.
+        let synced_at = 1_700_000_000;
+        let record = PrRecord {
+            id: "7#9".to_owned(),
+            repository_id: 7,
+            installation_id: 1,
+            owner: "acme".to_owned(),
+            repo: "api".to_owned(),
+            number: 9,
+            title: "Bump serde".to_owned(),
+            html_url: "https://github.com/acme/api/pull/9".to_owned(),
+            dependency: None,
+            from_version: None,
+            to_version: None,
+            dependencies: Vec::new(),
+            update_type: UpdateType::Unknown,
+            head_sha: "abc123".to_owned(),
+            check_status: CheckStatus::None,
+            mergeable: Mergeable::Unknown,
+            labels: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+            synced_at,
+        };
+
+        assert!(!record.is_stale(synced_at));
+        assert!(!record.is_stale(synced_at + 2_700));
+        assert!(record.is_stale(synced_at + 2_701));
+        assert!(!record.is_stale(synced_at - 1));
     }
 
     #[test]

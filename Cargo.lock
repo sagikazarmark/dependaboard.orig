@@ -871,6 +871,7 @@ dependencies = [
  "serde_yml",
  "thiserror 2.0.20",
  "uuid",
+ "web-time",
 ]
 
 [[package]]
@@ -944,7 +945,6 @@ dependencies = [
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-test",
- "web-time",
 ]
 
 [[package]]
