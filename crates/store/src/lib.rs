@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time:
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    CheckStatus, CursorError, DashboardPage, FacetCounts, Mergeable, Page, PageCursor, PrFilter,
-    PrKey, PrRecord, RepoRecord, UpdateType,
+    CheckStatus, CursorError, DashboardPage, FacetCounts, LabelFacet, Mergeable, Page, PageCursor,
+    PrFilter, PrKey, PrRecord, RepoRecord, UpdateType,
 };
 use libsql::{Builder, Database, Row, Transaction, Value};
 use thiserror::Error;
@@ -499,32 +499,60 @@ async fn list_repositories(connection: &libsql::Connection) -> Result<Vec<RepoRe
 
 async fn facet_counts(connection: &libsql::Connection) -> Result<FacetCounts, StoreError> {
     Ok(FacetCounts {
-        checks: grouped_counts(
+        checks: enum_counts(
             connection,
             "SELECT check_status, COUNT(*) FROM pull_requests GROUP BY check_status",
         )
         .await?,
-        update_types: grouped_counts(
+        update_types: enum_counts(
             connection,
             "SELECT update_type, COUNT(*) FROM pull_requests GROUP BY update_type",
         )
         .await?,
+        // Ties fall back to case-insensitive name order; the GROUP BY stays
+        // exact because the label filter matches labels byte for byte.
         labels: grouped_counts(
             connection,
-            "SELECT value, COUNT(*) FROM pull_requests, json_each(labels) GROUP BY value ORDER BY COUNT(*) DESC, value",
+            "SELECT value, COUNT(*) FROM pull_requests, json_each(labels) GROUP BY value ORDER BY COUNT(*) DESC, value COLLATE NOCASE",
         )
-        .await?,
+        .await?
+        .into_iter()
+        .map(|(label, count)| LabelFacet { label, count })
+        .collect(),
     })
 }
 
+/// Groups by a column that persists an enum's `Display` form and keys the
+/// result by the parsed enum, so callers never see the raw text. Unrecognised
+/// text is corrupt data, exactly as it is when reading a row.
+async fn enum_counts<T>(
+    connection: &libsql::Connection,
+    sql: &str,
+) -> Result<BTreeMap<T, u64>, StoreError>
+where
+    T: FromStr + Ord,
+{
+    grouped_counts(connection, sql)
+        .await?
+        .into_iter()
+        .map(|(key, count)| {
+            T::from_str(&key)
+                .map(|key| (key, count))
+                .map_err(|_| StoreError::CorruptEnum(key))
+        })
+        .collect()
+}
+
+/// Runs a `SELECT key, COUNT(*)` query and returns the rows in the order the
+/// database produced them, so an `ORDER BY` in the query survives.
 async fn grouped_counts(
     connection: &libsql::Connection,
     sql: &str,
-) -> Result<BTreeMap<String, u64>, StoreError> {
+) -> Result<Vec<(String, u64)>, StoreError> {
     let mut rows = connection.query(sql, ()).await?;
-    let mut counts = BTreeMap::new();
+    let mut counts = Vec::new();
     while let Some(row) = rows.next().await? {
-        counts.insert(row.get(0)?, unsigned(row.get::<i64>(1)?)?);
+        counts.push((row.get(0)?, unsigned(row.get::<i64>(1)?)?));
     }
     Ok(counts)
 }
@@ -843,6 +871,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.total, 1);
+    }
+
+    #[tokio::test]
+    async fn label_facets_are_ranked_by_count_then_name() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        // Popularity puts the alphabetically last label first and the
+        // alphabetically first label last, so a key-sorted map cannot pass.
+        // `go` and `Security` tie, and byte order would put `S` before `g`,
+        // so the tie also checks that names compare case-insensitively.
+        let labelled = [
+            (1, vec!["rust", "dependencies"]),
+            (2, vec!["rust", "Security", "go"]),
+            (3, vec!["rust", "go"]),
+            (4, vec!["rust", "Security"]),
+        ];
+        for (number, labels) in labelled {
+            let mut record = pr(1, number, 10);
+            record.labels = labels.into_iter().map(str::to_owned).collect();
+            store.upsert_pr(&record).await.unwrap();
+        }
+
+        let result = store
+            .list_prs(&PrFilter::default(), Page::default())
+            .await
+            .unwrap();
+
+        let ranked = result
+            .facets
+            .labels
+            .iter()
+            .map(|facet| (facet.label.as_str(), facet.count))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ranked,
+            [("rust", 4), ("go", 2), ("Security", 2), ("dependencies", 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn check_and_update_type_facets_are_keyed_by_their_enums() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        for number in 1..=3 {
+            store.upsert_pr(&pr(1, number, 10)).await.unwrap();
+        }
+        let mut failing_major = pr(1, 4, 10);
+        failing_major.check_status = CheckStatus::Failure;
+        failing_major.update_type = UpdateType::Major;
+        store.upsert_pr(&failing_major).await.unwrap();
+
+        let result = store
+            .list_prs(&PrFilter::default(), Page::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.facets.checks,
+            BTreeMap::from([(CheckStatus::Success, 3), (CheckStatus::Failure, 1)])
+        );
+        assert_eq!(
+            result.facets.update_types,
+            BTreeMap::from([(UpdateType::Minor, 3), (UpdateType::Major, 1)])
+        );
     }
 
     #[tokio::test]

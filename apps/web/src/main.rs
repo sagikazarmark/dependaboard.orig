@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use dependaboard_core::{
-    BatchProgress, BulkActionKind, CheckStatus, DashboardPage, Page, PrFilter, PrRecord, PrState,
-    PrTarget, TargetProgressState, UpdateType, new_batch_id,
+    BatchProgress, BulkActionKind, CheckStatus, DashboardPage, LabelFacet, Page, PrFilter,
+    PrRecord, PrState, PrTarget, TargetProgressState, UpdateType, new_batch_id,
 };
 use dioxus::prelude::*;
 
@@ -831,7 +831,7 @@ fn Dashboard(mut dark: Signal<bool>) -> Element {
                         FacetButton {
                             key: "check-{status}",
                             label: status_label(status),
-                            count: facet_count(page.as_ref(), "check", &status.to_string()),
+                            count: page.as_ref().map_or(0, |page| page.facets.check_count(status)),
                             active: filter().check_statuses.contains(&status),
                             tone: status_class(status),
                             onclick: move |_| {
@@ -848,7 +848,7 @@ fn Dashboard(mut dark: Signal<bool>) -> Element {
                         FacetButton {
                             key: "type-{update_type}",
                             label: update_type.to_string(),
-                            count: facet_count(page.as_ref(), "type", &update_type.to_string()),
+                            count: page.as_ref().map_or(0, |page| page.facets.update_type_count(update_type)),
                             active: filter().update_types.contains(&update_type),
                             tone: update_class(update_type),
                             onclick: move |_| {
@@ -860,25 +860,13 @@ fn Dashboard(mut dark: Signal<bool>) -> Element {
                 }
 
                 FilterSection { title: "Labels" }
-                div { class: "label-facets",
-                    if let Some(page) = &page {
-                        for (label, count) in page.facets.labels.iter().take(8) {
-                            {
-                                let label_value = label.clone();
-                                let active = filter().labels.contains(label);
-                                rsx! {
-                                    button {
-                                        class: if active { "label-filter active" } else { "label-filter" },
-                                        onclick: move |_| {
-                                            toggle_value(&mut filter.write().labels, label_value.clone());
-                                            cursor.set(None);
-                                        },
-                                        "{label} " span { "{count}" }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                LabelFacets {
+                    labels: page.as_ref().map(|page| page.facets.labels.clone()).unwrap_or_default(),
+                    active: filter().labels,
+                    ontoggle: move |label| {
+                        toggle_value(&mut filter.write().labels, label);
+                        cursor.set(None);
+                    },
                 }
 
                 FilterSection { title: "Accounts & repositories" }
@@ -1098,6 +1086,37 @@ fn FacetButton(
             span { class: "facet-dot {tone}" }
             span { "{label}" }
             code { "{count}" }
+        }
+    }
+}
+
+/// How many of the ranked labels the sidebar shows before cutting off.
+const LABEL_FACET_LIMIT: usize = 8;
+
+/// The most common labels as chips. `labels` arrives already ranked by the
+/// store (descending count, then name) and is rendered in that order.
+#[component]
+fn LabelFacets(
+    labels: Vec<LabelFacet>,
+    active: Vec<String>,
+    ontoggle: EventHandler<String>,
+) -> Element {
+    rsx! {
+        div { class: "label-facets",
+            for facet in labels.into_iter().take(LABEL_FACET_LIMIT) {
+                {
+                    let is_active = active.contains(&facet.label);
+                    let label_value = facet.label.clone();
+                    rsx! {
+                        button {
+                            key: "label-{facet.label}",
+                            class: if is_active { "label-filter active" } else { "label-filter" },
+                            onclick: move |_| ontoggle.call(label_value.clone()),
+                            "{facet.label} " span { "{facet.count}" }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1544,16 +1563,6 @@ fn toggle_value<T: PartialEq>(values: &mut Vec<T>, value: T) {
     }
 }
 
-fn facet_count(page: Option<&DashboardPage>, facet: &str, key: &str) -> u64 {
-    page.and_then(|page| match facet {
-        "check" => page.facets.checks.get(key),
-        "type" => page.facets.update_types.get(key),
-        _ => None,
-    })
-    .copied()
-    .unwrap_or_default()
-}
-
 fn status_label(status: CheckStatus) -> &'static str {
     match status {
         CheckStatus::Success => "Passing",
@@ -1750,6 +1759,36 @@ mod tests {
         }
     }
 
+    fn LabelFacetsFixture() -> Element {
+        // Nine labels already ranked by the store, deliberately not in
+        // alphabetical order, so the component can only pass by keeping the
+        // sequence it was given and cutting it at eight.
+        let labels = [
+            ("rust", 9),
+            ("go", 7),
+            ("security", 7),
+            ("dependencies", 5),
+            ("python", 4),
+            ("java", 3),
+            ("javascript", 2),
+            ("blocked", 1),
+            ("actions", 1),
+        ]
+        .into_iter()
+        .map(|(label, count)| LabelFacet {
+            label: label.to_owned(),
+            count,
+        })
+        .collect();
+        rsx! {
+            LabelFacets {
+                labels,
+                active: vec!["go".to_owned()],
+                ontoggle: move |_| {},
+            }
+        }
+    }
+
     #[test]
     fn grouped_row_does_not_repeat_a_long_title_as_its_version() {
         let mut dom = VirtualDom::new(GroupedRowFixture);
@@ -1768,6 +1807,34 @@ mod tests {
 
         assert!(
             html.contains(r#"<span class="status-badge">has_hooks</span>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn label_facets_keep_the_store_ranking_and_show_the_top_eight() {
+        let mut dom = VirtualDom::new(LabelFacetsFixture);
+        dom.rebuild_in_place();
+        let html = dioxus::ssr::render(&dom);
+
+        let positions = [
+            "rust <span>9</span>",
+            "go <span>7</span>",
+            "security <span>7</span>",
+            "dependencies <span>5</span>",
+            "python <span>4</span>",
+            "java <span>3</span>",
+            "javascript <span>2</span>",
+            "blocked <span>1</span>",
+        ]
+        .map(|chip| {
+            html.find(chip)
+                .unwrap_or_else(|| panic!("{chip} missing in {html}"))
+        });
+        assert!(positions.is_sorted(), "{html}");
+        assert!(!html.contains("actions"), "{html}");
+        assert!(
+            html.contains(r#"<button class="label-filter active">go "#),
             "{html}"
         );
     }

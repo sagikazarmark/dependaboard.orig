@@ -125,7 +125,11 @@ impl FromStr for UpdateType {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `Ord` follows declaration order and exists only so the status can key a
+/// `BTreeMap`; it says nothing about severity. Use `rollup_checks` for that.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
     Success,
@@ -532,11 +536,41 @@ impl Page {
     }
 }
 
+/// One entry of the ranked label facet: a label and how many open pull
+/// requests carry it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LabelFacet {
+    pub label: String,
+    pub count: u64,
+}
+
+/// Sidebar facet counts for the whole read model.
+///
+/// `checks` and `update_types` are closed sets, so they are keyed by their
+/// enums: the UI walks `CheckStatus::ALL` / `UpdateType::ALL` and looks each
+/// one up, treating an absent key as zero. Their map order carries no meaning.
+///
+/// `labels` is an open set ranked by popularity, so it is an ordered sequence:
+/// descending count, ties broken by case-insensitive label name. Consumers
+/// that truncate must keep this order rather than re-sorting by key.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FacetCounts {
-    pub checks: BTreeMap<String, u64>,
-    pub update_types: BTreeMap<String, u64>,
-    pub labels: BTreeMap<String, u64>,
+    pub checks: BTreeMap<CheckStatus, u64>,
+    pub update_types: BTreeMap<UpdateType, u64>,
+    pub labels: Vec<LabelFacet>,
+}
+
+impl FacetCounts {
+    pub fn check_count(&self, status: CheckStatus) -> u64 {
+        self.checks.get(&status).copied().unwrap_or_default()
+    }
+
+    pub fn update_type_count(&self, update_type: UpdateType) -> u64 {
+        self.update_types
+            .get(&update_type)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -958,6 +992,54 @@ mod tests {
             serde_json::from_str::<UserId>(r#""dashboard""#).unwrap(),
             user_id
         );
+    }
+
+    #[test]
+    fn facet_counts_round_trip_through_json_in_ranked_order() {
+        // Facets cross the server-function boundary as JSON, so enum keys must
+        // survive as object keys and the label ranking must not be re-sorted.
+        let facets = FacetCounts {
+            checks: BTreeMap::from([(CheckStatus::Success, 3), (CheckStatus::Failure, 1)]),
+            update_types: BTreeMap::from([(UpdateType::Minor, 4)]),
+            labels: vec![
+                LabelFacet {
+                    label: "rust".to_owned(),
+                    count: 4,
+                },
+                LabelFacet {
+                    label: "go".to_owned(),
+                    count: 2,
+                },
+                LabelFacet {
+                    label: "dependencies".to_owned(),
+                    count: 1,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&facets).unwrap();
+        assert!(json.contains(r#""success":3"#), "{json}");
+        assert!(json.contains(r#""failure":1"#), "{json}");
+        assert!(json.contains(r#""update_types":{"minor":4}"#), "{json}");
+        assert!(
+            json.contains(r#""labels":[{"label":"rust","count":4},{"label":"go","count":2}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<FacetCounts>(&json).unwrap(), facets);
+    }
+
+    #[test]
+    fn facet_count_lookups_treat_an_absent_enum_key_as_zero() {
+        let facets = FacetCounts {
+            checks: BTreeMap::from([(CheckStatus::Success, 3)]),
+            update_types: BTreeMap::from([(UpdateType::Minor, 4)]),
+            labels: Vec::new(),
+        };
+
+        assert_eq!(facets.check_count(CheckStatus::Success), 3);
+        assert_eq!(facets.check_count(CheckStatus::Pending), 0);
+        assert_eq!(facets.update_type_count(UpdateType::Minor), 4);
+        assert_eq!(facets.update_type_count(UpdateType::Major), 0);
     }
 
     #[test]
