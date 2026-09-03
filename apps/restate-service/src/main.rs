@@ -540,59 +540,27 @@ impl restate_sdk::serde::PayloadMetadata for SchedulerTick {
 impl InstallationSync {
     #[handler]
     async fn start(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
-        let started = ctx.get::<bool>(SCHEDULER_STARTED).await?.unwrap_or(false);
-        let tick_pending = ctx
-            .get::<bool>(SCHEDULER_TICK_PENDING)
-            .await?
-            .unwrap_or(false);
-        if started && tick_pending {
+        let state = read_scheduler_state(&ctx).await?;
+        let Some(next) = scheduler_start_transition(state)? else {
             return Ok(());
-        }
-        let current_generation = ctx.get::<u64>(SCHEDULER_GENERATION).await?.unwrap_or(0);
-        let generation = if started && current_generation > 0 {
-            current_generation
-        } else {
-            next_scheduler_generation(current_generation)?
         };
-        ctx.set(SCHEDULER_GENERATION, generation);
-        ctx.set(SCHEDULER_STARTED, true);
-        ctx.set(SCHEDULER_TICK_PENDING, true);
+        write_scheduler_state(&ctx, next);
         ctx.object_client::<InstallationSyncClient>(ctx.key())
-            .tick(SchedulerTick(Some(generation)))
+            .tick(SchedulerTick(Some(next.generation)))
             .send();
         Ok(())
     }
 
     #[handler]
     async fn tick(&self, ctx: ObjectContext<'_>, generation: SchedulerTick) -> HandlerResult<()> {
-        let started = ctx.get::<bool>(SCHEDULER_STARTED).await?.unwrap_or(false);
-        let tick_pending = ctx
-            .get::<bool>(SCHEDULER_TICK_PENDING)
-            .await?
-            .unwrap_or(false);
-        let mut current_generation = ctx.get::<u64>(SCHEDULER_GENERATION).await?.unwrap_or(0);
-        if !started {
-            return Ok(());
-        }
-        let generation = match generation.0 {
-            Some(generation) => generation,
-            None if tick_pending => return Ok(()),
-            None => {
-                current_generation = next_scheduler_generation(current_generation)?;
-                ctx.set(SCHEDULER_GENERATION, current_generation);
-                current_generation
-            }
+        let state = read_scheduler_state(&ctx).await?;
+        let mut restate = RestateTickEffects {
+            ctx: &ctx,
+            github: &self.github,
+            store: &self.store,
+            interval: self.interval,
         };
-        if !scheduler_tick_is_current(started, current_generation, generation) {
-            return Ok(());
-        }
-        ctx.clear(SCHEDULER_TICK_PENDING);
-        perform_installation_sync(&ctx, self.github.clone(), self.store.clone()).await?;
-        ctx.set(SCHEDULER_TICK_PENDING, true);
-        ctx.object_client::<InstallationSyncClient>(ctx.key())
-            .tick(SchedulerTick(Some(generation)))
-            .send_after(self.interval);
-        Ok(())
+        run_scheduler_tick(&mut restate, state, generation).await
     }
 
     #[handler]
@@ -637,8 +605,144 @@ fn next_scheduler_generation(current: u64) -> HandlerResult<u64> {
         .ok_or_else(|| TerminalError::new("scheduler generation overflow").into())
 }
 
-fn scheduler_tick_is_current(started: bool, current: u64, incoming: u64) -> bool {
-    started && current == incoming
+/// Scheduler state persisted on the `InstallationSync` object.
+///
+/// `tick_pending` promises that a tick for `generation` is queued or delayed inside
+/// Restate; `start` relies on it to stay idempotent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SchedulerState {
+    started: bool,
+    tick_pending: bool,
+    generation: u64,
+}
+
+impl SchedulerState {
+    /// A live chain with exactly one tick for `generation` inside Restate.
+    fn armed(generation: u64) -> Self {
+        Self {
+            started: true,
+            tick_pending: true,
+            generation,
+        }
+    }
+}
+
+async fn read_scheduler_state(ctx: &ObjectContext<'_>) -> HandlerResult<SchedulerState> {
+    Ok(SchedulerState {
+        started: ctx.get::<bool>(SCHEDULER_STARTED).await?.unwrap_or(false),
+        tick_pending: ctx
+            .get::<bool>(SCHEDULER_TICK_PENDING)
+            .await?
+            .unwrap_or(false),
+        generation: ctx.get::<u64>(SCHEDULER_GENERATION).await?.unwrap_or(0),
+    })
+}
+
+fn write_scheduler_state(ctx: &ObjectContext<'_>, state: SchedulerState) {
+    ctx.set(SCHEDULER_GENERATION, state.generation);
+    ctx.set(SCHEDULER_STARTED, state.started);
+    ctx.set(SCHEDULER_TICK_PENDING, state.tick_pending);
+}
+
+/// What `tick` must do, decided before any side effect runs.
+/// Decides whether `start` must (re)arm the chain, and with which generation.
+///
+/// `None` means a tick is already queued or delayed for the current generation, so
+/// starting again would fork a second perpetual chain.
+fn scheduler_start_transition(state: SchedulerState) -> HandlerResult<Option<SchedulerState>> {
+    if state.started && state.tick_pending {
+        return Ok(None);
+    }
+    let generation = if state.started && state.generation > 0 {
+        state.generation
+    } else {
+        next_scheduler_generation(state.generation)?
+    };
+    Ok(Some(SchedulerState::armed(generation)))
+}
+
+/// Decides whether `tick` must re-arm the chain and sweep, and with which generation.
+///
+/// `None` drops the tick without touching state: the chain is paused, the generation is
+/// stale (`pause`/`purge` bumped it), or a legacy generation-less tick arrived while a
+/// current tick is already pending. `Some(state)` is what to persist before sweeping.
+fn scheduler_tick_transition(
+    state: SchedulerState,
+    incoming: SchedulerTick,
+) -> HandlerResult<Option<SchedulerState>> {
+    if !state.started {
+        return Ok(None);
+    }
+    let generation = match incoming.0 {
+        Some(generation) if generation == state.generation => generation,
+        Some(_) => return Ok(None),
+        None if state.tick_pending => return Ok(None),
+        None => next_scheduler_generation(state.generation)?,
+    };
+    Ok(Some(SchedulerState::armed(generation)))
+}
+
+/// Side effects a tick asks of Restate, abstracted so `run_scheduler_tick` can be
+/// exercised against a recording fake without a runtime.
+trait SchedulerTickEffects {
+    fn installation_id(&self) -> &str;
+    fn persist(&mut self, state: SchedulerState);
+    fn schedule_tick(&mut self, generation: u64);
+    fn sweep(&mut self) -> impl Future<Output = HandlerResult<()>> + Send;
+}
+
+struct RestateTickEffects<'a, 'ctx> {
+    ctx: &'a ObjectContext<'ctx>,
+    github: &'a GithubClient,
+    store: &'a LibSqlPrStore,
+    interval: Duration,
+}
+
+impl SchedulerTickEffects for RestateTickEffects<'_, '_> {
+    fn installation_id(&self) -> &str {
+        self.ctx.key()
+    }
+
+    fn persist(&mut self, state: SchedulerState) {
+        write_scheduler_state(self.ctx, state);
+    }
+
+    fn schedule_tick(&mut self, generation: u64) {
+        self.ctx
+            .object_client::<InstallationSyncClient>(self.ctx.key())
+            .tick(SchedulerTick(Some(generation)))
+            .send_after(self.interval);
+    }
+
+    async fn sweep(&mut self) -> HandlerResult<()> {
+        perform_installation_sync(self.ctx, self.github.clone(), self.store.clone()).await
+    }
+}
+
+async fn run_scheduler_tick<E: SchedulerTickEffects>(
+    restate: &mut E,
+    state: SchedulerState,
+    incoming: SchedulerTick,
+) -> HandlerResult<()> {
+    let Some(next) = scheduler_tick_transition(state, incoming)? else {
+        return Ok(());
+    };
+    // Re-arm before sweeping. Restate never rolls back journaled state or sends, so the
+    // chain survives a terminal or aborted sweep instead of dying silently.
+    restate.persist(next);
+    restate.schedule_tick(next.generation);
+    if let Err(error) = restate.sweep().await {
+        // `HandlerError` only renders through `AsRef<dyn Error>`; its message already says
+        // whether Restate treated the failure as terminal or retryable.
+        let cause: &dyn std::error::Error = error.as_ref();
+        warn!(
+            installation_id = restate.installation_id(),
+            %cause,
+            "installation reconcile failed; the next tick is already scheduled"
+        );
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn invalidate_scheduler_generation(ctx: &ObjectContext<'_>) -> HandlerResult<()> {
@@ -1426,9 +1530,186 @@ mod tests {
     fn scheduler_generations_are_monotonic_and_cannot_wrap() {
         assert_eq!(next_scheduler_generation(41).unwrap(), 42);
         assert!(next_scheduler_generation(u64::MAX).is_err());
-        assert!(scheduler_tick_is_current(true, 42, 42));
-        assert!(!scheduler_tick_is_current(false, 42, 42));
-        assert!(!scheduler_tick_is_current(true, 43, 42));
+    }
+
+    #[test]
+    fn current_tick_rearms_the_chain_without_clearing_the_pending_flag() {
+        assert_eq!(
+            scheduler_tick_transition(SchedulerState::armed(42), SchedulerTick(Some(42))).unwrap(),
+            Some(SchedulerState {
+                started: true,
+                tick_pending: true,
+                generation: 42,
+            })
+        );
+    }
+
+    #[test]
+    fn stale_or_paused_ticks_are_dropped_without_touching_state() {
+        // `pause`/`purge` bump the generation, so a delayed tick from before that carries
+        // an older generation and must die even if `start` re-armed the chain since.
+        assert_eq!(
+            scheduler_tick_transition(SchedulerState::armed(43), SchedulerTick(Some(42))).unwrap(),
+            None
+        );
+        let paused = SchedulerState {
+            started: false,
+            tick_pending: false,
+            generation: 43,
+        };
+        assert_eq!(
+            scheduler_tick_transition(paused, SchedulerTick(Some(43))).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_ticks_yield_to_a_pending_tick_or_adopt_a_fresh_generation() {
+        assert_eq!(
+            scheduler_tick_transition(SchedulerState::armed(42), SchedulerTick(None)).unwrap(),
+            None
+        );
+        let orphaned = SchedulerState {
+            started: true,
+            tick_pending: false,
+            generation: 42,
+        };
+        assert_eq!(
+            scheduler_tick_transition(orphaned, SchedulerTick(None)).unwrap(),
+            Some(SchedulerState::armed(43))
+        );
+    }
+
+    /// Stands in for the Restate object context and records what a tick asked of it.
+    #[derive(Default)]
+    struct RecordedRestate {
+        persisted: Option<SchedulerState>,
+        scheduled: Vec<u64>,
+        swept: bool,
+        sweep_failure: Option<HandlerError>,
+    }
+
+    impl SchedulerTickEffects for RecordedRestate {
+        fn installation_id(&self) -> &str {
+            "1"
+        }
+
+        fn persist(&mut self, state: SchedulerState) {
+            self.persisted = Some(state);
+        }
+
+        fn schedule_tick(&mut self, generation: u64) {
+            self.scheduled.push(generation);
+        }
+
+        async fn sweep(&mut self) -> HandlerResult<()> {
+            self.swept = true;
+            match self.sweep_failure.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_terminal_sweep_failure_leaves_the_next_tick_scheduled() {
+        let mut restate = RecordedRestate {
+            sweep_failure: Some(
+                TerminalError::new("GitHub read failed with HTTP 401: Bad credentials").into(),
+            ),
+            ..Default::default()
+        };
+
+        let outcome = run_scheduler_tick(
+            &mut restate,
+            SchedulerState::armed(42),
+            SchedulerTick(Some(42)),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "the failed sweep stays visible to Restate"
+        );
+        assert_eq!(restate.scheduled, vec![42]);
+        assert_eq!(restate.persisted, Some(SchedulerState::armed(42)));
+    }
+
+    #[tokio::test]
+    async fn a_successful_tick_sweeps_and_schedules_exactly_one_successor() {
+        let mut restate = RecordedRestate::default();
+
+        run_scheduler_tick(
+            &mut restate,
+            SchedulerState::armed(42),
+            SchedulerTick(Some(42)),
+        )
+        .await
+        .unwrap();
+
+        assert!(restate.swept);
+        assert_eq!(restate.scheduled, vec![42]);
+        assert_eq!(restate.persisted, Some(SchedulerState::armed(42)));
+    }
+
+    #[tokio::test]
+    async fn a_stale_tick_neither_sweeps_nor_schedules() {
+        let mut restate = RecordedRestate::default();
+
+        run_scheduler_tick(
+            &mut restate,
+            SchedulerState::armed(43),
+            SchedulerTick(Some(42)),
+        )
+        .await
+        .unwrap();
+
+        assert!(!restate.swept);
+        assert!(restate.scheduled.is_empty());
+        assert_eq!(restate.persisted, None);
+    }
+
+    #[tokio::test]
+    async fn start_is_a_no_op_on_the_state_a_failed_sweep_leaves_behind() {
+        let mut restate = RecordedRestate {
+            sweep_failure: Some(TerminalError::new("projection store is read-only").into()),
+            ..Default::default()
+        };
+        let _ = run_scheduler_tick(
+            &mut restate,
+            SchedulerState::armed(42),
+            SchedulerTick(Some(42)),
+        )
+        .await;
+
+        let after_failure = restate.persisted.expect("tick persisted its state");
+        assert_eq!(scheduler_start_transition(after_failure).unwrap(), None);
+    }
+
+    #[test]
+    fn start_revives_a_paused_or_orphaned_chain_with_a_valid_generation() {
+        let paused = SchedulerState {
+            started: false,
+            tick_pending: false,
+            generation: 42,
+        };
+        assert_eq!(
+            scheduler_start_transition(paused).unwrap(),
+            Some(SchedulerState::armed(43))
+        );
+        let orphaned = SchedulerState {
+            started: true,
+            tick_pending: false,
+            generation: 42,
+        };
+        assert_eq!(
+            scheduler_start_transition(orphaned).unwrap(),
+            Some(SchedulerState::armed(42))
+        );
+        assert_eq!(
+            scheduler_start_transition(SchedulerState::default()).unwrap(),
+            Some(SchedulerState::armed(1))
+        );
     }
 
     #[test]

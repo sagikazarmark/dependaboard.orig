@@ -348,12 +348,21 @@ Three handlers, deliberately separated — collapsing them is the bug described 
 | Handler | Does | Schedules? |
 |---|---|---|
 | `sync_now()` | one full reconciliation | **never** |
-| `tick()` | **if `scheduler_started` is unset: return — no sync, no reschedule.** Else `sync_now()`, then schedule the next `tick` in 1h | yes |
-| `start()` | if `scheduler_started` is unset: set it, send `tick()` | only the first time |
+| `tick()` | **if `scheduler_started` is unset or the generation is stale: return — no sync, no reschedule.** Else schedule the next `tick` in 1h **first**, then `sync_now()` | yes |
+| `start()` | if a tick is already pending for the current generation: return. Else set `scheduler_started` + `scheduler_tick_pending`, send `tick()` | only when no tick is pending |
 
 - Service startup calls `start()`. Installation and repo-access webhooks call `sync_now()`.
   Only `tick()` ever creates a timer.
 - Keyed on installation so two sweeps can't overlap.
+
+**Re-arm before sweeping.** Restate commits journaled state writes and one-way sends as
+they happen and never rolls them back when a handler fails terminally. If `tick()` swept
+first and scheduled afterwards, a terminal sweep failure (a fatal GitHub 401/403, a
+terminal store error, an operator cancelling the invocation) would end the chain with no
+successor and nothing logged — until the next process restart called `start()`. So
+`tick()` persists `scheduler_tick_pending`, schedules its successor, and only then sweeps;
+a failed sweep is logged with the installation id and cause and the failure stays visible
+on the `tick` invocation, but the next tick fires regardless.
 
 **Why not one self-scheduling `sync_all`?** Because keyed concurrency *serialises*
 invocations; it does not *deduplicate* them. Restate's ingress even documents that its
