@@ -445,6 +445,16 @@ be subscribed to.
   Scope the delete: `... AND synced_at < reconcile_start`. Rows upserted by concurrent
   webhook syncs carry a fresher `synced_at` and survive. The completeness rule above
   covers partial listings; this one covers concurrent writers — you need both.
+- **One unsyncable PR must not abort the sweep.** A `PullRequest.sync` call only fails
+  once the callee has failed terminally (retryable failures are retried inside the
+  callee). Capture those failures instead of propagating them: attempt every listed PR,
+  `warn!` each failure with its key and cause, run `retain_prs` over the full listing
+  (the failed PR is still open on GitHub, so its row stays), and only then surface a
+  single `TerminalError` naming the failed keys so the invocation is visible in Restate.
+  Propagating early leaves that repo's closed PRs in the projection forever, and since
+  `reconcile` is fire-and-forget from `InstallationSync` nobody sees why. The aggregate
+  must be terminal, not retryable: the per-PR call results are already journaled, so a
+  retry would replay the same failures and loop.
 - `sync_sha(sha)` — resolve a commit SHA to PR(s) via the read model, fan out
   `PullRequest.sync`. Entry point for `status` and `check_suite` events (see §3).
 - Keyed per repo, so repos reconcile in parallel without overlapping themselves.
