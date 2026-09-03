@@ -957,17 +957,32 @@ pub struct GithubErrorResponse {
     pub retry_after_seconds: Option<u64>,
 }
 
+/// How long to back off from a secondary rate limit that carries no `Retry-After`.
+///
+/// GitHub's guidance is to wait at least one minute before retrying in that case.
+pub const DEFAULT_RATE_LIMIT_WAIT_SECONDS: u64 = 60;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Classification {
-    Retryable { after_seconds: Option<u64> },
+    /// Transient: retrying the identical request with backoff may succeed.
+    Retryable,
+    /// GitHub asked us to back off; do not retry before `until` (unix seconds).
+    RateLimited {
+        until: u64,
+    },
     Rejected(RejectReason),
     Fatal,
 }
 
+/// Classifies a failed GitHub response into an outcome for the caller.
+///
+/// `now` is the caller's unix-seconds clock, so the classification is a pure function of
+/// its inputs: journal it once and replay it verbatim rather than recomputing it.
 pub fn classify_github_error(
     response: &GithubErrorResponse,
     operation: Operation,
     known_resource: bool,
+    now: u64,
 ) -> Classification {
     let message = response.message.to_ascii_lowercase();
     let is_rate_limited = response.rate_limit_remaining == Some(0)
@@ -976,25 +991,21 @@ pub fn classify_github_error(
         || message.contains("rate limit exceeded")
         || (response.status == 429);
     if is_rate_limited {
-        let reset_after = response
-            .rate_limit_reset
-            .and_then(|reset| reset.checked_sub(unix_seconds()));
-        return Classification::Retryable {
-            after_seconds: response.retry_after_seconds.or(reset_after),
-        };
+        let until = response
+            .retry_after_seconds
+            .map(|after| now.saturating_add(after))
+            .or(response.rate_limit_reset)
+            .unwrap_or_else(|| now.saturating_add(DEFAULT_RATE_LIMIT_WAIT_SECONDS));
+        return Classification::RateLimited { until };
     }
     if response.status >= 500 {
-        return Classification::Retryable {
-            after_seconds: response.retry_after_seconds,
-        };
+        return Classification::Retryable;
     }
     if operation == Operation::Merge
         && response.status == 405
         && message.contains("base branch was modified")
     {
-        return Classification::Retryable {
-            after_seconds: response.retry_after_seconds,
-        };
+        return Classification::Retryable;
     }
     match (response.status, operation) {
         (404, _) if known_resource => Classification::Rejected(RejectReason::NotFound),
@@ -1408,7 +1419,7 @@ updated-dependencies:
     }
 
     #[test]
-    fn rate_limits_are_retryable_regardless_of_status() {
+    fn rate_limits_are_recognised_regardless_of_status() {
         for status in [403, 429] {
             let response = GithubErrorResponse {
                 status,
@@ -1416,21 +1427,65 @@ updated-dependencies:
                 ..Default::default()
             };
             assert!(matches!(
-                classify_github_error(&response, Operation::Comment, true),
-                Classification::Retryable { .. }
+                classify_github_error(&response, Operation::Comment, true, 1_000),
+                Classification::RateLimited { .. }
             ));
         }
-        let retry_after = GithubErrorResponse {
+    }
+
+    #[test]
+    fn retry_after_sets_the_rate_limit_deadline_relative_to_now() {
+        let response = GithubErrorResponse {
             status: 403,
             message: "slow down".to_owned(),
             retry_after_seconds: Some(30),
             ..Default::default()
         };
         assert_eq!(
-            classify_github_error(&retry_after, Operation::Read, false),
-            Classification::Retryable {
-                after_seconds: Some(30)
-            }
+            classify_github_error(&response, Operation::Read, false, 1_000),
+            Classification::RateLimited { until: 1_030 }
+        );
+    }
+
+    #[test]
+    fn a_primary_rate_limit_waits_for_the_advertised_reset() {
+        let response = GithubErrorResponse {
+            status: 403,
+            message: "API rate limit exceeded for installation ID 1.".to_owned(),
+            rate_limit_remaining: Some(0),
+            rate_limit_reset: Some(4_600),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_github_error(&response, Operation::Read, false, 1_000),
+            Classification::RateLimited { until: 4_600 }
+        );
+    }
+
+    #[test]
+    fn a_secondary_rate_limit_without_headers_waits_one_minute() {
+        // GitHub's guidance when Retry-After is absent is to wait at least a minute.
+        let response = GithubErrorResponse {
+            status: 403,
+            message: "You have exceeded a secondary rate limit.".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_github_error(&response, Operation::Comment, true, 1_000),
+            Classification::RateLimited { until: 1_060 }
+        );
+    }
+
+    #[test]
+    fn server_errors_are_retryable_without_a_deadline() {
+        let response = GithubErrorResponse {
+            status: 503,
+            message: "unavailable".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_github_error(&response, Operation::Read, false, 1_000),
+            Classification::Retryable
         );
     }
 
@@ -1441,10 +1496,10 @@ updated-dependencies:
             message: "Base branch was modified. Review and try the merge again.".to_owned(),
             ..Default::default()
         };
-        assert!(matches!(
-            classify_github_error(&transient, Operation::Merge, true),
-            Classification::Retryable { .. }
-        ));
+        assert_eq!(
+            classify_github_error(&transient, Operation::Merge, true, 1_000),
+            Classification::Retryable
+        );
 
         let permanent = GithubErrorResponse {
             status: 405,
@@ -1452,7 +1507,7 @@ updated-dependencies:
             ..Default::default()
         };
         assert_eq!(
-            classify_github_error(&permanent, Operation::Merge, true),
+            classify_github_error(&permanent, Operation::Merge, true, 1_000),
             Classification::Rejected(RejectReason::MergeMethodDisallowed)
         );
     }
@@ -1465,11 +1520,11 @@ updated-dependencies:
             ..Default::default()
         };
         assert_eq!(
-            classify_github_error(&response, Operation::Read, false),
+            classify_github_error(&response, Operation::Read, false, 1_000),
             Classification::Fatal
         );
         assert_eq!(
-            classify_github_error(&response, Operation::Read, true),
+            classify_github_error(&response, Operation::Read, true, 1_000),
             Classification::Rejected(RejectReason::NotFound)
         );
     }
