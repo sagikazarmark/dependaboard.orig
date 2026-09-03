@@ -384,6 +384,15 @@ The Compose file fixes `RESTATE_NODE_NAME=dependaboard` so the current project's
 
 Restate owns in-flight truth and retries. libSQL is the cross-PR query model used by the dashboard. The browser never calls Restate directly.
 
+`apps/web/src/components` is installed from the [dioxus-daisyui-components](https://github.com/sagikazarmark/dioxus-daisyui-components) registry and is not edited by hand. To update a component, re-run the install against a checkout of the registry:
+
+```sh
+cd apps/web
+dx components add <name> --path /path/to/dioxus-daisyui-components --force
+```
+
+The components emit daisyUI class names only; `apps/web/styles/app.css` scans that directory, so `npm run css:build` picks up new classes.
+
 ## Configuration Reference
 
 | Variable | Used by | Purpose |

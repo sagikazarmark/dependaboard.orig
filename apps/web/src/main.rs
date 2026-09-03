@@ -8,6 +8,22 @@ use dependaboard_core::{
 };
 use dioxus::prelude::*;
 
+// Installed from the dioxus-daisyui-components registry with `dx components add`;
+// each component carries its full daisyUI axis, so unused variants are expected.
+#[allow(dead_code, unused_imports)]
+mod components;
+
+use components::alert_dialog::{
+    AlertDialog, AlertDialogAction, AlertDialogActions, AlertDialogCancel, AlertDialogDescription,
+    AlertDialogDescriptionAppearance, AlertDialogTitle, AlertDialogTitleAppearance,
+};
+use components::button::{Button, ButtonSize};
+use components::loading::{Loading, LoadingSize};
+use components::toast::{
+    ToastCloseButton, ToastColor, ToastContent, ToastDescription, ToastOptions, ToastProps,
+    ToastPropsWithOwner, ToastProvider, ToastTitle, ToastTitleAppearance, use_toast,
+};
+
 #[cfg(feature = "server")]
 use {
     axum::{
@@ -553,19 +569,81 @@ struct CheckPullRequest {
     number: u64,
 }
 
+/// A bulk action the user has asked for but not yet confirmed.
+///
+/// The targets are resolved when the request is made, so the head SHAs the
+/// confirmation dialog talks about are the ones that get submitted, and the
+/// dialog's cancel and confirm paths do not depend on each other's ordering.
+#[derive(Clone, PartialEq)]
+struct PendingAction {
+    action: BulkActionKind,
+    targets: Vec<PrTarget>,
+}
+
 fn App() -> Element {
-    let mut dark = use_signal(|| true);
+    let dark = use_signal(|| true);
+    let theme = if dark() {
+        "dependaboard-dark"
+    } else {
+        "dependaboard-light"
+    };
+
+    rsx! {
+        document::Link { rel: "preconnect", href: "https://fonts.googleapis.com" }
+        document::Link { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "anonymous" }
+        document::Link {
+            rel: "stylesheet",
+            href: "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+        }
+        document::Stylesheet { href: asset!("/assets/main.css") }
+
+        // The toast region renders where the provider sits, so it has to be
+        // inside the themed shell for daisyUI's colour variables to reach it.
+        div { class: "app-shell", "data-theme": theme,
+            ToastProvider {
+                render_toast: Callback::new(|props: ToastPropsWithOwner| rsx! { AppToast { ..props } }),
+                Dashboard { dark }
+            }
+        }
+    }
+}
+
+/// The registry toast with this app's chrome: the message is the title, set in
+/// the same weight as the rest of the UI, and `toast-message` carries the look.
+fn AppToast(props: ToastProps) -> Element {
+    let color = ToastColor::of(props.toast_type).class();
+    rsx! {
+        dioxus_primitives::toast::Toast {
+            id: props.id,
+            index: props.index,
+            title: props.title,
+            description: props.description,
+            toast_type: props.toast_type,
+            on_close: props.on_close,
+            permanent: props.permanent,
+            duration: props.duration,
+            class: "alert {color} toast-message",
+            ToastContent {
+                ToastTitle { appearance: ToastTitleAppearance::None }
+                ToastDescription {}
+            }
+            ToastCloseButton {}
+        }
+    }
+}
+
+#[component]
+fn Dashboard(mut dark: Signal<bool>) -> Element {
+    let toast = use_toast();
     let mut aside_open = use_signal(|| true);
     let mut filter = use_signal(PrFilter::default);
     let mut cursor = use_signal(|| None::<String>);
     let mut refresh = use_signal(|| 0_u64);
     let mut selected = use_signal(BTreeSet::<String>::new);
     let mut detail = use_signal(|| None::<PrRecord>);
-    let mut detail_target = use_signal(|| None::<PrTarget>);
-    let mut confirm = use_signal(|| None::<BulkActionKind>);
+    let mut pending = use_signal(|| None::<PendingAction>);
     let mut active_batch = use_signal(|| None::<BatchProgress>);
     let mut progress_open = use_signal(|| false);
-    let mut toast = use_signal(|| None::<String>);
 
     use_effect(move || {
         let _ = filter();
@@ -599,418 +677,403 @@ fn App() -> Element {
         .unwrap_or_default();
     let total = page.as_ref().map(|page| page.total).unwrap_or_default();
     let selected_count = selected.read().len();
-    let theme = if dark() {
-        "dependaboard-dark"
-    } else {
-        "dependaboard-light"
-    };
     let active_filter_count = filter_count(&filter());
 
+    let mut reload = move || {
+        refresh += 1;
+        dashboard.restart();
+    };
+
+    let queue_batch = move |PendingAction { action, targets }: PendingAction| {
+        let batch_id = new_batch_id();
+        active_batch.set(Some(BatchProgress::queued(&batch_id, action, &targets)));
+        progress_open.set(true);
+        selected.write().clear();
+        spawn(async move {
+            loop {
+                match submit_batch(batch_id.clone(), action, targets.clone()).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        if let Ok(Some(progress)) = load_batch_progress(batch_id.clone()).await {
+                            active_batch.set(Some(progress));
+                            break;
+                        }
+                        toast.warning(
+                            format!("Batch submission interrupted; retrying: {error}"),
+                            ToastOptions::new(),
+                        );
+                        wait_one_second().await;
+                    }
+                }
+            }
+            loop {
+                wait_one_second().await;
+                match load_batch_progress(batch_id.clone()).await {
+                    Ok(Some(progress)) => {
+                        let completed = progress.completed;
+                        let failed = progress.failure.clone();
+                        active_batch.set(Some(progress));
+                        if completed {
+                            match failed {
+                                Some(failure) => {
+                                    toast.error(format!("Batch failed: {failure}"), sticky())
+                                }
+                                None => {
+                                    toast.success("Batch complete".to_owned(), ToastOptions::new())
+                                }
+                            }
+                            reload();
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        toast.warning(
+                            format!("Progress interrupted; retrying: {error}"),
+                            ToastOptions::new(),
+                        );
+                    }
+                }
+            }
+        });
+    };
+
     rsx! {
-        document::Link { rel: "preconnect", href: "https://fonts.googleapis.com" }
-        document::Link { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "anonymous" }
-        document::Link {
-            rel: "stylesheet",
-            href: "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
-        }
-        document::Stylesheet { href: asset!("/assets/main.css") }
-
-        div { class: "app-shell", "data-theme": theme,
-            header { class: "topbar",
-                div { class: "brand",
-                    button {
-                        class: "icon-button",
-                        title: "Show or hide filters",
-                        onclick: move |_| aside_open.toggle(),
-                        "="
-                    }
-                    span { class: "brand-mark" }
-                    strong { "dependabot" }
-                    span { class: "muted mono account-label", "/ installations" }
-                }
-                div { class: "view-switch",
-                    button {
-                        class: if !filter().needs_attention { "active" } else { "" },
-                        onclick: move |_| {
-                            filter.write().needs_attention = false;
-                            cursor.set(None);
-                        },
-                        "All open"
-                    }
-                    button {
-                        class: if filter().needs_attention { "active" } else { "" },
-                        onclick: move |_| {
-                            filter.write().needs_attention = true;
-                            cursor.set(None);
-                        },
-                        "Needs attention"
-                    }
-                }
-                div { class: "topbar-spacer" }
+        header { class: "topbar",
+            div { class: "brand",
                 button {
-                    class: "btn btn-ghost btn-xs theme-button",
-                    title: "Toggle color theme",
-                    onclick: move |_| dark.toggle(),
-                    if dark() { "light" } else { "dark" }
+                    class: "icon-button",
+                    title: "Show or hide filters",
+                    onclick: move |_| aside_open.toggle(),
+                    "="
                 }
+                span { class: "brand-mark" }
+                strong { "dependabot" }
+                span { class: "muted mono account-label", "/ installations" }
+            }
+            div { class: "view-switch",
                 button {
-                    class: "btn btn-sm sync-button",
+                    class: if !filter().needs_attention { "active" } else { "" },
                     onclick: move |_| {
-                        spawn(async move {
-                            if let Err(error) = request_sync().await {
-                                toast.set(Some(format!("Sync failed: {error}")));
-                            } else {
-                                toast.set(Some("Reconciliation queued".to_owned()));
-                                wait_one_second().await;
-                                refresh += 1;
-                                dashboard.restart();
-                            }
-                        });
+                        filter.write().needs_attention = false;
+                        cursor.set(None);
                     },
-                    span { class: "sync-glyph", "+" }
-                    "Sync"
+                    "All open"
                 }
-            }
-
-            div { class: "workspace",
-                aside {
-                    class: if aside_open() { "sidebar" } else { "sidebar sidebar-closed" },
-                    div { class: "search-wrap",
-                        span { "/" }
-                        input {
-                            class: "input input-sm",
-                            value: filter().query.unwrap_or_default(),
-                            placeholder: "dependency, repo, title...",
-                            oninput: move |event| {
-                                let value = event.value();
-                                filter.write().query = (!value.trim().is_empty()).then_some(value);
-                                cursor.set(None);
-                            }
-                        }
-                    }
-                    div { class: "filter-meta",
-                        span { class: "mono muted", "{active_filter_count} active" }
-                        button {
-                            disabled: active_filter_count == 0,
-                            onclick: move |_| {
-                                filter.set(PrFilter::default());
-                                cursor.set(None);
-                                selected.write().clear();
-                            },
-                            "clear"
-                        }
-                    }
-
-                    FilterSection { title: "Check rollup" }
-                    div { class: "facet-list",
-                        for status in CheckStatus::ALL {
-                            FacetButton {
-                                key: "check-{status}",
-                                label: status_label(status),
-                                count: facet_count(page.as_ref(), "check", &status.to_string()),
-                                active: filter().check_statuses.contains(&status),
-                                tone: status_class(status),
-                                onclick: move |_| {
-                                    toggle_value(&mut filter.write().check_statuses, status);
-                                    cursor.set(None);
-                                }
-                            }
-                        }
-                    }
-
-                    FilterSection { title: "Update type" }
-                    div { class: "facet-list",
-                        for update_type in UpdateType::ALL {
-                            FacetButton {
-                                key: "type-{update_type}",
-                                label: update_type.to_string(),
-                                count: facet_count(page.as_ref(), "type", &update_type.to_string()),
-                                active: filter().update_types.contains(&update_type),
-                                tone: update_class(update_type),
-                                onclick: move |_| {
-                                    toggle_value(&mut filter.write().update_types, update_type);
-                                    cursor.set(None);
-                                }
-                            }
-                        }
-                    }
-
-                    FilterSection { title: "Labels" }
-                    div { class: "label-facets",
-                        if let Some(page) = &page {
-                            for (label, count) in page.facets.labels.iter().take(8) {
-                                {
-                                    let label_value = label.clone();
-                                    let active = filter().labels.contains(label);
-                                    rsx! {
-                                        button {
-                                            class: if active { "label-filter active" } else { "label-filter" },
-                                            onclick: move |_| {
-                                                toggle_value(&mut filter.write().labels, label_value.clone());
-                                                cursor.set(None);
-                                            },
-                                            "{label} " span { "{count}" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    FilterSection { title: "Accounts & repositories" }
-                    div { class: "repo-list",
-                        if let Some(page) = &page {
-                            for repository in &page.repositories {
-                                {
-                                    let full_name = format!("{}/{}", repository.owner, repository.repo);
-                                    let selected_repo = filter().repos.contains(&full_name);
-                                    let repo_value = full_name.clone();
-                                    rsx! {
-                                        button {
-                                            class: if selected_repo { "repo-filter active" } else { "repo-filter" },
-                                            onclick: move |_| {
-                                                toggle_value(&mut filter.write().repos, repo_value.clone());
-                                                cursor.set(None);
-                                            },
-                                            span { class: "selection-box", if selected_repo { "x" } }
-                                            span { class: "repo-owner", "{repository.owner}/" }
-                                            span { "{repository.repo}" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                main { class: "content",
-                    div { class: "resultbar",
-                        span { class: "mono", "{total} pull requests" }
-                        button {
-                            disabled: rows.is_empty(),
-                            onclick: {
-                                let rows = rows.clone();
-                                move |_| {
-                                    let all_selected = rows.iter().all(|row| selected.read().contains(&row.id));
-                                    if all_selected {
-                                        for row in &rows { selected.write().remove(&row.id); }
-                                    } else {
-                                        for row in &rows { selected.write().insert(row.id.clone()); }
-                                    }
-                                }
-                            },
-                            if rows.iter().all(|row| selected.read().contains(&row.id)) && !rows.is_empty() {
-                                "clear visible"
-                            } else {
-                                "select visible"
-                            }
-                        }
-                        span { class: "result-spacer" }
-                        span { class: "muted mono desktop-only", "updated recently first" }
-                    }
-                    if active_filter_count > 0 {
-                        ActiveFilters { filter, cursor }
-                    }
-                    div { class: "table-scroll",
-                        div { class: "pr-grid table-head",
-                            span {}
-                            span { "PR" }
-                            span { "Dependency" }
-                            span { "Repository" }
-                            span { "Checks" }
-                            span { "Labels" }
-                            span { class: "right", "Updated" }
-                        }
-                        if let Some(error) = load_error {
-                            div { class: "empty-state error-state",
-                                strong { "The read model could not be loaded" }
-                                code { "{error}" }
-                                button { class: "btn btn-sm", onclick: move |_| dashboard.restart(), "Retry" }
-                            }
-                        } else if page.is_none() {
-                            div { class: "loading-state",
-                                span { class: "loading loading-spinner loading-sm" }
-                                "Reading the projection"
-                            }
-                        } else if rows.is_empty() {
-                            div { class: "empty-state",
-                                span { class: "empty-mark" }
-                                strong { "No open Dependabot pull requests" }
-                                p { "Try clearing filters or queue a reconciliation sweep." }
-                            }
-                        } else {
-                            for row in &rows {
-                                PrRow {
-                                    key: "{row.id}",
-                                    row: row.clone(),
-                                    checked: selected.read().contains(&row.id),
-                                    oncheck: move |id: String| {
-                                        if !selected.write().insert(id.clone()) {
-                                            selected.write().remove(&id);
-                                        }
-                                    },
-                                    onopen: move |row: PrRecord| detail.set(Some(row))
-                                }
-                            }
-                        }
-                        if let Some(next) = page.as_ref().and_then(|page| page.next_cursor.clone()) {
-                            div { class: "load-more",
-                                button {
-                                    class: "btn btn-sm btn-ghost",
-                                    onclick: move |_| {
-                                        selected.write().clear();
-                                        cursor.set(Some(next.clone()));
-                                    },
-                                    "Load next 50"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            footer { class: "statusbar",
-                span { class: "status-dot" }
-                span { "projection online" }
-                span { class: "status-spacer" }
-                if let Some(synced) = page.as_ref().and_then(|page| page.last_synced_at) {
-                    span { "last event {relative_time(synced)}" }
-                } else {
-                    span { "waiting for first reconciliation" }
-                }
-            }
-
-            if selected_count > 0 {
-                div { class: "action-bar",
-                    strong { class: "mono", "{selected_count} selected" }
-                    button { class: "action-link", onclick: move |_| selected.write().clear(), "clear" }
-                    span { class: "action-divider" }
-                    button { class: "btn btn-sm rebase-button", onclick: move |_| confirm.set(Some(BulkActionKind::Rebase)), "Request rebase" }
-                    button { class: "btn btn-sm merge-button", onclick: move |_| confirm.set(Some(BulkActionKind::Merge)), "Merge selected" }
-                }
-            }
-
-            if let Some(row) = detail() {
-                DetailDrawer {
-                    row,
-                    onclose: move |_| detail.set(None),
-                    onaction: move |action| {
-                        if let Some(row) = detail() {
-                            detail_target.set(Some(pr_target(&row)));
-                            confirm.set(Some(action));
-                        }
-                    },
-                    onsync: move |result: Result<Option<PrRecord>, String>| match result {
-                        Ok(Some(row)) => {
-                            detail.set(Some(row));
-                            toast.set(Some("Pull request synced".to_owned()));
-                            refresh += 1;
-                            dashboard.restart();
-                        }
-                        Ok(None) => {
-                            detail.set(None);
-                            toast.set(Some("Pull request is no longer open".to_owned()));
-                            refresh += 1;
-                            dashboard.restart();
-                        }
-                        Err(error) => toast.set(Some(error)),
-                    }
-                }
-            }
-
-            if let Some(progress) = active_batch() {
                 button {
-                    class: "progress-pill",
-                    onclick: move |_| progress_open.toggle(),
-                    span { class: if progress.completed { "progress-live complete" } else { "progress-live" } }
-                    "{progress.action}: {progress.succeeded + progress.rejected}/{progress.targets.len()}"
-                }
-                if progress_open() {
-                    ProgressDrawer { progress: progress.clone(), onclose: move |_| progress_open.set(false) }
+                    class: if filter().needs_attention { "active" } else { "" },
+                    onclick: move |_| {
+                        filter.write().needs_attention = true;
+                        cursor.set(None);
+                    },
+                    "Needs attention"
                 }
             }
+            div { class: "topbar-spacer" }
+            Button {
+                size: ButtonSize::Xs,
+                class: "btn-ghost theme-button",
+                title: "Toggle color theme",
+                onclick: move |_| dark.toggle(),
+                if dark() { "light" } else { "dark" }
+            }
+            Button {
+                size: ButtonSize::Sm,
+                class: "sync-button",
+                onclick: move |_| {
+                    spawn(async move {
+                        if let Err(error) = request_sync().await {
+                            toast.error(format!("Sync failed: {error}"), sticky());
+                        } else {
+                            toast.info("Reconciliation queued".to_owned(), ToastOptions::new());
+                            wait_one_second().await;
+                            reload();
+                        }
+                    });
+                },
+                span { class: "sync-glyph", "+" }
+                "Sync"
+            }
+        }
 
-            if let Some(action) = confirm() {
-                ConfirmModal {
-                    action,
-                    count: if detail_target().is_some() { 1 } else { selected_count },
-                    oncancel: move |_| {
-                        detail_target.set(None);
-                        confirm.set(None);
-                    },
-                    onconfirm: {
-                        let rows = rows.clone();
-                        move |_| {
-                            let targets = detail_target().map_or_else(
-                                || {
-                                    rows.iter()
-                                        .filter(|row| selected.read().contains(&row.id))
-                                        .map(pr_target)
-                                        .collect::<Vec<_>>()
-                                },
-                                |target| vec![target],
-                            );
-                            let batch_id = new_batch_id();
-                            active_batch.set(Some(BatchProgress::queued(
-                                &batch_id,
-                                action,
-                                &targets,
-                            )));
-                            progress_open.set(true);
-                            detail_target.set(None);
-                            confirm.set(None);
+        div { class: "workspace",
+            aside {
+                class: if aside_open() { "sidebar" } else { "sidebar sidebar-closed" },
+                div { class: "search-wrap",
+                    span { "/" }
+                    input {
+                        class: "input input-sm",
+                        value: filter().query.unwrap_or_default(),
+                        placeholder: "dependency, repo, title...",
+                        oninput: move |event| {
+                            let value = event.value();
+                            filter.write().query = (!value.trim().is_empty()).then_some(value);
+                            cursor.set(None);
+                        }
+                    }
+                }
+                div { class: "filter-meta",
+                    span { class: "mono muted", "{active_filter_count} active" }
+                    button {
+                        disabled: active_filter_count == 0,
+                        onclick: move |_| {
+                            filter.set(PrFilter::default());
+                            cursor.set(None);
                             selected.write().clear();
-                            spawn(async move {
-                                loop {
-                                    match submit_batch(batch_id.clone(), action, targets.clone()).await {
-                                        Ok(()) => break,
-                                        Err(error) => {
-                                            if let Ok(Some(progress)) = load_batch_progress(batch_id.clone()).await {
-                                                active_batch.set(Some(progress));
-                                                break;
-                                            }
-                                            toast.set(Some(format!("Batch submission interrupted; retrying: {error}")));
-                                            wait_one_second().await;
-                                        }
+                        },
+                        "clear"
+                    }
+                }
+
+                FilterSection { title: "Check rollup" }
+                div { class: "facet-list",
+                    for status in CheckStatus::ALL {
+                        FacetButton {
+                            key: "check-{status}",
+                            label: status_label(status),
+                            count: facet_count(page.as_ref(), "check", &status.to_string()),
+                            active: filter().check_statuses.contains(&status),
+                            tone: status_class(status),
+                            onclick: move |_| {
+                                toggle_value(&mut filter.write().check_statuses, status);
+                                cursor.set(None);
+                            }
+                        }
+                    }
+                }
+
+                FilterSection { title: "Update type" }
+                div { class: "facet-list",
+                    for update_type in UpdateType::ALL {
+                        FacetButton {
+                            key: "type-{update_type}",
+                            label: update_type.to_string(),
+                            count: facet_count(page.as_ref(), "type", &update_type.to_string()),
+                            active: filter().update_types.contains(&update_type),
+                            tone: update_class(update_type),
+                            onclick: move |_| {
+                                toggle_value(&mut filter.write().update_types, update_type);
+                                cursor.set(None);
+                            }
+                        }
+                    }
+                }
+
+                FilterSection { title: "Labels" }
+                div { class: "label-facets",
+                    if let Some(page) = &page {
+                        for (label, count) in page.facets.labels.iter().take(8) {
+                            {
+                                let label_value = label.clone();
+                                let active = filter().labels.contains(label);
+                                rsx! {
+                                    button {
+                                        class: if active { "label-filter active" } else { "label-filter" },
+                                        onclick: move |_| {
+                                            toggle_value(&mut filter.write().labels, label_value.clone());
+                                            cursor.set(None);
+                                        },
+                                        "{label} " span { "{count}" }
                                     }
                                 }
-                                loop {
-                                    wait_one_second().await;
-                                    match load_batch_progress(batch_id.clone()).await {
-                                        Ok(Some(progress)) => {
-                                            let completed = progress.completed;
-                                            let failed = progress.failure.clone();
-                                            active_batch.set(Some(progress));
-                                            if completed {
-                                                toast.set(Some(failed.map_or_else(
-                                                    || "Batch complete".to_owned(),
-                                                    |failure| format!("Batch failed: {failure}"),
-                                                )));
-                                                refresh += 1;
-                                                dashboard.restart();
-                                                break;
-                                            }
-                                        }
-                                        Ok(None) => {}
-                                        Err(error) => {
-                                            toast.set(Some(format!("Progress interrupted; retrying: {error}")));
-                                        }
+                            }
+                        }
+                    }
+                }
+
+                FilterSection { title: "Accounts & repositories" }
+                div { class: "repo-list",
+                    if let Some(page) = &page {
+                        for repository in &page.repositories {
+                            {
+                                let full_name = format!("{}/{}", repository.owner, repository.repo);
+                                let selected_repo = filter().repos.contains(&full_name);
+                                let repo_value = full_name.clone();
+                                rsx! {
+                                    button {
+                                        class: if selected_repo { "repo-filter active" } else { "repo-filter" },
+                                        onclick: move |_| {
+                                            toggle_value(&mut filter.write().repos, repo_value.clone());
+                                            cursor.set(None);
+                                        },
+                                        span { class: "selection-box", if selected_repo { "x" } }
+                                        span { class: "repo-owner", "{repository.owner}/" }
+                                        span { "{repository.repo}" }
                                     }
                                 }
-                            });
+                            }
                         }
                     }
                 }
             }
 
-            if let Some(message) = toast() {
-                div { class: "toast toast-end toast-bottom",
-                    div { class: "alert toast-message",
-                        span { "{message}" }
-                        button { onclick: move |_| toast.set(None), "x" }
+            main { class: "content",
+                div { class: "resultbar",
+                    span { class: "mono", "{total} pull requests" }
+                    button {
+                        disabled: rows.is_empty(),
+                        onclick: {
+                            let rows = rows.clone();
+                            move |_| {
+                                let all_selected = rows.iter().all(|row| selected.read().contains(&row.id));
+                                if all_selected {
+                                    for row in &rows { selected.write().remove(&row.id); }
+                                } else {
+                                    for row in &rows { selected.write().insert(row.id.clone()); }
+                                }
+                            }
+                        },
+                        if rows.iter().all(|row| selected.read().contains(&row.id)) && !rows.is_empty() {
+                            "clear visible"
+                        } else {
+                            "select visible"
+                        }
+                    }
+                    span { class: "result-spacer" }
+                    span { class: "muted mono desktop-only", "updated recently first" }
+                }
+                if active_filter_count > 0 {
+                    ActiveFilters { filter, cursor }
+                }
+                div { class: "table-scroll",
+                    div { class: "pr-grid table-head",
+                        span {}
+                        span { "PR" }
+                        span { "Dependency" }
+                        span { "Repository" }
+                        span { "Checks" }
+                        span { "Labels" }
+                        span { class: "right", "Updated" }
+                    }
+                    if let Some(error) = load_error {
+                        div { class: "empty-state error-state",
+                            strong { "The read model could not be loaded" }
+                            code { "{error}" }
+                            Button { size: ButtonSize::Sm, onclick: move |_| dashboard.restart(), "Retry" }
+                        }
+                    } else if page.is_none() {
+                        div { class: "loading-state",
+                            Loading { size: LoadingSize::Sm }
+                            "Reading the projection"
+                        }
+                    } else if rows.is_empty() {
+                        div { class: "empty-state",
+                            span { class: "empty-mark" }
+                            strong { "No open Dependabot pull requests" }
+                            p { "Try clearing filters or queue a reconciliation sweep." }
+                        }
+                    } else {
+                        for row in &rows {
+                            PrRow {
+                                key: "{row.id}",
+                                row: row.clone(),
+                                checked: selected.read().contains(&row.id),
+                                oncheck: move |id: String| {
+                                    if !selected.write().insert(id.clone()) {
+                                        selected.write().remove(&id);
+                                    }
+                                },
+                                onopen: move |row: PrRecord| detail.set(Some(row))
+                            }
+                        }
+                    }
+                    if let Some(next) = page.as_ref().and_then(|page| page.next_cursor.clone()) {
+                        div { class: "load-more",
+                            Button {
+                                size: ButtonSize::Sm,
+                                class: "btn-ghost",
+                                onclick: move |_| {
+                                    selected.write().clear();
+                                    cursor.set(Some(next.clone()));
+                                },
+                                "Load next 50"
+                            }
+                        }
                     }
                 }
             }
+        }
+
+        footer { class: "statusbar",
+            span { class: "status-dot" }
+            span { "projection online" }
+            span { class: "status-spacer" }
+            if let Some(synced) = page.as_ref().and_then(|page| page.last_synced_at) {
+                span { "last event {relative_time(synced)}" }
+            } else {
+                span { "waiting for first reconciliation" }
+            }
+        }
+
+        if selected_count > 0 {
+            div { class: "action-bar",
+                strong { class: "mono", "{selected_count} selected" }
+                button { class: "action-link", onclick: move |_| selected.write().clear(), "clear" }
+                span { class: "action-divider" }
+                Button {
+                    size: ButtonSize::Sm,
+                    class: "rebase-button",
+                    onclick: {
+                        let rows = rows.clone();
+                        move |_| pending.set(Some(PendingAction {
+                            action: BulkActionKind::Rebase,
+                            targets: selected_targets(&rows, &selected.read()),
+                        }))
+                    },
+                    "Request rebase"
+                }
+                Button {
+                    size: ButtonSize::Sm,
+                    class: "merge-button",
+                    onclick: {
+                        let rows = rows.clone();
+                        move |_| pending.set(Some(PendingAction {
+                            action: BulkActionKind::Merge,
+                            targets: selected_targets(&rows, &selected.read()),
+                        }))
+                    },
+                    "Merge selected"
+                }
+            }
+        }
+
+        if let Some(row) = detail() {
+            DetailDrawer {
+                row,
+                onclose: move |_| detail.set(None),
+                onaction: move |action| pending.set(Some(action)),
+                onsync: move |result: Result<Option<PrRecord>, String>| match result {
+                    Ok(Some(row)) => {
+                        detail.set(Some(row));
+                        toast.success("Pull request synced".to_owned(), ToastOptions::new());
+                        reload();
+                    }
+                    Ok(None) => {
+                        detail.set(None);
+                        toast.info("Pull request is no longer open".to_owned(), ToastOptions::new());
+                        reload();
+                    }
+                    Err(error) => toast.error(error, sticky()),
+                }
+            }
+        }
+
+        if let Some(progress) = active_batch() {
+            button {
+                class: "progress-pill",
+                onclick: move |_| progress_open.toggle(),
+                span { class: if progress.completed { "progress-live complete" } else { "progress-live" } }
+                "{progress.action}: {progress.succeeded + progress.rejected}/{progress.targets.len()}"
+            }
+            if progress_open() {
+                ProgressDrawer { progress: progress.clone(), onclose: move |_| progress_open.set(false) }
+            }
+        }
+
+        ConfirmModal {
+            pending: pending(),
+            oncancel: move |_| pending.set(None),
+            onconfirm: queue_batch,
         }
     }
 }
@@ -1132,11 +1195,37 @@ fn PrRow(
     }
 }
 
+/// The scrim, panel and header shared by the side drawers. Clicking the scrim
+/// or the close button closes; clicks inside the panel do not propagate.
+#[component]
+fn SidePanel(
+    class: &'static str,
+    eyebrow: String,
+    title: Element,
+    onclose: EventHandler<()>,
+    children: Element,
+) -> Element {
+    rsx! {
+        div { class: "drawer-scrim", onclick: move |_| onclose.call(()),
+            section { class: "side-drawer {class}", onclick: move |event| event.stop_propagation(),
+                div { class: "drawer-head",
+                    div {
+                        span { class: "eyebrow", "{eyebrow}" }
+                        h2 { {title} }
+                    }
+                    button { class: "close-button", onclick: move |_| onclose.call(()), "x" }
+                }
+                {children}
+            }
+        }
+    }
+}
+
 #[component]
 fn DetailDrawer(
     row: PrRecord,
-    onclose: EventHandler<MouseEvent>,
-    onaction: EventHandler<BulkActionKind>,
+    onclose: EventHandler<()>,
+    onaction: EventHandler<PendingAction>,
     onsync: EventHandler<Result<Option<PrRecord>, String>>,
 ) -> Element {
     let stale = unix_seconds().saturating_sub(row.synced_at) > 45 * 60;
@@ -1160,141 +1249,146 @@ fn DetailDrawer(
         .map(ToString::to_string);
     let sync_repository_id = row.repository_id;
     let sync_number = row.number;
+    let target = pr_target(&row);
+    let request = use_callback(move |action: BulkActionKind| {
+        onaction.call(PendingAction {
+            action,
+            targets: vec![target.clone()],
+        });
+    });
     rsx! {
-        div { class: "drawer-scrim", onclick: move |event| onclose.call(event),
-            section { class: "side-drawer detail-drawer", onclick: move |event| event.stop_propagation(),
-                div { class: "drawer-head",
-                    div {
-                        span { class: "eyebrow", "Pull request" }
-                        h2 {
-                            a {
-                                class: "github-pr-link",
-                                href: row.html_url.clone(),
-                                target: "_blank",
-                                rel: "noreferrer",
-                                "{row.owner}/{row.repo}#{row.number}"
-                                span { class: "external-link-glyph", "↗" }
-                            }
-                        }
-                    }
-                    button { class: "close-button", onclick: move |event| onclose.call(event), "x" }
+        SidePanel {
+            class: "detail-drawer",
+            eyebrow: "Pull request",
+            onclose,
+            title: rsx! {
+                a {
+                    class: "github-pr-link",
+                    href: row.html_url.clone(),
+                    target: "_blank",
+                    rel: "noreferrer",
+                    "{row.owner}/{row.repo}#{row.number}"
+                    span { class: "external-link-glyph", "↗" }
                 }
-                div { class: "drawer-body",
-                    h3 { "{row.title}" }
-                    div { class: "drawer-badges",
-                        span { class: "update-chip {update_class(row.update_type)}", "{row.update_type}" }
-                        span { class: "status-badge", span { class: "check-dot {status_class(row.check_status)}" } "{status_label(row.check_status)}" }
-                        if let Some(mergeable) = &row.mergeable { span { class: "status-badge", "{mergeable}" } }
-                        if stale { span { class: "status-badge stale-badge", "projection stale" } }
+            },
+            div { class: "drawer-body",
+                h3 { "{row.title}" }
+                div { class: "drawer-badges",
+                    span { class: "update-chip {update_class(row.update_type)}", "{row.update_type}" }
+                    span { class: "status-badge", span { class: "check-dot {status_class(row.check_status)}" } "{status_label(row.check_status)}" }
+                    if let Some(mergeable) = &row.mergeable { span { class: "status-badge", "{mergeable}" } }
+                    if stale { span { class: "status-badge stale-badge", "projection stale" } }
+                }
+                div { class: "drawer-actions",
+                    Button {
+                        size: ButtonSize::Sm,
+                        class: "rebase-button",
+                        onclick: move |_| request(BulkActionKind::Rebase),
+                        "Rebase"
                     }
-                    div { class: "drawer-actions",
-                        button {
-                            class: "btn btn-sm rebase-button",
-                            onclick: move |_| onaction.call(BulkActionKind::Rebase),
-                            "Rebase"
-                        }
-                        button {
-                            class: "btn btn-sm merge-button",
-                            onclick: move |_| onaction.call(BulkActionKind::Merge),
-                            "Merge"
-                        }
-                        button {
-                            class: "btn btn-sm drawer-sync",
-                            disabled: syncing() || sync_queued(),
-                            onclick: move |_| {
-                                syncing.set(true);
-                                spawn(async move {
-                                    match request_pr_sync(sync_repository_id, sync_number).await {
-                                        Ok(completion_id) => {
-                                            syncing.set(false);
-                                            sync_queued.set(true);
-                                            match wait_for_pr_sync_completion(
-                                                sync_repository_id,
-                                                sync_number,
-                                                completion_id,
-                                            ).await {
-                                                Ok(row) => {
-                                                    sync_queued.set(false);
-                                                    status.restart();
-                                                    onsync.call(Ok(row));
-                                                }
-                                                Err(error) => {
-                                                    sync_queued.set(false);
-                                                    onsync.call(Err(format!(
-                                                        "Sync was queued, but completion could not be confirmed: {error}"
-                                                    )));
-                                                }
+                    Button {
+                        size: ButtonSize::Sm,
+                        class: "merge-button",
+                        onclick: move |_| request(BulkActionKind::Merge),
+                        "Merge"
+                    }
+                    Button {
+                        size: ButtonSize::Sm,
+                        class: "drawer-sync",
+                        disabled: syncing() || sync_queued(),
+                        onclick: move |_| {
+                            syncing.set(true);
+                            spawn(async move {
+                                match request_pr_sync(sync_repository_id, sync_number).await {
+                                    Ok(completion_id) => {
+                                        syncing.set(false);
+                                        sync_queued.set(true);
+                                        match wait_for_pr_sync_completion(
+                                            sync_repository_id,
+                                            sync_number,
+                                            completion_id,
+                                        ).await {
+                                            Ok(row) => {
+                                                sync_queued.set(false);
+                                                status.restart();
+                                                onsync.call(Ok(row));
+                                            }
+                                            Err(error) => {
+                                                sync_queued.set(false);
+                                                onsync.call(Err(format!(
+                                                    "Sync was queued, but completion could not be confirmed: {error}"
+                                                )));
                                             }
                                         }
-                                        Err(error) => {
-                                            syncing.set(false);
-                                            onsync.call(Err(format!("Could not queue sync: {error}")));
-                                        }
                                     }
-                                });
-                            },
-                            if syncing() {
-                                "Queueing..."
-                            } else if sync_queued() {
-                                "Syncing..."
-                            } else {
-                                "Sync"
-                            }
+                                    Err(error) => {
+                                        syncing.set(false);
+                                        onsync.call(Err(format!("Could not queue sync: {error}")));
+                                    }
+                                }
+                            });
+                        },
+                        if syncing() {
+                            "Queueing..."
+                        } else if sync_queued() {
+                            "Syncing..."
+                        } else {
+                            "Sync"
                         }
                     }
+                }
+                dl { class: "detail-list",
+                    dt { "Head SHA" } dd { code { "{row.head_sha}" } }
+                    dt { "Last updated" } dd { "{relative_time(row.updated_at)}" }
+                    dt { "Projected" } dd { "{relative_time(row.synced_at)}" }
+                }
+                h4 { "Dependencies" }
+                div { class: "dependency-list",
+                    for dependency in &row.dependencies {
+                        div {
+                            strong { "{dependency.name}" }
+                            code { "{version_label(dependency.from_version.as_deref(), dependency.to_version.as_deref())}" }
+                            span { class: "update-chip {update_class(dependency.update_type)}", "{dependency.update_type}" }
+                        }
+                    }
+                }
+                h4 { "Labels" }
+                div { class: "drawer-labels",
+                    for label in &row.labels { span { "{label}" } }
+                }
+                h4 { "Durable state" }
+                if let Some(error) = status_error {
+                    p { class: "batch-failure", "Could not load activity: {error}" }
+                } else if let Some(state) = durable_state {
                     dl { class: "detail-list",
-                        dt { "Head SHA" } dd { code { "{row.head_sha}" } }
-                        dt { "Last updated" } dd { "{relative_time(row.updated_at)}" }
-                        dt { "Projected" } dd { "{relative_time(row.synced_at)}" }
-                    }
-                    h4 { "Dependencies" }
-                    div { class: "dependency-list",
-                        for dependency in &row.dependencies {
-                            div {
-                                strong { "{dependency.name}" }
-                                code { "{version_label(dependency.from_version.as_deref(), dependency.to_version.as_deref())}" }
-                                span { class: "update-chip {update_class(dependency.update_type)}", "{dependency.update_type}" }
-                            }
-                        }
-                    }
-                    h4 { "Labels" }
-                    div { class: "drawer-labels",
-                        for label in &row.labels { span { "{label}" } }
-                    }
-                    h4 { "Durable state" }
-                    if let Some(error) = status_error {
-                        p { class: "batch-failure", "Could not load activity: {error}" }
-                    } else if let Some(state) = durable_state {
-                        dl { class: "detail-list",
-                            dt { "Last canonical sync" }
-                            dd {
-                                if let Some(last_synced_at) = state.last_synced_at {
-                                    "{relative_time(last_synced_at)}"
-                                } else {
-                                    "not yet"
-                                }
-                            }
-                            dt { "Debounced sync" }
-                            dd { if state.sync_pending { "pending" } else { "idle" } }
-                        }
-                        div { class: "dependency-list",
-                            if state.history.is_empty() {
-                                div { "No durable activity recorded." }
+                        dt { "Last canonical sync" }
+                        dd {
+                            if let Some(last_synced_at) = state.last_synced_at {
+                                "{relative_time(last_synced_at)}"
                             } else {
-                                for entry in state.history.iter().rev() {
-                                    div {
-                                        strong { "{entry.action}" }
-                                        code { "{relative_time(entry.at)}" }
-                                        span { "{entry.detail}" }
-                                    }
+                                "not yet"
+                            }
+                        }
+                        dt { "Debounced sync" }
+                        dd { if state.sync_pending { "pending" } else { "idle" } }
+                    }
+                    div { class: "dependency-list",
+                        if state.history.is_empty() {
+                            div { "No durable activity recorded." }
+                        } else {
+                            for entry in state.history.iter().rev() {
+                                div {
+                                    strong { "{entry.action}" }
+                                    code { "{relative_time(entry.at)}" }
+                                    span { "{entry.detail}" }
                                 }
                             }
                         }
-                    } else {
-                        div { class: "loading-state",
-                            span { class: "loading loading-spinner loading-sm" }
-                            "Reading durable activity"
-                        }
+                    }
+                } else {
+                    div { class: "loading-state",
+                        Loading { size: LoadingSize::Sm }
+                        "Reading durable activity"
                     }
                 }
             }
@@ -1302,27 +1396,52 @@ fn DetailDrawer(
     }
 }
 
+/// The confirmation for a bulk action. Always mounted with a controlled open
+/// state so the dialog restores focus when it closes; both buttons close the
+/// dialog before their handler runs, so `oncancel` also fires ahead of
+/// `onconfirm` and must not hold anything the latter needs.
 #[component]
 fn ConfirmModal(
-    action: BulkActionKind,
-    count: usize,
-    oncancel: EventHandler<MouseEvent>,
-    onconfirm: EventHandler<MouseEvent>,
+    pending: Option<PendingAction>,
+    oncancel: EventHandler<()>,
+    onconfirm: EventHandler<PendingAction>,
 ) -> Element {
     rsx! {
-        div { class: "modal modal-open",
-            div { class: "modal-box confirm-box",
-                span { class: "eyebrow", "Durable bulk action" }
-                h2 { "{action} {count} pull requests?" }
-                p { "The selected head SHAs are captured now. Moved or ineligible pull requests will be rejected, not silently retried against new code." }
-                if action == BulkActionKind::Merge {
-                    div { class: "notice", "Uses the globally configured merge method." }
-                } else {
-                    div { class: "notice", "Rebase is requested by an idempotent @dependabot comment using the configured user token." }
+        AlertDialog {
+            id: "confirm-bulk-action",
+            class: "confirm-box",
+            open: Some(pending.is_some()),
+            on_open_change: move |open: bool| {
+                if !open {
+                    oncancel.call(());
                 }
-                div { class: "modal-action",
-                    button { class: "btn btn-ghost btn-sm", onclick: move |event| oncancel.call(event), "Cancel" }
-                    button { class: "btn btn-sm confirm-button", onclick: move |event| onconfirm.call(event), "Queue {action}" }
+            },
+            if let Some(pending) = pending {
+                {
+                    let action = pending.action;
+                    let count = pending.targets.len();
+                    rsx! {
+                        span { class: "eyebrow", "Durable bulk action" }
+                        AlertDialogTitle { appearance: AlertDialogTitleAppearance::None,
+                            "{action} {count} pull requests?"
+                        }
+                        AlertDialogDescription { appearance: AlertDialogDescriptionAppearance::None,
+                            "The selected head SHAs are captured now. Moved or ineligible pull requests will be rejected, not silently retried against new code."
+                        }
+                        if action == BulkActionKind::Merge {
+                            div { class: "notice", "Uses the globally configured merge method." }
+                        } else {
+                            div { class: "notice", "Rebase is requested by an idempotent @dependabot comment using the configured user token." }
+                        }
+                        AlertDialogActions {
+                            AlertDialogCancel { class: "btn-ghost btn-sm", "Cancel" }
+                            AlertDialogAction {
+                                class: "btn-sm confirm-button",
+                                on_click: move |_| onconfirm.call(pending.clone()),
+                                "Queue {action}"
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1330,7 +1449,7 @@ fn ConfirmModal(
 }
 
 #[component]
-fn ProgressDrawer(progress: BatchProgress, onclose: EventHandler<MouseEvent>) -> Element {
+fn ProgressDrawer(progress: BatchProgress, onclose: EventHandler<()>) -> Element {
     let completed = progress.succeeded + progress.rejected;
     let total = progress.targets.len();
     let percentage = if total == 0 {
@@ -1339,45 +1458,55 @@ fn ProgressDrawer(progress: BatchProgress, onclose: EventHandler<MouseEvent>) ->
         completed * 100 / total as u64
     };
     rsx! {
-        div { class: "drawer-scrim", onclick: move |event| onclose.call(event),
-            section { class: "side-drawer progress-drawer", onclick: move |event| event.stop_propagation(),
-                div { class: "drawer-head",
-                    div { span { class: "eyebrow", "Batch {progress.batch_id}" } h2 { "{progress.action} progress" } }
-                    button { class: "close-button", onclick: move |event| onclose.call(event), "x" }
+        SidePanel {
+            class: "progress-drawer",
+            eyebrow: "Batch {progress.batch_id}",
+            title: rsx! { "{progress.action} progress" },
+            onclose,
+            div { class: "progress-summary",
+                strong { "{completed}/{total}" }
+                span { "{progress.succeeded} succeeded, {progress.rejected} rejected" }
+                progress { class: "progress progress-primary", max: "100", value: "{percentage}" }
+                if let Some(failure) = &progress.failure {
+                    p { class: "batch-failure", "{failure}" }
                 }
-                div { class: "progress-summary",
-                    strong { "{completed}/{total}" }
-                    span { "{progress.succeeded} succeeded, {progress.rejected} rejected" }
-                    progress { class: "progress progress-primary", max: "100", value: "{percentage}" }
-                    if let Some(failure) = &progress.failure {
-                        p { class: "batch-failure", "{failure}" }
-                    }
-                }
-                div { class: "progress-list",
-                    for item in &progress.targets {
-                        div { class: "progress-row",
-                            span { class: "progress-state {progress_class(&item.state)}" }
-                            div {
-                                if let Some(html_url) = progress_target_url(&item.target) {
-                                    a {
-                                        class: "github-pr-link",
-                                        href: html_url,
-                                        target: "_blank",
-                                        rel: "noreferrer",
-                                        strong { "{item.target.owner}/{item.target.repo}#{item.target.number}" }
-                                        span { class: "external-link-glyph", "↗" }
-                                    }
-                                } else {
+            }
+            div { class: "progress-list",
+                for item in &progress.targets {
+                    div { class: "progress-row",
+                        span { class: "progress-state {progress_class(&item.state)}" }
+                        div {
+                            if let Some(html_url) = progress_target_url(&item.target) {
+                                a {
+                                    class: "github-pr-link",
+                                    href: html_url,
+                                    target: "_blank",
+                                    rel: "noreferrer",
                                     strong { "{item.target.owner}/{item.target.repo}#{item.target.number}" }
+                                    span { class: "external-link-glyph", "↗" }
                                 }
-                                small { "{progress_detail(&item.state)}" }
+                            } else {
+                                strong { "{item.target.owner}/{item.target.repo}#{item.target.number}" }
                             }
+                            small { "{progress_detail(&item.state)}" }
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// Errors stay until dismissed; every other toast auto-dismisses.
+fn sticky() -> ToastOptions {
+    ToastOptions::new().permanent(true)
+}
+
+fn selected_targets(rows: &[PrRecord], selected: &BTreeSet<String>) -> Vec<PrTarget> {
+    rows.iter()
+        .filter(|row| selected.contains(&row.id))
+        .map(pr_target)
+        .collect()
 }
 
 fn pr_target(row: &PrRecord) -> PrTarget {

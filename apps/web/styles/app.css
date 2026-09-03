@@ -1208,12 +1208,15 @@ code,
   font-weight: 400;
 }
 
+/* The toast region is always mounted; only the toasts themselves take clicks. */
 .toast {
   z-index: 50;
+  pointer-events: none;
 }
 
 .toast-message {
   display: flex;
+  align-items: center;
   width: min(390px, calc(100vw - 28px));
   min-height: 42px;
   border: 1px solid var(--line);
@@ -1221,14 +1224,16 @@ code,
   background: var(--color-base-200);
   box-shadow: 0 10px 32px rgb(0 0 0 / 25%);
   font-size: 11px;
+  pointer-events: auto;
 }
+
+.toast-message.alert-success { border-left: 2px solid var(--color-success); }
+.toast-message.alert-warning { border-left: 2px solid var(--color-warning); }
+.toast-message.alert-error { border-left: 2px solid var(--color-error); }
 
 .toast-message button {
   margin-left: auto;
-  border: 0;
   color: var(--muted);
-  background: transparent;
-  cursor: pointer;
 }
 
 @keyframes slidein {
