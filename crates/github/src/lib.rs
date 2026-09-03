@@ -937,8 +937,6 @@ struct CommitData {
 
 #[derive(Debug, Deserialize)]
 struct CheckRuns {
-    #[allow(dead_code)]
-    total_count: u64,
     check_runs: Vec<CheckRun>,
 }
 
