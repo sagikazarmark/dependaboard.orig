@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::BTreeMap, fmt, str::FromStr};
+use std::{cmp::Ordering, collections::BTreeMap, fmt, str::FromStr, sync::LazyLock};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use regex::Regex;
@@ -408,9 +408,16 @@ fn metadata_update_type(value: &str) -> UpdateType {
     }
 }
 
+/// Matches the "Bump <name> from <from> to <to>" subject Dependabot writes for
+/// single-dependency updates. Compiled once per process; the pattern is a
+/// literal, so a compile failure is a programming error rather than bad input.
+static TITLE_UPDATE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bbump\s+(.+?)\s+from\s+(\S+)\s+to\s+(\S+)")
+        .expect("Dependabot title pattern is a valid regex")
+});
+
 fn parse_title_update(title: &str) -> Option<(String, String, String, UpdateType)> {
-    let pattern = Regex::new(r"(?i)\bbump\s+(.+?)\s+from\s+(\S+)\s+to\s+(\S+)").ok()?;
-    let captures = pattern.captures(title)?;
+    let captures = TITLE_UPDATE_PATTERN.captures(title)?;
     let name = captures.get(1)?.as_str().trim().to_owned();
     let from = captures.get(2)?.as_str().trim_matches('`').to_owned();
     let to = captures
