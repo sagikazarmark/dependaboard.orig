@@ -31,10 +31,16 @@ pub struct GithubConfig {
 
 impl GithubConfig {
     pub fn from_env() -> Result<Self, GithubError> {
-        let private_key = match env::var("GITHUB_PRIVATE_KEY") {
-            Ok(value) => value.replace("\\n", "\n"),
-            Err(_) => {
-                let path = env::var("GITHUB_PRIVATE_KEY_PATH").map_err(|_| {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    /// Builds the config from a variable lookup, so the parsing rules can be
+    /// exercised without touching the process environment.
+    fn from_lookup(var: impl Fn(&str) -> Option<String>) -> Result<Self, GithubError> {
+        let private_key = match var("GITHUB_PRIVATE_KEY") {
+            Some(value) => value.replace("\\n", "\n"),
+            None => {
+                let path = var("GITHUB_PRIVATE_KEY_PATH").ok_or_else(|| {
                     GithubError::Config(
                         "set GITHUB_PRIVATE_KEY or GITHUB_PRIVATE_KEY_PATH".to_owned(),
                     )
@@ -44,15 +50,14 @@ impl GithubConfig {
                 })?
             }
         };
-        let dashboard_user =
-            env::var("DASHBOARD_USERNAME").unwrap_or_else(|_| "dependaboard".to_owned());
+        let dashboard_user = var("DASHBOARD_USERNAME").unwrap_or_else(|| "dependaboard".to_owned());
         if dashboard_user.trim().is_empty() {
             return Err(GithubError::Config(
                 "DASHBOARD_USERNAME must not be empty".to_owned(),
             ));
         }
-        let merge_method = env::var("GITHUB_MERGE_METHOD")
-            .unwrap_or_else(|_| MergeMethod::default().to_string())
+        let merge_method = var("GITHUB_MERGE_METHOD")
+            .unwrap_or_else(|| MergeMethod::default().to_string())
             .parse()
             .map_err(|_| {
                 GithubError::Config(
@@ -60,14 +65,14 @@ impl GithubConfig {
                 )
             })?;
         Ok(Self {
-            api_url: env::var("GITHUB_API_URL")
-                .unwrap_or_else(|_| "https://api.github.com".to_owned())
+            api_url: var("GITHUB_API_URL")
+                .unwrap_or_else(|| "https://api.github.com".to_owned())
                 .trim_end_matches('/')
                 .to_owned(),
-            app_id: parse_env("GITHUB_APP_ID")?,
-            installation_id: parse_env("GITHUB_INSTALLATION_ID")?,
+            app_id: parse_u64_var(&var, "GITHUB_APP_ID")?,
+            installation_id: parse_u64_var(&var, "GITHUB_INSTALLATION_ID")?,
             private_key: SecretString::from(private_key),
-            user_pat: SecretString::from(env::var("GITHUB_USER_PAT").map_err(|_| {
+            user_pat: SecretString::from(var("GITHUB_USER_PAT").ok_or_else(|| {
                 GithubError::Config("set GITHUB_USER_PAT for Dependabot rebase commands".to_owned())
             })?),
             dashboard_user: UserId::new(dashboard_user),
@@ -99,9 +104,9 @@ impl TokenProvider for StaticTokenProvider {
     }
 }
 
-fn parse_env(name: &str) -> Result<u64, GithubError> {
-    env::var(name)
-        .map_err(|_| GithubError::Config(format!("set {name}")))?
+fn parse_u64_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Result<u64, GithubError> {
+    var(name)
+        .ok_or_else(|| GithubError::Config(format!("set {name}")))?
         .parse()
         .map_err(|_| GithubError::Config(format!("{name} must be an unsigned integer")))
 }
@@ -109,6 +114,9 @@ fn parse_env(name: &str) -> Result<u64, GithubError> {
 #[derive(Clone)]
 pub struct GithubClient {
     config: Arc<GithubConfig>,
+    /// The App's RSA key, parsed once at construction so a malformed key is a
+    /// startup failure rather than a surprise on the first API call.
+    app_key: EncodingKey,
     http: reqwest::Client,
     tokens: Arc<Mutex<HashMap<u64, CachedToken>>>,
     user_tokens: Arc<dyn TokenProvider>,
@@ -133,6 +141,8 @@ impl GithubClient {
         config: GithubConfig,
         user_tokens: Arc<dyn TokenProvider>,
     ) -> Result<Self, GithubError> {
+        let app_key = EncodingKey::from_rsa_pem(config.private_key.expose_secret().as_bytes())
+            .map_err(|error| GithubError::Config(format!("invalid GitHub private key: {error}")))?;
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
@@ -141,6 +151,7 @@ impl GithubClient {
             .map_err(|error| GithubError::Transport(error.to_string()))?;
         Ok(Self {
             config: Arc::new(config),
+            app_key,
             http,
             tokens: Arc::new(Mutex::new(HashMap::new())),
             user_tokens,
@@ -199,8 +210,6 @@ impl GithubClient {
         }
 
         let now = unix_seconds();
-        let key = EncodingKey::from_rsa_pem(self.config.private_key.expose_secret().as_bytes())
-            .map_err(|error| GithubError::Config(format!("invalid GitHub private key: {error}")))?;
         encode(
             &Header::new(Algorithm::RS256),
             &Claims {
@@ -208,7 +217,7 @@ impl GithubClient {
                 exp: now + 9 * 60,
                 iss: self.config.app_id.to_string(),
             },
-            &key,
+            &self.app_key,
         )
         .map_err(|error| GithubError::Config(format!("cannot sign GitHub App JWT: {error}")))
     }
@@ -987,9 +996,77 @@ mod tests {
     use super::*;
     use dependaboard_core::DependencyUpdate;
 
+    /// A throwaway RSA key generated for the test suite.
+    const APP_KEY: &str = include_str!("../testdata/app-key.pem");
+
+    fn lookup(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: HashMap<String, String> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        move |name| vars.get(name).cloned()
+    }
+
+    fn required_env(private_key: &str) -> Vec<(&str, &str)> {
+        vec![
+            ("GITHUB_APP_ID", "1234"),
+            ("GITHUB_INSTALLATION_ID", "42"),
+            ("GITHUB_PRIVATE_KEY", private_key),
+            ("GITHUB_USER_PAT", "ghp_pat"),
+        ]
+    }
+
     #[test]
-    fn multiline_private_key_env_is_normalized() {
-        assert_eq!("a\\nb".replace("\\n", "\n"), "a\nb");
+    fn multiline_private_key_env_is_normalized_into_a_usable_key() {
+        // Secret stores commonly flatten PEM files to one line with literal `\n`.
+        let flattened = APP_KEY.trim_end().replace('\n', "\\n");
+
+        let config = GithubConfig::from_lookup(lookup(&required_env(&flattened))).unwrap();
+
+        assert_eq!(config.private_key.expose_secret(), APP_KEY.trim_end());
+        assert!(GithubClient::new(config).is_ok());
+    }
+
+    #[test]
+    fn config_applies_defaults_and_honours_overrides() {
+        let mut vars = required_env(APP_KEY);
+        let defaults = GithubConfig::from_lookup(lookup(&vars)).unwrap();
+        assert_eq!(defaults.api_url, "https://api.github.com");
+        assert_eq!(defaults.app_id, 1234);
+        assert_eq!(defaults.installation_id, 42);
+        assert_eq!(defaults.dashboard_user, UserId::new("dependaboard"));
+        assert_eq!(defaults.merge_method, MergeMethod::Squash);
+
+        vars.push(("GITHUB_API_URL", "https://ghe.example.com/api/v3/"));
+        vars.push(("GITHUB_MERGE_METHOD", "rebase"));
+        vars.push(("DASHBOARD_USERNAME", "octocat"));
+        let custom = GithubConfig::from_lookup(lookup(&vars)).unwrap();
+        assert_eq!(custom.api_url, "https://ghe.example.com/api/v3");
+        assert_eq!(custom.merge_method, MergeMethod::Rebase);
+        assert_eq!(custom.dashboard_user, UserId::new("octocat"));
+    }
+
+    #[test]
+    fn config_rejects_missing_or_malformed_settings() {
+        let missing_key = GithubConfig::from_lookup(lookup(&[("GITHUB_APP_ID", "1")]));
+        assert!(matches!(
+            missing_key,
+            Err(GithubError::Config(message)) if message.contains("GITHUB_PRIVATE_KEY")
+        ));
+
+        let mut vars = required_env(APP_KEY);
+        vars.push(("GITHUB_MERGE_METHOD", "fast-forward"));
+        assert!(matches!(
+            GithubConfig::from_lookup(lookup(&vars)),
+            Err(GithubError::Config(message)) if message.contains("GITHUB_MERGE_METHOD")
+        ));
+
+        let mut vars = required_env(APP_KEY);
+        vars[0] = ("GITHUB_APP_ID", "not-a-number");
+        assert!(matches!(
+            GithubConfig::from_lookup(lookup(&vars)),
+            Err(GithubError::Config(message)) if message.contains("GITHUB_APP_ID")
+        ));
     }
 
     #[test]
