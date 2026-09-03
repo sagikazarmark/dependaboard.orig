@@ -3,38 +3,51 @@ use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time:
 use async_trait::async_trait;
 use dependaboard_core::{
     CheckStatus, CursorError, DashboardPage, FacetCounts, LabelFacet, Mergeable, Page, PageCursor,
-    PrFilter, PrKey, PrRecord, RepoRecord, STALE_AFTER, UpdateType, unix_seconds,
+    PrFilter, PrKey, PrRecord, RepoRecord, UpdateType, unix_seconds,
 };
-use libsql::{Builder, Database, Row, Transaction, Value};
+use libsql::{Builder, Row, Value};
+use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
+use tokio::sync::{Mutex, MutexGuard};
+
+mod filter;
+
+use filter::filter_sql;
 
 const MIGRATION: &str = include_str!("../../../migrations/0001_initial.sql");
 
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
     pub url: String,
-    pub auth_token: String,
+    /// Remote libSQL/Turso token. Empty for a local file; `Debug` redacts it.
+    pub auth_token: SecretString,
 }
 
 impl StoreConfig {
     pub fn from_env() -> Self {
         Self {
             url: env::var("LIBSQL_URL").unwrap_or_else(|_| "data/dependaboard.db".to_owned()),
-            auth_token: env::var("LIBSQL_AUTH_TOKEN").unwrap_or_default(),
+            auth_token: SecretString::from(env::var("LIBSQL_AUTH_TOKEN").unwrap_or_default()),
         }
     }
 
     pub fn local(path: impl AsRef<Path>) -> Self {
         Self {
             url: path.as_ref().to_string_lossy().into_owned(),
-            auth_token: String::new(),
+            auth_token: SecretString::from(String::new()),
         }
     }
 }
 
+/// One libSQL connection per store, shared by clones and serialised by a
+/// mutex so a transaction on it never interleaves with another caller's
+/// statements. SQLite has a single writer anyway, so little concurrency is
+/// lost, and the busy timeout still waits out other processes. A future
+/// dropped mid-transaction is safe: libSQL rolls the transaction back (or
+/// closes the remote stream) when the `Transaction` drops.
 #[derive(Clone)]
 pub struct LibSqlPrStore {
-    database: Arc<Database>,
+    connection: Arc<Mutex<libsql::Connection>>,
 }
 
 impl LibSqlPrStore {
@@ -43,9 +56,12 @@ impl LibSqlPrStore {
             || config.url.starts_with("https://")
             || config.url.starts_with("http://")
         {
-            Builder::new_remote(config.url.clone(), config.auth_token.clone())
-                .build()
-                .await?
+            Builder::new_remote(
+                config.url.clone(),
+                config.auth_token.expose_secret().to_owned(),
+            )
+            .build()
+            .await?
         } else {
             if let Some(parent) = Path::new(&config.url)
                 .parent()
@@ -55,24 +71,27 @@ impl LibSqlPrStore {
             }
             Builder::new_local(&config.url).build().await?
         };
+        let connection = database.connect()?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute("PRAGMA foreign_keys = ON", ()).await?;
         let store = Self {
-            database: Arc::new(database),
+            connection: Arc::new(Mutex::new(connection)),
         };
         store.migrate().await?;
         Ok(store)
     }
 
     pub async fn migrate(&self) -> Result<(), StoreError> {
-        let connection = self.connection().await?;
+        let connection = self.connection().await;
         connection.execute_batch(MIGRATION).await?;
         Ok(())
     }
 
-    async fn connection(&self) -> Result<libsql::Connection, StoreError> {
-        let connection = self.database.connect()?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute("PRAGMA foreign_keys = ON", ()).await?;
-        Ok(connection)
+    /// Holds the connection for the duration of one store operation. The
+    /// lock is not re-entrant, so never call another `PrStore` method (or
+    /// `migrate`) while a guard is alive.
+    async fn connection(&self) -> MutexGuard<'_, libsql::Connection> {
+        self.connection.lock().await
     }
 }
 
@@ -109,7 +128,7 @@ pub trait PrStore: Send + Sync {
 #[async_trait]
 impl PrStore for LibSqlPrStore {
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<(), StoreError> {
-        let connection = self.connection().await?;
+        let connection = self.connection().await;
         let dependencies = serde_json::to_string(&pr.dependencies)?;
         let labels = serde_json::to_string(&pr.labels)?;
         connection
@@ -167,7 +186,7 @@ impl PrStore for LibSqlPrStore {
     }
 
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError> {
-        let connection = self.connection().await?;
+        let connection = self.connection().await;
         let mut rows = connection
             .query(
                 &format!("{} WHERE p.id = ?1", select_pr_sql()),
@@ -179,7 +198,7 @@ impl PrStore for LibSqlPrStore {
 
     async fn delete_pr(&self, key: &PrKey) -> Result<(), StoreError> {
         self.connection()
-            .await?
+            .await
             .execute(
                 "DELETE FROM pull_requests WHERE id = ?1",
                 vec![Value::Text(key.to_string())],
@@ -194,39 +213,23 @@ impl PrStore for LibSqlPrStore {
         live: &[u64],
         synced_before: u64,
     ) -> Result<u64, StoreError> {
-        let connection = self.connection().await?;
+        let connection = self.connection().await;
         retain_prs_on(&connection, repository_id, live, synced_before).await
     }
 
     async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage, StoreError> {
-        let connection = self.connection().await?;
-        let (where_sql, params) = filter_sql(filter)?;
+        let connection = self.connection().await;
+        let now = unix_seconds();
+        let (where_sql, params) = filter_sql(filter, None, now)?;
         let total = scalar_u64(
             &connection,
             &format!("SELECT COUNT(*) FROM pull_requests p {where_sql}"),
-            params.clone(),
+            params,
         )
         .await?;
 
-        let mut page_params = params;
-        let mut page_where = where_sql;
-        if let Some(after) = page.after.as_deref() {
-            let cursor = PageCursor::decode(after)?;
-            let prefix = if page_where.is_empty() {
-                " WHERE "
-            } else {
-                " AND "
-            };
-            let first = page_params.len() + 1;
-            page_where.push_str(&format!(
-                "{prefix}(p.updated_at < ?{first} OR (p.updated_at = ?{} AND p.id < ?{}))",
-                first + 1,
-                first + 2
-            ));
-            page_params.push(integer(cursor.updated_at)?);
-            page_params.push(integer(cursor.updated_at)?);
-            page_params.push(Value::Text(cursor.id));
-        }
+        let cursor = page.after.as_deref().map(PageCursor::decode).transpose()?;
+        let (page_where, mut page_params) = filter_sql(filter, cursor.as_ref(), now)?;
         let limit = page.normalized_limit() as usize;
         let limit_index = page_params.len() + 1;
         page_params.push(integer((limit + 1) as u64)?);
@@ -274,7 +277,7 @@ impl PrStore for LibSqlPrStore {
         repository_id: u64,
         sha: &str,
     ) -> Result<Vec<PrRecord>, StoreError> {
-        let connection = self.connection().await?;
+        let connection = self.connection().await;
         let mut rows = connection
             .query(
                 &format!(
@@ -292,7 +295,7 @@ impl PrStore for LibSqlPrStore {
     }
 
     async fn upsert_repo(&self, repo: &RepoRecord) -> Result<(), StoreError> {
-        let connection = self.connection().await?;
+        let connection = self.connection().await;
         upsert_repo_on(&connection, repo).await
     }
 
@@ -302,7 +305,7 @@ impl PrStore for LibSqlPrStore {
         repos: &[RepoRecord],
         synced_before: u64,
     ) -> Result<u64, StoreError> {
-        let connection = self.connection().await?;
+        let connection = self.connection().await;
         let transaction = connection.transaction().await?;
         for repo in repos {
             upsert_repo_on(&transaction, repo).await?;
@@ -322,14 +325,14 @@ impl PrStore for LibSqlPrStore {
         live: &[u64],
         synced_before: u64,
     ) -> Result<u64, StoreError> {
-        let connection = self.connection().await?;
+        let connection = self.connection().await;
         retain_repos_on(&connection, installation_id, live, synced_before).await
     }
 
     async fn purge_installation(&self, installation_id: u64) -> Result<u64, StoreError> {
         Ok(self
             .connection()
-            .await?
+            .await
             .execute(
                 "DELETE FROM repositories WHERE installation_id = ?1",
                 vec![integer(installation_id)?],
@@ -381,100 +384,6 @@ fn pr_from_row(row: Row) -> Result<PrRecord, StoreError> {
         updated_at: unsigned(row.get::<i64>(18)?)?,
         synced_at: unsigned(row.get::<i64>(19)?)?,
     })
-}
-
-fn filter_sql(filter: &PrFilter) -> Result<(String, Vec<Value>), StoreError> {
-    let mut clauses = Vec::new();
-    let mut params = Vec::new();
-    let mut bind = |value: Value| {
-        params.push(value);
-        format!("?{}", params.len())
-    };
-    if let Some(query) = filter
-        .query
-        .as_ref()
-        .filter(|query| !query.trim().is_empty())
-    {
-        let binding = bind(Value::Text(format!(
-            "%{}%",
-            query.trim().to_ascii_lowercase()
-        )));
-        clauses.push(format!(
-            "(LOWER(p.owner || '/' || p.repo || ' ' || p.title) LIKE {binding} OR EXISTS (
-                SELECT 1 FROM json_each(p.dependencies) d
-                WHERE LOWER(json_extract(d.value, '$.name')) LIKE {binding}
-            ))"
-        ));
-    }
-    if let Some(owner) = filter.owner.as_ref().filter(|owner| !owner.is_empty()) {
-        let binding = bind(Value::Text(owner.clone()));
-        clauses.push(format!("p.owner = {binding}"));
-    }
-    if !filter.repos.is_empty() {
-        let bindings = filter
-            .repos
-            .iter()
-            .map(|repo| bind(Value::Text(repo.clone())))
-            .collect::<Vec<_>>()
-            .join(", ");
-        clauses.push(format!("(p.owner || '/' || p.repo) IN ({bindings})"));
-    }
-    if !filter.update_types.is_empty() {
-        let bindings = filter
-            .update_types
-            .iter()
-            .map(|update_type| bind(Value::Text(update_type.to_string())))
-            .collect::<Vec<_>>()
-            .join(", ");
-        clauses.push(format!("p.update_type IN ({bindings})"));
-    }
-    if !filter.check_statuses.is_empty() {
-        let bindings = filter
-            .check_statuses
-            .iter()
-            .map(|status| bind(Value::Text(status.to_string())))
-            .collect::<Vec<_>>()
-            .join(", ");
-        clauses.push(format!("p.check_status IN ({bindings})"));
-    }
-    for label in &filter.labels {
-        let binding = bind(Value::Text(label.clone()));
-        clauses.push(format!(
-            "EXISTS (SELECT 1 FROM json_each(p.labels) l WHERE l.value = {binding})"
-        ));
-    }
-    if let Some(dependency) = filter
-        .dependency
-        .as_ref()
-        .filter(|dependency| !dependency.trim().is_empty())
-    {
-        let binding = bind(Value::Text(dependency.trim().to_ascii_lowercase()));
-        clauses.push(format!(
-            "(LOWER(p.dependency) = {binding} OR EXISTS (
-                SELECT 1 FROM json_each(p.dependencies) d
-                WHERE LOWER(json_extract(d.value, '$.name')) = {binding}
-            ))"
-        ));
-    }
-    if filter.needs_attention {
-        let stale_before = unix_seconds().saturating_sub(STALE_AFTER.as_secs());
-        let stale_binding = bind(integer(stale_before)?);
-        let conflicting = Mergeable::ALL
-            .into_iter()
-            .filter(|state| state.is_conflicting())
-            .map(|state| bind(Value::Text(state.to_string())))
-            .collect::<Vec<_>>()
-            .join(", ");
-        clauses.push(format!(
-            "(p.check_status IN ('failure', 'none') OR p.mergeable IN ({conflicting}) OR p.update_type = 'major' OR p.synced_at < {stale_binding})"
-        ));
-    }
-    let sql = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", clauses.join(" AND "))
-    };
-    Ok((sql, params))
 }
 
 async fn list_repositories(connection: &libsql::Connection) -> Result<Vec<RepoRecord>, StoreError> {
@@ -577,7 +486,10 @@ async fn scalar_optional_u64(
     row.get::<Option<i64>>(0)?.map(unsigned).transpose()
 }
 
-async fn upsert_repo_on(connection: &impl Execute, repo: &RepoRecord) -> Result<(), StoreError> {
+async fn upsert_repo_on(
+    connection: &libsql::Connection,
+    repo: &RepoRecord,
+) -> Result<(), StoreError> {
     connection
         .execute(
             r#"INSERT INTO repositories (
@@ -601,7 +513,7 @@ async fn upsert_repo_on(connection: &impl Execute, repo: &RepoRecord) -> Result<
 }
 
 async fn retain_prs_on(
-    connection: &impl Execute,
+    connection: &libsql::Connection,
     repository_id: u64,
     live: &[u64],
     synced_before: u64,
@@ -631,7 +543,7 @@ async fn retain_prs_on(
 }
 
 async fn retain_repos_on(
-    connection: &impl Execute,
+    connection: &libsql::Connection,
     installation_id: u64,
     live: &[u64],
     synced_before: u64,
@@ -658,25 +570,6 @@ async fn retain_repos_on(
             params,
         )
         .await?)
-}
-
-#[async_trait]
-trait Execute: Send + Sync {
-    async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<u64, libsql::Error>;
-}
-
-#[async_trait]
-impl Execute for libsql::Connection {
-    async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<u64, libsql::Error> {
-        libsql::Connection::execute(self, sql, params).await
-    }
-}
-
-#[async_trait]
-impl Execute for Transaction {
-    async fn execute(&self, sql: &str, params: Vec<Value>) -> Result<u64, libsql::Error> {
-        libsql::Connection::execute(self, sql, params).await
-    }
 }
 
 fn option_text(value: Option<String>) -> Value {
@@ -757,10 +650,25 @@ mod tests {
 
     async fn test_store() -> (TempDir, LibSqlPrStore) {
         let directory = tempfile::tempdir().unwrap();
-        let store = LibSqlPrStore::connect(&StoreConfig::local(directory.path().join("db.sqlite")))
+        let store = LibSqlPrStore::connect(&StoreConfig::local(database_path(&directory)))
             .await
             .unwrap();
         (directory, store)
+    }
+
+    fn database_path(directory: &TempDir) -> std::path::PathBuf {
+        directory.path().join("db.sqlite")
+    }
+
+    /// An independent connection to the test database, standing in for the
+    /// other process (web or Restate) that shares the file in production.
+    async fn sidecar(directory: &TempDir) -> libsql::Connection {
+        Builder::new_local(database_path(directory))
+            .build()
+            .await
+            .unwrap()
+            .connect()
+            .unwrap()
     }
 
     fn repo(id: u64, synced_at: u64) -> RepoRecord {
@@ -804,6 +712,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_in_memory_store_keeps_its_schema_across_calls() {
+        // SQLite gives every new connection to `:memory:` a fresh, empty
+        // database, so this only works if the store reuses one connection.
+        let store = LibSqlPrStore::connect(&StoreConfig::local(":memory:"))
+            .await
+            .unwrap();
+
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+
+        assert_eq!(
+            store.get_pr(&PrKey::new(1, 1)).await.unwrap(),
+            Some(pr(1, 1, 10))
+        );
+    }
+
+    #[test]
+    fn config_debug_output_redacts_the_auth_token() {
+        let config = StoreConfig {
+            url: "libsql://dependaboard.turso.io".to_owned(),
+            auth_token: SecretString::from("hunter2"),
+        };
+
+        let debug = format!("{config:?}");
+
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("libsql://dependaboard.turso.io"), "{debug}");
+    }
+
+    #[tokio::test]
     async fn upsert_and_keyset_page_round_trip() {
         let (_directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
@@ -837,6 +775,79 @@ mod tests {
             .unwrap();
         assert_eq!(second.rows[0].number, 1);
         assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn keyset_pages_break_equal_updated_at_ties_on_id_without_gaps_or_repeats() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        // Numbers straddle a digit boundary because ids are text: "1#9" sorts
+        // after "1#11", so ORDER BY and the cursor predicate must agree on
+        // the same (text) comparison or a page boundary skips a row.
+        for number in 8..=11 {
+            let mut record = pr(1, number, 10);
+            record.updated_at = 500;
+            store.upsert_pr(&record).await.unwrap();
+        }
+        let unpaged = store
+            .list_prs(&PrFilter::default(), Page::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            unpaged.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [9, 8, 11, 10]
+        );
+
+        let mut walked = Vec::new();
+        let mut after = None;
+        loop {
+            let page = store
+                .list_prs(&PrFilter::default(), Page { limit: 1, after })
+                .await
+                .unwrap();
+            walked.extend(page.rows.iter().map(|pr| pr.number));
+            after = page.next_cursor;
+            if after.is_none() {
+                break;
+            }
+            assert!(walked.len() < 8, "cursor never terminated: {walked:?}");
+        }
+
+        assert_eq!(walked, [9, 8, 11, 10]);
+    }
+
+    #[tokio::test]
+    async fn searching_for_like_wildcards_matches_them_literally() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        let titles = [
+            (1, "Bump coverage to 100%"),
+            (2, "Bump coverage to 100"),
+            (3, "Bump snake_case helper"),
+        ];
+        for (number, title) in titles {
+            let mut record = pr(1, number, 10);
+            record.title = title.to_owned();
+            store.upsert_pr(&record).await.unwrap();
+        }
+
+        for (query, expected) in [("%", [1]), ("_", [3])] {
+            let result = store
+                .list_prs(
+                    &PrFilter {
+                        query: Some(query.to_owned()),
+                        ..Default::default()
+                    },
+                    Page::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+                expected,
+                "query {query:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -931,6 +942,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn facets_and_repositories_span_the_whole_read_model_while_rows_honor_the_filter() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_repo(&repo(2, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+        let mut failing = pr(2, 2, 10);
+        failing.check_status = CheckStatus::Failure;
+        failing.labels = vec!["go".to_owned()];
+        store.upsert_pr(&failing).await.unwrap();
+
+        let result = store
+            .list_prs(
+                &PrFilter {
+                    check_statuses: vec![CheckStatus::Failure],
+                    ..Default::default()
+                },
+                Page::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.total, 1);
+        assert_eq!(
+            result.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [2]
+        );
+        // The sidebar must keep offering the filters that would widen the view.
+        assert_eq!(
+            result.facets.checks,
+            BTreeMap::from([(CheckStatus::Success, 1), (CheckStatus::Failure, 1)])
+        );
+        assert_eq!(
+            result
+                .facets
+                .labels
+                .iter()
+                .map(|facet| (facet.label.as_str(), facet.count))
+                .collect::<Vec<_>>(),
+            [("dependencies", 1), ("go", 1), ("rust", 1)]
+        );
+        assert_eq!(
+            result
+                .repositories
+                .iter()
+                .map(|repo| repo.repository_id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn last_synced_at_is_the_newest_sync_or_absent_when_empty() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        let empty = store
+            .list_prs(&PrFilter::default(), Page::default())
+            .await
+            .unwrap();
+        assert_eq!(empty.last_synced_at, None);
+
+        store.upsert_pr(&pr(1, 1, 300)).await.unwrap();
+        store.upsert_pr(&pr(1, 2, 700)).await.unwrap();
+        store.upsert_pr(&pr(1, 3, 500)).await.unwrap();
+
+        let synced = store
+            .list_prs(
+                // The freshness stamp is for the whole projection, not the
+                // rows the filter happens to leave visible.
+                &PrFilter {
+                    query: Some("no such pull request".to_owned()),
+                    ..Default::default()
+                },
+                Page::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(synced.total, 0);
+        assert_eq!(synced.last_synced_at, Some(700));
+    }
+
+    #[tokio::test]
     async fn needs_attention_surfaces_conflicting_pull_requests() {
         let (_directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
@@ -962,7 +1054,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_mergeable_text_is_read_without_error() {
-        let (_directory, store) = test_store().await;
+        let (directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
         // Rows written before `Mergeable` existed hold GitHub's raw
         // `mergeable_state`, NULL, or (defensively) text this crate has never
@@ -973,7 +1065,7 @@ mod tests {
             (3, Value::Null, Mergeable::Unknown),
             (4, Value::Text("conflicting".to_owned()), Mergeable::Unknown),
         ];
-        let connection = store.connection().await.unwrap();
+        let connection = sidecar(&directory).await;
         for (number, raw, _) in &legacy {
             let fixture = pr(1, *number, 10);
             connection
@@ -1043,20 +1135,56 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_local_writes_wait_for_the_writer() {
-        let (_directory, store) = test_store().await;
+    async fn writes_wait_for_a_writer_in_another_process() {
+        let (directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
 
-        let connection = store.connection().await.unwrap();
-        let transaction = connection.transaction().await.unwrap();
+        let other_process = sidecar(&directory).await;
+        let transaction = other_process.transaction().await.unwrap();
         upsert_repo_on(&transaction, &repo(2, 10)).await.unwrap();
 
-        let concurrent_store = store.clone();
-        let write = tokio::spawn(async move { concurrent_store.upsert_pr(&pr(1, 1, 10)).await });
+        let write = tokio::spawn(async move { store.upsert_pr(&pr(1, 1, 10)).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         transaction.commit().await.unwrap();
 
         write.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_transactions_on_cloned_stores_do_not_collide() {
+        // Clones share one connection, so without serialisation one sync's
+        // BEGIN would land inside the other's open transaction.
+        let (_directory, store) = test_store().await;
+        let syncs = [9_u64, 10].map(|installation| {
+            let store = store.clone();
+            tokio::spawn(async move {
+                for round in 0..25 {
+                    let mut record = repo(installation * 100 + round, 10);
+                    record.installation_id = installation;
+                    store
+                        .replace_installation_repos(installation, &[record], 20)
+                        .await?;
+                }
+                Ok::<_, StoreError>(())
+            })
+        });
+        for sync in syncs {
+            sync.await.unwrap().unwrap();
+        }
+
+        let page = store
+            .list_prs(&PrFilter::default(), Page::default())
+            .await
+            .unwrap();
+        let mut survivors = page
+            .repositories
+            .iter()
+            .map(|repo| (repo.installation_id, repo.repository_id))
+            .collect::<Vec<_>>();
+        survivors.sort_unstable();
+        // Every round retires the previous round's repo, so exactly the last
+        // one per installation remains.
+        assert_eq!(survivors, [(9, 924), (10, 1024)]);
     }
 
     #[test]

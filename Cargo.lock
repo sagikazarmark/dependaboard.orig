@@ -946,6 +946,7 @@ dependencies = [
  "async-trait",
  "dependaboard-core",
  "libsql",
+ "secrecy",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
