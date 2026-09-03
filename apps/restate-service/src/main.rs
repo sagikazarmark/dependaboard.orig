@@ -1274,7 +1274,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use dependaboard_core::{CheckStatus, PrRecord, PrTarget, UpdateType, UserId};
+    use dependaboard_core::{CheckStatus, Mergeable, PrRecord, PrTarget, UpdateType, UserId};
     use restate_sdk::service::Discoverable;
 
     use super::*;
@@ -1360,7 +1360,7 @@ mod tests {
             update_type: UpdateType::Unknown,
             head_sha: "abc123".to_owned(),
             check_status: CheckStatus::None,
-            mergeable: None,
+            mergeable: Mergeable::Unknown,
             labels: Vec::new(),
             created_at: 0,
             updated_at: 0,

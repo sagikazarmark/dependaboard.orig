@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
   update_type    TEXT NOT NULL,
   head_sha       TEXT NOT NULL,
   check_status   TEXT NOT NULL,
-  mergeable      TEXT,
+  mergeable      TEXT, -- GitHub REST mergeable_state vocabulary (core::Mergeable); NULL reads as unknown
   labels         TEXT NOT NULL DEFAULT '[]',
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,

@@ -168,6 +168,85 @@ impl FromStr for CheckStatus {
 #[error("unknown enum value: {0}")]
 pub struct ParseEnumError(String);
 
+/// GitHub's REST `mergeable_state` vocabulary for a pull request.
+///
+/// `Unknown` is a catch-all: GitHub reports it while mergeability is still
+/// being computed, and any value this crate does not recognise folds into it
+/// so that a new upstream state never breaks a sync.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mergeable {
+    Clean,
+    Dirty,
+    Blocked,
+    Behind,
+    Unstable,
+    Draft,
+    HasHooks,
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl Mergeable {
+    pub const ALL: [Self; 8] = [
+        Self::Clean,
+        Self::Dirty,
+        Self::Blocked,
+        Self::Behind,
+        Self::Unstable,
+        Self::Draft,
+        Self::HasHooks,
+        Self::Unknown,
+    ];
+
+    /// Maps a raw GitHub `mergeable_state` value. Total: unrecognised input
+    /// becomes [`Mergeable::Unknown`].
+    pub fn from_github_state(value: &str) -> Self {
+        match value {
+            "clean" => Self::Clean,
+            "dirty" => Self::Dirty,
+            "blocked" => Self::Blocked,
+            "behind" => Self::Behind,
+            "unstable" => Self::Unstable,
+            "draft" => Self::Draft,
+            "has_hooks" => Self::HasHooks,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// True when GitHub reports a base/head merge conflict (`dirty`). Other
+    /// non-clean states (`blocked`, `behind`, `unstable`, ...) are not
+    /// conflicts and are resolvable without a rebase.
+    pub fn is_conflicting(self) -> bool {
+        matches!(self, Self::Dirty)
+    }
+
+    /// Field-level deserializer that also accepts JSON `null` (the shape the
+    /// field had when it was `Option<String>`), folding it into `Unknown`.
+    fn deserialize_lenient<'de, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Option::<Self>::deserialize(deserializer)?.unwrap_or_default())
+    }
+}
+
+impl fmt::Display for Mergeable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Clean => "clean",
+            Self::Dirty => "dirty",
+            Self::Blocked => "blocked",
+            Self::Behind => "behind",
+            Self::Unstable => "unstable",
+            Self::Draft => "draft",
+            Self::HasHooks => "has_hooks",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckSignal {
     Pass,
@@ -374,7 +453,10 @@ pub struct PrRecord {
     pub update_type: UpdateType,
     pub head_sha: String,
     pub check_status: CheckStatus,
-    pub mergeable: Option<String>,
+    /// Snapshots persisted in Restate before this was an enum may carry
+    /// `null` or omit the field; both read as [`Mergeable::Unknown`].
+    #[serde(default, deserialize_with = "Mergeable::deserialize_lenient")]
+    pub mergeable: Mergeable,
     pub labels: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,
@@ -917,6 +999,104 @@ mod tests {
         ] {
             assert_eq!(check_signal(Some(value), None), Some(CheckSignal::Pending));
         }
+    }
+
+    #[test]
+    fn all_documented_mergeable_states_are_classified() {
+        for (value, expected) in [
+            ("clean", Mergeable::Clean),
+            ("dirty", Mergeable::Dirty),
+            ("blocked", Mergeable::Blocked),
+            ("behind", Mergeable::Behind),
+            ("unstable", Mergeable::Unstable),
+            ("draft", Mergeable::Draft),
+            ("has_hooks", Mergeable::HasHooks),
+            ("unknown", Mergeable::Unknown),
+        ] {
+            assert_eq!(Mergeable::from_github_state(value), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn undocumented_mergeable_states_fold_into_unknown() {
+        for value in ["", "conflicting", "mergeable", "CLEAN", "some_future_state"] {
+            assert_eq!(
+                Mergeable::from_github_state(value),
+                Mergeable::Unknown,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_dirty_counts_as_a_merge_conflict() {
+        // GitHub reports a base/head conflict as `dirty`; every other state
+        // (including `blocked` and `behind`) can be resolved without a rebase.
+        for state in Mergeable::ALL {
+            assert_eq!(
+                state.is_conflicting(),
+                state == Mergeable::Dirty,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mergeable_display_is_the_github_vocabulary() {
+        // The display form is what the store persists, so it must be exactly
+        // the string GitHub emits for that state and must read back losslessly.
+        assert_eq!(Mergeable::HasHooks.to_string(), "has_hooks");
+        for state in Mergeable::ALL {
+            assert_eq!(
+                Mergeable::from_github_state(&state.to_string()),
+                state,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_pr_record_json_deserializes_its_mergeable_field() {
+        // Restate journals hold PrRecord snapshots written when `mergeable`
+        // was `Option<String>`: a raw GitHub string, `null`, or (from before
+        // the field existed at all) absent. None of them may poison a journal.
+        fn record_with(mergeable: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({
+                "id": "7#9",
+                "repository_id": 7,
+                "installation_id": 1,
+                "owner": "acme",
+                "repo": "api",
+                "number": 9,
+                "title": "Bump serde",
+                "html_url": "https://github.com/acme/api/pull/9",
+                "dependency": null,
+                "from_version": null,
+                "to_version": null,
+                "dependencies": [],
+                "update_type": "unknown",
+                "head_sha": "abc123",
+                "check_status": "none",
+                "mergeable": mergeable,
+                "labels": [],
+                "created_at": 0,
+                "updated_at": 0,
+                "synced_at": 0
+            })
+        }
+        for (raw, expected) in [
+            (serde_json::json!("dirty"), Mergeable::Dirty),
+            (serde_json::json!("some_future_state"), Mergeable::Unknown),
+            (serde_json::json!(null), Mergeable::Unknown),
+        ] {
+            let record: PrRecord = serde_json::from_value(record_with(raw.clone()))
+                .unwrap_or_else(|error| panic!("{raw}: {error}"));
+            assert_eq!(record.mergeable, expected, "{raw}");
+        }
+        let mut absent = record_with(serde_json::Value::Null);
+        absent.as_object_mut().unwrap().remove("mergeable");
+        let record: PrRecord = serde_json::from_value(absent).unwrap();
+        assert_eq!(record.mergeable, Mergeable::Unknown);
     }
 
     #[test]

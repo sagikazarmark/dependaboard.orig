@@ -8,8 +8,8 @@ use std::{
 use async_trait::async_trait;
 use dependaboard_core::{
     CheckSignal, CommandRequest, DEPENDABOT_LOGIN, GithubErrorResponse, MergeMethod, MergeRequest,
-    PrKey, PrRecord, RepoRecord, SyncRequest, UpdateBranchRequest, UserId, combined_status_signal,
-    highest_update_type, parse_dependabot_metadata, rollup_checks,
+    Mergeable, PrKey, PrRecord, RepoRecord, SyncRequest, UpdateBranchRequest, UserId,
+    combined_status_signal, highest_update_type, parse_dependabot_metadata, rollup_checks,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::{Method, Response, StatusCode};
@@ -497,7 +497,10 @@ impl GithubApi for GithubClient {
             dependencies,
             head_sha: pull.head.sha,
             check_status,
-            mergeable: pull.mergeable_state,
+            mergeable: pull
+                .mergeable_state
+                .as_deref()
+                .map_or(Mergeable::Unknown, Mergeable::from_github_state),
             labels: pull.labels.into_iter().map(|label| label.name).collect(),
             created_at: parse_timestamp(&pull.created_at)?,
             updated_at: parse_timestamp(&pull.updated_at)?,

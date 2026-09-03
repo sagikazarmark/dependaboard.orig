@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time:
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    CheckStatus, CursorError, DashboardPage, FacetCounts, Page, PageCursor, PrFilter, PrKey,
-    PrRecord, RepoRecord, UpdateType,
+    CheckStatus, CursorError, DashboardPage, FacetCounts, Mergeable, Page, PageCursor, PrFilter,
+    PrKey, PrRecord, RepoRecord, UpdateType,
 };
 use libsql::{Builder, Database, Row, Transaction, Value};
 use thiserror::Error;
@@ -155,7 +155,7 @@ impl PrStore for LibSqlPrStore {
                     Value::Text(pr.update_type.to_string()),
                     Value::Text(pr.head_sha.clone()),
                     Value::Text(pr.check_status.to_string()),
-                    option_text(pr.mergeable.clone()),
+                    Value::Text(pr.mergeable.to_string()),
                     Value::Text(labels),
                     integer(pr.created_at)?,
                     integer(pr.updated_at)?,
@@ -369,7 +369,13 @@ fn pr_from_row(row: Row) -> Result<PrRecord, StoreError> {
         head_sha: row.get(13)?,
         check_status: CheckStatus::from_str(&check_status)
             .map_err(|_| StoreError::CorruptEnum(check_status))?,
-        mergeable: row.get(15)?,
+        // The column is nullable and was once written verbatim from GitHub, so
+        // NULL and any unrecognised legacy text deliberately fold into Unknown
+        // rather than surfacing as CorruptEnum.
+        mergeable: row
+            .get::<Option<String>>(15)?
+            .as_deref()
+            .map_or(Mergeable::Unknown, Mergeable::from_github_state),
         labels: serde_json::from_str(&row.get::<String>(16)?)?,
         created_at: unsigned(row.get::<i64>(17)?)?,
         updated_at: unsigned(row.get::<i64>(18)?)?,
@@ -452,9 +458,15 @@ fn filter_sql(filter: &PrFilter) -> Result<(String, Vec<Value>), StoreError> {
     }
     if filter.needs_attention {
         let stale_before = unix_seconds().saturating_sub(45 * 60);
-        let binding = bind(integer(stale_before)?);
+        let stale_binding = bind(integer(stale_before)?);
+        let conflicting = Mergeable::ALL
+            .into_iter()
+            .filter(|state| state.is_conflicting())
+            .map(|state| bind(Value::Text(state.to_string())))
+            .collect::<Vec<_>>()
+            .join(", ");
         clauses.push(format!(
-            "(p.check_status IN ('failure', 'none') OR p.mergeable = 'conflicting' OR p.update_type = 'major' OR p.synced_at < {binding})"
+            "(p.check_status IN ('failure', 'none') OR p.mergeable IN ({conflicting}) OR p.update_type = 'major' OR p.synced_at < {stale_binding})"
         ));
     }
     let sql = if clauses.is_empty() {
@@ -762,7 +774,7 @@ mod tests {
             update_type: UpdateType::Minor,
             head_sha: format!("sha-{number}"),
             check_status: CheckStatus::Success,
-            mergeable: Some("mergeable".to_owned()),
+            mergeable: Mergeable::Clean,
             labels: vec!["dependencies".to_owned(), "rust".to_owned()],
             created_at: 10,
             updated_at: 20 + number,
@@ -831,6 +843,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.total, 1);
+    }
+
+    #[tokio::test]
+    async fn needs_attention_surfaces_conflicting_pull_requests() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        // Both fixtures pass checks, are minor updates and were synced just
+        // now, so mergeability is the only attention trigger in play.
+        let now = unix_seconds();
+        let clean = pr(1, 1, now);
+        let mut conflicting = pr(1, 2, now);
+        conflicting.mergeable = Mergeable::Dirty;
+        store.upsert_pr(&clean).await.unwrap();
+        store.upsert_pr(&conflicting).await.unwrap();
+
+        let result = store
+            .list_prs(
+                &PrFilter {
+                    needs_attention: true,
+                    ..Default::default()
+                },
+                Page::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [2]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_mergeable_text_is_read_without_error() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        // Rows written before `Mergeable` existed hold GitHub's raw
+        // `mergeable_state`, NULL, or (defensively) text this crate has never
+        // heard of. None of them may make a pull request unreadable.
+        let legacy: [(u64, Value, Mergeable); 4] = [
+            (1, Value::Text("dirty".to_owned()), Mergeable::Dirty),
+            (2, Value::Text("has_hooks".to_owned()), Mergeable::HasHooks),
+            (3, Value::Null, Mergeable::Unknown),
+            (4, Value::Text("conflicting".to_owned()), Mergeable::Unknown),
+        ];
+        let connection = store.connection().await.unwrap();
+        for (number, raw, _) in &legacy {
+            let fixture = pr(1, *number, 10);
+            connection
+                .execute(
+                    r#"INSERT INTO pull_requests (
+                        id, repository_id, owner, repo, number, title, html_url,
+                        dependencies, update_type, head_sha, check_status, mergeable,
+                        labels, created_at, updated_at, synced_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '[]', ?8, ?9, ?10, ?11, '[]', 0, 0, 0)"#,
+                    vec![
+                        Value::Text(fixture.id.clone()),
+                        integer(fixture.repository_id).unwrap(),
+                        Value::Text(fixture.owner.clone()),
+                        Value::Text(fixture.repo.clone()),
+                        integer(fixture.number).unwrap(),
+                        Value::Text(fixture.title.clone()),
+                        Value::Text(fixture.html_url.clone()),
+                        Value::Text(fixture.update_type.to_string()),
+                        Value::Text(fixture.head_sha.clone()),
+                        Value::Text(fixture.check_status.to_string()),
+                        raw.clone(),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+
+        for (number, raw, expected) in legacy {
+            let record = store
+                .get_pr(&PrKey::new(1, number))
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("row {number} ({raw:?}) should be readable"));
+            assert_eq!(record.mergeable, expected, "{raw:?}");
+        }
     }
 
     #[tokio::test]

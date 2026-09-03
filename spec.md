@@ -676,7 +676,9 @@ CREATE TABLE pull_requests (
   update_type    TEXT,               -- major|minor|patch|unknown; highest in the group
   head_sha       TEXT NOT NULL,
   check_status   TEXT NOT NULL,
-  mergeable      TEXT,
+  mergeable      TEXT,               -- GitHub REST mergeable_state: clean|dirty|blocked|behind|
+                                     -- unstable|draft|has_hooks|unknown (core::Mergeable);
+                                     -- `dirty` is the merge-conflict state; NULL reads as unknown
   labels         TEXT NOT NULL DEFAULT '[]',
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,   -- GitHub's updated_at

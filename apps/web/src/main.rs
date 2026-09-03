@@ -1276,7 +1276,7 @@ fn DetailDrawer(
                 div { class: "drawer-badges",
                     span { class: "update-chip {update_class(row.update_type)}", "{row.update_type}" }
                     span { class: "status-badge", span { class: "check-dot {status_class(row.check_status)}" } "{status_label(row.check_status)}" }
-                    if let Some(mergeable) = &row.mergeable { span { class: "status-badge", "{mergeable}" } }
+                    span { class: "status-badge", "{row.mergeable}" }
                     if stale { span { class: "status-badge stale-badge", "projection stale" } }
                 }
                 div { class: "drawer-actions",
@@ -1684,13 +1684,15 @@ mod wasm_tests {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
+    use dependaboard_core::Mergeable;
+
     use super::*;
 
     const GROUPED_ROW_TITLE: &str =
         "build(deps): bump the github-actions group across 1 directory with 3 updates";
 
-    fn GroupedRowFixture() -> Element {
-        let row = PrRecord {
+    fn grouped_row() -> PrRecord {
+        PrRecord {
             id: "7#9".to_owned(),
             repository_id: 7,
             installation_id: 1,
@@ -1714,18 +1716,36 @@ mod tests {
             update_type: UpdateType::Minor,
             head_sha: "abc123".to_owned(),
             check_status: CheckStatus::Failure,
-            mergeable: Some("clean".to_owned()),
+            mergeable: Mergeable::Clean,
             labels: vec!["dependencies".to_owned(), "github_actions".to_owned()],
             created_at: 1,
             updated_at: 1,
             synced_at: unix_seconds(),
-        };
+        }
+    }
+
+    fn GroupedRowFixture() -> Element {
         rsx! {
             PrRow {
-                row,
+                row: grouped_row(),
                 checked: false,
                 oncheck: move |_| {},
                 onopen: move |_| {},
+            }
+        }
+    }
+
+    fn DrawerFixture() -> Element {
+        let mut row = grouped_row();
+        // `has_hooks` is the one state whose display form differs from its
+        // variant name, so the assertion below can tell Display from Debug.
+        row.mergeable = Mergeable::HasHooks;
+        rsx! {
+            DetailDrawer {
+                row,
+                onclose: move |_| {},
+                onaction: move |_| {},
+                onsync: move |_| {},
             }
         }
     }
@@ -1738,6 +1758,18 @@ mod tests {
 
         assert_eq!(html.matches(GROUPED_ROW_TITLE).count(), 1, "{html}");
         assert!(html.contains("<strong>3 dependencies</strong><span>group update</span>"));
+    }
+
+    #[test]
+    fn detail_drawer_shows_the_mergeable_state_in_its_display_form() {
+        let mut dom = VirtualDom::new(DrawerFixture);
+        dom.rebuild_in_place();
+        let html = dioxus::ssr::render(&dom);
+
+        assert!(
+            html.contains(r#"<span class="status-badge">has_hooks</span>"#),
+            "{html}"
+        );
     }
 
     #[test]
