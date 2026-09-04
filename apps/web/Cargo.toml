@@ -13,7 +13,7 @@ serde.workspace = true
 uuid.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-gloo-timers = { version = "0.3.0", features = ["futures"] }
+gloo-timers = { version = "0.4.0", features = ["futures"] }
 # Keep the library in lockstep with the CLI supplied by devenv.
 wasm-bindgen = "=0.2.126"
 
