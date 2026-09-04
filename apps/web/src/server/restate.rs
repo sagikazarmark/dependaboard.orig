@@ -53,16 +53,35 @@ impl RestateIngress {
         input: &T,
         idempotency_key: Option<&str>,
     ) -> Result<(), String> {
-        let mut request = self
-            .client
-            .post(format!("{}/restate/send/{path}", self.base))
-            .json(input);
+        let mut request = self.post("send", path).json(input);
         if let Some(key) = idempotency_key {
             request = request.header("idempotency-key", key);
         }
+        self.accept(path, request).await
+    }
+
+    /// Enqueues a one-way invocation of a handler that takes no input.
+    ///
+    /// Restate rejects any body for such a handler, even an empty JSON one, so
+    /// the request carries neither a body nor a content type.
+    pub(crate) async fn send_empty(&self, path: &str) -> Result<(), String> {
+        self.accept(path, self.post("send", path)).await
+    }
+
+    /// An authenticated POST to `/restate/{route}/{path}`, for `route` being
+    /// Restate's `send` (one-way) or `call` (request/response).
+    fn post(&self, route: &str, path: &str) -> reqwest::RequestBuilder {
+        let mut request = self
+            .client
+            .post(format!("{}/restate/{route}/{path}", self.base));
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
+        request
+    }
+
+    /// Sends a one-way invocation and reads Restate's answer as accepted or not.
+    async fn accept(&self, path: &str, request: reqwest::RequestBuilder) -> Result<(), String> {
         let response = request.send().await.map_err(|error| error.to_string())?;
         if response.status().is_success() {
             return Ok(());
@@ -82,13 +101,11 @@ impl RestateIngress {
     where
         R: DeserializeOwned,
     {
-        let mut request = self
-            .client
-            .post(format!("{}/restate/call/{path}", self.base));
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
-        }
-        let response = request.send().await.map_err(|error| error.to_string())?;
+        let response = self
+            .post("call", path)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
         let status = response.status();
         let value = response
             .json::<Value>()
@@ -107,6 +124,10 @@ pub(crate) async fn restate_send<T: Serialize + ?Sized>(
     input: &T,
 ) -> Result<(), String> {
     RestateIngress::from_env()?.send(path, input, None).await
+}
+
+pub(crate) async fn restate_send_empty(path: &str) -> Result<(), String> {
+    RestateIngress::from_env()?.send_empty(path).await
 }
 
 pub(crate) async fn restate_call<R>(path: &str) -> Result<R, String>
@@ -163,6 +184,41 @@ mod tests {
             .await;
 
         assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn empty_input_restate_send_has_no_body_or_content_type() {
+        async fn restate_ingress(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+            if headers.contains_key(header::CONTENT_TYPE) || !body.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "code": 400,
+                        "message": "input validation error: Expected body and content-type to be empty, but wasn't",
+                        "source": "ingress"
+                    })),
+                );
+            }
+            (
+                StatusCode::ACCEPTED,
+                axum::Json(serde_json::json!({
+                    "invocationId": "inv_1",
+                    "status": "Accepted"
+                })),
+            )
+        }
+
+        let address = serve(axum::Router::new().route(
+            "/restate/send/DashboardIngress/sync_installation",
+            post(restate_ingress),
+        ))
+        .await;
+
+        let result = ingress_at(address)
+            .send_empty("DashboardIngress/sync_installation")
+            .await;
+
+        assert_eq!(result, Ok(()));
     }
 
     #[test]

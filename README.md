@@ -262,7 +262,7 @@ docker compose --profile tools run --rm restate-cli \
 
 The CLI shares Restate's network namespace, and Compose maps `host.docker.internal` back to the host service on Linux and Docker Desktop. Re-run registration after changing Restate handler signatures. During local development, append `--force` only when you intentionally want Restate to accept a breaking service definition change.
 
-Confirm that `PullRequest`, `BulkAction`, `InstallationSync`, `RepoSync`, `WebhookIngress`, and `SchedulerIngress` appear at <http://127.0.0.1:9070>.
+Confirm that `PullRequest`, `BulkAction`, `InstallationSync`, `RepoSync`, `WebhookIngress`, `DashboardIngress`, and `SchedulerIngress` appear at <http://127.0.0.1:9070>.
 
 ### 11. Start the web app
 
@@ -300,9 +300,9 @@ docker compose --profile tools run --rm restate-cli whoami
 docker compose --profile tools run --rm restate-cli deployments list
 ```
 
-In the Restate UI, confirm the deployment lists `PullRequest`, `BulkAction`, `InstallationSync`, `RepoSync`, `WebhookIngress`, and `SchedulerIngress`. The Restate-service terminal should log `installation scheduler accepted by Restate`. In **Invocations**, confirm a completed `InstallationSync/tick` or `InstallationSync/sync_now` and completed `RepoSync/reconcile` invocations; those establish that reconciliation itself finished.
+In the Restate UI, confirm the deployment lists `PullRequest`, `BulkAction`, `InstallationSync`, `RepoSync`, `WebhookIngress`, `DashboardIngress`, and `SchedulerIngress`. The Restate-service terminal should log `installation scheduler accepted by Restate`. In **Invocations**, confirm a completed `InstallationSync/tick` or `InstallationSync/sync_now` and completed `RepoSync/reconcile` invocations; those establish that reconciliation itself finished.
 
-Use the dashboard's **Sync** button to request another reconciliation. The repository filter should list the repositories selected during App installation, even if none has an open Dependabot PR. Open a pull-request drawer to verify durable status history, then test merge or rebase only on a disposable repository where those actions are safe.
+Use the dashboard's **Sync** button to request another reconciliation; it appears in **Invocations** as `DashboardIngress/sync_installation`. The repository filter should list the repositories selected during App installation, even if none has an open Dependabot PR. Open a pull-request drawer to verify durable status history, then test merge or rebase only on a disposable repository where those actions are safe.
 
 In the GitHub App settings, open **Advanced > Recent deliveries**. Redeliver an `installation`, `installation_repositories`, or subscribed repository event and confirm it receives HTTP `200`. Dependaboard acknowledges GitHub's `ping` event with `204` without routing it. A `401` indicates a webhook-secret mismatch; a `400` indicates a malformed signature, a missing delivery header, or a content type other than `application/json`; a `502` indicates the web app could not enqueue the event into Restate.
 
@@ -384,6 +384,20 @@ The Compose file fixes `RESTATE_NODE_NAME=dependaboard` so the current project's
 
 Restate owns in-flight truth and retries. libSQL is the cross-PR query model used by the dashboard. The browser never calls Restate directly.
 
+### Restate ingress visibility
+
+Every Restate handler is reachable through the ingress unless marked private, and `BulkAction.run` can merge pull requests, so only the entry points the web app and the bootstrap need are public. Everything else is `ingress_private`, reachable only from another handler.
+
+| Public (ingress-reachable) | Private (Restate-internal only) |
+|---|---|
+| `WebhookIngress.dispatch` — verified GitHub deliveries, forwarded by the web edge | `PullRequest.sync`, `.closed`, `.merge`, `.command`, `.update_branch` |
+| `DashboardIngress.sync_installation`, `.sync_pull_request` — the dashboard's **Sync** buttons | `InstallationSync.*` |
+| `BulkAction.run`, `.progress` — batch merges and rebases | `RepoSync.*` |
+| `PullRequest.status` — the read the detail drawer polls | |
+| `SchedulerIngress.start` — arms the reconcile chain at startup | |
+
+The webhook dispatcher routes only what GitHub sends; the dashboard's manual refreshes have their own service, so a refresh skips the per-PR webhook debounce and records its completion id without the dispatcher knowing about it. Discovery tests in `pull_request.rs` and `dashboard.rs` pin the mixed-visibility `PullRequest` object and the public `DashboardIngress` service; keep this table in step with the `ingress_private` attributes when you change one.
+
 The Restate service stops on `SIGINT` or `SIGTERM`: it closes its listener, gives in-flight invocations up to ten seconds to finish, and leaves anything still running for Restate to retry against the next instance.
 
 `apps/web/src/components` is installed from the [dioxus-daisyui-components](https://github.com/sagikazarmark/dioxus-daisyui-components) registry and is not edited by hand. To update a component, re-run the install against a checkout of the registry:
@@ -421,7 +435,7 @@ Never edit a migration that has shipped; add a new one instead. `0001_initial.sq
 | Variable | Used by | Purpose |
 |---|---|---|
 | `GITHUB_APP_ID` | Restate service | Numeric GitHub App ID |
-| `GITHUB_INSTALLATION_ID` | Both | Installation to reconcile and target for manual sync |
+| `GITHUB_INSTALLATION_ID` | Both | Installation to reconcile; the web app refuses a per-PR sync for any other installation |
 | `GITHUB_PRIVATE_KEY` / `GITHUB_PRIVATE_KEY_PATH` | Restate service | RS256 App private key value or absolute PEM path |
 | `GITHUB_USER_PAT` | Restate service | User identity for `@dependabot rebase` comments |
 | `GITHUB_MERGE_METHOD` | Restate service | Explicit global method: `merge`, `squash` (default), or `rebase` |

@@ -160,7 +160,6 @@ fn route_delivery(envelope: &Envelope) -> Result<Disposition, String> {
         number,
         sha,
         pull_requests,
-        sync_completion_id: None,
     })))
 }
 

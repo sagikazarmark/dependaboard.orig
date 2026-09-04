@@ -760,6 +760,18 @@ pub struct SyncRequest {
     pub completion_id: Option<String>,
 }
 
+/// What the dashboard asks `DashboardIngress.sync_pull_request` for: a refresh of one pull
+/// request, reported back under `completion_id` once its snapshot is current.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualSyncRequest {
+    pub repository_id: u64,
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+    /// The id the dashboard polls `PullRequest.status` for, in `completed_sync_ids`.
+    pub completion_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncShaRequest {
     pub repository_id: u64,
@@ -818,11 +830,7 @@ pub struct WebhookEvent {
     pub sha: Option<String>,
     #[serde(default)]
     pub pull_requests: Vec<u64>,
-    #[serde(default)]
-    pub sync_completion_id: Option<String>,
 }
-
-pub const DASHBOARD_SYNC_ACTION: &str = "dashboard_sync";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
@@ -1236,7 +1244,13 @@ mod tests {
         }))
         .unwrap();
         assert!(state.completed_sync_ids.is_empty());
+    }
 
+    #[test]
+    fn webhook_events_journaled_with_the_retired_completion_id_still_deserialize() {
+        // Dashboard refreshes used to travel as webhook events carrying `sync_completion_id`;
+        // a `dispatch` journaled before they got their own service must still replay, and an
+        // event forwarded today must not carry it.
         let event: WebhookEvent = serde_json::from_value(serde_json::json!({
             "event": "pull_request",
             "action": "synchronize",
@@ -1246,10 +1260,26 @@ mod tests {
             "repo": "api",
             "number": 9,
             "sha": "abc123",
-            "pull_requests": []
+            "pull_requests": [],
+            "sync_completion_id": "sync-123"
         }))
         .unwrap();
-        assert_eq!(event.sync_completion_id, None);
+        assert_eq!(
+            event,
+            WebhookEvent {
+                event: "pull_request".to_owned(),
+                action: Some("synchronize".to_owned()),
+                installation_id: Some(42),
+                repository_id: Some(7),
+                owner: Some("acme".to_owned()),
+                repo: Some("api".to_owned()),
+                number: Some(9),
+                sha: Some("abc123".to_owned()),
+                pull_requests: Vec::new(),
+            }
+        );
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert!(serialized.get("sync_completion_id").is_none());
     }
 
     #[test]

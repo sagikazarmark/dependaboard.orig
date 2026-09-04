@@ -2,7 +2,7 @@
 //! object that owns them, and `SchedulerIngress` lets the bootstrap arm the installation's
 //! reconcile chain.
 
-use dependaboard_core::{DASHBOARD_SYNC_ACTION, PrKey, SyncRequest, SyncShaRequest, WebhookEvent};
+use dependaboard_core::{PrKey, SyncRequest, SyncShaRequest, WebhookEvent};
 use restate_sdk::prelude::*;
 use thiserror::Error;
 
@@ -178,8 +178,8 @@ fn route_pull_request(event: &WebhookEvent) -> Result<WebhookRoute, WebhookRejec
                 owner: owner.clone(),
                 repo: repo.clone(),
                 number,
-                bypass_debounce: action == Some(DASHBOARD_SYNC_ACTION),
-                completion_id: event.sync_completion_id.clone(),
+                bypass_debounce: false,
+                completion_id: None,
             })
         }
         _ => WebhookRoute::Ignore,
@@ -282,15 +282,7 @@ fn send_webhook_route(ctx: &Context<'_>, route: &WebhookRoute) {
 fn pull_request_action_requests_sync(action: Option<&str>) -> bool {
     matches!(
         action,
-        Some(
-            "opened"
-                | "reopened"
-                | "synchronize"
-                | "edited"
-                | "labeled"
-                | "unlabeled"
-                | DASHBOARD_SYNC_ACTION
-        )
+        Some("opened" | "reopened" | "synchronize" | "edited" | "labeled" | "unlabeled")
     )
 }
 
@@ -340,15 +332,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dashboard_action_requests_a_pull_request_sync() {
-        assert!(pull_request_action_requests_sync(Some(
-            DASHBOARD_SYNC_ACTION
-        )));
-        assert!(!pull_request_action_requests_sync(Some("closed")));
-        assert!(!pull_request_action_requests_sync(None));
-    }
-
     /// A delivery as the web edge forwards it, for installation 1 and repository 7.
     fn delivery(event: &str, action: Option<&str>) -> WebhookEvent {
         WebhookEvent {
@@ -361,7 +344,6 @@ mod tests {
             number: Some(9),
             sha: Some("abc123".to_owned()),
             pull_requests: Vec::new(),
-            sync_completion_id: None,
         }
     }
 
@@ -404,25 +386,18 @@ mod tests {
     }
 
     #[test]
-    fn a_dashboard_sync_routes_to_the_pull_request_bypassing_the_debounce() {
-        let mut event = delivery("pull_request", Some(DASHBOARD_SYNC_ACTION));
-        event.sync_completion_id = Some("completion-1".to_owned());
-
+    fn pull_request_deliveries_sync_behind_the_debounce_or_close() {
         assert_eq!(
-            route_webhook(1, &event).unwrap(),
+            route_webhook(1, &delivery("pull_request", Some("synchronize"))).unwrap(),
             WebhookRoute::SyncPullRequest(SyncRequest {
                 repository_id: 7,
                 owner: "acme".to_owned(),
                 repo: "api".to_owned(),
                 number: 9,
-                bypass_debounce: true,
-                completion_id: Some("completion-1".to_owned()),
+                bypass_debounce: false,
+                completion_id: None,
             })
         );
-        assert!(matches!(
-            route_webhook(1, &delivery("pull_request", Some("synchronize"))).unwrap(),
-            WebhookRoute::SyncPullRequest(request) if !request.bypass_debounce
-        ));
         assert_eq!(
             route_webhook(1, &delivery("pull_request", Some("closed"))).unwrap(),
             WebhookRoute::ClosePullRequest(PrKey::new(7, 9))
@@ -468,6 +443,9 @@ mod tests {
     fn routed_kinds_with_unhandled_actions_are_ignored_not_rejected() {
         for (event, action) in [
             ("pull_request", "assigned"),
+            // The dashboard's refreshes have their own service; nothing GitHub cannot send
+            // gets an arm here.
+            ("pull_request", "dashboard_sync"),
             ("check_suite", "requested"),
             ("check_run", "rerequested"),
             ("installation", "new_permissions_accepted"),

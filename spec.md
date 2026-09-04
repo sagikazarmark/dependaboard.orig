@@ -339,6 +339,20 @@ HTML marker — nobody reads it.
   event kind to one-way sends: `PullRequest.sync` / `PullRequest.closed`,
   `RepoSync.sync_sha`, `InstallationSync.sync_all`. No state, no GitHub calls, no keying.
 - Public; everything it calls is private.
+- Routes only what GitHub sends. The dashboard's manual refreshes used to be forged as
+  `pull_request` events with a made-up action and pushed through here, which hid the
+  manual-sync contract inside the webhook contract; they now have their own service.
+
+### `DashboardIngress` — service (unkeyed)
+
+- `sync_installation()` — the dashboard's global **Sync**: one-way
+  `InstallationSync.sync_now` for the configured installation. No input; the service
+  serves exactly one installation, as `SchedulerIngress.start` already assumes.
+- `sync_pull_request(ManualSyncRequest)` — the drawer's per-PR **Sync**: one-way
+  `PullRequest.sync` with the debounce bypassed (someone is waiting) and the request's
+  `completion_id`, which `sync` records in `completed_sync_ids` so the drawer can poll
+  `PullRequest.status` until its own refresh has landed.
+- Public; called only by the web backend.
 
 ### `InstallationSync` — virtual object, key = installation id
 
@@ -642,6 +656,7 @@ reachability is. Anything an external caller invokes must be public, which is wh
 |---|---|
 | `BulkAction.run`, `BulkAction.progress` | `PullRequest.*` |
 | `WebhookIngress.dispatch` | `InstallationSync.*`, `RepoSync.*`, `TokenStore.*` |
+| `DashboardIngress.sync_installation`, `DashboardIngress.sync_pull_request` | |
 
 Marking whole services private is simpler to reason about than per-handler flags; reach
 for handler-level only if you later need one shared handler exposed from an otherwise

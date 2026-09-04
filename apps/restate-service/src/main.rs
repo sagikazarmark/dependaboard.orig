@@ -2,6 +2,7 @@
 //! component to the endpoint, and asks Restate to arm the installation scheduler.
 
 mod bulk_action;
+mod dashboard;
 mod github;
 mod handler;
 mod ingress;
@@ -23,6 +24,7 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 
 use crate::{
     bulk_action::BulkAction,
+    dashboard::DashboardIngress,
     ingress::{SchedulerIngress, WebhookIngress},
     installation_sync::InstallationSync,
     pull_request::PullRequest,
@@ -77,6 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind(pull_request)
         .bind(BulkAction)
         .bind(WebhookIngress { installation_id })
+        .bind(DashboardIngress { installation_id })
         .bind(SchedulerIngress { installation_id })
         .bind(installation_sync)
         .bind(repo_sync)

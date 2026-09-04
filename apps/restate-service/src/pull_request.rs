@@ -568,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_sync_bypasses_the_event_debounce() {
+    fn a_manual_sync_bypasses_the_event_debounce() {
         let debounce = Duration::from_secs(20);
         assert!(should_debounce_sync(false, Some(100), 101, debounce));
         assert!(!should_debounce_sync(true, Some(100), 101, debounce));

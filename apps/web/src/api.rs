@@ -10,14 +10,12 @@ use dioxus::prelude::*;
 #[cfg(feature = "server")]
 use {
     crate::server::{
-        restate::{pr_status_path, restate_call, restate_send},
+        installation::github_installation_id,
+        restate::{pr_status_path, restate_call, restate_send, restate_send_empty},
         store::store,
-        sync::{github_installation_id, manual_pr_sync_event},
     },
     axum::extract::Extension,
-    dependaboard_core::{
-        BulkRequest, DASHBOARD_SYNC_ACTION, PrKey, UserId, WebhookEvent, new_batch_id,
-    },
+    dependaboard_core::{BulkRequest, ManualSyncRequest, PrKey, UserId, new_batch_id},
     dependaboard_store::PrStore,
     std::collections::BTreeSet,
 };
@@ -99,20 +97,7 @@ pub(crate) async fn load_pr_projection(
 
 #[server]
 pub(crate) async fn request_sync() -> Result<(), ServerFnError> {
-    let installation_id = github_installation_id()?;
-    let event = WebhookEvent {
-        event: "installation_repositories".to_owned(),
-        action: Some(DASHBOARD_SYNC_ACTION.to_owned()),
-        installation_id: Some(installation_id),
-        repository_id: None,
-        owner: None,
-        repo: None,
-        number: None,
-        sha: None,
-        pull_requests: Vec::new(),
-        sync_completion_id: None,
-    };
-    restate_send("WebhookIngress/dispatch", &event)
+    restate_send_empty("DashboardIngress/sync_installation")
         .await
         .map_err(ServerFnError::new)
 }
@@ -135,16 +120,14 @@ pub(crate) async fn request_pr_sync(
         ));
     }
     let completion_id = new_batch_id();
-    let event = manual_pr_sync_event(
-        installation_id,
-        row.repository_id,
-        row.owner,
-        row.repo,
-        row.number,
-        row.head_sha,
-        completion_id.clone(),
-    );
-    restate_send("WebhookIngress/dispatch", &event)
+    let request = ManualSyncRequest {
+        repository_id: row.repository_id,
+        owner: row.owner,
+        repo: row.repo,
+        number: row.number,
+        completion_id: completion_id.clone(),
+    };
+    restate_send("DashboardIngress/sync_pull_request", &request)
         .await
         .map_err(ServerFnError::new)?;
     Ok(completion_id)
