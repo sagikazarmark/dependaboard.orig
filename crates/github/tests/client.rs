@@ -7,10 +7,10 @@
 
 use dependaboard_core::{
     CheckStatus, CommandRequest, DEPENDABOT_LOGIN, DependabotCommand, DependencyUpdate,
-    GithubErrorResponse, MergeMethod, MergeRequest, Mergeable, PrRecord, PrTarget, SyncRequest,
-    UpdateBranchRequest, UpdateType, UserId, unix_seconds,
+    GithubErrorResponse, MergeMethod, MergeRequest, Mergeable, Operation, PrRecord, PrTarget,
+    SyncRequest, UpdateBranchRequest, UpdateType, UserId, unix_seconds,
 };
-use dependaboard_github::{GithubApi, GithubClient, GithubConfig, GithubError};
+use dependaboard_github::{GithubApi, GithubClient, GithubConfig, GithubError, ProtocolError};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use wiremock::{
@@ -94,7 +94,7 @@ fn github_error(status: u16, message: &str) -> ResponseTemplate {
 
 fn http_response(error: &GithubError) -> Option<&GithubErrorResponse> {
     match error {
-        GithubError::Http(response) | GithubError::HttpKnown(response) => Some(response),
+        GithubError::Http { response, .. } => Some(response),
         _ => None,
     }
 }
@@ -893,7 +893,13 @@ async fn merge_rejection_from_github_is_reported_against_the_known_pull_request(
     let error = client(&server).merge(&merge_request()).await.unwrap_err();
 
     assert!(
-        matches!(&error, GithubError::HttpKnown(response) if response.status == 405),
+        matches!(
+            &error,
+            GithubError::Http {
+                response,
+                known_resource: true
+            } if response.status == 405
+        ),
         "the pull request was verified to exist, got {error:?}"
     );
     server.verify().await;
@@ -985,6 +991,71 @@ async fn command_confirms_success_after_a_transport_failure() {
         detail,
         "command accepted as comment #777 (confirmed after an ambiguous response)"
     );
+}
+
+#[tokio::test]
+async fn command_confirms_success_after_an_unparsable_response() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_pull(&server, dependabot_pull()).await;
+    comment_page(1)
+        .respond_with(ok_json(json!([])))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    comment_page(1)
+        .respond_with(ok_json(json!([marked_comment(777)])))
+        .mount(&server)
+        .await;
+    comment_post()
+        .respond_with(unparsable_success())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let detail = client(&server)
+        .post_command(&command_request())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail,
+        "command accepted as comment #777 (confirmed after an ambiguous response)"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn command_that_cannot_be_sent_is_not_read_back() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_pull(&server, dependabot_pull()).await;
+    comment_page(1)
+        .respond_with(ok_json(json!([])))
+        .mount(&server)
+        .await;
+    // Only the configured dashboard user has a token; the request comes from someone else.
+    let config = GithubConfig {
+        dashboard_user: UserId::new("someone-else"),
+        ..config(&server)
+    };
+
+    let error = GithubClient::new(config)
+        .expect("test config builds a client")
+        .post_command(&command_request())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, GithubError::Config(message) if message.contains(DASHBOARD_USER)),
+        "expected the missing-token config error, got {error:?}"
+    );
+    assert_eq!(
+        request_count(&server, "GET", &comments_path()).await,
+        1,
+        "nothing reached GitHub, so there was nothing to read back"
+    );
+    assert_eq!(request_count(&server, "POST", &comments_path()).await, 0);
 }
 
 #[tokio::test]
@@ -1128,6 +1199,55 @@ async fn update_branch_confirms_success_when_the_head_moved_after_a_transport_fa
 }
 
 #[tokio::test]
+async fn update_branch_confirms_success_when_the_head_moved_after_an_unparsable_response() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_pull_then(&server, dependabot_pull(), stale_pull()).await;
+    update_branch_endpoint()
+        .respond_with(unparsable_success())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let detail = client(&server)
+        .update_branch(&update_branch_request())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        detail,
+        "branch updated (confirmed after an ambiguous response)"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn update_branch_reports_the_transport_failure_when_the_head_did_not_move() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_pull(&server, dependabot_pull()).await;
+    update_branch_endpoint()
+        .respond_with(transport_failure(&update_branch_path()))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .update_branch(&update_branch_request())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, GithubError::Transport(_)),
+        "expected a transport error, got {error:?}"
+    );
+    assert_eq!(
+        request_count(&server, "GET", &pull_path()).await,
+        2,
+        "the client re-fetched the pull request to check whether the head moved"
+    );
+}
+
+#[tokio::test]
 async fn update_branch_rejects_a_stale_head_without_calling_github() {
     let server = MockServer::start().await;
     mount_token(&server).await;
@@ -1185,7 +1305,16 @@ async fn rate_limit_headers_are_parsed_from_error_responses() {
         }
     );
     // A read that fails at the first fetch has not proven the resource exists.
-    assert!(matches!(error, GithubError::Http(_)), "got {error:?}");
+    assert!(
+        matches!(
+            error,
+            GithubError::Http {
+                known_resource: false,
+                ..
+            }
+        ),
+        "got {error:?}"
+    );
 }
 
 #[tokio::test]
@@ -1233,4 +1362,108 @@ async fn unparsable_error_bodies_still_carry_the_status_and_headers() {
     assert_eq!(response.status, 502);
     assert_eq!(response.message, "");
     assert_eq!(response.retry_after_seconds, Some(5));
+}
+
+// --- error sources --------------------------------------------------------
+
+/// The `source()` chain below `error`, outermost first, for inspecting what a
+/// client error wraps without caring how many layers deep it sits.
+fn source_chain(error: &GithubError) -> Vec<&(dyn std::error::Error + 'static)> {
+    let mut chain = Vec::new();
+    let mut current = std::error::Error::source(error);
+    while let Some(source) = current {
+        chain.push(source);
+        current = source.source();
+    }
+    chain
+}
+
+#[tokio::test]
+async fn transport_failures_keep_the_underlying_client_error_as_their_source() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_pull(&server, dependabot_pull()).await;
+    merge_endpoint()
+        .respond_with(transport_failure(&merge_path()))
+        .mount(&server)
+        .await;
+
+    let error = client(&server).merge(&merge_request()).await.unwrap_err();
+
+    assert!(
+        matches!(error, GithubError::Transport(_)),
+        "expected a transport error, got {error:?}"
+    );
+    assert!(
+        source_chain(&error)
+            .iter()
+            .any(|source| source.is::<reqwest::Error>()),
+        "the reqwest error should be reachable through source(), got {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn merge_reports_an_ambiguous_outcome_when_an_unreadable_answer_is_not_confirmed() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_pull(&server, dependabot_pull()).await;
+    merge_endpoint()
+        .respond_with(unparsable_success())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = client(&server).merge(&merge_request()).await.unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            GithubError::Ambiguous {
+                operation: Operation::Merge,
+                ..
+            }
+        ),
+        "expected an ambiguous merge outcome, got {error:?}"
+    );
+    let chain = source_chain(&error);
+    assert!(
+        chain.iter().any(|source| source.is::<ProtocolError>()),
+        "the unreadable answer should be the ambiguity's source, got {error:?}"
+    );
+    assert!(
+        chain.iter().any(|source| source.is::<reqwest::Error>()),
+        "the decode error should be reachable through source(), got {error:?}"
+    );
+    assert_eq!(
+        request_count(&server, "GET", &pull_path()).await,
+        2,
+        "the client re-fetched the pull request to check for a merge"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn unreadable_answers_keep_the_decode_error_as_their_source() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    pull_endpoint()
+        .respond_with(unparsable_success())
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .fetch_snapshot(&sync_request())
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, GithubError::Protocol(ProtocolError::Body(_))),
+        "expected an unreadable-body protocol error, got {error:?}"
+    );
+    assert!(
+        source_chain(&error)
+            .iter()
+            .any(|source| source.is::<reqwest::Error>()),
+        "the decode error should be reachable through source(), got {error:?}"
+    );
 }

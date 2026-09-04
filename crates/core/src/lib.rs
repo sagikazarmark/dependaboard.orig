@@ -840,6 +840,17 @@ pub enum Operation {
     UpdateBranch,
 }
 
+impl fmt::Display for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Read => "read",
+            Self::Merge => "merge",
+            Self::Comment => "comment",
+            Self::UpdateBranch => "update_branch",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubErrorResponse {
     pub status: u16,

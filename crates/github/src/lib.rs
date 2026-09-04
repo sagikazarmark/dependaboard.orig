@@ -3,8 +3,8 @@ use std::{collections::HashMap, env, fs, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use dependaboard_core::{
     CheckSignal, CommandRequest, DEPENDABOT_LOGIN, GithubErrorResponse, MergeMethod, MergeRequest,
-    Mergeable, PrKey, PrRecord, RepoRecord, SyncRequest, UpdateBranchRequest, UserId,
-    combined_status_signal, highest_update_type, parse_dependabot_metadata, rollup_checks,
+    Mergeable, Operation, PrKey, PrRecord, PrTarget, RepoRecord, SyncRequest, UpdateBranchRequest,
+    UserId, combined_status_signal, highest_update_type, parse_dependabot_metadata, rollup_checks,
     unix_seconds,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
@@ -148,7 +148,7 @@ impl GithubClient {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|error| GithubError::Transport(error.to_string()))?;
+            .map_err(GithubError::Transport)?;
         Ok(Self {
             config: Arc::new(config),
             app_key,
@@ -187,7 +187,7 @@ impl GithubClient {
             .bearer_auth(jwt)
             .send()
             .await
-            .map_err(|error| GithubError::Transport(error.to_string()))?;
+            .map_err(GithubError::Transport)?;
         let token: InstallationToken = parse_response(response).await?;
         let expires_at = parse_timestamp(&token.expires_at)?;
         let value = SecretString::from(token.token);
@@ -242,10 +242,7 @@ impl GithubClient {
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let response = request
-                .send()
-                .await
-                .map_err(|error| GithubError::Transport(error.to_string()))?;
+            let response = request.send().await.map_err(GithubError::Transport)?;
             if response.status() != StatusCode::UNAUTHORIZED || attempt == 1 {
                 return Ok(response);
             }
@@ -270,10 +267,7 @@ impl GithubClient {
         if let Some(body) = body {
             request = request.json(body);
         }
-        request
-            .send()
-            .await
-            .map_err(|error| GithubError::Transport(error.to_string()))
+        request.send().await.map_err(GithubError::Transport)
     }
 
     async fn installation_json<T: DeserializeOwned>(
@@ -418,6 +412,129 @@ impl GithubClient {
                 return Ok(None);
             }
             page += 1;
+        }
+    }
+
+    /// Reads the pull request a mutation targets.
+    async fn fetch_target(&self, target: &PrTarget) -> Result<GithubPull, GithubError> {
+        self.fetch_pull(
+            self.config.installation_id,
+            &target.owner,
+            &target.repo,
+            target.number,
+        )
+        .await
+    }
+
+    /// Runs one GitHub write against a verified pull request: fetch, verify, mutate, confirm.
+    ///
+    /// The pull request is read and checked to still be the open Dependabot pull request at
+    /// the head the caller last saw; only then does `mutate` send the write.
+    ///
+    /// GitHub mutations are at-least-once, so a replay must find work an earlier attempt
+    /// finished and not redo it. There are two places to notice that, and they sit on
+    /// opposite sides of the checks: `already_applied` sees the verify read itself, before
+    /// the state checks, because a merge that landed has closed the pull request and would
+    /// otherwise be rejected as gone; `mutate` may instead answer [`Write::AlreadyApplied`]
+    /// after the checks, for work that costs extra requests to detect (the comment marker
+    /// scan) and must not be spent on a pull request that is about to be rejected as stale.
+    ///
+    /// A lost answer (transport failure) or an unreadable one (a 2xx whose body does not
+    /// parse) is not yet a failure: `confirm` reads back whether the write landed and, when
+    /// it did, the mutation succeeds with that detail. Otherwise a transport failure stands
+    /// and an unreadable answer becomes [`GithubError::Ambiguous`]. Any other failure to
+    /// send means nothing reached GitHub and is returned as is. A read-back that itself
+    /// fails counts as unconfirmed.
+    ///
+    /// HTTP errors GitHub returns after the pull request was verified are flagged as coming
+    /// from a known resource.
+    async fn verified_mutation<T: DeserializeOwned>(
+        &self,
+        operation: Operation,
+        target: &PrTarget,
+        already_applied: impl FnOnce(&GithubPull) -> Option<String>,
+        mutate: impl AsyncFnOnce() -> Result<Write, GithubError>,
+        confirm: impl AsyncFnOnce() -> Result<Option<String>, GithubError>,
+    ) -> Result<MutationOutcome<T>, GithubError> {
+        let pull = self.fetch_target(target).await?;
+        if let Some(detail) = already_applied(&pull) {
+            return Ok(MutationOutcome::Applied(detail));
+        }
+        if pull.state != "open" || pull.user.login != DEPENDABOT_LOGIN {
+            return Err(not_found(
+                "pull request is closed or is not owned by Dependabot",
+            ));
+        }
+        if pull.head.sha != target.expected_sha {
+            return Err(GithubError::StaleSha {
+                expected: target.expected_sha.clone(),
+                actual: pull.head.sha,
+            });
+        }
+        let response = match mutate().await {
+            Ok(Write::Sent(response)) => response,
+            Ok(Write::AlreadyApplied(detail)) => return Ok(MutationOutcome::Applied(detail)),
+            Err(lost @ GithubError::Transport(_)) => {
+                return match confirm().await {
+                    Ok(Some(detail)) => Ok(MutationOutcome::Applied(detail)),
+                    Ok(None) | Err(_) => Err(lost),
+                };
+            }
+            Err(error) => return Err(error),
+        };
+        match parse_response(response).await.map_err(known_http) {
+            Ok(answer) => Ok(MutationOutcome::Answered(answer)),
+            Err(GithubError::Protocol(unreadable)) => match confirm().await {
+                Ok(Some(detail)) => Ok(MutationOutcome::Applied(detail)),
+                Ok(None) | Err(_) => Err(GithubError::Ambiguous {
+                    operation,
+                    source: unreadable,
+                }),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The read-back for writes whose effect shows on the pull request itself: `Some(detail)`
+    /// when `landed` holds for what GitHub now shows.
+    async fn confirm_on_pull(
+        &self,
+        target: &PrTarget,
+        detail: &str,
+        landed: impl FnOnce(&GithubPull) -> bool,
+    ) -> Result<Option<String>, GithubError> {
+        let pull = self.fetch_target(target).await?;
+        Ok(landed(&pull).then(|| detail.to_owned()))
+    }
+}
+
+/// What the mutate step of a verified mutation did.
+enum Write {
+    /// The write went out; GitHub's raw answer.
+    Sent(Response),
+    /// An earlier attempt already did the work, so nothing was sent.
+    AlreadyApplied(String),
+}
+
+/// How a verified mutation ended.
+enum MutationOutcome<T> {
+    /// GitHub answered and the client read the answer.
+    Answered(T),
+    /// The work is known to have happened without a readable answer: an earlier attempt
+    /// did it, or a read-back confirmed it after an ambiguous answer.
+    Applied(String),
+}
+
+impl<T> MutationOutcome<T> {
+    /// The outcome's detail: the one already known, or the one `answered` reads out of
+    /// GitHub's answer.
+    fn into_detail(
+        self,
+        answered: impl FnOnce(T) -> Result<String, GithubError>,
+    ) -> Result<String, GithubError> {
+        match self {
+            MutationOutcome::Answered(answer) => answered(answer),
+            MutationOutcome::Applied(detail) => Ok(detail),
         }
     }
 }
@@ -582,237 +699,151 @@ impl GithubApi for GithubClient {
     }
 
     async fn merge(&self, request: &MergeRequest) -> Result<String, GithubError> {
-        let pull = self
-            .fetch_pull(
-                self.config.installation_id,
-                &request.target.owner,
-                &request.target.repo,
-                request.target.number,
-            )
-            .await?;
-        if pull.merged {
-            return Ok("already merged".to_owned());
-        }
-        if pull.state != "open" || pull.user.login != DEPENDABOT_LOGIN {
-            return Err(not_found(
-                "pull request is closed or is not owned by Dependabot",
-            ));
-        }
-        if pull.head.sha != request.target.expected_sha {
-            return Err(GithubError::StaleSha {
-                expected: request.target.expected_sha.clone(),
-                actual: pull.head.sha,
-            });
-        }
+        let target = &request.target;
         let path = format!(
             "/repos/{}/{}/pulls/{}/merge",
-            request.target.owner, request.target.repo, request.target.number
+            target.owner, target.repo, target.number
         );
         let body = json!({
-            "sha": request.target.expected_sha,
+            "sha": target.expected_sha,
             "merge_method": self.config.merge_method.to_string(),
         });
-        let response = match self
-            .installation_request(self.config.installation_id, Method::PUT, &path, Some(&body))
-            .await
-        {
-            Ok(response) => response,
-            Err(original) => {
-                if self
-                    .fetch_pull(
-                        self.config.installation_id,
-                        &request.target.owner,
-                        &request.target.repo,
-                        request.target.number,
-                    )
-                    .await
-                    .is_ok_and(|pull| pull.merged)
-                {
-                    return Ok("merged (confirmed after an ambiguous response)".to_owned());
-                }
-                return Err(original);
+        self.verified_mutation(
+            Operation::Merge,
+            target,
+            |pull| pull.merged.then(|| "already merged".to_owned()),
+            async || {
+                self.installation_request(
+                    self.config.installation_id,
+                    Method::PUT,
+                    &path,
+                    Some(&body),
+                )
+                .await
+                .map(Write::Sent)
+            },
+            async || {
+                self.confirm_on_pull(
+                    target,
+                    "merged (confirmed after an ambiguous response)",
+                    |pull| pull.merged,
+                )
+                .await
+            },
+        )
+        .await?
+        .into_detail(|answer: MergeResult| {
+            if answer.merged {
+                Ok(answer.message)
+            } else {
+                Err(GithubError::Http {
+                    response: GithubErrorResponse {
+                        status: StatusCode::CONFLICT.as_u16(),
+                        message: answer.message,
+                        ..Default::default()
+                    },
+                    known_resource: true,
+                })
             }
-        };
-        let result: MergeResult = match parse_response(response).await.map_err(known_http) {
-            Ok(result) => result,
-            Err(GithubError::Protocol(message)) => {
-                if self
-                    .fetch_pull(
-                        self.config.installation_id,
-                        &request.target.owner,
-                        &request.target.repo,
-                        request.target.number,
-                    )
-                    .await
-                    .is_ok_and(|pull| pull.merged)
-                {
-                    return Ok("merged (confirmed after an ambiguous response)".to_owned());
-                }
-                return Err(GithubError::Transport(format!(
-                    "ambiguous merge response: {message}"
-                )));
-            }
-            Err(error) => return Err(error),
-        };
-        if result.merged {
-            Ok(result.message)
-        } else {
-            Err(GithubError::HttpKnown(GithubErrorResponse {
-                status: StatusCode::CONFLICT.as_u16(),
-                message: result.message,
-                ..Default::default()
-            }))
-        }
+        })
     }
 
     async fn post_command(&self, request: &CommandRequest) -> Result<String, GithubError> {
-        let pull = self
-            .fetch_pull(
-                self.config.installation_id,
-                &request.target.owner,
-                &request.target.repo,
-                request.target.number,
-            )
-            .await?;
-        if pull.state != "open" || pull.user.login != DEPENDABOT_LOGIN {
-            return Err(not_found(
-                "pull request is closed or is not owned by Dependabot",
-            ));
-        }
-        if pull.head.sha != request.target.expected_sha {
-            return Err(GithubError::StaleSha {
-                expected: request.target.expected_sha.clone(),
-                actual: pull.head.sha,
-            });
-        }
-
+        let target = &request.target;
         let marker = format!("<!-- dependaboard-batch:{} -->", request.batch_id);
         let path = format!(
             "/repos/{}/{}/issues/{}/comments",
-            request.target.owner, request.target.repo, request.target.number
+            target.owner, target.repo, target.number
         );
-        if let Some(comment_id) = self.find_comment_with_marker(&path, &marker).await? {
-            return Ok(format!("command already accepted as comment #{comment_id}"));
-        }
         let body = json!({
             "body": format!(
                 "@dependabot {}\n\n— via dependabot-dashboard ({})\n{}",
                 request.command, request.user_id, marker
             )
         });
-        let response = match self
-            .user_request(&request.user_id, Method::POST, &path, Some(&body))
-            .await
-        {
-            Ok(response) => response,
-            Err(original) => {
+        self.verified_mutation(
+            Operation::Comment,
+            target,
+            |_| None,
+            async || {
                 if let Some(comment_id) = self.find_comment_with_marker(&path, &marker).await? {
-                    return Ok(format!(
-                        "command accepted as comment #{comment_id} (confirmed after an ambiguous response)"
-                    ));
+                    return Ok(Write::AlreadyApplied(format!(
+                        "command already accepted as comment #{comment_id}"
+                    )));
                 }
-                return Err(original);
-            }
-        };
-        let comment: IssueComment = match parse_response(response).await.map_err(known_http) {
-            Ok(comment) => comment,
-            Err(GithubError::Protocol(message)) => {
-                if let Some(comment_id) = self.find_comment_with_marker(&path, &marker).await? {
-                    return Ok(format!(
-                        "command accepted as comment #{comment_id} (confirmed after an ambiguous response)"
-                    ));
-                }
-                return Err(GithubError::Transport(format!(
-                    "ambiguous comment response: {message}"
-                )));
-            }
-            Err(error) => return Err(error),
-        };
-        Ok(format!("GitHub accepted comment #{}", comment.id))
+                self.user_request(&request.user_id, Method::POST, &path, Some(&body))
+                    .await
+                    .map(Write::Sent)
+            },
+            async || {
+                Ok(self
+                    .find_comment_with_marker(&path, &marker)
+                    .await?
+                    .map(|comment_id| {
+                        format!(
+                            "command accepted as comment #{comment_id} (confirmed after an ambiguous response)"
+                        )
+                    }))
+            },
+        )
+        .await?
+        .into_detail(|comment: IssueComment| Ok(format!("GitHub accepted comment #{}", comment.id)))
     }
 
     async fn update_branch(&self, request: &UpdateBranchRequest) -> Result<String, GithubError> {
-        let pull = self
-            .fetch_pull(
-                self.config.installation_id,
-                &request.target.owner,
-                &request.target.repo,
-                request.target.number,
-            )
-            .await?;
-        if pull.state != "open" || pull.user.login != DEPENDABOT_LOGIN {
-            return Err(not_found(
-                "pull request is closed or is not owned by Dependabot",
-            ));
-        }
-        if pull.head.sha != request.target.expected_sha {
-            return Err(GithubError::StaleSha {
-                expected: request.target.expected_sha.clone(),
-                actual: pull.head.sha,
-            });
-        }
+        let target = &request.target;
         let path = format!(
             "/repos/{}/{}/pulls/{}/update-branch",
-            request.target.owner, request.target.repo, request.target.number
+            target.owner, target.repo, target.number
         );
-        let body = json!({ "expected_head_sha": request.target.expected_sha });
-        let response = match self
-            .installation_request(self.config.installation_id, Method::PUT, &path, Some(&body))
-            .await
-        {
-            Ok(response) => response,
-            Err(original) => {
-                if self
-                    .fetch_pull(
-                        self.config.installation_id,
-                        &request.target.owner,
-                        &request.target.repo,
-                        request.target.number,
-                    )
-                    .await
-                    .is_ok_and(|pull| pull.head.sha != request.target.expected_sha)
-                {
-                    return Ok("branch updated (confirmed after an ambiguous response)".to_owned());
-                }
-                return Err(original);
-            }
-        };
-        let result: UpdateBranchResult = match parse_response(response).await.map_err(known_http) {
-            Ok(result) => result,
-            Err(GithubError::Protocol(message)) => {
-                if self
-                    .fetch_pull(
-                        self.config.installation_id,
-                        &request.target.owner,
-                        &request.target.repo,
-                        request.target.number,
-                    )
-                    .await
-                    .is_ok_and(|pull| pull.head.sha != request.target.expected_sha)
-                {
-                    return Ok("branch updated (confirmed after an ambiguous response)".to_owned());
-                }
-                return Err(GithubError::Transport(format!(
-                    "ambiguous update-branch response: {message}"
-                )));
-            }
-            Err(error) => return Err(error),
-        };
-        Ok(result.message)
+        let body = json!({ "expected_head_sha": target.expected_sha });
+        self.verified_mutation(
+            Operation::UpdateBranch,
+            target,
+            |_| None,
+            async || {
+                self.installation_request(
+                    self.config.installation_id,
+                    Method::PUT,
+                    &path,
+                    Some(&body),
+                )
+                .await
+                .map(Write::Sent)
+            },
+            async || {
+                self.confirm_on_pull(
+                    target,
+                    "branch updated (confirmed after an ambiguous response)",
+                    |pull| pull.head.sha != target.expected_sha,
+                )
+                .await
+            },
+        )
+        .await?
+        .into_detail(|answer: UpdateBranchResult| Ok(answer.message))
     }
 }
 
 fn not_found(message: &str) -> GithubError {
-    GithubError::HttpKnown(GithubErrorResponse {
-        status: StatusCode::NOT_FOUND.as_u16(),
-        message: message.to_owned(),
-        ..Default::default()
-    })
+    GithubError::Http {
+        response: GithubErrorResponse {
+            status: StatusCode::NOT_FOUND.as_u16(),
+            message: message.to_owned(),
+            ..Default::default()
+        },
+        known_resource: true,
+    }
 }
 
+/// Marks an HTTP error as coming from a resource the client has already read, so a 404
+/// downstream means the pull request went away rather than that it was never visible.
 fn known_http(error: GithubError) -> GithubError {
     match error {
-        GithubError::Http(response) => GithubError::HttpKnown(response),
+        GithubError::Http { response, .. } => GithubError::Http {
+            response,
+            known_resource: true,
+        },
         error => error,
     }
 }
@@ -829,9 +860,12 @@ async fn parse_response<T: DeserializeOwned>(response: Response) -> Result<T, Gi
         return response
             .json::<T>()
             .await
-            .map_err(|error| GithubError::Protocol(format!("invalid GitHub response: {error}")));
+            .map_err(|error| GithubError::Protocol(ProtocolError::Body(error)));
     }
-    Err(GithubError::Http(http_error(response).await))
+    Err(GithubError::Http {
+        response: http_error(response).await,
+        known_resource: false,
+    })
 }
 
 async fn http_error(response: Response) -> GithubErrorResponse {
@@ -856,26 +890,52 @@ fn header_u64(response: &Response, name: &str) -> Option<u64> {
 
 fn parse_timestamp(value: &str) -> Result<u64, GithubError> {
     let timestamp = chrono::DateTime::parse_from_rfc3339(value)
-        .map_err(|error| GithubError::Protocol(format!("invalid GitHub timestamp: {error}")))?
+        .map_err(|error| GithubError::Protocol(ProtocolError::Timestamp(error)))?
         .timestamp();
-    u64::try_from(timestamp)
-        .map_err(|_| GithubError::Protocol("GitHub returned a timestamp before 1970".to_owned()))
+    u64::try_from(timestamp).map_err(|_| GithubError::Protocol(ProtocolError::TimestampBeforeEpoch))
 }
 
 #[derive(Debug, Error)]
 pub enum GithubError {
+    /// The request never completed: the client could not be built, the connection failed,
+    /// or the response was lost before it could be read.
     #[error("GitHub transport failed: {0}")]
-    Transport(String),
-    #[error("GitHub returned HTTP {status}: {message}", status = .0.status, message = .0.message)]
-    Http(GithubErrorResponse),
-    #[error("GitHub returned HTTP {status}: {message}", status = .0.status, message = .0.message)]
-    HttpKnown(GithubErrorResponse),
+    Transport(#[source] reqwest::Error),
+    /// GitHub answered with a non-success status.
+    ///
+    /// `known_resource` records whether the client had already proven the target exists
+    /// when this came back: a 404 on a pull request it just read means "gone", while a
+    /// 404 on the first read may be a permissions misconfiguration.
+    #[error("GitHub returned HTTP {}: {}", response.status, response.message)]
+    Http {
+        response: GithubErrorResponse,
+        known_resource: bool,
+    },
     #[error("GitHub protocol error: {0}")]
-    Protocol(String),
+    Protocol(#[source] ProtocolError),
+    /// A mutation's answer from GitHub could not be read and reading back did not show the
+    /// mutation as applied, so whether it happened is unknown. Safe to retry: every attempt
+    /// re-verifies the pull request before acting.
+    #[error("ambiguous GitHub {operation} response: {source}")]
+    Ambiguous {
+        operation: Operation,
+        source: ProtocolError,
+    },
     #[error("GitHub configuration error: {0}")]
     Config(String),
     #[error("pull request head changed from {expected} to {actual}")]
     StaleSha { expected: String, actual: String },
+}
+
+/// Why a successful GitHub answer could not be read.
+#[derive(Debug, Error)]
+pub enum ProtocolError {
+    #[error("invalid GitHub response: {0}")]
+    Body(#[source] reqwest::Error),
+    #[error("invalid GitHub timestamp: {0}")]
+    Timestamp(#[source] chrono::ParseError),
+    #[error("GitHub returned a timestamp before 1970")]
+    TimestampBeforeEpoch,
 }
 
 #[derive(Debug, Deserialize)]

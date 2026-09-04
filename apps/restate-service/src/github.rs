@@ -75,19 +75,21 @@ where
 {
     let (response, known_resource) = match result {
         Ok(value) => return Ok(Json::from(Attempt::Settled(Settled::Ok(value)))),
-        Err(GithubError::Http(response)) => (response, known_resource),
-        Err(GithubError::HttpKnown(response)) => (response, true),
+        Err(GithubError::Http {
+            response,
+            known_resource: verified,
+        }) => (response, known_resource || verified),
         Err(GithubError::StaleSha { expected, actual }) => {
             return Ok(Json::from(Attempt::Settled(Settled::StaleSha {
                 expected,
                 actual,
             })));
         }
-        Err(GithubError::Transport(message)) => {
-            return Err(RetryableServiceError::Github(message).into());
+        Err(error @ (GithubError::Transport(_) | GithubError::Ambiguous { .. })) => {
+            return Err(RetryableServiceError::Github(error.to_string()).into());
         }
-        Err(GithubError::Protocol(message) | GithubError::Config(message)) => {
-            return Err(TerminalError::new(message).into());
+        Err(error @ (GithubError::Protocol(_) | GithubError::Config(_))) => {
+            return Err(TerminalError::new(error.to_string()).into());
         }
     };
     let attempt = match classify_github_error(&response, operation, known_resource, now) {
@@ -239,6 +241,8 @@ pub(crate) fn rejected(reason: RejectReason) -> ActionOutcome {
 mod tests {
     use std::collections::VecDeque;
 
+    use dependaboard_github::ProtocolError;
+
     use super::*;
     use crate::store::store_retry_policy;
 
@@ -263,6 +267,15 @@ mod tests {
         }
     }
 
+    /// A real `reqwest::Error`: the only way to mint one outside reqwest is to ask it to
+    /// build a request it cannot.
+    fn reqwest_error() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("not a url")
+            .build()
+            .expect_err("an unparsable URL fails to build")
+    }
+
     #[test]
     fn a_rate_limited_response_is_journaled_with_its_deadline() {
         let response = GithubErrorResponse {
@@ -273,7 +286,10 @@ mod tests {
         };
 
         let attempt = journal_github_result::<()>(
-            Err(GithubError::Http(response.clone())),
+            Err(GithubError::Http {
+                response: response.clone(),
+                known_resource: false,
+            }),
             Operation::Comment,
             false,
             1_000,
@@ -294,12 +310,27 @@ mod tests {
             message: "unavailable".to_owned(),
             ..Default::default()
         };
-        let error = journal_failure(GithubError::Http(unavailable), Operation::Read);
+        let error = journal_failure(
+            GithubError::Http {
+                response: unavailable,
+                known_resource: false,
+            },
+            Operation::Read,
+        );
         assert!(is_retryable(&error), "{error:?}");
 
+        let error = journal_failure(GithubError::Transport(reqwest_error()), Operation::Read);
+        assert!(is_retryable(&error), "{error:?}");
+    }
+
+    #[test]
+    fn an_ambiguous_mutation_outcome_fails_the_attempt_so_the_bounded_policy_retries_it() {
         let error = journal_failure(
-            GithubError::Transport("connection reset".to_owned()),
-            Operation::Read,
+            GithubError::Ambiguous {
+                operation: Operation::Merge,
+                source: ProtocolError::Body(reqwest_error()),
+            },
+            Operation::Merge,
         );
         assert!(is_retryable(&error), "{error:?}");
     }
@@ -313,7 +344,10 @@ mod tests {
         };
 
         let attempt = journal_github_result::<()>(
-            Err(GithubError::HttpKnown(response.clone())),
+            Err(GithubError::Http {
+                response: response.clone(),
+                known_resource: true,
+            }),
             Operation::Read,
             false,
             1_000,
@@ -338,7 +372,10 @@ mod tests {
             ..Default::default()
         };
         let attempt = journal_github_result::<()>(
-            Err(GithubError::Http(response.clone())),
+            Err(GithubError::Http {
+                response: response.clone(),
+                known_resource: false,
+            }),
             Operation::Read,
             false,
             1_000,
@@ -351,7 +388,7 @@ mod tests {
     #[test]
     fn a_protocol_error_fails_the_attempt_terminally() {
         let error = journal_failure(
-            GithubError::Protocol("invalid GitHub response".to_owned()),
+            GithubError::Protocol(ProtocolError::Body(reqwest_error())),
             Operation::Read,
         );
         assert!(is_terminal(&error), "{error:?}");
