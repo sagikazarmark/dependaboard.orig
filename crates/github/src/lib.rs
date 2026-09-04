@@ -654,7 +654,14 @@ pub trait GithubApi: Send + Sync {
         repo: &str,
         repository_id: u64,
     ) -> Result<Vec<SyncRequest>, GithubError>;
-    async fn merge(&self, request: &MergeRequest) -> Result<String, GithubError>;
+    /// Merges the target with `merge_method`, the method its repository resolved
+    /// at its last sync because it disallows the configured preference, or with
+    /// the preference when `None`.
+    async fn merge(
+        &self,
+        request: &MergeRequest,
+        merge_method: Option<MergeMethod>,
+    ) -> Result<String, GithubError>;
     async fn post_command(&self, request: &CommandRequest) -> Result<String, GithubError>;
     async fn update_branch(&self, request: &UpdateBranchRequest) -> Result<String, GithubError>;
 }
@@ -746,12 +753,17 @@ impl GithubApi for GithubClient {
                 )
                 .await?;
             let count = response.repositories.len();
-            repositories.extend(response.repositories.into_iter().map(|repo| RepoRecord {
-                repository_id: repo.id,
-                installation_id: self.config.installation_id,
-                owner: repo.owner.login,
-                repo: repo.name,
-                synced_at,
+            repositories.extend(response.repositories.into_iter().map(|repo| {
+                RepoRecord {
+                    repository_id: repo.id,
+                    installation_id: self.config.installation_id,
+                    owner: repo.owner.login,
+                    repo: repo.name,
+                    merge_method: repo
+                        .merge_settings
+                        .method_instead_of(self.config.merge_method),
+                    synced_at,
+                }
             }));
             if count < 100 {
                 break;
@@ -800,7 +812,11 @@ impl GithubApi for GithubClient {
         Ok(pulls)
     }
 
-    async fn merge(&self, request: &MergeRequest) -> Result<String, GithubError> {
+    async fn merge(
+        &self,
+        request: &MergeRequest,
+        merge_method: Option<MergeMethod>,
+    ) -> Result<String, GithubError> {
         let target = &request.target;
         let path = format!(
             "/repos/{}/{}/pulls/{}/merge",
@@ -808,7 +824,9 @@ impl GithubApi for GithubClient {
         );
         let body = json!({
             "sha": target.expected_sha,
-            "merge_method": self.config.merge_method.to_string(),
+            "merge_method": merge_method
+                .unwrap_or(self.config.merge_method)
+                .to_string(),
         });
         self.verified_mutation(
             Operation::Merge,
@@ -1109,6 +1127,47 @@ struct GithubRepository {
     id: u64,
     name: String,
     owner: GithubUser,
+    #[serde(flatten)]
+    merge_settings: MergeSettings,
+}
+
+/// Which merge methods a repository's settings permit. GitHub's schema marks
+/// each flag optional with a default of `true`, so an absent flag reads as
+/// allowed.
+#[derive(Debug, Deserialize)]
+struct MergeSettings {
+    #[serde(default = "allowed_by_default")]
+    allow_squash_merge: bool,
+    #[serde(default = "allowed_by_default")]
+    allow_merge_commit: bool,
+    #[serde(default = "allowed_by_default")]
+    allow_rebase_merge: bool,
+}
+
+fn allowed_by_default() -> bool {
+    true
+}
+
+impl MergeSettings {
+    fn allows(&self, method: MergeMethod) -> bool {
+        match method {
+            MergeMethod::Squash => self.allow_squash_merge,
+            MergeMethod::Merge => self.allow_merge_commit,
+            MergeMethod::Rebase => self.allow_rebase_merge,
+        }
+    }
+
+    /// The method to merge with instead of `preferred`, when these settings
+    /// disallow it: the first allowed of squash, merge, rebase. `None` when
+    /// `preferred` is allowed, or when nothing is (GitHub then decides).
+    fn method_instead_of(&self, preferred: MergeMethod) -> Option<MergeMethod> {
+        if self.allows(preferred) {
+            return None;
+        }
+        [MergeMethod::Squash, MergeMethod::Merge, MergeMethod::Rebase]
+            .into_iter()
+            .find(|method| self.allows(*method))
+    }
 }
 
 #[derive(Debug, Deserialize)]

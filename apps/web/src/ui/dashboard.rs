@@ -451,6 +451,7 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
 
         ConfirmModal {
             pending: pending(),
+            repositories: page.as_ref().map(|page| page.repositories.clone()).unwrap_or_default(),
             oncancel: move |_| pending.set(None),
             onconfirm: queue_batch,
         }

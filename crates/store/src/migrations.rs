@@ -28,6 +28,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "pull_request_constraints",
         sql: include_str!("../../../migrations/0002_pull_request_constraints.sql"),
     },
+    Migration {
+        version: 3,
+        name: "repository_merge_method",
+        sql: include_str!("../../../migrations/0003_repository_merge_method.sql"),
+    },
 ];
 
 const CREATE_SCHEMA_MIGRATIONS: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (

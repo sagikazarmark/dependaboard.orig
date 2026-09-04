@@ -359,6 +359,11 @@ pub struct RepoRecord {
     pub installation_id: u64,
     pub owner: String,
     pub repo: String,
+    /// The method merges in this repository use when the configured
+    /// preference is disallowed there, resolved at the last repository sync.
+    /// `None` means the preference is allowed, or the row predates this field.
+    #[serde(default)]
+    pub merge_method: Option<MergeMethod>,
     pub synced_at: u64,
 }
 

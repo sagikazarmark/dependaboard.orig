@@ -356,6 +356,106 @@ async fn a_single_short_page_issues_exactly_one_request() {
     server.verify().await;
 }
 
+// --- merge method resolution ----------------------------------------------
+
+/// A listed repository with the given merge settings; `None` leaves the flag
+/// out of the answer, as GitHub does when the App cannot read it.
+fn repository_allowing(
+    id: u64,
+    squash: Option<bool>,
+    merge_commit: Option<bool>,
+    rebase: Option<bool>,
+) -> Value {
+    let mut repository = repository(id);
+    for (name, flag) in [
+        ("allow_squash_merge", squash),
+        ("allow_merge_commit", merge_commit),
+        ("allow_rebase_merge", rebase),
+    ] {
+        if let Some(flag) = flag {
+            repository[name] = json!(flag);
+        }
+    }
+    repository
+}
+
+#[tokio::test]
+async fn repository_listing_resolves_a_method_only_where_the_preferred_one_is_disallowed() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    // The client is configured to prefer squash.
+    repositories_endpoint(TOKEN)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "repositories": [
+                // Squash allowed: the preference stands, no override recorded.
+                repository_allowing(1, Some(true), Some(false), Some(false)),
+                // Squash disallowed: the first allowed of squash, merge, rebase.
+                repository_allowing(2, Some(false), Some(true), Some(true)),
+                repository_allowing(3, Some(false), Some(false), Some(true)),
+                // Flags absent read as allowed, matching GitHub's schema default.
+                repository_allowing(4, None, None, None),
+                repository_allowing(5, Some(false), None, Some(false)),
+                // Nothing allowed: nothing to resolve to; GitHub gets the preference.
+                repository_allowing(6, Some(false), Some(false), Some(false)),
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let repositories = client(&server)
+        .list_installation_repositories()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repositories
+            .iter()
+            .map(|repository| (repository.repository_id, repository.merge_method))
+            .collect::<Vec<_>>(),
+        [
+            (1, None),
+            (2, Some(MergeMethod::Merge)),
+            (3, Some(MergeMethod::Rebase)),
+            (4, None),
+            (5, Some(MergeMethod::Merge)),
+            (6, None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn repository_listing_honours_a_non_default_preference() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    repositories_endpoint(TOKEN)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "repositories": [
+                repository_allowing(1, Some(true), Some(true), Some(false)),
+                repository_allowing(2, Some(true), Some(true), Some(true)),
+            ]
+        })))
+        .mount(&server)
+        .await;
+    let config = GithubConfig {
+        merge_method: MergeMethod::Rebase,
+        ..config(&server)
+    };
+
+    let repositories = GithubClient::new(config)
+        .unwrap()
+        .list_installation_repositories()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        repositories
+            .iter()
+            .map(|repository| (repository.repository_id, repository.merge_method))
+            .collect::<Vec<_>>(),
+        [(1, Some(MergeMethod::Squash)), (2, None)]
+    );
+}
+
 // --- snapshot assembly ----------------------------------------------------
 
 const NUMBER: u64 = 9;
@@ -921,7 +1021,34 @@ async fn merge_succeeds_when_the_head_matches() {
         .mount(&server)
         .await;
 
-    let detail = client(&server).merge(&merge_request()).await.unwrap();
+    let detail = client(&server).merge(&merge_request(), None).await.unwrap();
+
+    assert_eq!(detail, MERGED_MESSAGE);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn merge_uses_the_repository_method_when_it_disallows_the_configured_one() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_pull(&server, dependabot_pull()).await;
+    // The client prefers squash, but this repository's sync resolved to a
+    // merge commit. Only that method is accepted here; squash would 405.
+    Mock::given(method("PUT"))
+        .and(path(merge_path()))
+        .and(bearer_token(TOKEN))
+        .and(body_json(
+            json!({ "sha": HEAD_SHA, "merge_method": "merge" }),
+        ))
+        .respond_with(merged_response())
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let detail = client(&server)
+        .merge(&merge_request(), Some(MergeMethod::Merge))
+        .await
+        .unwrap();
 
     assert_eq!(detail, MERGED_MESSAGE);
     server.verify().await;
@@ -937,7 +1064,7 @@ async fn merge_confirms_success_after_a_transport_failure() {
         .mount(&server)
         .await;
 
-    let detail = client(&server).merge(&merge_request()).await.unwrap();
+    let detail = client(&server).merge(&merge_request(), None).await.unwrap();
 
     assert_eq!(detail, CONFIRMED_MERGE);
 }
@@ -953,7 +1080,7 @@ async fn merge_confirms_success_after_an_unparsable_response() {
         .mount(&server)
         .await;
 
-    let detail = client(&server).merge(&merge_request()).await.unwrap();
+    let detail = client(&server).merge(&merge_request(), None).await.unwrap();
 
     assert_eq!(detail, CONFIRMED_MERGE);
     server.verify().await;
@@ -969,7 +1096,10 @@ async fn merge_reports_the_transport_failure_when_the_confirm_shows_no_merge() {
         .mount(&server)
         .await;
 
-    let error = client(&server).merge(&merge_request()).await.unwrap_err();
+    let error = client(&server)
+        .merge(&merge_request(), None)
+        .await
+        .unwrap_err();
 
     assert!(
         matches!(error, GithubError::Transport(_)),
@@ -994,7 +1124,10 @@ async fn merge_rejects_a_stale_head_without_calling_github() {
         .mount(&server)
         .await;
 
-    let error = client(&server).merge(&merge_request()).await.unwrap_err();
+    let error = client(&server)
+        .merge(&merge_request(), None)
+        .await
+        .unwrap_err();
 
     assert_stale_sha(&error);
     server.verify().await;
@@ -1012,7 +1145,7 @@ async fn merge_is_a_no_op_when_github_already_merged_the_pull_request() {
         .mount(&server)
         .await;
 
-    let detail = client(&server).merge(&merge_request()).await.unwrap();
+    let detail = client(&server).merge(&merge_request(), None).await.unwrap();
 
     assert_eq!(detail, "already merged");
     server.verify().await;
@@ -1029,7 +1162,10 @@ async fn merge_rejection_from_github_is_reported_against_the_known_pull_request(
         .mount(&server)
         .await;
 
-    let error = client(&server).merge(&merge_request()).await.unwrap_err();
+    let error = client(&server)
+        .merge(&merge_request(), None)
+        .await
+        .unwrap_err();
 
     assert!(
         matches!(
@@ -1611,7 +1747,10 @@ async fn transport_failures_keep_the_underlying_client_error_as_their_source() {
         .mount(&server)
         .await;
 
-    let error = client(&server).merge(&merge_request()).await.unwrap_err();
+    let error = client(&server)
+        .merge(&merge_request(), None)
+        .await
+        .unwrap_err();
 
     assert!(
         matches!(error, GithubError::Transport(_)),
@@ -1636,7 +1775,10 @@ async fn merge_reports_an_ambiguous_outcome_when_an_unreadable_answer_is_not_con
         .mount(&server)
         .await;
 
-    let error = client(&server).merge(&merge_request()).await.unwrap_err();
+    let error = client(&server)
+        .merge(&merge_request(), None)
+        .await
+        .unwrap_err();
 
     assert!(
         matches!(

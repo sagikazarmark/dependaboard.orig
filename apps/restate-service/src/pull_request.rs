@@ -262,6 +262,26 @@ impl PullRequest {
                 })));
             }
 
+            // The repository's row carries the method its last sync resolved when it
+            // disallows the configured preference. A missing row (the repository was
+            // purged mid-batch) or a row from before the column reads as no override,
+            // and the client falls back to the preference, as before.
+            let store = self.store.clone();
+            let repository_id = request.target.repository_id;
+            let merge_method = ctx
+                .run(move || async move {
+                    Ok(Json::from(
+                        store
+                            .get_repo(repository_id)
+                            .await
+                            .map_err(store_failure)?
+                            .and_then(|repository| repository.merge_method),
+                    ))
+                })
+                .retry_policy(store_retry_policy())
+                .name("read-repository-merge-method")
+                .await?
+                .into_inner();
             let github = self.github.clone();
             let merge_request = request.clone();
             let result = run_github_step(&mut RestateGithubStep {
@@ -272,7 +292,7 @@ impl PullRequest {
                 call: move || {
                     let github = github.clone();
                     let merge_request = merge_request.clone();
-                    async move { github.merge(&merge_request).await }
+                    async move { github.merge(&merge_request, merge_method).await }
                 },
             })
             .await?;

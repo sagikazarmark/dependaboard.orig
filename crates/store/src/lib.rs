@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time:
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    CheckStatus, CursorError, DashboardPage, FacetCounts, LabelFacet, Mergeable, Page, PageCursor,
-    PrFilter, PrKey, PrRecord, RepoRecord, UpdateType, unix_seconds,
+    CursorError, DashboardPage, FacetCounts, LabelFacet, Mergeable, Page, PageCursor, PrFilter,
+    PrKey, PrRecord, RepoRecord, unix_seconds,
 };
 use libsql::{Builder, Row, Value};
 use secrecy::{ExposeSecret, SecretString};
@@ -114,6 +114,7 @@ pub trait PrStore: Send + Sync {
     async fn prs_for_sha(&self, repository_id: u64, sha: &str)
     -> Result<Vec<PrRecord>, StoreError>;
     async fn upsert_repo(&self, repo: &RepoRecord) -> Result<(), StoreError>;
+    async fn get_repo(&self, repository_id: u64) -> Result<Option<RepoRecord>, StoreError>;
     async fn replace_installation_repos(
         &self,
         installation_id: u64,
@@ -297,6 +298,17 @@ impl PrStore for LibSqlPrStore {
         upsert_repo_on(&connection, repo).await
     }
 
+    async fn get_repo(&self, repository_id: u64) -> Result<Option<RepoRecord>, StoreError> {
+        let connection = self.connection().await;
+        let mut rows = connection
+            .query(
+                &format!("{} WHERE repository_id = ?1", select_repo_sql()),
+                vec![integer(repository_id)?],
+            )
+            .await?;
+        rows.next().await?.map(repo_from_row).transpose()
+    }
+
     async fn replace_installation_repos(
         &self,
         installation_id: u64,
@@ -379,8 +391,6 @@ fn page_sql(where_sql: &str, limit_index: usize) -> String {
 }
 
 fn pr_from_row(row: Row) -> Result<PrRecord, StoreError> {
-    let update_type: String = row.get(12)?;
-    let check_status: String = row.get(14)?;
     Ok(PrRecord {
         id: row.get(0)?,
         repository_id: unsigned(row.get::<i64>(1)?)?,
@@ -394,11 +404,9 @@ fn pr_from_row(row: Row) -> Result<PrRecord, StoreError> {
         from_version: row.get(9)?,
         to_version: row.get(10)?,
         dependencies: serde_json::from_str(&row.get::<String>(11)?)?,
-        update_type: UpdateType::from_str(&update_type)
-            .map_err(|_| StoreError::CorruptEnum(update_type))?,
+        update_type: stored_enum(row.get(12)?)?,
         head_sha: row.get(13)?,
-        check_status: CheckStatus::from_str(&check_status)
-            .map_err(|_| StoreError::CorruptEnum(check_status))?,
+        check_status: stored_enum(row.get(14)?)?,
         // The column is nullable and was once written verbatim from GitHub, so
         // NULL and any unrecognised legacy text deliberately fold into Unknown
         // rather than surfacing as CorruptEnum.
@@ -413,22 +421,34 @@ fn pr_from_row(row: Row) -> Result<PrRecord, StoreError> {
     })
 }
 
+/// Parses a column that persists an enum's `Display` form. Unrecognised text
+/// is corrupt data.
+fn stored_enum<T: FromStr>(value: String) -> Result<T, StoreError> {
+    T::from_str(&value).map_err(|_| StoreError::CorruptEnum(value))
+}
+
+fn select_repo_sql() -> &'static str {
+    "SELECT repository_id, installation_id, owner, repo, merge_method, synced_at FROM repositories"
+}
+
+fn repo_from_row(row: Row) -> Result<RepoRecord, StoreError> {
+    Ok(RepoRecord {
+        repository_id: unsigned(row.get::<i64>(0)?)?,
+        installation_id: unsigned(row.get::<i64>(1)?)?,
+        owner: row.get(2)?,
+        repo: row.get(3)?,
+        merge_method: row.get::<Option<String>>(4)?.map(stored_enum).transpose()?,
+        synced_at: unsigned(row.get::<i64>(5)?)?,
+    })
+}
+
 async fn list_repositories(connection: &libsql::Connection) -> Result<Vec<RepoRecord>, StoreError> {
     let mut rows = connection
-        .query(
-            "SELECT repository_id, installation_id, owner, repo, synced_at FROM repositories ORDER BY owner, repo",
-            (),
-        )
+        .query(&format!("{} ORDER BY owner, repo", select_repo_sql()), ())
         .await?;
     let mut repositories = Vec::new();
     while let Some(row) = rows.next().await? {
-        repositories.push(RepoRecord {
-            repository_id: unsigned(row.get::<i64>(0)?)?,
-            installation_id: unsigned(row.get::<i64>(1)?)?,
-            owner: row.get(2)?,
-            repo: row.get(3)?,
-            synced_at: unsigned(row.get::<i64>(4)?)?,
-        });
+        repositories.push(repo_from_row(row)?);
     }
     Ok(repositories)
 }
@@ -471,11 +491,7 @@ where
     grouped_counts(connection, sql)
         .await?
         .into_iter()
-        .map(|(key, count)| {
-            T::from_str(&key)
-                .map(|key| (key, count))
-                .map_err(|_| StoreError::CorruptEnum(key))
-        })
+        .map(|(key, count)| Ok((stored_enum(key)?, count)))
         .collect()
 }
 
@@ -520,18 +536,20 @@ async fn upsert_repo_on(
     connection
         .execute(
             r#"INSERT INTO repositories (
-                repository_id, installation_id, owner, repo, synced_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5)
+                repository_id, installation_id, owner, repo, merge_method, synced_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
             ON CONFLICT(repository_id) DO UPDATE SET
                 installation_id = excluded.installation_id,
                 owner = excluded.owner,
                 repo = excluded.repo,
+                merge_method = excluded.merge_method,
                 synced_at = excluded.synced_at"#,
             vec![
                 integer(repo.repository_id)?,
                 integer(repo.installation_id)?,
                 Value::Text(repo.owner.clone()),
                 Value::Text(repo.repo.clone()),
+                option_text(repo.merge_method.map(|method| method.to_string())),
                 integer(repo.synced_at)?,
             ],
         )
@@ -687,7 +705,7 @@ fn retryable_sqlite_code(code: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use dependaboard_core::{CheckStatus, DependencyUpdate, UpdateType};
+    use dependaboard_core::{CheckStatus, DependencyUpdate, MergeMethod, UpdateType};
     use tempfile::TempDir;
 
     use super::*;
@@ -721,6 +739,7 @@ mod tests {
             installation_id: 9,
             owner: "acme".to_owned(),
             repo: format!("repo-{id}"),
+            merge_method: None,
             synced_at,
         }
     }
@@ -1339,6 +1358,37 @@ mod tests {
         assert!(store.get_pr(&PrKey::new(1, 2)).await.unwrap().is_some());
         store.purge_installation(9).await.unwrap();
         assert!(store.get_pr(&PrKey::new(1, 2)).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_repository_keeps_the_merge_method_it_was_synced_with() {
+        let (_directory, store) = test_store().await;
+        // `acme/repo-1` disallows the preferred method, so its sync resolved
+        // a different one; `acme/repo-2` allows it and carries no override.
+        let overridden = RepoRecord {
+            merge_method: Some(MergeMethod::Rebase),
+            ..repo(1, 10)
+        };
+        store
+            .replace_installation_repos(9, &[overridden.clone(), repo(2, 10)], 20)
+            .await
+            .unwrap();
+
+        assert_eq!(store.get_repo(1).await.unwrap(), Some(overridden));
+        assert_eq!(store.get_repo(2).await.unwrap(), Some(repo(2, 10)));
+        assert_eq!(store.get_repo(3).await.unwrap(), None);
+        let listed = store
+            .list_prs(&PrFilter::default(), Page::default())
+            .await
+            .unwrap()
+            .repositories;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|repository| (repository.repository_id, repository.merge_method))
+                .collect::<Vec<_>>(),
+            [(1, Some(MergeMethod::Rebase)), (2, None)]
+        );
     }
 
     #[tokio::test]

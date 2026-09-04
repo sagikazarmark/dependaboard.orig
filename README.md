@@ -230,7 +230,7 @@ If you did not retain the webhook secret, generate a replacement with `openssl r
 
 The files are sourced as shell code. Keep values single-quoted as shown, do not add spaces around `=`, and never paste untrusted text into them. The generated hexadecimal secrets and GitHub token are safe inside single quotes.
 
-`GITHUB_MERGE_METHOD` is one global explicit method: `merge`, `squash`, or `rebase`. The selected repositories must permit it or GitHub will return a per-PR rejection.
+`GITHUB_MERGE_METHOD` is the preferred merge method: `merge`, `squash`, or `rebase`. Each repository sync reads which methods the repository allows; a repository that disallows the preference is merged with the first allowed of squash, merge, rebase instead, and the confirmation dialog names such repositories with the method they will use. A repository that allows none of the three (or that has not been synced since installation) still gets the preference, and GitHub rejects the merge per PR.
 
 The Restate SDK endpoint is unauthenticated and must not listen on a LAN interface. On Docker Desktop, leave `RESTATE_SERVICE_ADDRESS='127.0.0.1:9080'`. On native Linux, find Docker's host gateway:
 
@@ -364,7 +364,7 @@ Confirm the App is installed on the expected repositories, `GITHUB_INSTALLATION_
 
 **Merge is rejected**
 
-Confirm the repository permits `GITHUB_MERGE_METHOD`, required checks and branch protection permit the merge, and the GitHub App still has Pull requests and Contents write access.
+Confirm the repository allows at least one of squash, merge, and rebase, required checks and branch protection permit the merge, and the GitHub App still has Pull requests and Contents write access. The per-repository method is resolved at repository sync, so after changing a repository's merge settings or `GITHUB_MERGE_METHOD`, run **Sync** (or wait for the next reconciliation) before merging.
 
 **Rebase comments return 403**
 
@@ -438,7 +438,7 @@ Never edit a migration that has shipped; add a new one instead. `0001_initial.sq
 | `GITHUB_INSTALLATION_ID` | Both | Installation to reconcile; the web app refuses a per-PR sync for any other installation |
 | `GITHUB_PRIVATE_KEY` / `GITHUB_PRIVATE_KEY_PATH` | Restate service | RS256 App private key value or absolute PEM path |
 | `GITHUB_USER_PAT` | Restate service | User identity for `@dependabot rebase` comments |
-| `GITHUB_MERGE_METHOD` | Restate service | Explicit global method: `merge`, `squash` (default), or `rebase` |
+| `GITHUB_MERGE_METHOD` | Restate service | Preferred merge method: `merge`, `squash` (default), or `rebase`; a repository that disallows it is merged with the first allowed of squash, merge, rebase |
 | `GITHUB_WEBHOOK_SECRET` | Web app | HMAC-SHA256 webhook verification; required at startup |
 | `GITHUB_API_URL` | Restate service | GitHub REST API root, default `https://api.github.com`. The GraphQL endpoint is derived from it: `/graphql` under that root, or `/api/graphql` when the root is GitHub Enterprise's `/api/v3` |
 | `DASHBOARD_USERNAME` | Both | Basic Auth username and PAT identity |
@@ -477,7 +477,7 @@ Automated tests do not possess GitHub credentials. Before relying on a deploymen
 3. Suspend and unsuspend the installation, wait beyond `RECONCILE_INTERVAL_SECONDS`, and confirm only one reconciliation chain remains active.
 4. Delete the installation and confirm its projected repositories and pull requests are purged, and that `PullRequest/status` for one of them returns no state.
 5. Close a Dependabot pull request while the Restate service is down, bring it back, wait for the next `RepoSync/reconcile`, and confirm the row is gone, `PullRequest/status` returns no state, and the detail drawer reports the pull request as no longer open.
-6. Queue a merge and confirm GitHub records the App installation as actor and uses `GITHUB_MERGE_METHOD`.
+6. Queue a merge and confirm GitHub records the App installation as actor and uses `GITHUB_MERGE_METHOD`. In a repository that disallows that method, confirm the dialog names the repository with the method it will use, and that the merge succeeds with it.
 7. Queue a rebase and confirm the PAT user authors one marked, attributed `@dependabot rebase` comment.
 8. Restart the Restate service during an in-flight batch and confirm target progress resumes.
 9. Inspect Restate inputs, journals, and object state and confirm the PAT value is absent.
