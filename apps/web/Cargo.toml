@@ -23,6 +23,7 @@ base64.workspace = true
 dependaboard-store = { path = "../../crates/store" }
 octoevents.workspace = true
 reqwest.workspace = true
+secrecy.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

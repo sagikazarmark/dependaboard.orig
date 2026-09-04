@@ -1,45 +1,37 @@
 //! The Restate ingress client: one-way sends, request/response calls, and the
 //! paths the dashboard addresses its virtual objects by.
 
+use std::time::Duration;
+
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
+use crate::server::config::RestateConfig;
+
 /// The Restate ingress this deployment enqueues work on.
 ///
-/// Built once at startup and shared through router state, so the webhook
-/// route can be exercised against a stand-in ingress. The `#[server]`
-/// functions have no router state and go through [`RestateIngress::from_env`]
-/// on each call instead.
+/// Built once at startup around one connection pool and shared with the
+/// webhook route through its router state and with the `#[server]` functions
+/// through [`crate::server::state::ServerState`].
 #[derive(Clone)]
 pub(crate) struct RestateIngress {
-    pub(super) client: reqwest::Client,
-    pub(super) base: String,
-    pub(super) token: Option<String>,
+    client: reqwest::Client,
+    base: String,
+    token: Option<SecretString>,
 }
 
 impl RestateIngress {
-    pub(crate) fn from_env() -> Result<Self, String> {
-        let base = std::env::var("RESTATE_INGRESS_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned())
-            .trim_end_matches('/')
-            .to_owned();
-        let token = std::env::var("RESTATE_AUTH_TOKEN")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                std::env::var("RESTATE_API_KEY")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-            });
+    pub(crate) fn new(config: RestateConfig) -> Result<Self, String> {
         let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
             .build()
             .map_err(|error| error.to_string())?;
         Ok(Self {
             client,
-            base,
-            token,
+            base: config.base,
+            token: config.token,
         })
     }
 
@@ -75,7 +67,7 @@ impl RestateIngress {
             .client
             .post(format!("{}/restate/{route}/{path}", self.base));
         if let Some(token) = &self.token {
-            request = request.bearer_auth(token);
+            request = request.bearer_auth(token.expose_secret());
         }
         request
     }
@@ -117,24 +109,6 @@ impl RestateIngress {
         let output = value.get("output").cloned().unwrap_or(value);
         serde_json::from_value(output).map_err(|error| error.to_string())
     }
-}
-
-pub(crate) async fn restate_send<T: Serialize + ?Sized>(
-    path: &str,
-    input: &T,
-) -> Result<(), String> {
-    RestateIngress::from_env()?.send(path, input, None).await
-}
-
-pub(crate) async fn restate_send_empty(path: &str) -> Result<(), String> {
-    RestateIngress::from_env()?.send_empty(path).await
-}
-
-pub(crate) async fn restate_call<R>(path: &str) -> Result<R, String>
-where
-    R: DeserializeOwned,
-{
-    RestateIngress::from_env()?.call(path).await
 }
 
 pub(crate) fn pr_status_path(repository_id: u64, number: u64) -> String {

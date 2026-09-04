@@ -14,6 +14,10 @@ pub const DEPENDABOT_LOGIN: &str = "dependabot[bot]";
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
 pub const MAX_PAGE_SIZE: u32 = 100;
 pub const MAX_BATCH_TARGETS: usize = 100;
+/// How many of the ranked labels the dashboard's label facet shows.
+pub const LABEL_FACET_LIMIT: usize = 8;
+/// How many labels a dashboard row shows before folding the rest into a count.
+pub const ROW_LABEL_LIMIT: usize = 2;
 /// How long a projected row is trusted after we last fetched it (`synced_at`).
 /// Older rows are flagged stale in the UI and count as "needs attention".
 /// Shorter than the hourly reconcile sweep so a missed sweep is visible.

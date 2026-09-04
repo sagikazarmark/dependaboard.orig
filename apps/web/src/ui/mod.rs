@@ -1,6 +1,7 @@
 //! The dashboard UI: the themed shell, its toast chrome, and the pieces the
 //! page components share.
 
+mod batch;
 mod confirm_modal;
 mod dashboard;
 mod detail_drawer;
@@ -8,9 +9,12 @@ mod filters;
 mod format;
 mod pr_row;
 mod progress_drawer;
+mod search_box;
 mod side_panel;
 #[cfg(all(test, feature = "server"))]
 mod test_support;
+
+use std::time::Duration;
 
 use dependaboard_core::{BulkActionKind, PrRecord, PrTarget};
 use dioxus::prelude::*;
@@ -96,9 +100,27 @@ pub(crate) fn pr_target(row: &PrRecord) -> PrTarget {
     }
 }
 
-pub(crate) async fn wait_one_second() {
+/// How often the dashboard asks the server about work it is waiting on.
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+pub(crate) async fn sleep(duration: Duration) {
     #[cfg(target_arch = "wasm32")]
-    gloo_timers::future::TimeoutFuture::new(1_000).await;
+    gloo_timers::future::TimeoutFuture::new(
+        u32::try_from(duration.as_millis()).unwrap_or(u32::MAX),
+    )
+    .await;
     #[cfg(not(target_arch = "wasm32"))]
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    tokio::time::sleep(duration).await;
+}
+
+/// The text a failed server call shows the user. The server has already
+/// reduced its own failures to a message that names the component, so that
+/// message is shown as is; a round trip that never produced one gets a fixed
+/// line. The error itself goes to the log in full either way.
+pub(crate) fn user_facing(error: &ServerFnError) -> String {
+    dioxus::logger::tracing::warn!(%error, "server call failed");
+    match error {
+        ServerFnError::ServerError { message, .. } => message.clone(),
+        _ => "The dashboard server could not be reached".to_owned(),
+    }
 }

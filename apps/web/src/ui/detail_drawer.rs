@@ -1,6 +1,8 @@
 //! The drawer for one pull request: its projection, durable state, and the
 //! per-row rebase, merge, and sync actions.
 
+use std::time::Duration;
+
 use dependaboard_core::{BulkActionKind, PrRecord, PrState, unix_seconds};
 use dioxus::prelude::*;
 
@@ -9,7 +11,14 @@ use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
 use crate::ui::side_panel::SidePanel;
-use crate::ui::{PendingAction, pr_target, wait_one_second};
+use crate::ui::{POLL_INTERVAL, PendingAction, pr_target, sleep, user_facing};
+
+/// How long the drawer waits for a manual sync to complete before it stops
+/// polling for it.
+const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// [`SYNC_TIMEOUT`] in polls.
+const SYNC_POLLS: u64 = SYNC_TIMEOUT.as_secs() / POLL_INTERVAL.as_secs();
 
 #[component]
 pub(crate) fn DetailDrawer(
@@ -103,7 +112,10 @@ pub(crate) fn DetailDrawer(
                                     }
                                     Err(error) => {
                                         syncing.set(false);
-                                        onsync.call(Err(format!("Could not queue sync: {error}")));
+                                        onsync.call(Err(format!(
+                                            "Could not queue sync: {}",
+                                            user_facing(&error)
+                                        )));
                                     }
                                 }
                             });
@@ -160,7 +172,7 @@ impl DurableStatus {
     fn from_resource(resource: Option<&Result<Option<PrState>, ServerFnError>>) -> Self {
         match resource {
             None => Self::Loading,
-            Some(Err(error)) => Self::Failed(error.to_string()),
+            Some(Err(error)) => Self::Failed(user_facing(error)),
             Some(Ok(None)) => Self::Gone,
             Some(Ok(Some(state))) => Self::Present(Box::new(state.clone())),
         }
@@ -221,24 +233,29 @@ async fn wait_for_pr_sync_completion(
     completion_id: String,
 ) -> Result<Option<PrRecord>, String> {
     let mut last_error = None;
-    for _ in 0..60 {
-        wait_one_second().await;
+    for _ in 0..SYNC_POLLS {
+        sleep(POLL_INTERVAL).await;
         match load_pr_status(repository_id, number).await {
             Ok(state) if sync_id_completed(state.as_ref(), &completion_id) => {
                 match load_pr_projection(repository_id, number).await {
                     Ok(row) => return Ok(row),
-                    Err(error) => last_error = Some(error.to_string()),
+                    Err(error) => last_error = Some(user_facing(&error)),
                 }
             }
             Ok(_) => match load_pr_projection(repository_id, number).await {
                 Ok(None) => return Ok(None),
                 Ok(Some(_)) => last_error = None,
-                Err(error) => last_error = Some(error.to_string()),
+                Err(error) => last_error = Some(user_facing(&error)),
             },
-            Err(error) => last_error = Some(error.to_string()),
+            Err(error) => last_error = Some(user_facing(&error)),
         }
     }
-    Err(last_error.unwrap_or_else(|| "the sync did not complete within 60 seconds".to_owned()))
+    Err(last_error.unwrap_or_else(|| {
+        format!(
+            "the sync did not complete within {} seconds",
+            SYNC_TIMEOUT.as_secs()
+        )
+    }))
 }
 
 fn sync_id_completed(state: Option<&PrState>, completion_id: &str) -> bool {

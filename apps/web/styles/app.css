@@ -228,35 +228,6 @@ code,
   flex: 1;
 }
 
-.rate-block {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.rate-block code {
-  color: var(--muted);
-  font-size: 10px;
-}
-
-.rate-track {
-  width: 72px;
-  height: 4px;
-  overflow: hidden;
-  border-radius: 3px;
-  background: var(--color-base-300);
-}
-
-.rate-fill {
-  width: 74%;
-  height: 100%;
-  background: var(--color-primary);
-}
-
 .theme-button {
   min-height: 26px;
   border: 1px solid var(--line);

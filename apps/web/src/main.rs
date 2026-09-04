@@ -17,10 +17,13 @@ mod ui;
 use {
     crate::server::{
         auth::require_dashboard_auth,
+        config::Config,
         restate::RestateIngress,
-        webhook::{WebhookState, webhook_router, webhook_verifier},
+        state::ServerState,
+        webhook::{WebhookState, webhook_router},
     },
-    axum::middleware,
+    axum::{Extension, middleware},
+    dependaboard_store::{LibSqlPrStore, StoreConfig},
     dioxus::server::{DioxusRouterExt, ServeConfig},
 };
 
@@ -30,24 +33,29 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "dependaboard_web=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "dependaboard_web=info".into()),
         )
         .init();
 
+    let config = Config::from_env().unwrap_or_else(|error| panic!("{error}"));
     let address = dioxus::cli_config::fullstack_address_or_localhost();
-    let dashboard_password =
-        std::env::var("DASHBOARD_PASSWORD").expect("DASHBOARD_PASSWORD must be configured");
-    assert!(
-        !dashboard_password.trim().is_empty(),
-        "DASHBOARD_PASSWORD must not be empty"
-    );
+    let ingress = RestateIngress::new(config.restate).expect("Restate ingress client should build");
+    let store = LibSqlPrStore::connect(&StoreConfig::from_env())
+        .await
+        .expect("read-model store should connect");
+    let state = ServerState {
+        ingress: ingress.clone(),
+        store,
+        installation_id: config.installation_id,
+    };
     let dashboard = axum::Router::new()
         .serve_dioxus_application(ServeConfig::new(), ui::App)
-        .layer(middleware::from_fn(require_dashboard_auth));
-    let webhooks = webhook_router(WebhookState {
-        verifier: webhook_verifier(),
-        ingress: RestateIngress::from_env().expect("Restate ingress client should build"),
-    });
+        .layer(Extension(state))
+        .layer(middleware::from_fn_with_state(
+            config.credentials,
+            require_dashboard_auth,
+        ));
+    let webhooks = webhook_router(WebhookState::new(&config.webhook_secret, ingress));
     let router = webhooks.merge(dashboard);
     let listener = tokio::net::TcpListener::bind(address)
         .await

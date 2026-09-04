@@ -37,6 +37,14 @@ pub(crate) fn version_label(from: Option<&str>, to: Option<&str>) -> String {
     }
 }
 
+/// `count` as a phrase: "1 pull request", "12 pull requests".
+pub(crate) fn pull_requests(count: u64) -> String {
+    match count {
+        1 => "1 pull request".to_owned(),
+        count => format!("{count} pull requests"),
+    }
+}
+
 pub(crate) fn relative_time(timestamp: u64) -> String {
     let now = unix_seconds();
     let seconds = now.saturating_sub(timestamp);
@@ -46,6 +54,18 @@ pub(crate) fn relative_time(timestamp: u64) -> String {
         3600..=86_399 => format!("{}h", seconds / 3600),
         86_400..=604_799 => format!("{}d", seconds / 86_400),
         _ => format!("{}w", seconds / 604_800),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pull_request_count_reads_as_a_phrase() {
+        assert_eq!(pull_requests(0), "0 pull requests");
+        assert_eq!(pull_requests(1), "1 pull request");
+        assert_eq!(pull_requests(12), "12 pull requests");
     }
 }
 

@@ -1,6 +1,6 @@
 //! The sidebar filter controls and the active-filter chips above the table.
 
-use dependaboard_core::{LabelFacet, PrFilter};
+use dependaboard_core::{LABEL_FACET_LIMIT, LabelFacet, PrFilter};
 use dioxus::prelude::*;
 
 #[component]
@@ -27,11 +27,9 @@ pub(crate) fn FacetButton(
     }
 }
 
-/// How many of the ranked labels the sidebar shows before cutting off.
-const LABEL_FACET_LIMIT: usize = 8;
-
-/// The most common labels as chips. `labels` arrives already ranked by the
-/// store (descending count, then name) and is rendered in that order.
+/// The most common labels as chips, cut off at [`LABEL_FACET_LIMIT`]. `labels`
+/// arrives already ranked by the store (descending count, then name) and is
+/// rendered in that order.
 #[component]
 pub(crate) fn LabelFacets(
     labels: Vec<LabelFacet>,
@@ -103,14 +101,15 @@ fn FilterChip(kind: &'static str, label: String, onclick: EventHandler<MouseEven
     }
 }
 
+/// How many filters the dashboard's controls have set. `PrFilter` also carries
+/// `owner` and `dependency`, which nothing on the dashboard sets, so they are
+/// not counted.
 pub(crate) fn filter_count(filter: &PrFilter) -> usize {
     usize::from(filter.query.is_some())
-        + usize::from(filter.owner.is_some())
         + filter.repos.len()
         + filter.update_types.len()
         + filter.check_statuses.len()
         + filter.labels.len()
-        + usize::from(filter.dependency.is_some())
         + usize::from(filter.needs_attention)
 }
 
@@ -124,6 +123,8 @@ pub(crate) fn toggle_value<T: PartialEq>(values: &mut Vec<T>, value: T) {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
+    use dependaboard_core::{CheckStatus, UpdateType};
+
     use super::*;
 
     fn LabelFacetsFixture() -> Element {
@@ -182,5 +183,40 @@ mod tests {
             html.contains(r#"<button class="label-filter active">go "#),
             "{html}"
         );
+    }
+
+    /// The count in the sidebar promises controls the user can clear: one chip
+    /// per facet value plus the search box for the query. `owner` and
+    /// `dependency` have no control on the dashboard, so they do not count.
+    #[test]
+    fn the_active_filter_count_covers_only_filters_the_dashboard_can_set() {
+        #[component]
+        fn Fixture(filter: PrFilter) -> Element {
+            let filter = use_signal(|| filter);
+            let cursor = use_signal(|| None);
+            rsx! { ActiveFilters { filter, cursor } }
+        }
+        let filter = PrFilter {
+            query: Some("serde".to_owned()),
+            owner: Some("acme".to_owned()),
+            repos: vec!["acme/api".to_owned(), "acme/web".to_owned()],
+            update_types: vec![UpdateType::Major],
+            check_statuses: vec![CheckStatus::Failure, CheckStatus::None],
+            labels: vec!["rust".to_owned()],
+            dependency: Some("serde".to_owned()),
+            needs_attention: true,
+        };
+
+        let mut dom = VirtualDom::new_with_props(
+            Fixture,
+            FixtureProps {
+                filter: filter.clone(),
+            },
+        );
+        dom.rebuild_in_place();
+        let html = dioxus::ssr::render(&dom);
+
+        assert_eq!(html.matches(r#"class="filter-chip""#).count(), 7, "{html}");
+        assert_eq!(filter_count(&filter), 8);
     }
 }

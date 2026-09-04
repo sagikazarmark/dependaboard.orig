@@ -435,7 +435,7 @@ Never edit a migration that has shipped; add a new one instead. `0001_initial.sq
 | Variable | Used by | Purpose |
 |---|---|---|
 | `GITHUB_APP_ID` | Restate service | Numeric GitHub App ID |
-| `GITHUB_INSTALLATION_ID` | Both | Installation to reconcile; the web app refuses a per-PR sync for any other installation |
+| `GITHUB_INSTALLATION_ID` | Both | Installation to reconcile; required at startup, and the web app refuses a per-PR sync for any other installation |
 | `GITHUB_PRIVATE_KEY` / `GITHUB_PRIVATE_KEY_PATH` | Restate service | RS256 App private key value or absolute PEM path |
 | `GITHUB_USER_PAT` | Restate service | User identity for `@dependabot rebase` comments |
 | `GITHUB_MERGE_METHOD` | Restate service | Preferred merge method: `merge`, `squash` (default), or `rebase`; a repository that disallows it is merged with the first allowed of squash, merge, rebase |

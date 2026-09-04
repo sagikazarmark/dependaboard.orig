@@ -11,26 +11,24 @@ use axum::{
 };
 use dependaboard_core::WebhookEvent;
 use octoevents::{Envelope, EventKind, ResponseStatus, Secret, Verifier};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::server::restate::RestateIngress;
-
-/// Builds the webhook verifier once, so a missing secret fails at startup
-/// rather than at the first delivery.
-pub(crate) fn webhook_verifier() -> Verifier {
-    let secret =
-        std::env::var("GITHUB_WEBHOOK_SECRET").expect("GITHUB_WEBHOOK_SECRET must be configured");
-    assert!(
-        !secret.trim().is_empty(),
-        "GITHUB_WEBHOOK_SECRET must not be empty"
-    );
-    Verifier::new(Secret::new(secret))
-}
 
 #[derive(Clone)]
 pub(crate) struct WebhookState {
     pub(crate) verifier: Verifier,
     pub(crate) ingress: RestateIngress,
+}
+
+impl WebhookState {
+    pub(crate) fn new(webhook_secret: &SecretString, ingress: RestateIngress) -> Self {
+        Self {
+            verifier: Verifier::new(Secret::new(webhook_secret.expose_secret().to_owned())),
+            ingress,
+        }
+    }
 }
 
 pub(crate) fn webhook_router(state: WebhookState) -> axum::Router {

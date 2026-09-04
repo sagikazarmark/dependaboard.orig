@@ -2,15 +2,16 @@
 
 use std::net::SocketAddr;
 
+use crate::server::config::RestateConfig;
 use crate::server::restate::RestateIngress;
 
 /// A client for a Restate ingress stand-in listening at `address`.
 pub(crate) fn ingress_at(address: SocketAddr) -> RestateIngress {
-    RestateIngress {
-        client: reqwest::Client::new(),
+    RestateIngress::new(RestateConfig {
         base: format!("http://{address}"),
         token: None,
-    }
+    })
+    .unwrap()
 }
 
 /// Serves `router` on a loopback port for the rest of the test; the task

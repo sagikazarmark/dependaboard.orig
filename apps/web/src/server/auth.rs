@@ -3,18 +3,29 @@
 
 use axum::{
     body::Body,
+    extract::State,
     http::{HeaderMap, Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dependaboard_core::UserId;
+use secrecy::ExposeSecret;
 
-pub(crate) async fn require_dashboard_auth(mut request: Request<Body>, next: Next) -> Response {
-    let username =
-        std::env::var("DASHBOARD_USERNAME").unwrap_or_else(|_| "dependaboard".to_owned());
-    let password = std::env::var("DASHBOARD_PASSWORD").unwrap_or_default();
-    let authenticated_user = authenticated_dashboard_user(request.headers(), &username, &password);
+use crate::server::config::Credentials;
+
+/// The credentials arrive as middleware state, resolved once at startup, so
+/// no request re-reads them from the environment.
+pub(crate) async fn require_dashboard_auth(
+    State(credentials): State<Credentials>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let authenticated_user = authenticated_dashboard_user(
+        request.headers(),
+        &credentials.username,
+        credentials.password.expose_secret(),
+    );
     if let Some(user_id) = authenticated_user {
         request.extensions_mut().insert(user_id);
         return next.run(request).await;

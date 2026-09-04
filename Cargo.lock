@@ -966,6 +966,7 @@ dependencies = [
  "gloo-timers",
  "octoevents",
  "reqwest 0.13.4",
+ "secrecy",
  "serde",
  "serde_json",
  "tokio",

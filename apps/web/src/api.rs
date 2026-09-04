@@ -1,6 +1,6 @@
 //! The server functions the dashboard calls. Compiled on both targets: the
 //! wasm build gets the client stubs, the server build the bodies, which reach
-//! the store and Restate through [`crate::server`].
+//! the store and Restate through [`crate::server::state::ServerState`].
 
 use dependaboard_core::{
     BatchProgress, BulkActionKind, DashboardPage, Page, PrFilter, PrRecord, PrState, PrTarget,
@@ -9,30 +9,26 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use {
-    crate::server::{
-        installation::github_installation_id,
-        restate::{pr_status_path, restate_call, restate_send, restate_send_empty},
-        store::store,
-    },
+    crate::server::{restate::pr_status_path, state::ServerState},
     axum::extract::Extension,
     dependaboard_core::{BulkRequest, ManualSyncRequest, PrKey, UserId, new_batch_id},
-    dependaboard_store::PrStore,
+    dependaboard_store::{PrStore, StoreError},
     std::collections::BTreeSet,
 };
 
-#[server]
+#[server(state: Extension<ServerState>)]
 pub(crate) async fn load_dashboard(
     filter: PrFilter,
     page: Page,
 ) -> Result<DashboardPage, ServerFnError> {
-    let store = store().await?;
-    store
+    state
+        .store
         .list_prs(&filter, page)
         .await
-        .map_err(|error| ServerFnError::new(error.to_string()))
+        .map_err(store_failure)
 }
 
-#[server(user: Extension<UserId>)]
+#[server(state: Extension<ServerState>, user: Extension<UserId>)]
 pub(crate) async fn submit_batch(
     batch_id: String,
     action: BulkActionKind,
@@ -56,65 +52,72 @@ pub(crate) async fn submit_batch(
         targets,
         user_id: user.0,
     };
-    restate_send(&format!("BulkAction/{batch_id}/run"), &request)
+    state
+        .ingress
+        .send(&format!("BulkAction/{batch_id}/run"), &request, None)
         .await
-        .map_err(ServerFnError::new)
+        .map_err(restate_unavailable)
 }
 
-#[server]
+#[server(state: Extension<ServerState>)]
 pub(crate) async fn load_batch_progress(
     batch_id: String,
 ) -> Result<Option<BatchProgress>, ServerFnError> {
     if !dependaboard_core::valid_batch_id(&batch_id) {
         return Err(ServerFnError::new("batch id must be a UUIDv7"));
     }
-    restate_call(&format!("BulkAction/{batch_id}/progress"))
+    state
+        .ingress
+        .call(&format!("BulkAction/{batch_id}/progress"))
         .await
-        .map_err(ServerFnError::new)
+        .map_err(restate_unavailable)
 }
 
-#[server]
+#[server(state: Extension<ServerState>)]
 pub(crate) async fn load_pr_status(
     repository_id: u64,
     number: u64,
 ) -> Result<Option<PrState>, ServerFnError> {
-    restate_call(&pr_status_path(repository_id, number))
+    state
+        .ingress
+        .call(&pr_status_path(repository_id, number))
         .await
-        .map_err(ServerFnError::new)
+        .map_err(restate_unavailable)
 }
 
-#[server]
+#[server(state: Extension<ServerState>)]
 pub(crate) async fn load_pr_projection(
     repository_id: u64,
     number: u64,
 ) -> Result<Option<PrRecord>, ServerFnError> {
-    store()
-        .await?
+    state
+        .store
         .get_pr(&PrKey::new(repository_id, number))
         .await
-        .map_err(|error| ServerFnError::new(error.to_string()))
+        .map_err(store_failure)
 }
 
-#[server]
+#[server(state: Extension<ServerState>)]
 pub(crate) async fn request_sync() -> Result<(), ServerFnError> {
-    restate_send_empty("DashboardIngress/sync_installation")
+    state
+        .ingress
+        .send_empty("DashboardIngress/sync_installation")
         .await
-        .map_err(ServerFnError::new)
+        .map_err(restate_unavailable)
 }
 
-#[server]
+#[server(state: Extension<ServerState>)]
 pub(crate) async fn request_pr_sync(
     repository_id: u64,
     number: u64,
 ) -> Result<String, ServerFnError> {
-    let installation_id = github_installation_id()?;
-    let row = store()
-        .await?
+    let row = state
+        .store
         .get_pr(&PrKey::new(repository_id, number))
         .await
-        .map_err(|error| ServerFnError::new(error.to_string()))?
+        .map_err(store_failure)?
         .ok_or_else(|| ServerFnError::new("pull request is no longer in the dashboard"))?;
-    if row.installation_id != installation_id {
+    if row.installation_id != state.installation_id {
         return Err(ServerFnError::new(
             "pull request does not belong to the configured installation",
         ));
@@ -127,8 +130,70 @@ pub(crate) async fn request_pr_sync(
         number: row.number,
         completion_id: completion_id.clone(),
     };
-    restate_send("DashboardIngress/sync_pull_request", &request)
+    state
+        .ingress
+        .send("DashboardIngress/sync_pull_request", &request, None)
         .await
-        .map_err(ServerFnError::new)?;
+        .map_err(restate_unavailable)?;
     Ok(completion_id)
+}
+
+/// Turns a read-model failure into the browser's error. A page cursor the
+/// browser sent that no longer parses is its own fault and is named as such;
+/// anything else is logged in full and reduced to a message that names the
+/// component, not the cause: the cause can carry connection strings and
+/// credentials, and the user cannot act on it anyway.
+#[cfg(feature = "server")]
+fn store_failure(error: StoreError) -> ServerFnError {
+    match error {
+        StoreError::Cursor(error) => ServerFnError::new(error.to_string()),
+        error => {
+            tracing::error!(%error, "read model query failed");
+            ServerFnError::new("The read model is unavailable")
+        }
+    }
+}
+
+/// Logs a Restate failure in full; the browser learns only that Restate did
+/// not take the request.
+#[cfg(feature = "server")]
+fn restate_unavailable(error: String) -> ServerFnError {
+    tracing::error!(error, "Restate request failed");
+    ServerFnError::new("Restate is unavailable")
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use dependaboard_core::CursorError;
+
+    use super::*;
+
+    #[test]
+    fn infrastructure_failures_reach_the_browser_without_their_detail() {
+        let detail = "libsql://db.internal: connection refused (token=abc)";
+        let store = store_failure(StoreError::CorruptEnum(detail.to_owned()));
+        let restate = restate_unavailable(format!("Restate returned 502: {detail}"));
+
+        for error in [store, restate] {
+            let ServerFnError::ServerError { message, .. } = error else {
+                panic!("a server-side failure: {error}");
+            };
+            assert!(!message.contains(detail), "{message}");
+            assert!(!message.contains("libsql"), "{message}");
+            assert!(!message.is_empty());
+        }
+    }
+
+    /// A cursor the browser sent is the browser's fault, not the store's, and
+    /// saying so is what lets the user start over.
+    #[test]
+    fn a_bad_page_cursor_is_reported_as_such() {
+        let ServerFnError::ServerError { message, .. } =
+            store_failure(StoreError::Cursor(CursorError::Invalid))
+        else {
+            panic!("a server-side failure");
+        };
+
+        assert_eq!(message, "invalid page cursor");
+    }
 }

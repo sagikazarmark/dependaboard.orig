@@ -4,24 +4,26 @@
 use std::collections::BTreeSet;
 
 use dependaboard_core::{
-    BatchProgress, BulkActionKind, CheckStatus, Page, PrFilter, PrRecord, PrTarget, UpdateType,
-    new_batch_id,
+    BatchProgress, BulkActionKind, CheckStatus, DEFAULT_PAGE_SIZE, Page, PrFilter, PrRecord,
+    PrTarget, UpdateType, new_batch_id,
 };
 use dioxus::prelude::*;
 
-use crate::api::{load_batch_progress, load_dashboard, request_sync, submit_batch};
+use crate::api::{load_dashboard, request_sync};
 use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
 use crate::components::toast::{ToastOptions, use_toast};
+use crate::ui::batch::{BatchOutcome, STALL_TIMEOUT, SUBMIT_ATTEMPTS, ServerBatch, run_batch};
 use crate::ui::confirm_modal::ConfirmModal;
 use crate::ui::detail_drawer::DetailDrawer;
 use crate::ui::filters::{
     ActiveFilters, FacetButton, FilterSection, LabelFacets, filter_count, toggle_value,
 };
-use crate::ui::format::{relative_time, status_class, status_label, update_class};
+use crate::ui::format::{pull_requests, relative_time, status_class, status_label, update_class};
 use crate::ui::pr_row::PrRow;
 use crate::ui::progress_drawer::ProgressDrawer;
-use crate::ui::{PendingAction, pr_target, wait_one_second};
+use crate::ui::search_box::SearchBox;
+use crate::ui::{POLL_INTERVAL, PendingAction, pr_target, sleep, user_facing};
 
 #[component]
 pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
@@ -29,7 +31,6 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
     let mut aside_open = use_signal(|| true);
     let mut filter = use_signal(PrFilter::default);
     let mut cursor = use_signal(|| None::<String>);
-    let mut refresh = use_signal(|| 0_u64);
     let mut selected = use_signal(BTreeSet::<String>::new);
     let mut detail = use_signal(|| None::<PrRecord>);
     let mut pending = use_signal(|| None::<PendingAction>);
@@ -45,10 +46,9 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
     let mut dashboard = use_resource(move || {
         let filter = filter();
         let page = Page {
-            limit: 50,
             after: cursor(),
+            ..Page::default()
         };
-        let _ = refresh();
         async move { load_dashboard(filter, page).await }
     });
 
@@ -61,7 +61,7 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
         .read()
         .as_ref()
         .and_then(|result| result.as_ref().err())
-        .map(ToString::to_string);
+        .map(user_facing);
     let rows = page
         .as_ref()
         .map(|page| page.rows.clone())
@@ -70,10 +70,7 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
     let selected_count = selected.read().len();
     let active_filter_count = filter_count(&filter());
 
-    let mut reload = move || {
-        refresh += 1;
-        dashboard.restart();
-    };
+    let mut reload = move || dashboard.restart();
 
     let queue_batch = move |PendingAction { action, targets }: PendingAction| {
         let batch_id = new_batch_id();
@@ -81,49 +78,37 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
         progress_open.set(true);
         selected.write().clear();
         spawn(async move {
-            loop {
-                match submit_batch(batch_id.clone(), action, targets.clone()).await {
-                    Ok(()) => break,
-                    Err(error) => {
-                        if let Ok(Some(progress)) = load_batch_progress(batch_id.clone()).await {
-                            active_batch.set(Some(progress));
-                            break;
-                        }
-                        toast.warning(
-                            format!("Batch submission interrupted; retrying: {error}"),
-                            ToastOptions::new(),
-                        );
-                        wait_one_second().await;
+            let mut batch = ServerBatch {
+                batch_id,
+                action,
+                targets,
+            };
+            let outcome = run_batch(&mut batch, |progress| {
+                active_batch.set(Some(progress.clone()));
+            })
+            .await;
+            match outcome {
+                BatchOutcome::Completed(progress) => {
+                    match progress.failure {
+                        Some(failure) => toast.error(format!("Batch failed: {failure}"), sticky()),
+                        None => toast.success("Batch complete".to_owned(), ToastOptions::new()),
                     }
+                    reload();
                 }
-            }
-            loop {
-                wait_one_second().await;
-                match load_batch_progress(batch_id.clone()).await {
-                    Ok(Some(progress)) => {
-                        let completed = progress.completed;
-                        let failed = progress.failure.clone();
-                        active_batch.set(Some(progress));
-                        if completed {
-                            match failed {
-                                Some(failure) => {
-                                    toast.error(format!("Batch failed: {failure}"), sticky())
-                                }
-                                None => {
-                                    toast.success("Batch complete".to_owned(), ToastOptions::new())
-                                }
-                            }
-                            reload();
-                            break;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        toast.warning(
-                            format!("Progress interrupted; retrying: {error}"),
-                            ToastOptions::new(),
-                        );
-                    }
+                BatchOutcome::NotSubmitted(error) => toast.error(
+                    format!("Batch was not submitted after {SUBMIT_ATTEMPTS} attempts: {error}"),
+                    sticky(),
+                ),
+                BatchOutcome::Stalled(error) => {
+                    let reason = error.unwrap_or_else(|| {
+                        format!("no progress for {} minutes", STALL_TIMEOUT.as_secs() / 60)
+                    });
+                    toast.error(
+                        format!(
+                            "Lost track of the batch ({reason}). It may still be running in Restate; reload to see where it got to."
+                        ),
+                        sticky(),
+                    );
                 }
             }
         });
@@ -174,10 +159,10 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
                 onclick: move |_| {
                     spawn(async move {
                         if let Err(error) = request_sync().await {
-                            toast.error(format!("Sync failed: {error}"), sticky());
+                            toast.error(format!("Sync failed: {}", user_facing(&error)), sticky());
                         } else {
                             toast.info("Reconciliation queued".to_owned(), ToastOptions::new());
-                            wait_one_second().await;
+                            sleep(POLL_INTERVAL).await;
                             reload();
                         }
                     });
@@ -190,19 +175,7 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
         div { class: "workspace",
             aside {
                 class: if aside_open() { "sidebar" } else { "sidebar sidebar-closed" },
-                div { class: "search-wrap",
-                    span { "/" }
-                    input {
-                        class: "input input-sm",
-                        value: filter().query.unwrap_or_default(),
-                        placeholder: "dependency, repo, title...",
-                        oninput: move |event| {
-                            let value = event.value();
-                            filter.write().query = (!value.trim().is_empty()).then_some(value);
-                            cursor.set(None);
-                        }
-                    }
-                }
+                SearchBox { filter, cursor }
                 div { class: "filter-meta",
                     span { class: "mono muted", "{active_filter_count} active" }
                     button {
@@ -288,7 +261,7 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
 
             main { class: "content",
                 div { class: "resultbar",
-                    span { class: "mono", "{total} pull requests" }
+                    span { class: "mono", "{pull_requests(total)}" }
                     button {
                         disabled: rows.is_empty(),
                         onclick: {
@@ -336,11 +309,7 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
                             "Reading the projection"
                         }
                     } else if rows.is_empty() {
-                        div { class: "empty-state",
-                            span { class: "empty-mark" }
-                            strong { "No open Dependabot pull requests" }
-                            p { "Try clearing filters or queue a reconciliation sweep." }
-                        }
+                        EmptyState { filtered: active_filter_count > 0 }
                     } else {
                         for row in &rows {
                             PrRow {
@@ -365,7 +334,7 @@ pub(crate) fn Dashboard(mut dark: Signal<bool>) -> Element {
                                     selected.write().clear();
                                     cursor.set(Some(next.clone()));
                                 },
-                                "Load next 50"
+                                "Load next {DEFAULT_PAGE_SIZE}"
                             }
                         }
                     }
@@ -463,9 +432,53 @@ fn sticky() -> ToastOptions {
     ToastOptions::new().permanent(true)
 }
 
+/// The table body when the page has no rows. `filtered` says whether filters
+/// are active, because "nothing matches" and "nothing is open" call for
+/// different next steps.
+#[component]
+fn EmptyState(filtered: bool) -> Element {
+    rsx! {
+        div { class: "empty-state",
+            span { class: "empty-mark" }
+            if filtered {
+                strong { "No pull requests match these filters" }
+                p { "Clear a filter to widen the list." }
+            } else {
+                strong { "No open Dependabot pull requests" }
+                p { "Queue a reconciliation sweep to check GitHub again." }
+            }
+        }
+    }
+}
+
 fn selected_targets(rows: &[PrRecord], selected: &BTreeSet<String>) -> Vec<PrTarget> {
     rows.iter()
         .filter(|row| selected.contains(&row.id))
         .map(pr_target)
         .collect()
+}
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    use super::*;
+
+    fn render_empty_state(filtered: bool) -> String {
+        let mut dom = VirtualDom::new_with_props(EmptyState, EmptyStateProps { filtered });
+        dom.rebuild_in_place();
+        dioxus::ssr::render(&dom)
+    }
+
+    #[test]
+    fn an_empty_page_says_whether_filters_hid_the_pull_requests() {
+        let filtered = render_empty_state(true);
+        assert!(filtered.contains("No pull requests match"), "{filtered}");
+        assert!(!filtered.contains("No open Dependabot"), "{filtered}");
+
+        let unfiltered = render_empty_state(false);
+        assert!(
+            unfiltered.contains("No open Dependabot pull requests"),
+            "{unfiltered}"
+        );
+        assert!(!unfiltered.contains("filter"), "{unfiltered}");
+    }
 }

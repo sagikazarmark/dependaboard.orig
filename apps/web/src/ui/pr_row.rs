@@ -1,6 +1,6 @@
 //! The pull request row of the dashboard table.
 
-use dependaboard_core::{PrRecord, unix_seconds};
+use dependaboard_core::{PrRecord, ROW_LABEL_LIMIT, unix_seconds};
 use dioxus::prelude::*;
 
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
@@ -48,8 +48,8 @@ pub(crate) fn PrRow(
                 span { "{status_label(row.check_status)}" }
             }
             div { class: "row-labels",
-                for label in row.labels.iter().take(2) { span { "{label}" } }
-                if row.labels.len() > 2 { span { "+{row.labels.len() - 2}" } }
+                for label in row.labels.iter().take(ROW_LABEL_LIMIT) { span { "{label}" } }
+                if row.labels.len() > ROW_LABEL_LIMIT { span { "+{row.labels.len() - ROW_LABEL_LIMIT}" } }
             }
             time { class: "right mono", "{relative_time(row.updated_at)}" }
         }
@@ -80,5 +80,34 @@ mod tests {
 
         assert_eq!(html.matches(GROUPED_ROW_TITLE).count(), 1, "{html}");
         assert!(html.contains("<strong>3 dependencies</strong><span>group update</span>"));
+    }
+
+    fn ManyLabelsFixture() -> Element {
+        let mut row = grouped_row();
+        row.labels = ["dependencies", "rust", "security", "blocked"]
+            .map(str::to_owned)
+            .to_vec();
+        rsx! {
+            PrRow {
+                row,
+                checked: false,
+                oncheck: move |_| {},
+                onopen: move |_| {},
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_shows_the_first_labels_and_folds_the_rest_into_a_count() {
+        let mut dom = VirtualDom::new(ManyLabelsFixture);
+        dom.rebuild_in_place();
+        let html = dioxus::ssr::render(&dom);
+
+        assert!(
+            html.contains(
+                r#"<div class="row-labels"><span>dependencies</span><span>rust</span><span>+2</span></div>"#
+            ),
+            "{html}"
+        );
     }
 }

@@ -8,6 +8,7 @@ use crate::components::alert_dialog::{
     AlertDialogDescriptionAppearance, AlertDialogTitle, AlertDialogTitleAppearance,
 };
 use crate::ui::PendingAction;
+use crate::ui::format::pull_requests;
 
 /// The confirmation for a bulk action. Always mounted with a controlled open
 /// state so the dialog restores focus when it closes; both buttons close the
@@ -37,12 +38,12 @@ pub(crate) fn ConfirmModal(
             if let Some(pending) = pending {
                 {
                     let action = pending.action;
-                    let count = pending.targets.len();
+                    let count = pull_requests(pending.targets.len() as u64);
                     let overrides = merge_method_overrides(&pending.targets, &repositories);
                     rsx! {
                         span { class: "eyebrow", "Durable bulk action" }
                         AlertDialogTitle { appearance: AlertDialogTitleAppearance::None,
-                            "{action} {count} pull requests?"
+                            "{action} {count}?"
                         }
                         AlertDialogDescription { appearance: AlertDialogDescriptionAppearance::None,
                             "The selected head SHAs are captured now. Moved or ineligible pull requests will be rejected, not silently retried against new code."
@@ -211,5 +212,20 @@ mod tests {
 
         assert!(html.contains("@dependabot"), "{html}");
         assert!(!html.contains("merge method"), "{html}");
+    }
+
+    #[test]
+    fn the_title_counts_one_pull_request_in_the_singular() {
+        let web = repository(8, "web", None);
+
+        let one = render(BulkActionKind::Merge, vec![target_in(&web, 2)], vec![]);
+        assert!(one.contains("merge 1 pull request?"), "{one}");
+
+        let two = render(
+            BulkActionKind::Rebase,
+            vec![target_in(&web, 2), target_in(&web, 3)],
+            vec![],
+        );
+        assert!(two.contains("rebase 2 pull requests?"), "{two}");
     }
 }
