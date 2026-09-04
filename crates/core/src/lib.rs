@@ -326,14 +326,13 @@ pub fn check_signal(status: Option<&str>, conclusion: Option<&str>) -> Option<Ch
     }
 }
 
-pub fn combined_status_signal(state: &str, total_count: u64) -> Option<CheckSignal> {
-    if total_count == 0 {
-        return None;
-    }
+/// What one commit status contributes, by its state. `expected` is a required context
+/// that has not reported yet, which the truth table counts as pending.
+pub fn status_signal(state: &str) -> Option<CheckSignal> {
     match state {
         "success" => Some(CheckSignal::Pass),
         "failure" | "error" => Some(CheckSignal::Fail),
-        "pending" => Some(CheckSignal::Pending),
+        "pending" | "expected" => Some(CheckSignal::Pending),
         _ => None,
     }
 }
@@ -1058,6 +1057,13 @@ mod tests {
         ] {
             assert_eq!(check_signal(Some(value), None), Some(CheckSignal::Pending));
         }
+        assert_eq!(status_signal("success"), Some(CheckSignal::Pass));
+        for value in ["failure", "error"] {
+            assert_eq!(status_signal(value), Some(CheckSignal::Fail));
+        }
+        for value in ["pending", "expected"] {
+            assert_eq!(status_signal(value), Some(CheckSignal::Pending));
+        }
     }
 
     #[test]
@@ -1191,15 +1197,6 @@ mod tests {
         absent.as_object_mut().unwrap().remove("mergeable");
         let record: PrRecord = serde_json::from_value(absent).unwrap();
         assert_eq!(record.mergeable, Mergeable::Unknown);
-    }
-
-    #[test]
-    fn zero_classic_statuses_contribute_nothing() {
-        assert_eq!(combined_status_signal("pending", 0), None);
-        assert_eq!(
-            combined_status_signal("pending", 1),
-            Some(CheckSignal::Pending)
-        );
     }
 
     #[test]

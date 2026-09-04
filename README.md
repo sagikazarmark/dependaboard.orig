@@ -138,15 +138,15 @@ Set the basic fields:
 - **Callback URL, setup URL, device flow:** leave disabled or empty; the MVP does not use OAuth.
 - **Where can this GitHub App be installed?:** choose the account scope appropriate for the repositories you will monitor. For local testing, limiting it to your own account is simplest.
 
-Set these **Repository permissions**:
+Set these **Repository permissions**. The same installation token serves both APIs the service uses: one GraphQL query reads each pull request's snapshot, and REST performs the writes and lists installations and pull requests.
 
-| Permission | Access |
-|---|---|
-| Pull requests | Read and write |
-| Contents | Read and write |
-| Checks | Read-only |
-| Commit statuses | Read-only |
-| Metadata | Read-only |
+| Permission | Access | Needed for |
+|---|---|---|
+| Pull requests | Read and write | Reading pull request snapshots (title, state, author, labels, mergeability), listing open Dependabot pull requests, merging, and posting `@dependabot` commands |
+| Contents | Read and write | Reading the head commit message that carries Dependabot's update metadata, and updating a branch |
+| Checks | Read-only | Check runs and check suites in the snapshot's check rollup |
+| Commit statuses | Read-only | Legacy commit statuses in the snapshot's check rollup |
+| Metadata | Read-only | Resolving repositories and listing the installation's repositories (granted to every App) |
 
 Subscribe to these repository events:
 
@@ -379,7 +379,7 @@ The Compose file fixes `RESTATE_NODE_NAME=dependaboard` so the current project's
 - `apps/web`: Dioxus web UI, authenticated server functions, and the signed GitHub webhook route.
 - `apps/restate-service`: Restate virtual objects and workflows. GitHub and libSQL side effects are journaled with `ctx.run`.
 - `crates/core`: shared domain contracts, dependency parsing, check rollups, and GitHub error classification. Dependabot metadata parsing is behind the opt-in `dependabot-metadata` feature so the browser bundle's dependency graph stays free of `regex`, `semver`, and `serde_yml`; only `crates/github` enables it.
-- `crates/github`: GitHub App JWT/token handling, canonical PR reads, merge calls, and idempotent user-authored Dependabot commands.
+- `crates/github`: GitHub App JWT/token handling, canonical PR reads, merge calls, and idempotent user-authored Dependabot commands. A pull request snapshot is one GraphQL query (it was five or more REST requests: pull request, head commit, paginated check runs, paginated check suites, combined status); only a commit with more than a hundred check contexts or suites costs a further request per extra page. Mutations and installation listing stay on REST.
 - `crates/store`: local or remote libSQL projection behind `PrStore`.
 
 Restate owns in-flight truth and retries. libSQL is the cross-PR query model used by the dashboard. The browser never calls Restate directly.
@@ -440,7 +440,7 @@ Never edit a migration that has shipped; add a new one instead. `0001_initial.sq
 | `GITHUB_USER_PAT` | Restate service | User identity for `@dependabot rebase` comments |
 | `GITHUB_MERGE_METHOD` | Restate service | Explicit global method: `merge`, `squash` (default), or `rebase` |
 | `GITHUB_WEBHOOK_SECRET` | Web app | HMAC-SHA256 webhook verification; required at startup |
-| `GITHUB_API_URL` | Restate service | GitHub API root, default `https://api.github.com` |
+| `GITHUB_API_URL` | Restate service | GitHub REST API root, default `https://api.github.com`. The GraphQL endpoint is derived from it: `/graphql` under that root, or `/api/graphql` when the root is GitHub Enterprise's `/api/v3` |
 | `DASHBOARD_USERNAME` | Both | Basic Auth username and PAT identity |
 | `DASHBOARD_PASSWORD` | Web app | Required Basic Auth password |
 | `LIBSQL_URL` | Both | Local path or remote `libsql://` URL |

@@ -4,8 +4,7 @@ use async_trait::async_trait;
 use dependaboard_core::{
     CheckSignal, CommandRequest, DEPENDABOT_LOGIN, GithubErrorResponse, MergeMethod, MergeRequest,
     Mergeable, Operation, PrKey, PrRecord, PrTarget, RepoRecord, SyncRequest, UpdateBranchRequest,
-    UserId, combined_status_signal, highest_update_type, parse_dependabot_metadata, rollup_checks,
-    unix_seconds,
+    UserId, highest_update_type, parse_dependabot_metadata, rollup_checks, unix_seconds,
 };
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::{Method, Response, StatusCode};
@@ -14,6 +13,14 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::Mutex;
+
+use crate::graphql::{
+    CHECK_CONTEXTS_PAGE_QUERY, CHECK_SUITES_PAGE_QUERY, CheckContextsPage, CheckSuitesPage,
+    CommitData, GraphqlResponse, SnapshotData, check_context_signal, check_suite_signal,
+    head_commit_query, snapshot_query,
+};
+
+mod graphql;
 
 const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "dependaboard/0.1";
@@ -78,6 +85,15 @@ impl GithubConfig {
             dashboard_user: UserId::new(dashboard_user),
             merge_method,
         })
+    }
+
+    /// Where the GraphQL API answers, derived from the REST root: `/graphql` beside
+    /// `api.github.com`'s root, and `/api/graphql` beside GitHub Enterprise's `/api/v3`.
+    fn graphql_url(&self) -> String {
+        match self.api_url.strip_suffix("/api/v3") {
+            Some(host) => format!("{host}/api/graphql"),
+            None => format!("{}/graphql", self.api_url),
+        }
     }
 }
 
@@ -229,13 +245,26 @@ impl GithubClient {
         path: &str,
         body: Option<&Value>,
     ) -> Result<Response, GithubError> {
+        let url = format!("{}{}", self.config.api_url, path);
+        self.installation_send(installation_id, method, &url, body)
+            .await
+    }
+
+    /// Sends one request as the installation, refreshing the token once on a 401.
+    async fn installation_send(
+        &self,
+        installation_id: u64,
+        method: Method,
+        url: &str,
+        body: Option<&Value>,
+    ) -> Result<Response, GithubError> {
         for attempt in 0..2 {
             let token = self
                 .installation_token(installation_id, attempt > 0)
                 .await?;
             let mut request = self
                 .http
-                .request(method.clone(), format!("{}{}", self.config.api_url, path))
+                .request(method.clone(), url)
                 .header("Accept", "application/vnd.github+json")
                 .header("X-GitHub-Api-Version", API_VERSION)
                 .bearer_auth(token.expose_secret());
@@ -248,6 +277,49 @@ impl GithubClient {
             }
         }
         unreachable!("the authorization loop always returns")
+    }
+
+    /// Runs one GraphQL query as the installation and reads its `data`.
+    ///
+    /// A non-success status is the same HTTP error a REST call would raise. Inside a
+    /// success, GraphQL reports failures as `errors`, which are read before `data` and
+    /// folded into [`GithubError::Http`] with the status the REST API would have used
+    /// (see [`graphql::error_status`]), so callers classify both APIs' failures alike.
+    /// The rate-limit headers are read either way: GitHub's primary GraphQL limit
+    /// arrives as a `RATE_LIMITED` error inside a `200` whose headers carry the reset.
+    async fn graphql_query<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        variables: Value,
+    ) -> Result<T, GithubError> {
+        let response = self
+            .installation_send(
+                self.config.installation_id,
+                Method::POST,
+                &self.config.graphql_url(),
+                Some(&json!({ "query": query, "variables": variables })),
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(GithubError::Http {
+                response: http_error(response).await,
+                known_resource: false,
+            });
+        }
+        let rate_limit = RateLimitHeaders::read(&response);
+        let answer: GraphqlResponse<T> = response
+            .json()
+            .await
+            .map_err(|error| GithubError::Protocol(ProtocolError::Body(error)))?;
+        if !answer.errors.is_empty() {
+            return Err(GithubError::Http {
+                response: graphql::error_response(&answer.errors, rate_limit),
+                known_resource: false,
+            });
+        }
+        answer
+            .data
+            .ok_or(GithubError::Protocol(ProtocolError::Missing("data")))
     }
 
     async fn user_request(
@@ -300,87 +372,119 @@ impl GithubClient {
         .await
     }
 
-    async fn fetch_commit_message(
+    /// Reads the pull request's GraphQL snapshot, whatever its state or author; the
+    /// caller decides whether it is one the dashboard projects.
+    async fn fetch_pull_request_node(
         &self,
-        installation_id: u64,
-        owner: &str,
-        repo: &str,
-        sha: &str,
-    ) -> Result<String, GithubError> {
-        let response: GithubCommit = self
-            .installation_json(
-                installation_id,
-                Method::GET,
-                &format!("/repos/{owner}/{repo}/commits/{sha}"),
-                None,
+        request: &SyncRequest,
+    ) -> Result<graphql::PullRequestNode, GithubError> {
+        let data: SnapshotData = self
+            .graphql_query(
+                &snapshot_query(),
+                json!({
+                    "owner": request.owner,
+                    "repo": request.repo,
+                    "number": request.number,
+                }),
             )
             .await?;
-        Ok(response.commit.message)
+        if let Some(rate_limit) = &data.rate_limit {
+            tracing::debug!(
+                owner = %request.owner,
+                repo = %request.repo,
+                number = request.number,
+                cost = rate_limit.cost,
+                remaining = rate_limit.remaining,
+                "fetched pull request snapshot over GraphQL"
+            );
+        }
+        data.repository
+            .and_then(|repository| repository.pull_request)
+            .ok_or(GithubError::Protocol(ProtocolError::Missing(
+                "pull request",
+            )))
     }
 
-    async fn fetch_check_signals(
+    /// The pull request's head commit: the one GitHub lists last, unless that is not the
+    /// commit at `headRefOid`, in which case the head is read by SHA.
+    async fn fetch_head_commit(
         &self,
-        installation_id: u64,
-        owner: &str,
-        repo: &str,
+        request: &SyncRequest,
+        pull: graphql::PullRequestNode,
+    ) -> Result<graphql::Commit, GithubError> {
+        let head_sha = pull.head_ref_oid.clone();
+        if let Some(listed) = pull.last_listed_commit()
+            && listed.oid == head_sha
+        {
+            return Ok(listed);
+        }
+        self.commit_by_sha(&head_commit_query(), request, &head_sha, None)
+            .await?
+            .ok_or(GithubError::Protocol(ProtocolError::Missing("head commit")))
+    }
+
+    /// Runs a query that addresses the commit at `sha` in the pull request's repository,
+    /// continuing a paged connection from `after` when given.
+    async fn commit_by_sha<T: DeserializeOwned>(
+        &self,
+        query: &str,
+        request: &SyncRequest,
         sha: &str,
-    ) -> Result<Vec<CheckSignal>, GithubError> {
-        let mut page = 1;
-        let mut signals = Vec::new();
-        loop {
-            let response: CheckRuns = self
-                .installation_json(
-                    installation_id,
-                    Method::GET,
-                    &format!(
-                        "/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100&page={page}"
-                    ),
-                    None,
-                )
-                .await?;
-            let count = response.check_runs.len();
-            signals.extend(response.check_runs.into_iter().filter_map(|run| {
-                dependaboard_core::check_signal(run.status.as_deref(), run.conclusion.as_deref())
-            }));
-            if count < 100 {
-                break;
-            }
-            page += 1;
-        }
-        let mut page = 1;
-        loop {
-            let response: CheckSuites = self
-                .installation_json(
-                    installation_id,
-                    Method::GET,
-                    &format!(
-                        "/repos/{owner}/{repo}/commits/{sha}/check-suites?per_page=100&page={page}"
-                    ),
-                    None,
-                )
-                .await?;
-            let count = response.check_suites.len();
-            signals.extend(
-                response
-                    .check_suites
-                    .into_iter()
-                    .filter_map(|suite| check_suite_signal(&suite)),
-            );
-            if count < 100 {
-                break;
-            }
-            page += 1;
-        }
-        let combined: CombinedStatus = self
-            .installation_json(
-                installation_id,
-                Method::GET,
-                &format!("/repos/{owner}/{repo}/commits/{sha}/status"),
-                None,
+        after: Option<&str>,
+    ) -> Result<Option<T>, GithubError> {
+        let data: CommitData<T> = self
+            .graphql_query(
+                query,
+                json!({
+                    "owner": request.owner,
+                    "repo": request.repo,
+                    "sha": sha,
+                    "after": after,
+                }),
             )
             .await?;
-        if let Some(signal) = combined_status_signal(&combined.state, combined.total_count) {
-            signals.push(signal);
+        Ok(data.into_commit())
+    }
+
+    /// Rolls the head commit's check runs, commit statuses, and check suites up into
+    /// signals, following every page so a failure past the first hundred still counts.
+    async fn check_signals(
+        &self,
+        request: &SyncRequest,
+        commit: graphql::Commit,
+    ) -> Result<Vec<CheckSignal>, GithubError> {
+        let sha = &commit.oid;
+        let mut signals = Vec::new();
+        let mut contexts = commit.status_check_rollup.map(|rollup| rollup.contexts);
+        while let Some(page) = contexts.take() {
+            signals.extend(page.nodes.iter().filter_map(check_context_signal));
+            if let Some(after) = page.next_cursor() {
+                contexts = self
+                    .commit_by_sha::<CheckContextsPage>(
+                        CHECK_CONTEXTS_PAGE_QUERY,
+                        request,
+                        sha,
+                        Some(after),
+                    )
+                    .await?
+                    .and_then(|commit| commit.status_check_rollup)
+                    .map(|rollup| rollup.contexts);
+            }
+        }
+        let mut suites = commit.check_suites;
+        while let Some(page) = suites.take() {
+            signals.extend(page.nodes.iter().filter_map(check_suite_signal));
+            if let Some(after) = page.next_cursor() {
+                suites = self
+                    .commit_by_sha::<CheckSuitesPage>(
+                        CHECK_SUITES_PAGE_QUERY,
+                        request,
+                        sha,
+                        Some(after),
+                    )
+                    .await?
+                    .and_then(|commit| commit.check_suites);
+            }
         }
         Ok(signals)
     }
@@ -561,28 +665,36 @@ impl GithubApi for GithubClient {
         self.installation_id()
     }
 
+    /// One GraphQL request in the common case, where the REST reads it replaced cost at
+    /// least five (pull request, head commit, check runs, check suites, combined status),
+    /// more with pagination. Only a commit with over a hundred check contexts or suites
+    /// costs a further request per extra page.
     async fn fetch_snapshot(&self, request: &SyncRequest) -> Result<Option<PrRecord>, GithubError> {
         let installation_id = self.config.installation_id;
-        let pull = self
-            .fetch_pull(
-                installation_id,
-                &request.owner,
-                &request.repo,
-                request.number,
-            )
-            .await?;
-        if pull.state != "open" || pull.user.login != DEPENDABOT_LOGIN {
+        let pull = self.fetch_pull_request_node(request).await?;
+        if !pull.is_open_dependabot_pull() {
             return Ok(None);
         }
-        let message = self
-            .fetch_commit_message(
-                installation_id,
-                &request.owner,
-                &request.repo,
-                &pull.head.sha,
-            )
-            .await?;
-        let dependencies = parse_dependabot_metadata(&message, &pull.title);
+        let title = pull.title.clone();
+        let url = pull.url.clone();
+        let mergeable = pull.mergeable_state().map_or(Mergeable::Unknown, |state| {
+            Mergeable::from_github_state(&state)
+        });
+        let labels = pull
+            .labels
+            .as_ref()
+            .map(|labels| {
+                labels
+                    .nodes
+                    .iter()
+                    .map(|label| label.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let created_at = parse_timestamp(&pull.created_at)?;
+        let updated_at = parse_timestamp(&pull.updated_at)?;
+        let head = self.fetch_head_commit(request, pull).await?;
+        let dependencies = parse_dependabot_metadata(&head.message, &title);
         let (dependency, from_version, to_version) = if dependencies.len() == 1 {
             let dependency = &dependencies[0];
             (
@@ -593,15 +705,8 @@ impl GithubApi for GithubClient {
         } else {
             (None, None, None)
         };
-        let check_status = rollup_checks(
-            self.fetch_check_signals(
-                installation_id,
-                &request.owner,
-                &request.repo,
-                &pull.head.sha,
-            )
-            .await?,
-        );
+        let head_sha = head.oid.clone();
+        let check_status = rollup_checks(self.check_signals(request, head).await?);
         let synced_at = unix_seconds();
         Ok(Some(PrRecord {
             id: PrKey::new(request.repository_id, request.number).to_string(),
@@ -610,22 +715,19 @@ impl GithubApi for GithubClient {
             owner: request.owner.clone(),
             repo: request.repo.clone(),
             number: request.number,
-            title: pull.title,
-            html_url: pull.html_url,
+            title,
+            html_url: url,
             dependency,
             from_version,
             to_version,
             update_type: highest_update_type(&dependencies),
             dependencies,
-            head_sha: pull.head.sha,
+            head_sha,
             check_status,
-            mergeable: pull
-                .mergeable_state
-                .as_deref()
-                .map_or(Mergeable::Unknown, Mergeable::from_github_state),
-            labels: pull.labels.into_iter().map(|label| label.name).collect(),
-            created_at: parse_timestamp(&pull.created_at)?,
-            updated_at: parse_timestamp(&pull.updated_at)?,
+            mergeable,
+            labels,
+            created_at,
+            updated_at,
             synced_at,
         }))
     }
@@ -848,12 +950,6 @@ fn known_http(error: GithubError) -> GithubError {
     }
 }
 
-fn check_suite_signal(suite: &CheckRun) -> Option<CheckSignal> {
-    // Runs carry active/pass state; suites only add failures that can occur before a run exists.
-    dependaboard_core::check_signal(suite.status.as_deref(), suite.conclusion.as_deref())
-        .filter(|signal| matches!(signal, CheckSignal::Fail))
-}
-
 async fn parse_response<T: DeserializeOwned>(response: Response) -> Result<T, GithubError> {
     let status = response.status();
     if status.is_success() {
@@ -870,17 +966,44 @@ async fn parse_response<T: DeserializeOwned>(response: Response) -> Result<T, Gi
 
 async fn http_error(response: Response) -> GithubErrorResponse {
     let status = response.status().as_u16();
-    let remaining = header_u64(&response, "x-ratelimit-remaining");
-    let reset = header_u64(&response, "x-ratelimit-reset");
-    let retry_after = header_u64(&response, "retry-after");
+    let rate_limit = RateLimitHeaders::read(&response);
     let body = response.json::<GithubErrorBody>().await.unwrap_or_default();
-    GithubErrorResponse {
-        status,
-        message: body.message,
-        documentation_url: body.documentation_url,
-        rate_limit_remaining: remaining,
-        rate_limit_reset: reset,
-        retry_after_seconds: retry_after,
+    rate_limit.error(status, body.message, body.documentation_url)
+}
+
+/// The rate-limit headers GitHub attaches to every answer, REST or GraphQL, as unix
+/// seconds and counts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RateLimitHeaders {
+    pub(crate) remaining: Option<u64>,
+    pub(crate) reset: Option<u64>,
+    pub(crate) retry_after: Option<u64>,
+}
+
+impl RateLimitHeaders {
+    fn read(response: &Response) -> Self {
+        Self {
+            remaining: header_u64(response, "x-ratelimit-remaining"),
+            reset: header_u64(response, "x-ratelimit-reset"),
+            retry_after: header_u64(response, "retry-after"),
+        }
+    }
+
+    /// A failed answer that carried these headers.
+    pub(crate) fn error(
+        self,
+        status: u16,
+        message: String,
+        documentation_url: Option<String>,
+    ) -> GithubErrorResponse {
+        GithubErrorResponse {
+            status,
+            message,
+            documentation_url,
+            rate_limit_remaining: self.remaining,
+            rate_limit_reset: self.reset,
+            retry_after_seconds: self.retry_after,
+        }
     }
 }
 
@@ -936,6 +1059,10 @@ pub enum ProtocolError {
     Timestamp(#[source] chrono::ParseError),
     #[error("GitHub returned a timestamp before 1970")]
     TimestampBeforeEpoch,
+    /// A well-formed GraphQL answer that reported no error yet lacks a part the query
+    /// asked for, such as a pull request with no head commit.
+    #[error("GitHub GraphQL answer is missing its {0}")]
+    Missing(&'static str),
 }
 
 #[derive(Debug, Deserialize)]
@@ -961,57 +1088,15 @@ struct GithubHead {
     sha: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct GithubLabel {
-    name: String,
-}
-
+/// The REST view of a pull request, read to verify a mutation's target: snapshots come
+/// from GraphQL, so only the fields the verify and confirm steps look at are kept.
 #[derive(Debug, Deserialize)]
 struct GithubPull {
-    title: String,
-    html_url: String,
     state: String,
     user: GithubUser,
     head: GithubHead,
     #[serde(default)]
-    labels: Vec<GithubLabel>,
-    created_at: String,
-    updated_at: String,
-    mergeable_state: Option<String>,
-    #[serde(default)]
     merged: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubCommit {
-    commit: CommitData,
-}
-
-#[derive(Debug, Deserialize)]
-struct CommitData {
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CheckRuns {
-    check_runs: Vec<CheckRun>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CheckRun {
-    status: Option<String>,
-    conclusion: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CheckSuites {
-    check_suites: Vec<CheckRun>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CombinedStatus {
-    state: String,
-    total_count: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1149,27 +1234,6 @@ mod tests {
             highest_update_type(&dependencies),
             dependaboard_core::UpdateType::Minor
         );
-    }
-
-    #[test]
-    fn queued_suite_container_does_not_override_successful_checks() {
-        let queued_suite = CheckRun {
-            status: Some("queued".to_owned()),
-            conclusion: None,
-        };
-        let failed_suite = CheckRun {
-            status: Some("completed".to_owned()),
-            conclusion: Some("startup_failure".to_owned()),
-        };
-        let signals = [Some(CheckSignal::Pass), check_suite_signal(&queued_suite)]
-            .into_iter()
-            .flatten();
-
-        assert_eq!(
-            rollup_checks(signals),
-            dependaboard_core::CheckStatus::Success
-        );
-        assert_eq!(check_suite_signal(&failed_suite), Some(CheckSignal::Fail));
     }
 
     #[tokio::test]

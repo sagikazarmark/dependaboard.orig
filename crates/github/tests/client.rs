@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 use wiremock::{
     Mock, MockBuilder, MockServer, ResponseTemplate,
     matchers::{
-        bearer_token, body_json, body_string_contains, header_regex, method, path, query_param,
+        bearer_token, body_json, body_partial_json, body_string_contains, header_regex, method,
+        path, query_param,
     },
 };
 
@@ -430,33 +431,92 @@ async fn mount_pull(server: &MockServer, pull: Value) {
         .await;
 }
 
-async fn mount_commit(server: &MockServer, message: &str) {
-    Mock::given(method("GET"))
-        .and(path(format!("/repos/{OWNER}/{REPO}/commits/{HEAD_SHA}")))
-        .respond_with(ok_json(json!({ "commit": { "message": message } })))
-        .mount(server)
-        .await;
+const GRAPHQL_PATH: &str = "/graphql";
+
+/// The GraphQL endpoint, matched on the installation token it was sent with.
+fn graphql_endpoint() -> MockBuilder {
+    Mock::given(method("POST"))
+        .and(path(GRAPHQL_PATH))
+        .and(bearer_token(TOKEN))
 }
 
-/// Check signals for [`HEAD_SHA`]. Only the first page is served so a
-/// pagination regression surfaces as an unmatched request, not a spin.
-async fn mount_checks(server: &MockServer, runs: Value, suites: Value, status: Value) {
-    let commit = format!("/repos/{OWNER}/{REPO}/commits/{HEAD_SHA}");
-    Mock::given(method("GET"))
-        .and(path(format!("{commit}/check-runs")))
-        .and(query_param("page", "1"))
-        .respond_with(ok_json(json!({ "check_runs": runs })))
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("{commit}/check-suites")))
-        .and(query_param("page", "1"))
-        .respond_with(ok_json(json!({ "check_suites": suites })))
-        .mount(server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("{commit}/status")))
-        .respond_with(ok_json(status))
+/// The one query a snapshot costs, addressed at [`NUMBER`] in [`OWNER`]/[`REPO`].
+fn snapshot_query() -> MockBuilder {
+    graphql_endpoint()
+        .and(body_string_contains("query PullRequestSnapshot"))
+        .and(body_partial_json(json!({
+            "variables": { "owner": OWNER, "repo": REPO, "number": NUMBER }
+        })))
+}
+
+/// A connection page holding `nodes`; `next` is the cursor of the page after it, if any.
+fn page(nodes: Vec<Value>, next: Option<&str>) -> Value {
+    json!({
+        "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+        "nodes": nodes,
+    })
+}
+
+fn check_run(status: &str, conclusion: Option<&str>) -> Value {
+    json!({ "__typename": "CheckRun", "status": status, "conclusion": conclusion })
+}
+
+fn status_context(state: &str) -> Value {
+    json!({ "__typename": "StatusContext", "state": state })
+}
+
+fn check_suite(status: &str, conclusion: Option<&str>) -> Value {
+    json!({ "status": status, "conclusion": conclusion })
+}
+
+/// The head commit as GraphQL reports it: [`HEAD_SHA`], its message, the first page of
+/// check runs and commit statuses under `statusCheckRollup`, and the first page of check
+/// suites. A commit with no checks or statuses has a `null` rollup.
+fn head_commit(message: &str, contexts: Vec<Value>, suites: Vec<Value>) -> Value {
+    let rollup = if contexts.is_empty() {
+        Value::Null
+    } else {
+        json!({ "contexts": page(contexts, None) })
+    };
+    json!({
+        "oid": HEAD_SHA,
+        "message": message,
+        "statusCheckRollup": rollup,
+        "checkSuites": page(suites, None),
+    })
+}
+
+/// GraphQL's view of the same pull request as [`dependabot_pull`]: open, authored by the
+/// Dependabot app (which GraphQL reports as the `Bot` named `dependabot`, where REST says
+/// `dependabot[bot]`), at [`HEAD_SHA`] with `commit` as its head.
+fn pull_request_node(commit: Value) -> Value {
+    json!({
+        "title": "Bump serde from 1.0.1 to 1.0.2",
+        "url": format!("https://github.com/{OWNER}/{REPO}/pull/{NUMBER}"),
+        "state": "OPEN",
+        "author": { "__typename": "Bot", "login": "dependabot" },
+        "createdAt": CREATED_AT,
+        "updatedAt": UPDATED_AT,
+        "mergeStateStatus": "CLEAN",
+        "headRefOid": HEAD_SHA,
+        "labels": { "nodes": [{ "name": "dependencies" }, { "name": "rust" }] },
+        "commits": { "nodes": [{ "commit": commit }] },
+    })
+}
+
+/// A successful GraphQL answer carrying `pull_request` under `data`.
+fn snapshot_response(pull_request: Value) -> Value {
+    json!({
+        "data": {
+            "rateLimit": { "cost": 3, "remaining": 4997 },
+            "repository": { "pullRequest": pull_request },
+        }
+    })
+}
+
+async fn mount_snapshot(server: &MockServer, pull_request: Value) {
+    snapshot_query()
+        .respond_with(ok_json(snapshot_response(pull_request)))
         .mount(server)
         .await;
 }
@@ -472,21 +532,23 @@ fn sync_request() -> SyncRequest {
     }
 }
 
+/// The expected record here is the one the REST-backed client produced for this pull
+/// request before snapshots moved to GraphQL; a GraphQL answer describing the same pull
+/// request must project to it unchanged.
 #[tokio::test]
 async fn snapshot_of_a_single_dependency_pull_request() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    mount_pull(&server, dependabot_pull()).await;
-    mount_commit(
+    mount_snapshot(
         &server,
-        "Bump serde from 1.0.1 to 1.0.2\n\n---\nupdated-dependencies:\n- dependency-name: serde\n  dependency-type: direct:production\n  update-type: version-update:semver-patch\n...",
-    )
-    .await;
-    mount_checks(
-        &server,
-        json!([{ "status": "completed", "conclusion": "success" }]),
-        json!([{ "status": "completed", "conclusion": "success" }]),
-        json!({ "state": "success", "total_count": 1 }),
+        pull_request_node(head_commit(
+            "Bump serde from 1.0.1 to 1.0.2\n\n---\nupdated-dependencies:\n- dependency-name: serde\n  dependency-type: direct:production\n  update-type: version-update:semver-patch\n...",
+            vec![
+                check_run("COMPLETED", Some("SUCCESS")),
+                status_context("SUCCESS"),
+            ],
+            vec![check_suite("COMPLETED", Some("SUCCESS"))],
+        )),
     )
     .await;
 
@@ -528,29 +590,26 @@ async fn snapshot_of_a_single_dependency_pull_request() {
             synced_at: record.synced_at,
         }
     );
+    assert_eq!(
+        api_request_count(&server).await,
+        1,
+        "a snapshot is one GraphQL request"
+    );
 }
 
 #[tokio::test]
 async fn snapshot_of_a_grouped_pull_request_keeps_every_dependency() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    let mut pull = dependabot_pull();
-    pull["title"] = json!("Bump the cargo group with 2 updates");
-    pull["mergeable_state"] = json!("behind");
-    mount_pull(&server, pull).await;
-    mount_commit(
-        &server,
+    // No runs or statuses yet: only a suite that failed to start.
+    let mut pull = pull_request_node(head_commit(
         "Bump the cargo group with 2 updates\n\n---\nupdated-dependencies:\n- dependency-name: tokio\n  update-type: version-update:semver-minor\n- dependency-name: serde\n  update-type: version-update:semver-major\n...",
-    )
-    .await;
-    // No runs yet: only a suite that failed to start, plus an empty legacy status.
-    mount_checks(
-        &server,
-        json!([]),
-        json!([{ "status": "completed", "conclusion": "startup_failure" }]),
-        json!({ "state": "pending", "total_count": 0 }),
-    )
-    .await;
+        vec![],
+        vec![check_suite("COMPLETED", Some("STARTUP_FAILURE"))],
+    ));
+    pull["title"] = json!("Bump the cargo group with 2 updates");
+    pull["mergeStateStatus"] = json!("BEHIND");
+    mount_snapshot(&server, pull).await;
 
     let record = client(&server)
         .fetch_snapshot(&sync_request())
@@ -574,78 +633,82 @@ async fn snapshot_of_a_grouped_pull_request_keeps_every_dependency() {
     assert_eq!(record.mergeable, Mergeable::Behind);
 }
 
-#[tokio::test]
-async fn snapshot_skips_pull_requests_not_authored_by_dependabot() {
+/// Asserts that `pull_request` is not projected, and that finding out cost one request.
+async fn assert_snapshot_skipped(pull_request: Value, case: &str) {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    let mut pull = dependabot_pull();
-    pull["user"] = json!({ "login": "octocat" });
-    mount_pull(&server, pull).await;
+    mount_snapshot(&server, pull_request).await;
 
     let record = client(&server)
         .fetch_snapshot(&sync_request())
         .await
         .unwrap();
 
-    assert_eq!(record, None);
-    assert_eq!(
-        api_request_count(&server).await,
-        1,
-        "no commit or check requests follow the pull fetch"
-    );
+    assert_eq!(record, None, "{case}");
+    assert_eq!(api_request_count(&server).await, 1, "{case}");
+}
+
+#[tokio::test]
+async fn snapshot_skips_pull_requests_not_authored_by_dependabot() {
+    // A user account named `dependabot` is not the Dependabot app: only GraphQL's `Bot`
+    // maps onto REST's `dependabot[bot]`.
+    for author in [
+        json!({ "__typename": "User", "login": "octocat" }),
+        json!({ "__typename": "User", "login": "dependabot" }),
+        Value::Null,
+    ] {
+        let mut pull = pull_request_node(head_commit("Bump serde", vec![], vec![]));
+        pull["author"] = author.clone();
+        assert_snapshot_skipped(pull, &format!("author {author}")).await;
+    }
 }
 
 #[tokio::test]
 async fn snapshot_skips_closed_pull_requests() {
-    let server = MockServer::start().await;
-    mount_token(&server).await;
-    let mut pull = dependabot_pull();
-    pull["state"] = json!("closed");
-    mount_pull(&server, pull).await;
+    for state in ["CLOSED", "MERGED"] {
+        let mut pull = pull_request_node(head_commit("Bump serde", vec![], vec![]));
+        pull["state"] = json!(state);
+        assert_snapshot_skipped(pull, &format!("state {state}")).await;
+    }
+}
 
-    let record = client(&server)
-        .fetch_snapshot(&sync_request())
-        .await
-        .unwrap();
+/// A follow-up page of the head commit's check contexts or suites, continuing from `after`.
+fn check_page_query(operation: &str, after: &str) -> MockBuilder {
+    graphql_endpoint()
+        .and(body_string_contains(format!("query {operation}")))
+        .and(body_partial_json(json!({
+            "variables": { "owner": OWNER, "repo": REPO, "sha": HEAD_SHA, "after": after }
+        })))
+}
 
-    assert_eq!(record, None);
-    assert_eq!(api_request_count(&server).await, 1);
+/// The answer to a query addressing [`HEAD_SHA`] directly: `commit` under `object`.
+fn commit_response(commit: Value) -> Value {
+    json!({ "data": { "repository": { "object": commit } } })
 }
 
 #[tokio::test]
-async fn check_runs_are_read_across_pages_until_the_short_one() {
+async fn check_contexts_are_read_across_pages_until_the_last_one() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    mount_pull(&server, dependabot_pull()).await;
-    mount_commit(&server, "Bump serde from 1.0.1 to 1.0.2").await;
-    let commit = format!("/repos/{OWNER}/{REPO}/commits/{HEAD_SHA}");
-    let check_runs = format!("{commit}/check-runs");
     let passing: Vec<Value> = (0..100)
-        .map(|_| json!({ "status": "completed", "conclusion": "success" }))
+        .map(|_| check_run("COMPLETED", Some("SUCCESS")))
         .collect();
+    let mut pull = pull_request_node(head_commit(
+        "Bump serde from 1.0.1 to 1.0.2",
+        vec![],
+        vec![],
+    ));
+    pull["commits"]["nodes"][0]["commit"]["statusCheckRollup"] =
+        json!({ "contexts": page(passing, Some("cursor-100")) });
+    mount_snapshot(&server, pull).await;
     // The one still-running check hides on the second page.
-    let pages = [
-        json!(passing),
-        json!([{ "status": "in_progress", "conclusion": null }]),
-    ];
-    for (index, runs) in pages.into_iter().enumerate() {
-        Mock::given(method("GET"))
-            .and(path(&check_runs))
-            .and(query_param("per_page", "100"))
-            .and(query_param("page", (index + 1).to_string()))
-            .respond_with(ok_json(json!({ "check_runs": runs })))
-            .expect(1)
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path(format!("{commit}/check-suites")))
-        .respond_with(ok_json(json!({ "check_suites": [] })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("{commit}/status")))
-        .respond_with(ok_json(json!({ "state": "success", "total_count": 0 })))
+    check_page_query("CheckContextsPage", "cursor-100")
+        .respond_with(ok_json(commit_response(json!({
+            "statusCheckRollup": {
+                "contexts": page(vec![check_run("IN_PROGRESS", None)], None)
+            }
+        }))))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -656,7 +719,83 @@ async fn check_runs_are_read_across_pages_until_the_short_one() {
         .expect("an open Dependabot pull request is projected");
 
     assert_eq!(record.check_status, CheckStatus::Pending);
-    assert_eq!(request_count(&server, "GET", &check_runs).await, 2);
+    assert_eq!(api_request_count(&server).await, 2);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn check_suites_are_read_across_pages_until_the_last_one() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let passing: Vec<Value> = (0..100)
+        .map(|_| check_suite("COMPLETED", Some("SUCCESS")))
+        .collect();
+    let mut pull = pull_request_node(head_commit(
+        "Bump serde from 1.0.1 to 1.0.2",
+        vec![check_run("COMPLETED", Some("SUCCESS"))],
+        vec![],
+    ));
+    pull["commits"]["nodes"][0]["commit"]["checkSuites"] = page(passing, Some("cursor-100"));
+    mount_snapshot(&server, pull).await;
+    // The workflow that never started hides on the second page.
+    check_page_query("CheckSuitesPage", "cursor-100")
+        .respond_with(ok_json(commit_response(json!({
+            "checkSuites": page(vec![check_suite("COMPLETED", Some("STARTUP_FAILURE"))], None)
+        }))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let record = client(&server)
+        .fetch_snapshot(&sync_request())
+        .await
+        .unwrap()
+        .expect("an open Dependabot pull request is projected");
+
+    assert_eq!(record.check_status, CheckStatus::Failure);
+    assert_eq!(api_request_count(&server).await, 2);
+    server.verify().await;
+}
+
+/// GitHub lists a pull request's commits by date, so the last listed one is not always the
+/// head: a commit carrying an older date can be pushed on top. The snapshot must describe
+/// the commit at `headRefOid`, fetched by SHA when the listing disagrees.
+#[tokio::test]
+async fn snapshot_reads_the_head_by_sha_when_the_last_listed_commit_is_not_it() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let mut older = head_commit(
+        "Bump serde from 1.0.0 to 1.0.1",
+        vec![check_run("COMPLETED", Some("FAILURE"))],
+        vec![],
+    );
+    older["oid"] = json!("older999");
+    mount_snapshot(&server, pull_request_node(older)).await;
+    graphql_endpoint()
+        .and(body_string_contains("query HeadCommit"))
+        .and(body_partial_json(json!({
+            "variables": { "owner": OWNER, "repo": REPO, "sha": HEAD_SHA }
+        })))
+        .respond_with(ok_json(commit_response(head_commit(
+            "Bump serde from 1.0.1 to 1.0.2\n\n---\nupdated-dependencies:\n- dependency-name: serde\n  update-type: version-update:semver-patch\n...",
+            vec![check_run("COMPLETED", Some("SUCCESS"))],
+            vec![],
+        ))))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let record = client(&server)
+        .fetch_snapshot(&sync_request())
+        .await
+        .unwrap()
+        .expect("an open Dependabot pull request is projected");
+
+    assert_eq!(record.head_sha, HEAD_SHA);
+    assert_eq!(record.dependency.as_deref(), Some("serde"));
+    assert_eq!(record.to_version.as_deref(), Some("1.0.2"));
+    assert_eq!(record.check_status, CheckStatus::Success);
+    assert_eq!(api_request_count(&server).await, 2);
     server.verify().await;
 }
 
@@ -1274,7 +1413,7 @@ async fn update_branch_rejects_a_stale_head_without_calling_github() {
 async fn rate_limit_headers_are_parsed_from_error_responses() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    pull_endpoint()
+    snapshot_query()
         .respond_with(
             ResponseTemplate::new(403)
                 .insert_header("x-ratelimit-remaining", "0")
@@ -1317,11 +1456,95 @@ async fn rate_limit_headers_are_parsed_from_error_responses() {
     );
 }
 
+/// GitHub's primary GraphQL limit does not fail the HTTP request: the answer is a `200`
+/// carrying a `RATE_LIMITED` error, and only its headers say when the limit resets.
+#[tokio::test]
+async fn a_rate_limited_graphql_answer_is_an_http_error_with_its_headers() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    snapshot_query()
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-ratelimit-remaining", "0")
+                .insert_header("x-ratelimit-reset", "1700000000")
+                .set_body_json(json!({
+                    "data": null,
+                    "errors": [{
+                        "type": "RATE_LIMITED",
+                        "message": "API rate limit exceeded for installation ID 42.",
+                    }],
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .fetch_snapshot(&sync_request())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        http_response(&error).cloned().expect("an HTTP error"),
+        GithubErrorResponse {
+            status: 429,
+            message: "API rate limit exceeded for installation ID 42.".to_owned(),
+            documentation_url: None,
+            rate_limit_remaining: Some(0),
+            rate_limit_reset: Some(1_700_000_000),
+            retry_after_seconds: None,
+        }
+    );
+}
+
+/// A pull request GraphQL cannot resolve reads exactly like a REST 404, so the caller's
+/// "gone if it was known, misconfigured if not" logic is unchanged.
+#[tokio::test]
+async fn an_unresolvable_pull_request_reads_as_not_found() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    snapshot_query()
+        .respond_with(ok_json(json!({
+            "data": { "repository": { "pullRequest": null } },
+            "errors": [{
+                "type": "NOT_FOUND",
+                "path": ["repository", "pullRequest"],
+                "message": "Could not resolve to a PullRequest with the number of 9.",
+            }],
+        })))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .fetch_snapshot(&sync_request())
+        .await
+        .unwrap_err();
+
+    let response = http_response(&error).expect("an HTTP error");
+    assert_eq!(response.status, 404);
+    assert_eq!(
+        response.message,
+        "Could not resolve to a PullRequest with the number of 9."
+    );
+    assert_eq!(response.rate_limit_remaining, None);
+    assert_eq!(response.rate_limit_reset, None);
+    assert_eq!(response.retry_after_seconds, None);
+    assert!(
+        matches!(
+            error,
+            GithubError::Http {
+                known_resource: false,
+                ..
+            }
+        ),
+        "got {error:?}"
+    );
+}
+
 #[tokio::test]
 async fn missing_rate_limit_headers_are_left_unset() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    pull_endpoint()
+    snapshot_query()
         .respond_with(github_error(404, "Not Found"))
         .mount(&server)
         .await;
@@ -1344,7 +1567,7 @@ async fn missing_rate_limit_headers_are_left_unset() {
 async fn unparsable_error_bodies_still_carry_the_status_and_headers() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    pull_endpoint()
+    snapshot_query()
         .respond_with(
             ResponseTemplate::new(502)
                 .insert_header("retry-after", "5")
@@ -1446,7 +1669,7 @@ async fn merge_reports_an_ambiguous_outcome_when_an_unreadable_answer_is_not_con
 async fn unreadable_answers_keep_the_decode_error_as_their_source() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    pull_endpoint()
+    snapshot_query()
         .respond_with(unparsable_success())
         .mount(&server)
         .await;

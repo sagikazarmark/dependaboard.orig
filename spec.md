@@ -76,13 +76,17 @@ sync(SyncRequest {
 ```
 PullRequest.sync
   → debounce check (below); maybe return without fetching
-  → GET pull request
-  → GET head commit          (YAML metadata block → update type, §5)
-  → GET check runs for the ref, ALL pages at per_page=100
-  → GET combined status for the ref              (→ rollup, see §5b)
+  → one GraphQL query: pull request (title, state, author, labels, mergeability),
+    head commit message (YAML metadata block → update type, §5),
+    check runs + commit statuses + check suites, first 100 of each  (→ rollup, see §5b)
+  → follow cursors only if a commit has more than 100 contexts or suites
   → build PrSnapshot → update object state → upsert read model
   → set last_synced_at
 ```
+
+This was five or more REST reads (pull request, head commit, check runs, check suites,
+combined status — several paginated) before it became one query; REST remains for the
+mutations and the installation and pull-request listings.
 
 One canonical sync path serves webhooks, reconciliation, initial import and manual
 refresh. It also makes the webhook Worker trivially boring, which is the point.
@@ -104,13 +108,14 @@ concurrency is the *whole* locking story. No `in_flight` field, no awakeables, n
 logic.
 
 **Debounce `sync`, or event storms eat the rate budget.** Every `check_run` `created`
-and `completed` event routes to a full canonical sync — 4+ API calls. One push to a PR
-with a 20-job matrix fires ~40 `check_run` events plus `check_suite` plus possibly
-`status` events, so a single push costs 40+ serialized full syncs ≈ 160+ API calls. Bulk-
-rebase 50 PRs — the feature this tool exists for — and the resulting Dependabot pushes
-generate thousands of calls within minutes, against the same rate budget everything else
-in this section works to protect. Keyed concurrency serialises those syncs; it does not
-collapse them — all 40 queued invocations run to completion.
+and `completed` event routes to a full canonical sync — one GraphQL query today, 4+ REST
+calls when this was written. One push to a PR with a 20-job matrix fires ~40 `check_run`
+events plus `check_suite` plus possibly `status` events, so a single push costs 40+
+serialized full syncs (≈ 160+ API calls over REST). Bulk-rebase 50 PRs — the feature this
+tool exists for — and the resulting Dependabot pushes generate thousands of syncs within
+minutes, against the same rate budget everything else in this section works to protect.
+Keyed concurrency serialises those syncs; it does not collapse them — all 40 queued
+invocations run to completion.
 
 The fix is ~20 lines at the top of `sync`:
 
@@ -746,8 +751,9 @@ CREATE TABLE pull_requests (
   update_type    TEXT,               -- major|minor|patch|unknown; highest in the group
   head_sha       TEXT NOT NULL,
   check_status   TEXT NOT NULL,
-  mergeable      TEXT,               -- GitHub REST mergeable_state: clean|dirty|blocked|behind|
-                                     -- unstable|draft|has_hooks|unknown (core::Mergeable);
+  mergeable      TEXT,               -- GraphQL mergeStateStatus lowercased (= REST mergeable_state):
+                                     -- clean|dirty|blocked|behind|unstable|draft|has_hooks|unknown
+                                     -- (core::Mergeable);
                                      -- `dirty` is the merge-conflict state; NULL reads as unknown
   labels         TEXT NOT NULL DEFAULT '[]',
   created_at     INTEGER NOT NULL,
@@ -853,19 +859,19 @@ else (nothing reported)   → None
 Failure beats pending deliberately: a red build stays visible in the filter instead of
 hiding behind an unrelated queued job.
 
-**Paginate the check runs.** *List check runs for a ref* returns 30 by default, max 100
-per page. A commit with a matrix build easily exceeds 30, and the failure you care about
-is as likely to be on page 2 as page 1 — so a single unpaginated call can render a red PR
-green. Fetch every page at `per_page=100` before rolling up. This is a one-line bug with
-a very bad blast radius in a bulk-merge tool.
+**Paginate the check runs.** GraphQL pages `statusCheckRollup.contexts` and `checkSuites`
+at 100 (REST's *List check runs for a ref* returned 30 by default, max 100). A commit with
+a matrix build easily exceeds a page, and the failure you care about is as likely to be on
+page 2 as page 1 — so a single unpaginated read can render a red PR green. Follow every
+cursor before rolling up. This is a one-line bug with a very bad blast radius in a
+bulk-merge tool.
 
-**Use `total_count` for the None distinction.** The combined-status endpoint reports
-`state: pending` both when something is genuinely pending *and* when there are zero
-statuses — so `state` alone collapses "no CI configured" and "CI hasn't finished", which
-mean opposite things at merge time. But you don't need to walk the contexts: `total_count
-== 0` means no classic-status contribution at all, and otherwise the combined `state` is
-already the correct rollup over contexts. Pull individual contexts only if the UI wants
-to show them.
+**Tell "no statuses" from "pending".** REST's combined-status endpoint reports `state:
+pending` both when something is genuinely pending *and* when there are zero statuses —
+so `state` alone collapses "no CI configured" and "CI hasn't finished", which mean
+opposite things at merge time; there, `total_count == 0` was the tell. GraphQL lists the
+status contexts individually, so each contributes on its own state and an empty list
+contributes nothing, which is the same distinction without the counter.
 
 **Subscribe to `check_run` as well.** With only `pull_request.synchronize` →
 `check_suite.completed`, there's a window where `sync` runs before Actions has created
