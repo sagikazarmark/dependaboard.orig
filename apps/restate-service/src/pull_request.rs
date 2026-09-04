@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use bytes::Bytes;
 use dependaboard_core::{
     ActionLog, ActionOutcome, CommandRequest, MergeRequest, Operation, PrKey, PrState,
     RejectReason, SyncRequest, UpdateBranchRequest, unix_seconds,
@@ -10,6 +11,7 @@ use dependaboard_core::{
 use dependaboard_github::{GithubApi, GithubClient};
 use dependaboard_store::{LibSqlPrStore, PrStore};
 use restate_sdk::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     github::{RestateGithubStep, Settled, action_result, read_result, rejected, run_github_step},
@@ -24,6 +26,67 @@ pub(crate) struct PullRequest {
     pub(crate) github: GithubClient,
     pub(crate) store: LibSqlPrStore,
     pub(crate) debounce: Duration,
+}
+
+/// What `PullRequest.closed` was told about why the pull request is gone.
+///
+/// A webhook knows GitHub closed it and sends nothing: an empty body is the unconditional
+/// form, which also keeps `closed` sends journaled before this payload existed deliverable.
+/// A sweep that pruned the row only knows the pull request was absent when its listing
+/// started, so it names that instant: a pull request synced since then was reopened and
+/// re-projected behind the sweep's back, and keeps its state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ClosedRequest {
+    pub(crate) synced_before: Option<u64>,
+}
+
+impl restate_sdk::serde::Serialize for ClosedRequest {
+    type Error = serde_json::Error;
+
+    fn serialize(&self) -> Result<Bytes, Self::Error> {
+        serde_json::to_vec(self).map(Bytes::from)
+    }
+}
+
+impl restate_sdk::serde::Deserialize for ClosedRequest {
+    type Error = serde_json::Error;
+
+    fn deserialize(bytes: &mut Bytes) -> Result<Self, Self::Error> {
+        if bytes.is_empty() {
+            Ok(Self::default())
+        } else {
+            serde_json::from_slice(bytes)
+        }
+    }
+}
+
+impl restate_sdk::serde::PayloadMetadata for ClosedRequest {
+    fn json_schema() -> Option<serde_json::Value> {
+        Some(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "synced_before": { "type": ["integer", "null"], "minimum": 0 }
+            }
+        }))
+    }
+}
+
+/// What `PullRequest.closed` did, for its log line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClosedOutcome {
+    /// Row and state are gone.
+    Retired,
+    /// A sweep's fence found the pull request synced since the sweep began; it is open again.
+    Kept,
+}
+
+impl HandlerOutcome for ClosedOutcome {
+    fn outcome(&self) -> String {
+        match self {
+            Self::Retired => "retired".to_owned(),
+            Self::Kept => "kept; synced since the sweep began".to_owned(),
+        }
+    }
 }
 
 /// What one `PullRequest.sync` attempt did, for its log line.
@@ -145,12 +208,19 @@ impl PullRequest {
     }
 
     #[handler(ingress_private)]
-    async fn closed(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
+    async fn closed(&self, ctx: ObjectContext<'_>, request: ClosedRequest) -> HandlerResult<()> {
         traced("PullRequest/closed", ctx.key(), async {
             let key = ctx
                 .key()
                 .parse::<PrKey>()
                 .map_err(|error| TerminalError::new(error.to_string()))?;
+            let state = ctx
+                .get::<Json<PrState>>(PR_STATE)
+                .await?
+                .map(Json::into_inner);
+            if !closed_retires(state.as_ref(), request) {
+                return Ok(ClosedOutcome::Kept);
+            }
             let store = self.store.clone();
             ctx.run(move || async move {
                 store.delete_pr(&key).await.map_err(store_failure)?;
@@ -160,9 +230,10 @@ impl PullRequest {
             .name("delete-closed-pr-projection")
             .await?;
             ctx.clear_all();
-            Ok(())
+            Ok(ClosedOutcome::Retired)
         })
         .await
+        .map(|_| ())
     }
 
     #[handler(ingress_private)]
@@ -382,6 +453,19 @@ fn should_debounce_sync(
         && last_synced_at.is_some_and(|last| now.saturating_sub(last) < debounce.as_secs())
 }
 
+/// Whether `closed` retires the pull request, or a sweep's fence finds it synced since the
+/// sweep's listing started — reopened and re-projected — and leaves it alone.
+///
+/// The boundary mirrors the projection's `synced_at < reconcile_start` prune guard: a
+/// pull request synced at or after that instant would have kept its row too.
+fn closed_retires(state: Option<&PrState>, request: ClosedRequest) -> bool {
+    let Some(synced_before) = request.synced_before else {
+        return true;
+    };
+    let last_synced_at = state.and_then(|state| state.last_synced_at);
+    !last_synced_at.is_some_and(|last| last >= synced_before)
+}
+
 fn outcome_detail(outcome: &ActionOutcome) -> String {
     match outcome {
         ActionOutcome::Succeeded { detail } => detail.clone(),
@@ -392,6 +476,21 @@ fn outcome_detail(outcome: &ActionOutcome) -> String {
 /// The key of the `PullRequest` object a sync request addresses.
 pub(crate) fn request_key(request: &SyncRequest) -> PrKey {
     PrKey::new(request.repository_id, request.number)
+}
+
+/// Tells the pull request's object it is no longer open, one-way, from any Restate context.
+/// A sweep passes the instant its listing started as `request.synced_before`; a webhook
+/// passes the default. The projection row is usually already gone by the time this is
+/// sent; `closed` tolerates that and retires the durable state regardless, so the object
+/// stops serving a snapshot nobody else has.
+pub(crate) fn close_pull_request<'ctx>(
+    ctx: &impl ContextClient<'ctx>,
+    key: &PrKey,
+    request: ClosedRequest,
+) {
+    ctx.object_client::<PullRequestClient>(key.to_string())
+        .closed(request)
+        .send();
 }
 
 fn target_matches_snapshot(
@@ -473,5 +572,67 @@ mod tests {
         let debounce = Duration::from_secs(20);
         assert!(should_debounce_sync(false, Some(100), 101, debounce));
         assert!(!should_debounce_sync(true, Some(100), 101, debounce));
+    }
+
+    #[test]
+    fn a_sweep_fence_spares_a_pull_request_synced_since_the_listing_started() {
+        let resynced = PrState {
+            last_synced_at: Some(1_000),
+            ..PrState::default()
+        };
+        let sweep_began_at = |synced_before| ClosedRequest {
+            synced_before: Some(synced_before),
+        };
+
+        assert!(
+            !closed_retires(Some(&resynced), sweep_began_at(900)),
+            "a webhook re-synced it after the sweep listed: it is open again"
+        );
+        assert!(
+            !closed_retires(Some(&resynced), sweep_began_at(1_000)),
+            "the boundary mirrors the projection's `synced_at < reconcile_start` guard"
+        );
+        assert!(closed_retires(Some(&resynced), sweep_began_at(1_001)));
+    }
+
+    #[test]
+    fn a_webhook_closed_retires_regardless_of_sync_time() {
+        let fresh = PrState {
+            last_synced_at: Some(u64::MAX),
+            ..PrState::default()
+        };
+
+        assert!(closed_retires(Some(&fresh), ClosedRequest::default()));
+        assert!(closed_retires(None, ClosedRequest::default()));
+    }
+
+    #[test]
+    fn an_unsynced_object_never_outranks_a_sweep_fence() {
+        let never_synced = PrState {
+            sync_pending: true,
+            ..PrState::default()
+        };
+        let fence = ClosedRequest {
+            synced_before: Some(900),
+        };
+
+        assert!(closed_retires(Some(&never_synced), fence));
+        assert!(closed_retires(None, fence));
+    }
+
+    #[test]
+    fn closed_accepts_an_empty_body_as_the_unconditional_form() {
+        let mut legacy = bytes::Bytes::new();
+        assert_eq!(
+            <ClosedRequest as restate_sdk::serde::Deserialize>::deserialize(&mut legacy).unwrap(),
+            ClosedRequest::default()
+        );
+        let mut fenced = bytes::Bytes::from_static(br#"{"synced_before":900}"#);
+        assert_eq!(
+            <ClosedRequest as restate_sdk::serde::Deserialize>::deserialize(&mut fenced).unwrap(),
+            ClosedRequest {
+                synced_before: Some(900)
+            }
+        );
     }
 }

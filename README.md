@@ -461,11 +461,12 @@ Automated tests do not possess GitHub credentials. Before relying on a deploymen
 1. Confirm signed `pull_request` (`opened`, `reopened`, `synchronize`, `edited`, `labeled`, `unlabeled`, or `closed`), `check_run` (`created` or `completed`), `check_suite` (`completed`), and `status` deliveries return `200` and update the projection.
 2. Confirm malformed or incorrectly signed webhook deliveries return `400` or `401`.
 3. Suspend and unsuspend the installation, wait beyond `RECONCILE_INTERVAL_SECONDS`, and confirm only one reconciliation chain remains active.
-4. Delete the installation and confirm its projected repositories and pull requests are purged.
-5. Queue a merge and confirm GitHub records the App installation as actor and uses `GITHUB_MERGE_METHOD`.
-6. Queue a rebase and confirm the PAT user authors one marked, attributed `@dependabot rebase` comment.
-7. Restart the Restate service during an in-flight batch and confirm target progress resumes.
-8. Inspect Restate inputs, journals, and object state and confirm the PAT value is absent.
+4. Delete the installation and confirm its projected repositories and pull requests are purged, and that `PullRequest/status` for one of them returns no state.
+5. Close a Dependabot pull request while the Restate service is down, bring it back, wait for the next `RepoSync/reconcile`, and confirm the row is gone, `PullRequest/status` returns no state, and the detail drawer reports the pull request as no longer open.
+6. Queue a merge and confirm GitHub records the App installation as actor and uses `GITHUB_MERGE_METHOD`.
+7. Queue a rebase and confirm the PAT user authors one marked, attributed `@dependabot rebase` comment.
+8. Restart the Restate service during an in-flight batch and confirm target progress resumes.
+9. Inspect Restate inputs, journals, and object state and confirm the PAT value is absent.
 
 ## License
 

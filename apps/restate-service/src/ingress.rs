@@ -9,7 +9,7 @@ use thiserror::Error;
 use crate::{
     handler::{HandlerOutcome, traced},
     installation_sync::InstallationSyncClient,
-    pull_request::{PullRequestClient, request_key},
+    pull_request::{ClosedRequest, PullRequestClient, close_pull_request, request_key},
     repo_sync::RepoSyncClient,
 };
 
@@ -243,9 +243,7 @@ fn missing_fields(
 fn send_webhook_route(ctx: &Context<'_>, route: &WebhookRoute) {
     match route {
         WebhookRoute::ClosePullRequest(key) => {
-            ctx.object_client::<PullRequestClient>(key.to_string())
-                .closed()
-                .send();
+            close_pull_request(ctx, key, ClosedRequest::default());
         }
         WebhookRoute::SyncPullRequest(request) => {
             ctx.object_client::<PullRequestClient>(request_key(request).to_string())

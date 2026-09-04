@@ -92,7 +92,7 @@ refresh. It also makes the webhook Worker trivially boring, which is the point.
 | Handler | Kind | Behaviour |
 |---|---|---|
 | `sync(SyncRequest)` | exclusive | Debounce, then fetch canonical state from GitHub, update state, write through to `PrStore`. Idempotent. |
-| `closed()` | exclusive | PR merged or closed: clear the object's state keys, `delete_pr()` from the read model. |
+| `closed(synced_before?)` | exclusive | PR merged or closed: clear the object's state keys, `delete_pr()` from the read model. A sweep passes the instant its listing started; the object stands down if it has synced since (reopened behind the sweep). Webhooks pass nothing: unconditional. |
 | `merge(MergeRequest)` | exclusive | Guard `expected_sha == snapshot.sha`; `PUT /pulls/{n}/merge` with an explicit `merge_method`; on success `delete_pr()`. |
 | `command(DependabotCommand)` | exclusive | Post `@dependabot <cmd>` + attribution footer. **User token required** — see §6. Fire-and-forget. |
 | `update_branch()` | exclusive | `PUT /pulls/{n}/update-branch` with `expected_head_sha`. App-identity alternative to rebase. |
@@ -419,7 +419,7 @@ budget and then park.
 | Action | Handler | Why |
 |---|---|---|
 | `created`, `unsuspend`, `installation_repositories.*` | `sync_now()` | access exists; enumerate |
-| `deleted` | `purge()` | delete this installation's repos + cascade; no API call |
+| `deleted` | `purge()` | delete this installation's repos + cascade, then send `PullRequest.closed` to every PR that went with them; no API call |
 | `suspend` | `pause()` | clear `scheduler_started`, stop ticking; don't call GitHub |
 
 `resume` after a suspension goes through `start()` again. These events are delivered to
@@ -432,6 +432,20 @@ be subscribed to.
   `dependabot[bot]`, fan out `PullRequest.sync`, **then delete read-model rows for this
   repo that weren't in the listing**. This is what makes reconciliation authoritative
   rather than additive-only.
+- **A pruned row takes its object's state with it.** Deleting the row is only half the
+  cleanup: the `PullRequest` object still holds the snapshot, and `status()` keeps
+  serving it to the detail drawer indefinitely. `retain_prs` reports the keys it
+  actually deleted; `reconcile` sends `PullRequest.closed` to each. Fan out from what
+  was *deleted*, not from what was *absent from the listing*: a PR reopened mid-sweep and
+  re-synced by its own webhook survives the `synced_at` guard below and must not be
+  closed. That guard covers a webhook that lands *before* the delete; one that lands
+  between the delete and the `closed` invocation would still be wiped, so the sweep's
+  `closed` carries `reconcile_start` and the object stands down when its
+  `last_synced_at >= reconcile_start` — the same boundary, applied on the object side.
+  `purge()` does the same over everything the installation delete removed, unfenced:
+  the App has lost the installation, so nothing can reopen those.
+  *Not yet covered:* `retain_repos` (a repo leaving the installation) cascades PR rows
+  without retiring their objects.
 - **`retain_prs` runs only after every page has been fetched successfully.** A listing
   that fails on page 3 of 5 must abort the whole reconcile, not treat two pages as the
   authoritative live set — otherwise a transient API error silently deletes most of a
@@ -653,12 +667,16 @@ pub trait PrStore {
     /// Reconciliation: drop rows for this repo not in `live` AND synced before the
     /// listing started. The `synced_before` guard keeps rows written by concurrent
     /// webhook syncs alive — without it, a PR opened mid-reconcile gets deleted.
-    async fn retain_prs(&self, repository_id: u64, live: &[u64], synced_before: u64) -> Result<u64>;
+    /// Returns the keys it deleted so the caller can retire their object state too.
+    async fn retain_prs(&self, repository_id: u64, live: &[u64], synced_before: u64) -> Result<Vec<PrKey>>;
     async fn list_prs(&self, f: &PrFilter, page: Page) -> Result<Vec<PrRecord>>;
     async fn upsert_repo(&self, repo: &RepoRecord) -> Result<()>;
     /// Drop repos (and cascade their PRs) no longer in the installation.
     /// Same `synced_before` guard as retain_prs, for the same race.
     async fn retain_repos(&self, installation_id: u64, live: &[u64], synced_before: u64) -> Result<u64>;
+    /// Drop every repo of a deleted installation and its PRs; returns the PR keys so
+    /// `purge()` can retire their object state.
+    async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>>;
 }
 
 pub struct PrFilter {

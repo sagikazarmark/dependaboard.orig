@@ -1034,6 +1034,15 @@ code,
   font-size: 10px;
 }
 
+.durable-state-gone {
+  margin: 0;
+  padding: 8px 0;
+  border-top: 1px solid var(--line-soft);
+  color: var(--color-warning);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .dependency-list {
   border-top: 1px solid var(--line-soft);
 }

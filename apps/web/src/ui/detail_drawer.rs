@@ -26,17 +26,7 @@ pub(crate) fn DetailDrawer(
         let number = row.number;
         move || load_pr_status(repository_id, number)
     });
-    let durable_state = status
-        .read()
-        .as_ref()
-        .and_then(|result| result.as_ref().ok())
-        .cloned()
-        .flatten();
-    let status_error = status
-        .read()
-        .as_ref()
-        .and_then(|result| result.as_ref().err())
-        .map(ToString::to_string);
+    let durable_state = DurableStatus::from_resource(status.read().as_ref());
     let sync_repository_id = row.repository_id;
     let sync_number = row.number;
     let target = pr_target(&row);
@@ -147,42 +137,81 @@ pub(crate) fn DetailDrawer(
                     for label in &row.labels { span { "{label}" } }
                 }
                 h4 { "Durable state" }
-                if let Some(error) = status_error {
-                    p { class: "batch-failure", "Could not load activity: {error}" }
-                } else if let Some(state) = durable_state {
-                    dl { class: "detail-list",
-                        dt { "Last canonical sync" }
-                        dd {
-                            if let Some(last_synced_at) = state.last_synced_at {
-                                "{relative_time(last_synced_at)}"
-                            } else {
-                                "not yet"
-                            }
-                        }
-                        dt { "Debounced sync" }
-                        dd { if state.sync_pending { "pending" } else { "idle" } }
+                DurableState { status: durable_state }
+            }
+        }
+    }
+}
+
+/// What the drawer knows about the pull request's durable state, read off the
+/// `PullRequest/status` resource.
+#[derive(Clone, Debug, PartialEq)]
+enum DurableStatus {
+    /// The answer is still in flight.
+    Loading,
+    Failed(String),
+    /// The object holds nothing: the pull request closed and its state was retired
+    /// with its row — or, rarely, the state was reset and the next sync restores it.
+    Gone,
+    Present(Box<PrState>),
+}
+
+impl DurableStatus {
+    fn from_resource(resource: Option<&Result<Option<PrState>, ServerFnError>>) -> Self {
+        match resource {
+            None => Self::Loading,
+            Some(Err(error)) => Self::Failed(error.to_string()),
+            Some(Ok(None)) => Self::Gone,
+            Some(Ok(Some(state))) => Self::Present(Box::new(state.clone())),
+        }
+    }
+}
+
+/// The drawer's durable-state section.
+#[component]
+fn DurableState(status: DurableStatus) -> Element {
+    match status {
+        DurableStatus::Loading => rsx! {
+            div { class: "loading-state",
+                Loading { size: LoadingSize::Sm }
+                "Reading durable activity"
+            }
+        },
+        DurableStatus::Failed(error) => rsx! {
+            p { class: "batch-failure", "Could not load activity: {error}" }
+        },
+        DurableStatus::Gone => rsx! {
+            p { class: "durable-state-gone",
+                "No durable state: this pull request is no longer open, or has not been synced since its state was reset."
+            }
+        },
+        DurableStatus::Present(state) => rsx! {
+            dl { class: "detail-list",
+                dt { "Last canonical sync" }
+                dd {
+                    if let Some(last_synced_at) = state.last_synced_at {
+                        "{relative_time(last_synced_at)}"
+                    } else {
+                        "not yet"
                     }
-                    div { class: "dependency-list",
-                        if state.history.is_empty() {
-                            div { "No durable activity recorded." }
-                        } else {
-                            for entry in state.history.iter().rev() {
-                                div {
-                                    strong { "{entry.action}" }
-                                    code { "{relative_time(entry.at)}" }
-                                    span { "{entry.detail}" }
-                                }
-                            }
-                        }
-                    }
+                }
+                dt { "Debounced sync" }
+                dd { if state.sync_pending { "pending" } else { "idle" } }
+            }
+            div { class: "dependency-list",
+                if state.history.is_empty() {
+                    div { "No durable activity recorded." }
                 } else {
-                    div { class: "loading-state",
-                        Loading { size: LoadingSize::Sm }
-                        "Reading durable activity"
+                    for entry in state.history.iter().rev() {
+                        div {
+                            strong { "{entry.action}" }
+                            code { "{relative_time(entry.at)}" }
+                            span { "{entry.detail}" }
+                        }
                     }
                 }
             }
-        }
+        },
     }
 }
 
@@ -253,6 +282,37 @@ mod tests {
             html.contains(r#"<span class="status-badge">has_hooks</span>"#),
             "{html}"
         );
+    }
+
+    fn render_durable_state(status: DurableStatus) -> String {
+        let mut dom = VirtualDom::new_with_props(DurableState, DurableStateProps { status });
+        dom.rebuild_in_place();
+        dioxus::ssr::render(&dom)
+    }
+
+    #[test]
+    fn durable_state_reports_a_pull_request_that_is_no_longer_open() {
+        let html = render_durable_state(DurableStatus::Gone);
+
+        assert!(html.contains("no longer open"), "{html}");
+        assert!(!html.contains("Reading durable activity"), "{html}");
+    }
+
+    #[test]
+    fn durable_state_keeps_reading_while_the_answer_is_in_flight() {
+        let html = render_durable_state(DurableStatus::Loading);
+
+        assert!(html.contains("Reading durable activity"), "{html}");
+        assert!(!html.contains("no longer open"), "{html}");
+    }
+
+    #[test]
+    fn an_empty_status_answer_means_the_state_is_gone_not_still_loading() {
+        assert_eq!(
+            DurableStatus::from_resource(Some(&Ok(None))),
+            DurableStatus::Gone
+        );
+        assert_eq!(DurableStatus::from_resource(None), DurableStatus::Loading);
     }
 
     #[test]

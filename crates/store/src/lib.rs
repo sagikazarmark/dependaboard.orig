@@ -100,12 +100,16 @@ pub trait PrStore: Send + Sync {
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<(), StoreError>;
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError>;
     async fn delete_pr(&self, key: &PrKey) -> Result<(), StoreError>;
+    /// Reconciliation: drops this repository's rows that are not in `live` and
+    /// were synced before the listing started, and reports which ones went so
+    /// the caller can retire their durable state too. The `synced_before`
+    /// guard keeps rows written by concurrent webhook syncs alive.
     async fn retain_prs(
         &self,
         repository_id: u64,
         live: &[u64],
         synced_before: u64,
-    ) -> Result<u64, StoreError>;
+    ) -> Result<Vec<PrKey>, StoreError>;
     async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage, StoreError>;
     async fn prs_for_sha(&self, repository_id: u64, sha: &str)
     -> Result<Vec<PrRecord>, StoreError>;
@@ -122,7 +126,10 @@ pub trait PrStore: Send + Sync {
         live: &[u64],
         synced_before: u64,
     ) -> Result<u64, StoreError>;
-    async fn purge_installation(&self, installation_id: u64) -> Result<u64, StoreError>;
+    /// Drops the installation's repositories and their pull requests, and
+    /// reports which pull requests went so the caller can retire their durable
+    /// state too.
+    async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>, StoreError>;
 }
 
 #[async_trait]
@@ -212,7 +219,7 @@ impl PrStore for LibSqlPrStore {
         repository_id: u64,
         live: &[u64],
         synced_before: u64,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<Vec<PrKey>, StoreError> {
         let connection = self.connection().await;
         retain_prs_on(&connection, repository_id, live, synced_before).await
     }
@@ -320,15 +327,30 @@ impl PrStore for LibSqlPrStore {
         retain_repos_on(&connection, installation_id, live, synced_before).await
     }
 
-    async fn purge_installation(&self, installation_id: u64) -> Result<u64, StoreError> {
-        Ok(self
-            .connection()
-            .await
+    async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>, StoreError> {
+        let connection = self.connection().await;
+        let transaction = connection.transaction().await?;
+        // The repository delete would cascade anyway; deleting the pull requests
+        // first is what lets `RETURNING` report them.
+        let rows = transaction
+            .query(
+                r#"DELETE FROM pull_requests
+                   WHERE repository_id IN (
+                       SELECT repository_id FROM repositories WHERE installation_id = ?1
+                   )
+                   RETURNING repository_id, number"#,
+                vec![integer(installation_id)?],
+            )
+            .await?;
+        let purged = deleted_pr_keys(rows).await?;
+        transaction
             .execute(
                 "DELETE FROM repositories WHERE installation_id = ?1",
                 vec![integer(installation_id)?],
             )
-            .await?)
+            .await?;
+        transaction.commit().await?;
+        Ok(purged)
     }
 }
 
@@ -522,7 +544,7 @@ async fn retain_prs_on(
     repository_id: u64,
     live: &[u64],
     synced_before: u64,
-) -> Result<u64, StoreError> {
+) -> Result<Vec<PrKey>, StoreError> {
     let mut params = vec![integer(repository_id)?, integer(synced_before)?];
     let live_clause = if live.is_empty() {
         String::new()
@@ -537,14 +559,31 @@ async fn retain_prs_on(
             .join(", ");
         format!(" AND number NOT IN ({placeholders})")
     };
-    Ok(connection
-        .execute(
+    let rows = connection
+        .query(
             &format!(
-                "DELETE FROM pull_requests WHERE repository_id = ?1 AND synced_at < ?2{live_clause}"
+                "DELETE FROM pull_requests WHERE repository_id = ?1 AND synced_at < ?2{live_clause} RETURNING repository_id, number"
             ),
             params,
         )
-        .await?)
+        .await?;
+    deleted_pr_keys(rows).await
+}
+
+/// Collects a `DELETE ... RETURNING repository_id, number` over `pull_requests`
+/// into keys, in a stable order. SQLite performs the delete on the first step;
+/// the remaining steps only hand back the rows, which must all be drained to
+/// learn every key.
+async fn deleted_pr_keys(mut rows: libsql::Rows) -> Result<Vec<PrKey>, StoreError> {
+    let mut keys = Vec::new();
+    while let Some(row) = rows.next().await? {
+        keys.push(PrKey::new(
+            unsigned(row.get::<i64>(0)?)?,
+            unsigned(row.get::<i64>(1)?)?,
+        ));
+    }
+    keys.sort_by_key(|key| (key.repository_id, key.number));
+    Ok(keys)
 }
 
 async fn retain_repos_on(
@@ -1216,6 +1255,76 @@ mod tests {
         assert_eq!(
             store.get_pr(&PrKey::new(1, 7)).await.unwrap(),
             Some(pr(1, 7, 10))
+        );
+    }
+
+    #[tokio::test]
+    async fn retain_reports_exactly_the_rows_it_pruned() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_repo(&repo(2, 10)).await.unwrap();
+        // Stale and absent from the listing: pruned.
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 4, 10)).await.unwrap();
+        // Still listed as open: kept.
+        store.upsert_pr(&pr(1, 2, 10)).await.unwrap();
+        // Written by a concurrent webhook sync after the listing started: kept.
+        store.upsert_pr(&pr(1, 3, 30)).await.unwrap();
+        // Another repository: out of scope.
+        store.upsert_pr(&pr(2, 1, 10)).await.unwrap();
+
+        let pruned = store.retain_prs(1, &[2], 20).await.unwrap();
+
+        assert_eq!(pruned, vec![PrKey::new(1, 1), PrKey::new(1, 4)]);
+        assert!(store.get_pr(&PrKey::new(1, 1)).await.unwrap().is_none());
+        assert!(store.get_pr(&PrKey::new(1, 4)).await.unwrap().is_none());
+        assert!(store.get_pr(&PrKey::new(1, 2)).await.unwrap().is_some());
+        assert!(store.get_pr(&PrKey::new(1, 3)).await.unwrap().is_some());
+        assert!(store.get_pr(&PrKey::new(2, 1)).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn purge_reports_every_pull_request_of_the_installation_and_spares_the_rest() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_repo(&repo(2, 10)).await.unwrap();
+        let other_installation = RepoRecord {
+            installation_id: 11,
+            ..repo(3, 10)
+        };
+        store.upsert_repo(&other_installation).await.unwrap();
+        store.upsert_pr(&pr(1, 5, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 8, 40)).await.unwrap();
+        store.upsert_pr(&pr(2, 1, 10)).await.unwrap();
+        store.upsert_pr(&pr(3, 2, 10)).await.unwrap();
+
+        let purged = store.purge_installation(9).await.unwrap();
+
+        assert_eq!(
+            purged,
+            vec![PrKey::new(1, 5), PrKey::new(1, 8), PrKey::new(2, 1)]
+        );
+        assert!(store.get_pr(&PrKey::new(1, 5)).await.unwrap().is_none());
+        assert!(store.get_pr(&PrKey::new(2, 1)).await.unwrap().is_none());
+        assert_eq!(
+            store.get_pr(&PrKey::new(3, 2)).await.unwrap(),
+            Some(PrRecord {
+                installation_id: 11,
+                ..pr(3, 2, 10)
+            })
+        );
+        let repositories = store
+            .list_prs(&PrFilter::default(), Page::default())
+            .await
+            .unwrap()
+            .repositories;
+        assert_eq!(
+            repositories
+                .iter()
+                .map(|repository| repository.repository_id)
+                .collect::<Vec<_>>(),
+            vec![3],
+            "only the other installation's repository survives"
         );
     }
 

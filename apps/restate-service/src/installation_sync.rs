@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use dependaboard_core::{Operation, unix_seconds};
+use dependaboard_core::{Operation, PrKey, unix_seconds};
 use dependaboard_github::{GithubApi, GithubClient};
 use dependaboard_store::{LibSqlPrStore, PrStore};
 use restate_sdk::prelude::*;
@@ -12,6 +12,7 @@ use restate_sdk::prelude::*;
 use crate::{
     github::{RestateGithubStep, read_result, run_github_step},
     handler::{HandlerOutcome, traced},
+    pull_request::{ClosedRequest, close_pull_request},
     repo_sync::RepoSyncClient,
     store::{store_failure, store_retry_policy},
 };
@@ -163,20 +164,16 @@ impl InstallationSync {
                 .key()
                 .parse::<u64>()
                 .map_err(|_| TerminalError::new("installation key must be an integer"))?;
-            let store = self.store.clone();
-            ctx.run(move || async move {
-                store
-                    .purge_installation(installation_id)
-                    .await
-                    .map_err(store_failure)?;
-                Ok(())
-            })
-            .retry_policy(store_retry_policy())
-            .name("purge-installation")
-            .await?;
-            Ok(())
+            let mut restate = RestatePurgeEffects {
+                ctx: &ctx,
+                store: &self.store,
+                installation_id,
+            };
+            let pull_requests = run_installation_purge(&mut restate).await?;
+            Ok(format!("purged {pull_requests} pull requests"))
         })
         .await
+        .map(|_| ())
     }
 }
 
@@ -363,6 +360,62 @@ async fn perform_installation_sync(
             .send();
     }
     Ok(count)
+}
+
+/// Side effects a purge asks of Restate and the store, abstracted so
+/// `run_installation_purge` can be exercised against a recording fake without a runtime.
+trait InstallationPurgeEffects {
+    /// Drops the installation's repositories and pull requests from the projection;
+    /// resolves to the pull requests it removed.
+    fn purge_projection(&mut self) -> impl Future<Output = HandlerResult<Vec<PrKey>>> + Send;
+    /// Retires the pull request's durable state, so its object stops serving a snapshot
+    /// the projection no longer has.
+    fn close_pull_request(&mut self, key: &PrKey);
+}
+
+struct RestatePurgeEffects<'a, 'ctx> {
+    ctx: &'a ObjectContext<'ctx>,
+    store: &'a LibSqlPrStore,
+    installation_id: u64,
+}
+
+impl InstallationPurgeEffects for RestatePurgeEffects<'_, '_> {
+    async fn purge_projection(&mut self) -> HandlerResult<Vec<PrKey>> {
+        let store = self.store.clone();
+        let installation_id = self.installation_id;
+        let purged = self
+            .ctx
+            .run(move || async move {
+                Ok(Json::from(
+                    store
+                        .purge_installation(installation_id)
+                        .await
+                        .map_err(store_failure)?,
+                ))
+            })
+            .retry_policy(store_retry_policy())
+            .name("purge-installation")
+            .await?;
+        Ok(purged.into_inner())
+    }
+
+    fn close_pull_request(&mut self, key: &PrKey) {
+        // Unfenced: the App has lost the installation, so no webhook can reopen these.
+        close_pull_request(self.ctx, key, ClosedRequest::default());
+    }
+}
+
+/// Purges the installation's projection, then retires the durable state of every pull
+/// request that went with it, so no object keeps serving a snapshot for a repository the
+/// App can no longer see. Resolves to how many pull requests were retired.
+async fn run_installation_purge<E: InstallationPurgeEffects>(
+    restate: &mut E,
+) -> HandlerResult<usize> {
+    let purged = restate.purge_projection().await?;
+    for key in &purged {
+        restate.close_pull_request(key);
+    }
+    Ok(purged.len())
 }
 
 #[cfg(test)]
@@ -564,6 +617,66 @@ mod tests {
         assert_eq!(
             <SchedulerTick as restate_sdk::serde::Deserialize>::deserialize(&mut current).unwrap(),
             SchedulerTick(Some(42))
+        );
+    }
+
+    /// Stands in for Restate and the store during an installation purge and records what
+    /// the purge asked of them.
+    #[derive(Default)]
+    struct RecordedPurge {
+        /// What the projection reports removing when purged.
+        pull_requests: Vec<PrKey>,
+        purge_failure: Option<HandlerError>,
+        closed: Vec<PrKey>,
+    }
+
+    impl InstallationPurgeEffects for RecordedPurge {
+        async fn purge_projection(&mut self) -> HandlerResult<Vec<PrKey>> {
+            match self.purge_failure.take() {
+                Some(error) => Err(error),
+                None => Ok(self.pull_requests.clone()),
+            }
+        }
+
+        fn close_pull_request(&mut self, key: &PrKey) {
+            self.closed.push(key.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_purge_retires_the_durable_state_of_every_pull_request_it_removed() {
+        let mut restate = RecordedPurge {
+            pull_requests: vec![PrKey::new(7, 3), PrKey::new(7, 9), PrKey::new(8, 1)],
+            ..Default::default()
+        };
+
+        let retired = run_installation_purge(&mut restate).await.unwrap();
+
+        assert_eq!(retired, 3);
+        assert_eq!(
+            restate.closed,
+            vec![PrKey::new(7, 3), PrKey::new(7, 9), PrKey::new(8, 1)],
+            "no pull request of a deleted installation may keep a snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_purge_retires_nothing() {
+        let mut restate = RecordedPurge {
+            pull_requests: vec![PrKey::new(7, 3)],
+            purge_failure: Some(TerminalError::new("projection store is read-only").into()),
+            ..Default::default()
+        };
+
+        let outcome = run_installation_purge(&mut restate).await;
+
+        assert!(
+            outcome.is_err(),
+            "the failed purge stays visible to Restate"
+        );
+        assert!(
+            restate.closed.is_empty(),
+            "the projection still holds the rows, so their objects keep their state"
         );
     }
 }

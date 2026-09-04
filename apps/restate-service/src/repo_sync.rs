@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use dependaboard_core::{Operation, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds};
+use dependaboard_core::{Operation, PrKey, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds};
 use dependaboard_github::{GithubApi, GithubClient};
 use dependaboard_store::{LibSqlPrStore, PrStore};
 use restate_sdk::prelude::*;
@@ -12,7 +12,7 @@ use tracing::warn;
 use crate::{
     github::{RestateGithubStep, read_result, run_github_step},
     handler::traced,
-    pull_request::{PullRequestClient, request_key, short_sha},
+    pull_request::{ClosedRequest, PullRequestClient, close_pull_request, request_key, short_sha},
     store::{store_failure, store_retry_policy},
 };
 
@@ -29,10 +29,15 @@ trait RepoReconcileEffects {
         &mut self,
         request: &SyncRequest,
     ) -> impl Future<Output = Result<(), TerminalError>> + Send;
+    /// Prunes the projection down to `live`; resolves to the keys it removed.
     fn retain_pull_requests(
         &mut self,
         live: &[u64],
-    ) -> impl Future<Output = HandlerResult<()>> + Send;
+    ) -> impl Future<Output = HandlerResult<Vec<PrKey>>> + Send;
+    /// Retires the pull request's durable state, so its object stops serving a snapshot
+    /// the projection no longer has. Fenced by the sweep's start: a pull request synced
+    /// since then was reopened behind the sweep's back and keeps its state.
+    fn close_pull_request(&mut self, key: &PrKey);
 }
 
 struct RestateReconcileEffects<'a, 'ctx> {
@@ -81,27 +86,40 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
             .await
     }
 
-    async fn retain_pull_requests(&mut self, live: &[u64]) -> HandlerResult<()> {
+    async fn retain_pull_requests(&mut self, live: &[u64]) -> HandlerResult<Vec<PrKey>> {
         let store = self.store.clone();
         let repository_id = self.repository_id();
         let reconcile_start = self.reconcile_start;
         let live = live.to_vec();
-        self.ctx
+        let pruned = self
+            .ctx
             .run(move || async move {
-                store
-                    .retain_prs(repository_id, &live, reconcile_start)
-                    .await
-                    .map_err(store_failure)?;
-                Ok(())
+                Ok(Json::from(
+                    store
+                        .retain_prs(repository_id, &live, reconcile_start)
+                        .await
+                        .map_err(store_failure)?,
+                ))
             })
             .retry_policy(store_retry_policy())
             .name("retain-live-pull-requests")
             .await?;
-        Ok(())
+        Ok(pruned.into_inner())
+    }
+
+    fn close_pull_request(&mut self, key: &PrKey) {
+        close_pull_request(
+            self.ctx,
+            key,
+            ClosedRequest {
+                synced_before: Some(self.reconcile_start),
+            },
+        );
     }
 }
 
-/// Sweeps every listed pull request, then prunes the projection down to the listing.
+/// Sweeps every listed pull request, prunes the projection down to the listing, then
+/// retires the durable state of every pull request that pruning removed.
 ///
 /// A pull request that fails terminally is logged and remembered rather than propagated,
 /// so one unsyncable pull request can neither starve the rest of the repository nor skip
@@ -126,7 +144,10 @@ async fn run_repo_reconcile<E: RepoReconcileEffects>(restate: &mut E) -> Handler
         .iter()
         .map(|request| request.number)
         .collect::<Vec<_>>();
-    restate.retain_pull_requests(&live).await?;
+    let pruned = restate.retain_pull_requests(&live).await?;
+    for key in &pruned {
+        restate.close_pull_request(key);
+    }
     if failed.is_empty() {
         return Ok(pulls.len());
     }
@@ -255,8 +276,11 @@ mod tests {
         pulls: Vec<SyncRequest>,
         listing_failure: Option<HandlerError>,
         sync_failures: BTreeMap<u64, TerminalError>,
+        /// What the projection reports pruning when retention runs.
+        pruned: Vec<PrKey>,
         synced: Vec<u64>,
         retained: Option<Vec<u64>>,
+        closed: Vec<PrKey>,
     }
 
     impl RepoReconcileEffects for RecordedRepoSync {
@@ -279,10 +303,32 @@ mod tests {
             }
         }
 
-        async fn retain_pull_requests(&mut self, live: &[u64]) -> HandlerResult<()> {
+        async fn retain_pull_requests(&mut self, live: &[u64]) -> HandlerResult<Vec<PrKey>> {
             self.retained = Some(live.to_vec());
-            Ok(())
+            Ok(self.pruned.clone())
         }
+
+        fn close_pull_request(&mut self, key: &PrKey) {
+            self.closed.push(key.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn every_pruned_pull_request_has_its_durable_state_closed() {
+        let mut restate = RecordedRepoSync {
+            pulls: vec![dependabot_pull(12)],
+            pruned: vec![PrKey::new(7, 3), PrKey::new(7, 9)],
+            ..Default::default()
+        };
+
+        run_repo_reconcile(&mut restate).await.unwrap();
+
+        assert_eq!(restate.retained, Some(vec![12]));
+        assert_eq!(
+            restate.closed,
+            vec![PrKey::new(7, 3), PrKey::new(7, 9)],
+            "a row pruned from the projection must not keep a snapshot in its object"
+        );
     }
 
     #[tokio::test]
@@ -297,6 +343,7 @@ mod tests {
                 19,
                 TerminalError::new("GitHub read failed with HTTP 404: Not Found"),
             )]),
+            pruned: vec![PrKey::new(7, 5)],
             ..Default::default()
         };
 
@@ -308,6 +355,11 @@ mod tests {
             Some(vec![12, 19, 23]),
             "the failed pull request is still open on GitHub, so its row must survive"
         );
+        assert_eq!(
+            restate.closed,
+            vec![PrKey::new(7, 5)],
+            "the pruned pull request's durable state is retired despite the failed sync"
+        );
         assert!(outcome.is_err(), "the failed sync stays visible to Restate");
     }
 
@@ -318,6 +370,7 @@ mod tests {
             listing_failure: Some(
                 TerminalError::new("GitHub read failed with HTTP 401: Bad credentials").into(),
             ),
+            pruned: vec![PrKey::new(7, 3)],
             ..Default::default()
         };
 
@@ -328,6 +381,10 @@ mod tests {
         assert_eq!(
             restate.retained, None,
             "an unknown live set must not delete anything"
+        );
+        assert!(
+            restate.closed.is_empty(),
+            "nothing was pruned, so no durable state may be retired"
         );
     }
 
