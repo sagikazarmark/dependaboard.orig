@@ -378,7 +378,7 @@ The Compose file fixes `RESTATE_NODE_NAME=dependaboard` so the current project's
 
 - `apps/web`: Dioxus web UI, authenticated server functions, and the signed GitHub webhook route.
 - `apps/restate-service`: Restate virtual objects and workflows. GitHub and libSQL side effects are journaled with `ctx.run`.
-- `crates/core`: shared domain contracts, dependency parsing, check rollups, and GitHub error classification.
+- `crates/core`: shared domain contracts, dependency parsing, check rollups, and GitHub error classification. Dependabot metadata parsing is behind the opt-in `dependabot-metadata` feature so the browser bundle's dependency graph stays free of `regex`, `semver`, and `serde_yml`; only `crates/github` enables it.
 - `crates/github`: GitHub App JWT/token handling, canonical PR reads, merge calls, and idempotent user-authored Dependabot commands.
 - `crates/store`: local or remote libSQL projection behind `PrStore`.
 
@@ -445,6 +445,7 @@ For production, point both binaries at the same remote libSQL database, expose o
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace
+cargo test -p dependaboard-core --all-features
 cargo test -p dependaboard-web --features server --no-default-features
 cargo check -p dependaboard-web --target wasm32-unknown-unknown
 cargo clippy --workspace --all-targets -- -D warnings

@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
-dependaboard-core = { path = "../core" }
+dependaboard-core = { path = "../core", features = ["dependabot-metadata"] }
 http.workspace = true
 jsonwebtoken.workspace = true
 reqwest.workspace = true
