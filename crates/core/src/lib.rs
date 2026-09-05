@@ -717,6 +717,12 @@ pub struct TargetProgress {
     pub state: TargetProgressState,
 }
 
+/// Where a bulk action stands: one state per target and the running tally.
+///
+/// A target that fails terminally is recorded and the batch carries on, so the tally has
+/// three terminal columns and the batch is complete once every target is in one of them.
+/// The batch itself has no failure of its own: the reason a target failed lives on that
+/// target. (State retained from before this held a batch-level `failure`; it is ignored.)
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchProgress {
     pub batch_id: String,
@@ -725,7 +731,8 @@ pub struct BatchProgress {
     pub completed: bool,
     pub succeeded: u64,
     pub rejected: u64,
-    pub failure: Option<String>,
+    #[serde(default)]
+    pub failed: u64,
 }
 
 impl BatchProgress {
@@ -748,34 +755,56 @@ impl BatchProgress {
             completed: false,
             succeeded: 0,
             rejected: 0,
-            failure: None,
+            failed: 0,
         }
     }
+    /// The target's action has been sent.
+    pub fn start(&mut self, key: &str) {
+        self.set_state(key, TargetProgressState::Running);
+    }
 
+    /// The target's action completed: GitHub did it, or said no for good.
     pub fn record(&mut self, key: &str, outcome: ActionOutcome) {
         let state = match outcome {
-            ActionOutcome::Succeeded { detail } => {
-                self.succeeded += 1;
-                TargetProgressState::Succeeded { detail }
-            }
-            ActionOutcome::Rejected { reason } => {
-                self.rejected += 1;
-                TargetProgressState::Rejected { reason }
-            }
+            ActionOutcome::Succeeded { detail } => TargetProgressState::Succeeded { detail },
+            ActionOutcome::Rejected { reason } => TargetProgressState::Rejected { reason },
         };
-        if let Some(target) = self
+        self.set_state(key, state);
+    }
+
+    /// The target's action failed terminally without an outcome; `detail` says why.
+    pub fn record_failure(&mut self, key: &str, detail: impl Into<String>) {
+        self.set_state(
+            key,
+            TargetProgressState::Failed {
+                detail: detail.into(),
+            },
+        );
+    }
+
+    /// How many targets have reached a terminal state, whichever one.
+    pub fn settled(&self) -> u64 {
+        self.succeeded + self.rejected + self.failed
+    }
+
+    /// Moves the target to `state` and keeps the tally in step with it. A key the batch
+    /// does not contain changes nothing: the tally must only ever count targets.
+    fn set_state(&mut self, key: &str, state: TargetProgressState) {
+        let Some(target) = self
             .targets
             .iter_mut()
             .find(|target| target.target.key() == key)
-        {
-            target.state = state;
+        else {
+            return;
+        };
+        match &state {
+            TargetProgressState::Succeeded { .. } => self.succeeded += 1,
+            TargetProgressState::Rejected { .. } => self.rejected += 1,
+            TargetProgressState::Failed { .. } => self.failed += 1,
+            TargetProgressState::Queued | TargetProgressState::Running => {}
         }
-        self.completed = self.succeeded + self.rejected == self.targets.len() as u64;
-    }
-
-    pub fn fail(&mut self, detail: impl Into<String>) {
-        self.failure = Some(detail.into());
-        self.completed = true;
+        target.state = state;
+        self.completed = self.settled() == self.targets.len() as u64;
     }
 }
 
@@ -1279,6 +1308,97 @@ mod tests {
         assert!(valid_batch_id(&id));
         assert!(!valid_batch_id("550e8400-e29b-41d4-a716-446655440000"));
         assert!(!valid_batch_id("not-a-uuid"));
+    }
+
+    /// A target for pull request `number` in repository 7.
+    fn batch_target(number: u64) -> PrTarget {
+        PrTarget {
+            repository_id: 7,
+            owner: "acme".to_owned(),
+            repo: "api".to_owned(),
+            number,
+            expected_sha: "abc123".to_owned(),
+            title: format!("Bump dependency {number}"),
+            html_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_batch_completes_once_every_target_has_settled_including_the_failed_ones() {
+        let targets = [batch_target(1), batch_target(2), batch_target(3)];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+
+        progress.start(&targets[0].key());
+        assert_eq!(progress.targets[0].state, TargetProgressState::Running);
+
+        progress.record(
+            &targets[0].key(),
+            ActionOutcome::Succeeded {
+                detail: "merged".to_owned(),
+            },
+        );
+        progress.record_failure(
+            &targets[1].key(),
+            "GitHub mutation failed with HTTP 500: boom",
+        );
+        assert!(
+            !progress.completed,
+            "one target is still queued, so the batch is not over"
+        );
+
+        progress.record(
+            &targets[2].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::NotMergeable,
+            },
+        );
+
+        assert_eq!(
+            (progress.succeeded, progress.rejected, progress.failed),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            progress.targets[1].state,
+            TargetProgressState::Failed {
+                detail: "GitHub mutation failed with HTTP 500: boom".to_owned()
+            }
+        );
+        assert!(progress.completed);
+    }
+
+    #[test]
+    fn an_outcome_for_a_pull_request_outside_the_batch_changes_nothing() {
+        let targets = [batch_target(1)];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+
+        progress.record_failure(&batch_target(99).key(), "boom");
+
+        assert_eq!(progress.settled(), 0);
+        assert!(
+            !progress.completed,
+            "a stray outcome must not count towards the batch's own targets"
+        );
+    }
+
+    #[test]
+    fn batch_progress_retained_before_failed_targets_were_counted_still_deserializes() {
+        // Workflow state is retained for seven days; progress written before the
+        // `failed` counter existed carried a batch-level `failure` instead.
+        let progress: BatchProgress = serde_json::from_value(serde_json::json!({
+            "batch_id": "batch-1",
+            "action": "merge",
+            "targets": [],
+            "completed": true,
+            "succeeded": 2,
+            "rejected": 0,
+            "failure": "Terminal error [500]: GitHub mutation failed"
+        }))
+        .unwrap();
+
+        assert_eq!(progress.failed, 0);
+        assert!(progress.completed);
+        let serialized = serde_json::to_value(&progress).unwrap();
+        assert!(serialized.get("failure").is_none());
     }
 
     #[test]

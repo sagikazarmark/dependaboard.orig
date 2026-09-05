@@ -7,12 +7,12 @@ use crate::ui::side_panel::SidePanel;
 
 #[component]
 pub(crate) fn ProgressDrawer(progress: BatchProgress, onclose: EventHandler<()>) -> Element {
-    let completed = progress.succeeded + progress.rejected;
+    let settled = progress.settled();
     let total = progress.targets.len();
     let percentage = if total == 0 {
         100
     } else {
-        completed * 100 / total as u64
+        settled * 100 / total as u64
     };
     rsx! {
         SidePanel {
@@ -21,12 +21,9 @@ pub(crate) fn ProgressDrawer(progress: BatchProgress, onclose: EventHandler<()>)
             title: rsx! { "{progress.action} progress" },
             onclose,
             div { class: "progress-summary",
-                strong { "{completed}/{total}" }
-                span { "{progress.succeeded} succeeded, {progress.rejected} rejected" }
+                strong { "{settled}/{total}" }
+                span { "{progress.succeeded} succeeded, {progress.rejected} rejected, {progress.failed} failed" }
                 progress { class: "progress progress-primary", max: "100", value: "{percentage}" }
-                if let Some(failure) = &progress.failure {
-                    p { class: "batch-failure", "{failure}" }
-                }
             }
             div { class: "progress-list",
                 for item in &progress.targets {

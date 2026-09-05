@@ -1226,14 +1226,6 @@ code,
   height: 4px;
 }
 
-.progress-summary .batch-failure {
-  grid-column: 1 / -1;
-  margin: 4px 0 0;
-  color: var(--color-error);
-  font-family: "IBM Plex Mono", monospace;
-  font-size: 10px;
-}
-
 .progress-list {
   flex: 1;
   overflow-y: auto;

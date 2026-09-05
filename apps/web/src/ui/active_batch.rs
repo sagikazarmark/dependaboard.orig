@@ -27,7 +27,7 @@ pub(crate) fn ActiveBatch(
             class: "progress-pill",
             onclick: move |_| open.toggle(),
             span { class: if progress.completed { "progress-live complete" } else { "progress-live" } }
-            "{progress.action}: {progress.succeeded + progress.rejected}/{progress.targets.len()}"
+            "{progress.action}: {progress.settled()}/{progress.targets.len()}"
         }
         if open() {
             ProgressDrawer { progress: progress.clone(), onclose: move |_| open.set(false) }
@@ -60,10 +60,7 @@ pub(crate) fn queue_batch(
         .await;
         match outcome {
             BatchOutcome::Completed(progress) => {
-                match progress.failure {
-                    Some(failure) => toast.error(format!("Batch failed: {failure}"), sticky()),
-                    None => toast.success("Batch complete".to_owned(), ToastOptions::new()),
-                }
+                toast_completion(&toast, &progress);
                 state.reload();
             }
             BatchOutcome::NotSubmitted(error) => toast.error(
@@ -83,6 +80,23 @@ pub(crate) fn queue_batch(
             }
         }
     });
+}
+
+/// Announces a finished batch. A batch always runs to the end now; what varies is whether
+/// every target settled cleanly or some failed, in which case the drawer has their reasons.
+fn toast_completion(toast: &Toasts, progress: &BatchProgress) {
+    if progress.failed == 0 {
+        toast.success("Batch complete".to_owned(), ToastOptions::new());
+    } else {
+        toast.warning(
+            format!(
+                "Batch complete: {} of {} targets failed. Open the batch for their reasons.",
+                progress.failed,
+                progress.targets.len()
+            ),
+            sticky(),
+        );
+    }
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -140,7 +154,10 @@ mod tests {
         fn Fixture() -> Element {
             let progress = use_signal(|| {
                 let mut progress = half_done_merge();
-                progress.fail("Restate went away");
+                progress.record_failure(
+                    &pr_target(&serde_row()).key(),
+                    "GitHub mutation failed with HTTP 500: Internal Server Error",
+                );
                 Some(progress)
             });
             let open = use_signal(|| true);
@@ -149,8 +166,15 @@ mod tests {
         let html = render(Fixture);
 
         assert!(html.contains(r#"class="progress-live complete""#), "{html}");
+        assert!(
+            html.contains("merge: 2/2"),
+            "the pill counts the failed target too: {html}"
+        );
         assert!(html.contains("merge progress"), "{html}");
-        assert!(html.contains("1 succeeded, 0 rejected"), "{html}");
-        assert!(html.contains("Restate went away"), "{html}");
+        assert!(html.contains("1 succeeded, 0 rejected, 1 failed"), "{html}");
+        assert!(
+            html.contains("GitHub mutation failed with HTTP 500: Internal Server Error"),
+            "the failed target's row shows its reason: {html}"
+        );
     }
 }

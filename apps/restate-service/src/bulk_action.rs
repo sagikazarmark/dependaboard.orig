@@ -8,10 +8,11 @@ use std::{
 };
 
 use dependaboard_core::{
-    BatchProgress, BulkActionKind, BulkRequest, CommandRequest, DependabotCommand,
-    MAX_BATCH_TARGETS, MergeRequest, PrTarget, TargetProgressState, valid_batch_id,
+    ActionOutcome, BatchProgress, BulkActionKind, BulkRequest, CommandRequest, DependabotCommand,
+    MAX_BATCH_TARGETS, MergeRequest, PrTarget, UserId, valid_batch_id,
 };
 use restate_sdk::prelude::*;
+use tracing::warn;
 
 use crate::{
     handler::{HandlerOutcome, traced, traced_read},
@@ -21,6 +22,9 @@ use crate::{
 const BATCH_PROGRESS: &str = "progress";
 /// How many pull requests one merge round sends to GitHub at once.
 const MAX_CONCURRENT: NonZeroUsize = NonZeroUsize::new(3).unwrap();
+/// How long a rebase batch waits between two Dependabot comments, so a run of them does
+/// not trip GitHub's secondary rate limit on content creation.
+const COMMENT_SPACING: Duration = Duration::from_millis(350);
 
 pub(crate) struct BulkAction;
 
@@ -28,11 +32,155 @@ impl HandlerOutcome for Json<BatchProgress> {
     fn outcome(&self) -> String {
         let progress = &self.0;
         format!(
-            "{} succeeded, {} rejected of {} targets",
+            "{} succeeded, {} rejected, {} failed of {} targets",
             progress.succeeded,
             progress.rejected,
+            progress.failed,
             progress.targets.len()
         )
+    }
+}
+
+/// The calls a bulk action asks Restate to make, abstracted so `run_bulk_action` can be
+/// exercised against a recording fake without a runtime.
+///
+/// A Restate-to-Restate call only fails once the callee has failed terminally; retryable
+/// failures are retried inside the `PullRequest` handler and never surface here.
+trait BulkActionEffects {
+    /// The workflow key, which is also what the progress and every per-target request carry.
+    fn batch_id(&self) -> &str;
+    /// Sends one round of merges to GitHub at once and hands each outcome to `landed`, with
+    /// the target's index in `targets`, as it arrives rather than once the round is over.
+    fn merge_round(
+        &mut self,
+        targets: &[PrTarget],
+        landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
+    ) -> impl Future<Output = Result<(), TerminalError>> + Send;
+    /// Asks Dependabot to rebase one pull request; resolves once the comment is posted.
+    fn rebase(
+        &mut self,
+        target: &PrTarget,
+    ) -> impl Future<Output = Result<ActionOutcome, TerminalError>> + Send;
+    /// Waits [`COMMENT_SPACING`] durably between two comments.
+    fn pause(&mut self) -> impl Future<Output = Result<(), TerminalError>> + Send;
+}
+
+struct RestateBulkAction<'a, 'ctx> {
+    ctx: &'a WorkflowContext<'ctx>,
+    user_id: UserId,
+}
+
+impl BulkActionEffects for RestateBulkAction<'_, '_> {
+    fn batch_id(&self) -> &str {
+        self.ctx.key()
+    }
+
+    async fn merge_round(
+        &mut self,
+        targets: &[PrTarget],
+        mut landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
+    ) -> Result<(), TerminalError> {
+        let mut calls = DurableFuturesUnordered::new();
+        for target in targets {
+            calls.push(
+                self.ctx
+                    .object_client::<PullRequestClient>(target.key())
+                    .merge(Json::from(MergeRequest {
+                        batch_id: self.ctx.key().to_owned(),
+                        target: target.clone(),
+                    }))
+                    .call(),
+            );
+        }
+        while let Some((index, outcome)) = calls.next().await? {
+            landed(index, outcome.map(Json::into_inner));
+        }
+        Ok(())
+    }
+
+    async fn rebase(&mut self, target: &PrTarget) -> Result<ActionOutcome, TerminalError> {
+        self.ctx
+            .object_client::<PullRequestClient>(target.key())
+            .command(Json::from(CommandRequest {
+                batch_id: self.ctx.key().to_owned(),
+                target: target.clone(),
+                user_id: self.user_id.clone(),
+                command: DependabotCommand::Rebase,
+            }))
+            .call()
+            .await
+            .map(Json::into_inner)
+    }
+
+    async fn pause(&mut self) -> Result<(), TerminalError> {
+        self.ctx.sleep(COMMENT_SPACING).await
+    }
+}
+
+/// Drives every target of the batch to a terminal state and resolves to the final tally.
+///
+/// Merges go out in the rounds `plan_merge_rounds` lays out; rebases go one at a time with
+/// a pause between comments. `publish` is called with each change in progress, so the
+/// dashboard sees every target settle as it happens rather than when the batch is over.
+/// A target that fails terminally is recorded as failed with its reason and the batch
+/// carries on: one pull request's problem is not a reason to leave the rest queued.
+async fn run_bulk_action<E: BulkActionEffects>(
+    restate: &mut E,
+    request: &BulkRequest,
+    mut publish: impl FnMut(&BatchProgress) + Send,
+) -> HandlerResult<BatchProgress> {
+    let mut progress = BatchProgress::queued(restate.batch_id(), request.action, &request.targets);
+    publish(&progress);
+    match request.action {
+        BulkActionKind::Merge => {
+            for round in plan_merge_rounds(&request.targets, MAX_CONCURRENT) {
+                for target in &round {
+                    progress.start(&target.key());
+                }
+                publish(&progress);
+                restate
+                    .merge_round(&round, |index, outcome| {
+                        settle(&mut progress, &round[index], outcome);
+                        publish(&progress);
+                    })
+                    .await?;
+            }
+        }
+        BulkActionKind::Rebase => {
+            for target in &request.targets {
+                progress.start(&target.key());
+                publish(&progress);
+                let outcome = restate.rebase(target).await;
+                settle(&mut progress, target, outcome);
+                publish(&progress);
+                if !progress.completed {
+                    restate.pause().await?;
+                }
+            }
+        }
+    }
+    Ok(progress)
+}
+
+/// Records how one target's action ended. A terminal failure is that target's alone: it is
+/// noted with its reason, logged, and the batch moves on.
+fn settle(
+    progress: &mut BatchProgress,
+    target: &PrTarget,
+    outcome: Result<ActionOutcome, TerminalError>,
+) {
+    let key = target.key();
+    match outcome {
+        Ok(outcome) => progress.record(&key, outcome),
+        Err(error) => {
+            warn!(
+                batch_id = %progress.batch_id,
+                pull_request = %key,
+                cause = %error,
+                "target failed terminally; continuing the batch"
+            );
+            progress.record_failure(&key, error.message());
+        }
     }
 }
 
@@ -47,46 +195,14 @@ impl BulkAction {
         traced("BulkAction/run", ctx.key(), async {
             let request = request.into_inner();
             validate_batch_request(ctx.key(), &request)?;
-            let mut progress = BatchProgress::queued(ctx.key(), request.action, &request.targets);
-            ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-            match request.action {
-                BulkActionKind::Merge => {
-                    run_merge_batch(&ctx, &request, &mut progress).await?;
-                }
-                BulkActionKind::Rebase => {
-                    for target in &request.targets {
-                        mark_running(&mut progress, &target.key());
-                        ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-                        let outcome = match ctx
-                            .object_client::<PullRequestClient>(target.key())
-                            .command(Json::from(CommandRequest {
-                                batch_id: ctx.key().to_owned(),
-                                target: target.clone(),
-                                user_id: request.user_id.clone(),
-                                command: DependabotCommand::Rebase,
-                            }))
-                            .call()
-                            .await
-                        {
-                            Ok(outcome) => outcome.into_inner(),
-                            Err(error) => {
-                                let detail = error.to_string();
-                                mark_failed(&mut progress, &target.key(), detail.clone());
-                                progress.fail(detail);
-                                ctx.set(BATCH_PROGRESS, Json::from(progress));
-                                return Err(error.into());
-                            }
-                        };
-                        progress.record(&target.key(), outcome);
-                        ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-                        if !progress.completed {
-                            ctx.sleep(Duration::from_millis(350)).await?;
-                        }
-                    }
-                }
-            }
-            progress.completed = true;
-            ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
+            let mut restate = RestateBulkAction {
+                ctx: &ctx,
+                user_id: request.user_id.clone(),
+            };
+            let progress = run_bulk_action(&mut restate, &request, |progress| {
+                ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
+            })
+            .await?;
             Ok(Json::from(progress))
         })
         .await
@@ -108,53 +224,7 @@ impl BulkAction {
     }
 }
 
-async fn run_merge_batch(
-    ctx: &WorkflowContext<'_>,
-    request: &BulkRequest,
-    progress: &mut BatchProgress,
-) -> HandlerResult<()> {
-    for round in plan_merge_rounds(&request.targets, MAX_CONCURRENT) {
-        for target in &round {
-            mark_running(progress, &target.key());
-        }
-        ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-        let mut calls = DurableFuturesUnordered::new();
-        for target in &round {
-            calls.push(
-                ctx.object_client::<PullRequestClient>(target.key())
-                    .merge(Json::from(MergeRequest {
-                        batch_id: ctx.key().to_owned(),
-                        target: target.clone(),
-                    }))
-                    .call(),
-            );
-        }
-        let mut first_error = None;
-        while let Some((index, outcome)) = calls.next().await? {
-            let outcome = match outcome {
-                Ok(outcome) => outcome.into_inner(),
-                Err(error) => {
-                    mark_failed(progress, &round[index].key(), error.to_string());
-                    ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                    continue;
-                }
-            };
-            progress.record(&round[index].key(), outcome);
-            ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-        }
-        if let Some(error) = first_error {
-            progress.fail(error.to_string());
-            ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-            return Err(error.into());
-        }
-    }
-    Ok(())
-}
-
-/// Splits a merge batch into the rounds `run_merge_batch` sends to GitHub together.
+/// Splits a merge batch into the rounds `run_bulk_action` sends to GitHub together.
 ///
 /// Two pull requests in one repository never share a round: merging the first moves the
 /// base branch under the second, so they go one round after another in batch order. Each
@@ -182,26 +252,6 @@ fn plan_merge_rounds(targets: &[PrTarget], max_concurrent: NonZeroUsize) -> Vec<
     }
 }
 
-fn mark_running(progress: &mut BatchProgress, key: &str) {
-    if let Some(target) = progress
-        .targets
-        .iter_mut()
-        .find(|target| target.target.key() == key)
-    {
-        target.state = TargetProgressState::Running;
-    }
-}
-
-fn mark_failed(progress: &mut BatchProgress, key: &str, detail: String) {
-    if let Some(target) = progress
-        .targets
-        .iter_mut()
-        .find(|target| target.target.key() == key)
-    {
-        target.state = TargetProgressState::Failed { detail };
-    }
-}
-
 fn validate_batch_request(batch_id: &str, request: &BulkRequest) -> HandlerResult<()> {
     if !valid_batch_id(batch_id) {
         return Err(TerminalError::new("batch key must be a UUIDv7").into());
@@ -225,7 +275,7 @@ fn validate_batch_request(batch_id: &str, request: &BulkRequest) -> HandlerResul
 
 #[cfg(test)]
 mod tests {
-    use dependaboard_core::UserId;
+    use dependaboard_core::{RejectReason, TargetProgressState, UserId};
 
     use super::*;
     use crate::test_support::target;
@@ -237,6 +287,295 @@ mod tests {
             number,
             ..target()
         }
+    }
+
+    fn request(action: BulkActionKind, targets: Vec<PrTarget>) -> BulkRequest {
+        BulkRequest {
+            action,
+            targets,
+            user_id: UserId::new("dashboard"),
+        }
+    }
+
+    fn merged() -> ActionOutcome {
+        ActionOutcome::Succeeded {
+            detail: "merged".to_owned(),
+        }
+    }
+
+    fn forbidden() -> ActionOutcome {
+        ActionOutcome::Rejected {
+            reason: RejectReason::Forbidden,
+        }
+    }
+
+    fn github_500() -> TerminalError {
+        TerminalError::new("GitHub mutation failed with HTTP 500: Internal Server Error")
+    }
+
+    /// Stands in for the `PullRequest` objects a batch calls and records what it sent them.
+    ///
+    /// Each pull request answers with its scripted outcome, or succeeds when none is
+    /// scripted. A merge round lands its outcomes in reverse order of sending, so a batch
+    /// that confused the round's indices would record outcomes against the wrong targets.
+    #[derive(Default)]
+    struct RecordedBulkAction {
+        answers: BTreeMap<u64, Result<ActionOutcome, TerminalError>>,
+        /// Pull request numbers in the order their actions were sent.
+        sent: Vec<u64>,
+        pauses: u32,
+    }
+
+    impl RecordedBulkAction {
+        fn answering(
+            answers: impl IntoIterator<Item = (u64, Result<ActionOutcome, TerminalError>)>,
+        ) -> Self {
+            Self {
+                answers: answers.into_iter().collect(),
+                ..Default::default()
+            }
+        }
+
+        fn answer(&mut self, target: &PrTarget) -> Result<ActionOutcome, TerminalError> {
+            self.sent.push(target.number);
+            self.answers
+                .remove(&target.number)
+                .unwrap_or_else(|| Ok(merged()))
+        }
+    }
+
+    impl BulkActionEffects for RecordedBulkAction {
+        fn batch_id(&self) -> &str {
+            "batch-1"
+        }
+
+        async fn merge_round(
+            &mut self,
+            targets: &[PrTarget],
+            mut landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
+        ) -> Result<(), TerminalError> {
+            let outcomes = targets
+                .iter()
+                .map(|target| self.answer(target))
+                .collect::<Vec<_>>();
+            for (index, outcome) in outcomes.into_iter().enumerate().rev() {
+                landed(index, outcome);
+            }
+            Ok(())
+        }
+
+        async fn rebase(&mut self, target: &PrTarget) -> Result<ActionOutcome, TerminalError> {
+            self.answer(target)
+        }
+
+        async fn pause(&mut self) -> Result<(), TerminalError> {
+            self.pauses += 1;
+            Ok(())
+        }
+    }
+
+    async fn run(
+        restate: &mut RecordedBulkAction,
+        request: &BulkRequest,
+    ) -> (BatchProgress, Vec<BatchProgress>) {
+        let mut published = Vec::new();
+        let progress = run_bulk_action(restate, request, |progress| {
+            published.push(progress.clone());
+        })
+        .await
+        .unwrap();
+        (progress, published)
+    }
+
+    fn state_of(progress: &BatchProgress, number: u64) -> &TargetProgressState {
+        &progress
+            .targets
+            .iter()
+            .find(|target| target.target.number == number)
+            .expect("the target is in the batch")
+            .state
+    }
+
+    #[tokio::test]
+    async fn a_target_that_fails_terminally_is_recorded_and_the_rest_of_the_batch_still_runs() {
+        // Three pull requests in one repository merge one round after another, so an abort
+        // on the second would have left the third queued forever.
+        let request = request(
+            BulkActionKind::Merge,
+            vec![pull(7, 1), pull(7, 2), pull(7, 3)],
+        );
+        let mut restate = RecordedBulkAction::answering([(2, Err(github_500()))]);
+
+        let (progress, _) = run(&mut restate, &request).await;
+
+        assert_eq!(restate.sent, vec![1, 2, 3]);
+        assert!(progress.completed, "the batch ran to the end");
+        assert_eq!(
+            (progress.succeeded, progress.rejected, progress.failed),
+            (2, 0, 1)
+        );
+        assert_eq!(
+            state_of(&progress, 2),
+            &TargetProgressState::Failed {
+                detail: "GitHub mutation failed with HTTP 500: Internal Server Error".to_owned()
+            },
+            "the failed target carries the callee's reason, not the SDK's wrapping of it"
+        );
+        assert_eq!(
+            state_of(&progress, 3),
+            &TargetProgressState::Succeeded {
+                detail: "merged".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_whose_every_target_merges_completes_with_only_successes() {
+        let request = request(
+            BulkActionKind::Merge,
+            vec![pull(7, 1), pull(8, 4), pull(9, 2)],
+        );
+        let mut restate = RecordedBulkAction::default();
+
+        let (progress, _) = run(&mut restate, &request).await;
+
+        assert!(progress.completed);
+        assert_eq!(
+            (progress.succeeded, progress.rejected, progress.failed),
+            (3, 0, 0)
+        );
+        assert!(
+            progress.targets.iter().all(|target| target.state
+                == TargetProgressState::Succeeded {
+                    detail: "merged".to_owned()
+                }),
+            "{:?}",
+            progress.targets
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_target_is_counted_apart_from_the_failed_ones() {
+        let request = request(BulkActionKind::Merge, vec![pull(7, 1), pull(8, 4)]);
+        let mut restate = RecordedBulkAction::answering([(4, Ok(forbidden()))]);
+
+        let (progress, _) = run(&mut restate, &request).await;
+
+        assert!(progress.completed);
+        assert_eq!(
+            (progress.succeeded, progress.rejected, progress.failed),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            state_of(&progress, 4),
+            &TargetProgressState::Rejected {
+                reason: RejectReason::Forbidden
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_merge_round_settles_each_target_on_its_own() {
+        // Three repositories merge in one concurrent round; each lands its own verdict.
+        let request = request(
+            BulkActionKind::Merge,
+            vec![pull(7, 1), pull(8, 4), pull(9, 2)],
+        );
+        let mut restate =
+            RecordedBulkAction::answering([(4, Ok(forbidden())), (2, Err(github_500()))]);
+
+        let (progress, _) = run(&mut restate, &request).await;
+
+        assert!(progress.completed);
+        assert_eq!(
+            (progress.succeeded, progress.rejected, progress.failed),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            state_of(&progress, 1),
+            &TargetProgressState::Succeeded {
+                detail: "merged".to_owned()
+            }
+        );
+        assert_eq!(
+            state_of(&progress, 4),
+            &TargetProgressState::Rejected {
+                reason: RejectReason::Forbidden
+            }
+        );
+        assert_eq!(
+            state_of(&progress, 2),
+            &TargetProgressState::Failed {
+                detail: "GitHub mutation failed with HTTP 500: Internal Server Error".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_rebase_batch_reports_every_column_and_paces_its_comments() {
+        let request = request(
+            BulkActionKind::Rebase,
+            vec![pull(7, 1), pull(7, 2), pull(7, 3), pull(7, 4)],
+        );
+        let mut restate =
+            RecordedBulkAction::answering([(2, Err(github_500())), (3, Ok(forbidden()))]);
+
+        let (progress, _) = run(&mut restate, &request).await;
+
+        assert_eq!(
+            restate.sent,
+            vec![1, 2, 3, 4],
+            "the failure did not stop the rest"
+        );
+        assert!(progress.completed);
+        assert_eq!(
+            (progress.succeeded, progress.rejected, progress.failed),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            restate.pauses, 3,
+            "one pause between each pair of comments and none after the last"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_is_published_as_each_target_settles_not_once_the_round_is_over() {
+        // Three repositories merge in one round; the dashboard must see them land one by one.
+        let request = request(
+            BulkActionKind::Merge,
+            vec![pull(7, 1), pull(8, 1), pull(9, 1)],
+        );
+        let mut restate = RecordedBulkAction::default();
+
+        let (_, published) = run(&mut restate, &request).await;
+
+        let settled_per_publish = published
+            .iter()
+            .map(|progress| progress.succeeded + progress.rejected + progress.failed)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            settled_per_publish,
+            vec![0, 0, 1, 2, 3],
+            "queued, the round running, then one more settled per publish"
+        );
+        assert!(
+            published.last().is_some_and(|progress| progress.completed),
+            "the last publish is the finished batch"
+        );
+    }
+
+    #[test]
+    fn the_completion_line_lists_every_column() {
+        let targets = [pull(7, 1), pull(7, 2), pull(7, 3)];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        progress.record(&targets[0].key(), merged());
+        progress.record(&targets[1].key(), forbidden());
+        progress.record_failure(&targets[2].key(), "boom");
+
+        assert_eq!(
+            Json::from(progress).outcome(),
+            "1 succeeded, 1 rejected, 1 failed of 3 targets"
+        );
     }
 
     #[test]
