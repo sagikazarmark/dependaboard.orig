@@ -7,7 +7,7 @@ use crate::api::request_sync;
 use crate::components::button::{Button, ButtonSize};
 use crate::components::toast::{ToastOptions, use_toast};
 use crate::ui::dashboard_state::use_dashboard;
-use crate::ui::{POLL_INTERVAL, sleep, sticky, user_facing};
+use crate::ui::{sticky, user_facing};
 
 /// The top bar; `dark` is the theme in force and `aside_open` whether the
 /// sidebar is showing, both toggled from here.
@@ -16,6 +16,7 @@ pub(crate) fn TopBar(mut dark: Signal<bool>, mut aside_open: Signal<bool>) -> El
     let toast = use_toast();
     let mut state = use_dashboard();
     let needs_attention = state.filter().needs_attention;
+    let syncing = state.syncing();
     rsx! {
         header { class: "topbar",
             div { class: "brand",
@@ -49,21 +50,26 @@ pub(crate) fn TopBar(mut dark: Signal<bool>, mut aside_open: Signal<bool>) -> El
                 onclick: move |_| dark.toggle(),
                 if dark() { "light" } else { "dark" }
             }
+            // The sync is one-way: Restate takes it and the sweep runs on
+            // its own. The glyph spins until the rows reload, which the live
+            // refresh sees to once the sweep's first change lands.
             Button {
                 size: ButtonSize::Sm,
                 class: "sync-button",
+                disabled: syncing,
                 onclick: move |_| {
+                    state.begin_sync();
                     spawn(async move {
-                        if let Err(error) = request_sync().await {
-                            toast.error(format!("Sync failed: {}", user_facing(&error)), sticky());
-                        } else {
-                            toast.info("Reconciliation queued".to_owned(), ToastOptions::new());
-                            sleep(POLL_INTERVAL).await;
-                            state.reload.call(());
+                        match request_sync().await {
+                            Ok(()) => toast.info("Reconciliation queued".to_owned(), ToastOptions::new()),
+                            Err(error) => {
+                                state.end_sync();
+                                toast.error(format!("Sync failed: {}", user_facing(&error)), sticky());
+                            }
                         }
                     });
                 },
-                span { class: "sync-glyph", "+" }
+                span { class: if syncing { "sync-glyph spinning" } else { "sync-glyph" }, "⟳" }
                 "Sync"
             }
         }
@@ -102,5 +108,27 @@ mod tests {
         );
         assert!(html.contains(">light</button>"), "{html}");
         assert!(html.contains("Sync"), "{html}");
+        assert!(html.contains(r#"<span class="sync-glyph">"#), "{html}");
+        assert!(!html.contains("disabled"), "{html}");
+    }
+
+    /// While a manual sync is in flight the glyph spins and the button will
+    /// not queue another.
+    #[test]
+    fn the_sync_glyph_spins_while_a_sync_is_in_flight() {
+        fn Fixture() -> Element {
+            let dark = use_signal(|| true);
+            let aside_open = use_signal(|| true);
+            rsx! {
+                DashboardFixture { syncing: true, TopBar { dark, aside_open } }
+            }
+        }
+        let html = render(Fixture);
+
+        assert!(
+            html.contains(r#"<span class="sync-glyph spinning">"#),
+            "{html}"
+        );
+        assert!(html.contains("disabled"), "{html}");
     }
 }

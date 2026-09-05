@@ -21,6 +21,7 @@ pub(crate) fn PrTable(onopen: EventHandler<PrRecord>) -> Element {
     let total = page.map(|page| page.total).unwrap_or_default();
     let active_filter_count = filter_count(&state.filter());
     let all_visible_selected = state.all_visible_selected();
+    let now = state.now();
     rsx! {
         main { class: "content",
             div { class: "resultbar",
@@ -51,7 +52,7 @@ pub(crate) fn PrTable(onopen: EventHandler<PrRecord>) -> Element {
                         div { class: "empty-state error-state",
                             strong { "The read model could not be loaded" }
                             code { "{error}" }
-                            Button { size: ButtonSize::Sm, onclick: move |_| state.reload.call(()), "Retry" }
+                            Button { size: ButtonSize::Sm, onclick: move |_| state.reload(), "Retry" }
                         }
                     },
                     PageStatus::Loading => rsx! {
@@ -69,6 +70,7 @@ pub(crate) fn PrTable(onopen: EventHandler<PrRecord>) -> Element {
                                 key: "{row.id}",
                                 row: row.clone(),
                                 checked: state.is_selected(&row.id),
+                                now,
                                 oncheck: move |id| state.toggle_selected(id),
                                 onopen,
                             }

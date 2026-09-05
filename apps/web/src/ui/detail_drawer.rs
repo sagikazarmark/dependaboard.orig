@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use dependaboard_core::{BulkActionKind, PrKey, PrRecord, PrState, unix_seconds};
+use dependaboard_core::{BulkActionKind, PrKey, PrRecord, PrState};
 use dioxus::logger::tracing;
 use dioxus::prelude::*;
 
@@ -53,10 +53,12 @@ impl From<PrRecord> for OpenPr {
 ///
 /// A pull request still [`OpenPr::Loading`] has its row read here. The drawer
 /// opens once the row is in hand; if the pull request has gone since the link
-/// was made, or cannot be read, nothing opens.
+/// was made, or cannot be read, nothing opens. `now` is the dashboard's
+/// clock, which the drawer's times are read against.
 #[component]
 pub(crate) fn OpenDetail(
     mut detail: Signal<Option<OpenPr>>,
+    now: u64,
     onaction: EventHandler<PendingAction>,
     onsync: EventHandler<Result<Option<PrRecord>, String>>,
 ) -> Element {
@@ -87,6 +89,7 @@ pub(crate) fn OpenDetail(
             DetailDrawer {
                 key: "{row.id}",
                 row: (**row).clone(),
+                now,
                 onclose: move |_| detail.set(None),
                 onaction,
                 onsync,
@@ -98,11 +101,12 @@ pub(crate) fn OpenDetail(
 #[component]
 pub(crate) fn DetailDrawer(
     row: PrRecord,
+    now: u64,
     onclose: EventHandler<()>,
     onaction: EventHandler<PendingAction>,
     onsync: EventHandler<Result<Option<PrRecord>, String>>,
 ) -> Element {
-    let stale = row.is_stale(unix_seconds());
+    let stale = row.is_stale(now);
     let mut syncing = use_signal(|| false);
     let mut sync_queued = use_signal(|| false);
     let mut status = use_resource({
@@ -206,8 +210,8 @@ pub(crate) fn DetailDrawer(
                 }
                 dl { class: "detail-list",
                     dt { "Head SHA" } dd { code { "{row.head_sha}" } }
-                    dt { "Last updated" } dd { "{relative_time(row.updated_at)}" }
-                    dt { "Projected" } dd { "{relative_time(row.synced_at)}" }
+                    dt { "Last updated" } dd { "{relative_time(now, row.updated_at)}" }
+                    dt { "Projected" } dd { "{relative_time(now, row.synced_at)}" }
                 }
                 h4 { "Dependencies" }
                 div { class: "dependency-list",
@@ -224,7 +228,7 @@ pub(crate) fn DetailDrawer(
                     for label in &row.labels { span { "{label}" } }
                 }
                 h4 { "Durable state" }
-                DurableState { status: durable_state }
+                DurableState { status: durable_state, now }
             }
         }
     }
@@ -254,9 +258,10 @@ impl DurableStatus {
     }
 }
 
-/// The drawer's durable-state section.
+/// The drawer's durable-state section; `now` is the clock its times are
+/// read against.
 #[component]
-fn DurableState(status: DurableStatus) -> Element {
+fn DurableState(status: DurableStatus, now: u64) -> Element {
     match status {
         DurableStatus::Loading => rsx! {
             div { class: "loading-state",
@@ -277,7 +282,7 @@ fn DurableState(status: DurableStatus) -> Element {
                 dt { "Last canonical sync" }
                 dd {
                     if let Some(last_synced_at) = state.last_synced_at {
-                        "{relative_time(last_synced_at)}"
+                        "{relative_time(now, last_synced_at)}"
                     } else {
                         "not yet"
                     }
@@ -292,7 +297,7 @@ fn DurableState(status: DurableStatus) -> Element {
                     for entry in state.history.iter().rev() {
                         div {
                             strong { "{entry.action}" }
-                            code { "{relative_time(entry.at)}" }
+                            code { "{relative_time(now, entry.at)}" }
                             span { "{entry.detail}" }
                         }
                     }
@@ -348,14 +353,14 @@ mod tests {
     use dioxus::core::{Mutation, consume_context_from_scope};
 
     use super::*;
-    use crate::ui::test_support::{grouped_row, render, serde_row};
+    use crate::ui::test_support::{FIXTURE_NOW, grouped_row, render, serde_row};
 
     #[test]
     fn the_drawer_is_there_for_the_open_pull_request_and_gone_when_none_is() {
         fn Closed() -> Element {
             let detail = use_signal(|| None);
             rsx! {
-                OpenDetail { detail, onaction: move |_| {}, onsync: move |_| {} }
+                OpenDetail { detail, now: FIXTURE_NOW, onaction: move |_| {}, onsync: move |_| {} }
             }
         }
         let closed = render(Closed);
@@ -364,7 +369,7 @@ mod tests {
         fn Open() -> Element {
             let detail = use_signal(|| Some(OpenPr::from(grouped_row())));
             rsx! {
-                OpenDetail { detail, onaction: move |_| {}, onsync: move |_| {} }
+                OpenDetail { detail, now: FIXTURE_NOW, onaction: move |_| {}, onsync: move |_| {} }
             }
         }
         let open = render(Open);
@@ -384,7 +389,7 @@ mod tests {
         fn Fixture() -> Element {
             let detail = use_context_provider(|| Signal::new(Some(OpenPr::from(grouped_row()))));
             rsx! {
-                OpenDetail { detail, onaction: move |_| {}, onsync: move |_| {} }
+                OpenDetail { detail, now: FIXTURE_NOW, onaction: move |_| {}, onsync: move |_| {} }
             }
         }
         let mut dom = VirtualDom::new(Fixture);
@@ -421,6 +426,7 @@ mod tests {
         rsx! {
             DetailDrawer {
                 row,
+                now: FIXTURE_NOW,
                 onclose: move |_| {},
                 onaction: move |_| {},
                 onsync: move |_| {},
@@ -441,7 +447,13 @@ mod tests {
     }
 
     fn render_durable_state(status: DurableStatus) -> String {
-        let mut dom = VirtualDom::new_with_props(DurableState, DurableStateProps { status });
+        let mut dom = VirtualDom::new_with_props(
+            DurableState,
+            DurableStateProps {
+                status,
+                now: FIXTURE_NOW,
+            },
+        );
         dom.rebuild_in_place();
         dioxus::ssr::render(&dom)
     }

@@ -10,6 +10,7 @@ mod dashboard_state;
 mod detail_drawer;
 mod filters;
 mod format;
+mod live;
 mod pr_row;
 mod pr_table;
 mod progress_drawer;

@@ -62,29 +62,40 @@ pub(crate) struct DashboardState {
     pub(crate) page: ReadSignal<PageStatus>,
     /// The read model's facets and freshness for the filter in force.
     pub(crate) summary: ReadSignal<SummaryStatus>,
+    /// The dashboard's clock, in Unix seconds. It ticks on its own, so the
+    /// relative times a component prints against it move without anything
+    /// else happening.
+    now: ReadSignal<u64>,
+    /// Whether a manual sync is in flight: asked for, and not yet followed by
+    /// a reload of the rows.
+    syncing: Signal<bool>,
     /// Asks the read model again for the same filter and cursor.
-    pub(crate) reload: Callback<()>,
+    reload: Callback<()>,
 }
 
 impl DashboardState {
-    /// Provides the state to the calling component's subtree. `page` and
-    /// `summary` are boxed once, here, since every conversion to a
+    /// Provides the state to the calling component's subtree. `page`,
+    /// `summary`, and `now` are boxed once, here, since every conversion to a
     /// [`ReadSignal`] takes a slot in the scope for as long as the scope
-    /// lives.
+    /// lives. No manual sync is in flight to begin with.
     pub(crate) fn provide(
         filter: Signal<PrFilter>,
         cursor: Signal<Option<String>>,
         selected: Signal<BTreeSet<String>>,
         page: impl Into<ReadSignal<PageStatus>>,
         summary: impl Into<ReadSignal<SummaryStatus>>,
+        now: impl Into<ReadSignal<u64>>,
         reload: Callback<()>,
     ) -> Self {
+        let syncing = use_signal(|| false);
         use_context_provider(|| Self {
             filter,
             cursor,
             selected,
             page: page.into(),
             summary: summary.into(),
+            now: now.into(),
+            syncing,
             reload,
         })
     }
@@ -98,6 +109,38 @@ impl DashboardState {
     /// The cursor of the page in force; `None` is the first page.
     pub(crate) fn cursor(&self) -> ReadableRef<'_, Signal<Option<String>>> {
         self.cursor.read()
+    }
+
+    /// The dashboard's clock, in Unix seconds. Reading it in a component
+    /// subscribes the component to its ticks.
+    pub(crate) fn now(&self) -> u64 {
+        *self.now.read()
+    }
+
+    /// Whether a manual sync is in flight.
+    pub(crate) fn syncing(&self) -> bool {
+        *self.syncing.read()
+    }
+
+    /// A manual sync has been asked for. It is in flight until the rows
+    /// reload, or until [`Self::end_sync`] says it never got going.
+    pub(crate) fn begin_sync(&mut self) {
+        self.syncing.set(true);
+    }
+
+    /// The manual sync is over without the rows having reloaded: Restate did
+    /// not take it, or the dashboard has stopped waiting for it.
+    pub(crate) fn end_sync(&mut self) {
+        if *self.syncing.peek() {
+            self.syncing.set(false);
+        }
+    }
+
+    /// Asks the read model again for the same filter and cursor. A manual
+    /// sync in flight is over: the rows reloading is what it was waiting for.
+    pub(crate) fn reload(&mut self) {
+        self.end_sync();
+        self.reload.call(());
     }
 
     /// Applies `change` to the filter, restarts paging, and drops the
@@ -252,18 +295,23 @@ mod tests {
     use dioxus::core::consume_context_from_scope;
 
     use super::*;
-    use crate::ui::test_support::{loaded_page, loaded_summary};
+    use crate::ui::test_support::{FIXTURE_NOW, loaded_page, loaded_summary};
 
     /// A dashboard state on the app scope: the fixture page loaded, on its
     /// second page, with one row selected, so the tests can see both reset.
     fn Fixture() -> Element {
+        let reloads = use_context_provider(|| Signal::new(0u32));
         DashboardState::provide(
             use_signal(PrFilter::default),
             use_signal(|| Some("page-2".to_owned())),
             use_signal(|| BTreeSet::from(["7#9".to_owned()])),
             use_signal(|| PageStatus::Loaded(loaded_page())),
             use_signal(|| SummaryStatus::Loaded(loaded_summary())),
-            use_callback(|_| {}),
+            use_signal(|| FIXTURE_NOW),
+            use_callback(move |()| {
+                let mut reloads = reloads;
+                *reloads.write() += 1;
+            }),
         );
         rsx! {}
     }
@@ -275,6 +323,43 @@ mod tests {
             .in_runtime(|| consume_context_from_scope::<DashboardState>(ScopeId::APP))
             .expect("the fixture provides the dashboard state");
         (dom, state)
+    }
+
+    fn reloads(dom: &VirtualDom) -> u32 {
+        dom.in_runtime(|| {
+            *consume_context_from_scope::<Signal<u32>>(ScopeId::APP)
+                .expect("the fixture counts reloads")
+                .read()
+        })
+    }
+
+    /// The sync glyph spins from the moment a manual sync is asked for until
+    /// the rows reload, whatever reloaded them; a sync Restate did not take
+    /// is over at once.
+    #[test]
+    fn a_manual_sync_is_in_flight_until_the_rows_reload_or_it_is_ended() {
+        let (dom, mut state) = mount();
+
+        dom.in_runtime(|| {
+            assert!(!state.syncing());
+            state.begin_sync();
+            assert!(state.syncing());
+            state.reload();
+            assert!(!state.syncing());
+            assert_eq!(reloads(&dom), 1);
+
+            state.begin_sync();
+            state.end_sync();
+            assert!(!state.syncing());
+            assert_eq!(reloads(&dom), 1, "ending a sync does not reload");
+        });
+    }
+
+    #[test]
+    fn the_clock_is_the_one_the_dashboard_was_given() {
+        let (dom, state) = mount();
+
+        dom.in_runtime(|| assert_eq!(state.now(), FIXTURE_NOW));
     }
 
     #[test]

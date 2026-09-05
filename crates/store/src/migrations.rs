@@ -33,6 +33,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "repository_merge_method",
         sql: include_str!("../../../migrations/0003_repository_merge_method.sql"),
     },
+    Migration {
+        version: 4,
+        name: "projection_revision",
+        sql: include_str!("../../../migrations/0004_projection_revision.sql"),
+    },
 ];
 
 const CREATE_SCHEMA_MIGRATIONS: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (

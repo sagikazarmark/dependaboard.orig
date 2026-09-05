@@ -1,7 +1,8 @@
 //! The dashboard page: filters, the pull request table, selection, and the
 //! bulk-action flow from confirmation through progress. The filter, cursor,
 //! and open pull request live in the URL as well, so a view can be shared and
-//! survives a refresh.
+//! survives a refresh. The rows keep themselves current: the page follows the
+//! read model's revision and reloads when it moves.
 
 use std::collections::BTreeSet;
 
@@ -15,6 +16,7 @@ use crate::ui::active_batch::{ActiveBatch, queue_batch};
 use crate::ui::confirm_modal::ConfirmModal;
 use crate::ui::dashboard_state::{DashboardState, PageStatus, SummaryStatus};
 use crate::ui::detail_drawer::{OpenDetail, OpenPr};
+use crate::ui::live::{use_clock, use_live_refresh, use_visibility};
 use crate::ui::pr_table::PrTable;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::status_bar::StatusBar;
@@ -31,7 +33,8 @@ use crate::ui::{PendingAction, sticky};
 ///
 /// The rows and the facets are two requests: the rows follow the filter and
 /// the cursor, the facets the filter alone, so loading the next page leaves
-/// the facets as they are.
+/// the facets as they are. Both are asked again when the read model's
+/// revision moves, which the page polls for while the tab is showing.
 #[component]
 pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     let toast = use_toast();
@@ -48,6 +51,8 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     let mut pending = use_signal(|| None::<PendingAction>);
     let active_batch = use_signal(|| None::<BatchProgress>);
     let progress_open = use_signal(|| false);
+    let visible = use_visibility();
+    let now = use_clock(visible);
 
     let mut rows = use_resource(move || {
         let filter = filter();
@@ -63,12 +68,16 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     });
     let page = use_memo(move || PageStatus::from_resource(rows.read().as_ref()));
     let summary_status = use_memo(move || SummaryStatus::from_resource(summary.read().as_ref()));
+    // The resources keep their last answer while the next is in flight, so a
+    // reload leaves the rows standing until the fresh ones land.
     let reload = use_callback(move |()| {
         rows.restart();
         summary.restart();
     });
-    let mut state = DashboardState::provide(filter, cursor, selected, page, summary_status, reload);
+    let mut state =
+        DashboardState::provide(filter, cursor, selected, page, summary_status, now, reload);
     use_url_sync(state, detail);
+    use_live_refresh(state, visible);
     let summary = summary_status.read();
 
     rsx! {
@@ -85,17 +94,18 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
 
         OpenDetail {
             detail,
+            now: state.now(),
             onaction: move |action| pending.set(Some(action)),
             onsync: move |result: Result<Option<PrRecord>, String>| match result {
                 Ok(Some(row)) => {
                     detail.set(Some(row.into()));
                     toast.success("Pull request synced".to_owned(), ToastOptions::new());
-                    reload.call(());
+                    state.reload();
                 }
                 Ok(None) => {
                     detail.set(None);
                     toast.info("Pull request is no longer open".to_owned(), ToastOptions::new());
-                    reload.call(());
+                    state.reload();
                 }
                 Err(error) => toast.error(error, sticky()),
             },
@@ -119,7 +129,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
             oncancel: move |_| pending.set(None),
             onconfirm: move |action| {
                 state.clear_selection();
-                queue_batch(action, active_batch, progress_open, toast, reload);
+                queue_batch(action, active_batch, progress_open, toast, state);
             },
         }
     }

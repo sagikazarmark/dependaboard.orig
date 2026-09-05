@@ -118,6 +118,10 @@ pub trait PrStore: Send + Sync {
     /// does not depend on paging, so a caller moving to the next page need not
     /// ask again.
     async fn dashboard_summary(&self, filter: &PrFilter) -> Result<DashboardSummary, StoreError>;
+    /// A counter that moves whenever a row of the read model changes, however
+    /// it changes. Cheap to read, so a dashboard can ask often and reload
+    /// only when the answer differs from the one it last saw.
+    async fn projection_revision(&self) -> Result<u64, StoreError>;
     async fn prs_for_sha(&self, repository_id: u64, sha: &str)
     -> Result<Vec<PrRecord>, StoreError>;
     async fn upsert_repo(&self, repo: &RepoRecord) -> Result<(), StoreError>;
@@ -281,6 +285,16 @@ impl PrStore for LibSqlPrStore {
             facets,
             last_synced_at,
         })
+    }
+
+    async fn projection_revision(&self) -> Result<u64, StoreError> {
+        let connection = self.connection().await;
+        scalar_u64(
+            &connection,
+            "SELECT revision FROM projection_revision WHERE id = 1",
+            Vec::new(),
+        )
+        .await
     }
 
     async fn prs_for_sha(
@@ -1404,6 +1418,84 @@ mod tests {
             .unwrap();
         assert_eq!(synced.facets.checks, BTreeMap::new());
         assert_eq!(synced.last_synced_at, Some(700));
+    }
+
+    /// The dashboard polls the revision to learn whether anything it shows
+    /// has changed, so every write that changes a row moves it — the rows a
+    /// repository delete takes with it included — and reads and writes that
+    /// change nothing leave it where it is.
+    #[tokio::test]
+    async fn the_projection_revision_advances_on_every_row_change_and_only_then() {
+        /// The revision as the dashboard follows it: what it last saw.
+        struct Follower<'a> {
+            store: &'a LibSqlPrStore,
+            seen: u64,
+        }
+
+        impl Follower<'_> {
+            async fn advanced(&mut self, what: &str) {
+                let now = self.store.projection_revision().await.unwrap();
+                assert!(now > self.seen, "{what} should advance the revision");
+                self.seen = now;
+            }
+
+            async fn unchanged(&self, what: &str) {
+                let now = self.store.projection_revision().await.unwrap();
+                assert_eq!(now, self.seen, "{what} should not advance the revision");
+            }
+        }
+
+        let (_directory, store) = test_store().await;
+        let mut follower = Follower {
+            seen: store.projection_revision().await.unwrap(),
+            store: &store,
+        };
+
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        follower.advanced("adding a repository").await;
+        store.upsert_pr(&pr(1, 1, 100)).await.unwrap();
+        follower.advanced("adding a pull request").await;
+        store.upsert_pr(&pr(1, 1, 200)).await.unwrap();
+        follower.advanced("syncing a pull request again").await;
+
+        store
+            .list_prs(&PrFilter::default(), Page::default())
+            .await
+            .unwrap();
+        store.dashboard_summary(&PrFilter::default()).await.unwrap();
+        store.get_pr(&PrKey::new(1, 1)).await.unwrap();
+        follower.unchanged("reading").await;
+        store.retain_prs(1, &[1], 1_000).await.unwrap();
+        follower
+            .unchanged("a reconciliation that prunes nothing")
+            .await;
+
+        store.delete_pr(&PrKey::new(1, 1)).await.unwrap();
+        follower.advanced("deleting a pull request").await;
+        store.upsert_pr(&pr(1, 2, 100)).await.unwrap();
+        store.upsert_pr(&pr(1, 3, 100)).await.unwrap();
+        follower.advanced("adding pull requests").await;
+        store.retain_prs(1, &[2], 1_000).await.unwrap();
+        follower
+            .advanced("a reconciliation that prunes a row")
+            .await;
+
+        store.upsert_repo(&repo(2, 10)).await.unwrap();
+        store.upsert_pr(&pr(2, 1, 100)).await.unwrap();
+        follower
+            .advanced("adding a second repository with a pull request")
+            .await;
+        store
+            .replace_installation_repos(9, &[repo(1, 20)], 1_000)
+            .await
+            .unwrap();
+        follower
+            .advanced("an installation sync that drops a repository")
+            .await;
+        assert_eq!(store.get_pr(&PrKey::new(2, 1)).await.unwrap(), None);
+
+        store.purge_installation(9).await.unwrap();
+        follower.advanced("purging the installation").await;
     }
 
     #[tokio::test]

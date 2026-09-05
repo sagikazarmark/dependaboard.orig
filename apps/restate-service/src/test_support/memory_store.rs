@@ -148,6 +148,12 @@ impl PrStore for MemoryPrStore {
         )
     }
 
+    async fn projection_revision(&self) -> Result<u64, StoreError> {
+        unimplemented!(
+            "the Restate service never asks whether the projection moved; the dashboard polls it through the web app"
+        )
+    }
+
     async fn prs_for_sha(
         &self,
         repository_id: u64,

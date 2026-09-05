@@ -1,14 +1,17 @@
 //! The pull request row of the dashboard table.
 
-use dependaboard_core::{PrRecord, ROW_LABEL_LIMIT, unix_seconds};
+use dependaboard_core::{PrRecord, ROW_LABEL_LIMIT};
 use dioxus::prelude::*;
 
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
 
+/// One row; `now` is the dashboard's clock, which the row's age and staleness
+/// are read against.
 #[component]
 pub(crate) fn PrRow(
     row: PrRecord,
     checked: bool,
+    now: u64,
     oncheck: EventHandler<String>,
     onopen: EventHandler<PrRecord>,
 ) -> Element {
@@ -19,7 +22,7 @@ pub(crate) fn PrRow(
         .clone()
         .unwrap_or_else(|| format!("{} dependencies", row.dependencies.len()));
     let versions = version_label(row.from_version.as_deref(), row.to_version.as_deref());
-    let stale = row.is_stale(unix_seconds());
+    let stale = row.is_stale(now);
     let row_class = match (checked, stale) {
         (true, true) => "pr-grid pr-row selected stale",
         (true, false) => "pr-grid pr-row selected",
@@ -51,7 +54,7 @@ pub(crate) fn PrRow(
                 for label in row.labels.iter().take(ROW_LABEL_LIMIT) { span { "{label}" } }
                 if row.labels.len() > ROW_LABEL_LIMIT { span { "+{row.labels.len() - ROW_LABEL_LIMIT}" } }
             }
-            time { class: "right mono", "{relative_time(row.updated_at)}" }
+            time { class: "right mono", "{relative_time(now, row.updated_at)}" }
         }
     }
 }
@@ -59,13 +62,14 @@ pub(crate) fn PrRow(
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-    use crate::ui::test_support::{GROUPED_ROW_TITLE, grouped_row};
+    use crate::ui::test_support::{FIXTURE_NOW, GROUPED_ROW_TITLE, grouped_row};
 
     fn GroupedRowFixture() -> Element {
         rsx! {
             PrRow {
                 row: grouped_row(),
                 checked: false,
+                now: FIXTURE_NOW,
                 oncheck: move |_| {},
                 onopen: move |_| {},
             }
@@ -91,6 +95,7 @@ mod tests {
             PrRow {
                 row,
                 checked: false,
+                now: FIXTURE_NOW,
                 oncheck: move |_| {},
                 onopen: move |_| {},
             }

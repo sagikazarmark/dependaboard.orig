@@ -245,9 +245,21 @@ code,
 }
 
 .sync-glyph {
+  display: inline-block;
   color: var(--color-primary);
   font-family: "IBM Plex Mono", monospace;
   font-size: 15px;
+}
+
+/* A manual sync is in flight: the glyph turns until the rows reload. */
+.sync-glyph.spinning {
+  animation: spin 0.8s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sync-glyph.spinning {
+    animation: throb 1.3s infinite;
+  }
 }
 
 .workspace {
@@ -1332,6 +1344,10 @@ code,
 @keyframes throb {
   0%, 100% { opacity: 0.35; }
   50% { opacity: 1; }
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 @media (max-width: 900px) {

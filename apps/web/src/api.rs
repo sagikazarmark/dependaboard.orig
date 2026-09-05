@@ -41,6 +41,18 @@ pub(crate) async fn load_summary(filter: PrFilter) -> Result<DashboardSummary, S
         .map_err(store_failure)
 }
 
+/// The read model's revision: a counter that moves whenever a row changes.
+/// Cheap enough for the dashboard to poll, so it can reload the rows only
+/// when the answer has moved since it last asked.
+#[server(state: Extension<ServerState>)]
+pub(crate) async fn load_projection_revision() -> Result<u64, ServerFnError> {
+    state
+        .store
+        .projection_revision()
+        .await
+        .map_err(store_failure)
+}
+
 #[server(state: Extension<ServerState>, user: Extension<UserId>)]
 pub(crate) async fn submit_batch(
     batch_id: String,

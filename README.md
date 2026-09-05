@@ -384,6 +384,12 @@ The Compose file fixes `RESTATE_NODE_NAME=dependaboard` so the current project's
 
 Restate owns in-flight truth and retries. libSQL is the cross-PR query model used by the dashboard. The browser never calls Restate directly.
 
+### Live refresh
+
+The read model changes behind the dashboard's back — webhooks land, the hourly sweep runs — and the dashboard follows without a hand on it. The store keeps a `projection_revision` counter that SQLite triggers move on every insert, update, or delete of a pull request or repository row (a cascade included), so "has anything changed?" is one cheap read rather than a comparison of the rows. While the tab is showing, the dashboard polls that revision every ten seconds and reloads the rows and facets only when it has moved; a hidden tab polls nothing and catches up the moment it shows again. The relative times tick once a minute against the same clock.
+
+The global **Sync** button is one-way — Restate takes the request and the sweep runs on its own — so the glyph spins from the click until the rows reload, which the poll brings about within a second of the sweep's first write. The poll runs every second while a sync is being followed and gives up after a minute, reloading once, if nothing reaches the store.
+
 ### Restate ingress visibility
 
 Every Restate handler is reachable through the ingress unless marked private, and `BulkAction.run` can merge pull requests, so only the entry points the web app and the bootstrap need are public. Everything else is `ingress_private`, reachable only from another handler.

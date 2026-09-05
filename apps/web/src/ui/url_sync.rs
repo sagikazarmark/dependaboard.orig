@@ -103,7 +103,7 @@ mod tests {
 
     use super::*;
     use crate::ui::dashboard_state::{PageStatus, SummaryStatus};
-    use crate::ui::test_support::{grouped_row, loaded_page, loaded_summary};
+    use crate::ui::test_support::{FIXTURE_NOW, grouped_row, loaded_page, loaded_summary};
 
     /// A browser history: in memory, and firing `popstate` — the callback
     /// given to [`History::updater`] — when it goes back or forward, as the
@@ -177,6 +177,7 @@ mod tests {
             use_signal(BTreeSet::new),
             use_signal(|| PageStatus::Loaded(loaded_page())),
             use_signal(|| SummaryStatus::Loaded(loaded_summary())),
+            use_signal(|| FIXTURE_NOW),
             use_callback(|_| {}),
         );
         use_url_sync(state, detail);

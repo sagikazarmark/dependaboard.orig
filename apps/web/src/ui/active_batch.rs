@@ -7,6 +7,7 @@ use dioxus::prelude::*;
 
 use crate::components::toast::{ToastOptions, Toasts};
 use crate::ui::batch::{BatchOutcome, STALL_TIMEOUT, SUBMIT_ATTEMPTS, ServerBatch, run_batch};
+use crate::ui::dashboard_state::DashboardState;
 use crate::ui::progress_drawer::ProgressDrawer;
 use crate::ui::{PendingAction, sticky};
 
@@ -42,7 +43,7 @@ pub(crate) fn queue_batch(
     mut progress: Signal<Option<BatchProgress>>,
     mut open: Signal<bool>,
     toast: Toasts,
-    reload: Callback<()>,
+    mut state: DashboardState,
 ) {
     let batch_id = new_batch_id();
     progress.set(Some(BatchProgress::queued(&batch_id, action, &targets)));
@@ -63,7 +64,7 @@ pub(crate) fn queue_batch(
                     Some(failure) => toast.error(format!("Batch failed: {failure}"), sticky()),
                     None => toast.success("Batch complete".to_owned(), ToastOptions::new()),
                 }
-                reload.call(());
+                state.reload();
             }
             BatchOutcome::NotSubmitted(error) => toast.error(
                 format!("Batch was not submitted after {SUBMIT_ATTEMPTS} attempts: {error}"),

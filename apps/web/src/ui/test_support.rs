@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dependaboard_core::{
     CheckStatus, DashboardPage, DashboardSummary, DependencyUpdate, FacetCounts, LabelFacet,
-    Mergeable, PrFilter, PrRecord, RepoFacet, RepoRecord, UpdateType, unix_seconds,
+    Mergeable, PrFilter, PrRecord, RepoFacet, RepoRecord, UpdateType,
 };
 use dioxus::prelude::*;
 
@@ -13,6 +13,10 @@ use crate::ui::dashboard_state::{DashboardState, PageStatus, SummaryStatus};
 
 pub(crate) const GROUPED_ROW_TITLE: &str =
     "build(deps): bump the github-actions group across 1 directory with 3 updates";
+
+/// The fixture dashboard's clock: the moment [`grouped_row`] and
+/// [`loaded_summary`] were synced, so their times read as "now".
+pub(crate) const FIXTURE_NOW: u64 = 1_700_000_000;
 
 pub(crate) fn grouped_row() -> PrRecord {
     PrRecord {
@@ -43,7 +47,7 @@ pub(crate) fn grouped_row() -> PrRecord {
         labels: vec!["dependencies".to_owned(), "github_actions".to_owned()],
         created_at: 1,
         updated_at: 1,
-        synced_at: unix_seconds(),
+        synced_at: FIXTURE_NOW,
     }
 }
 
@@ -122,30 +126,38 @@ pub(crate) fn loaded_summary() -> DashboardSummary {
             ],
             repositories,
         },
-        last_synced_at: Some(unix_seconds()),
+        last_synced_at: Some(FIXTURE_NOW),
     }
 }
 
 /// Mounts `children` where the dashboard's components expect to be: under a
 /// toast provider and a dashboard state with `filter` in force, `page` and
-/// `summary` as the read model's answers, and `selected` picked. Reloads go
-/// nowhere.
+/// `summary` as the read model's answers, `selected` picked, the clock at
+/// `now`, and a manual sync in flight if `syncing`. Reloads go nowhere.
 #[component]
 pub(crate) fn DashboardFixture(
     #[props(default)] filter: PrFilter,
     #[props(default = PageStatus::Loading)] page: PageStatus,
     #[props(default = SummaryStatus::Loading)] summary: SummaryStatus,
     #[props(default)] selected: BTreeSet<String>,
+    #[props(default = FIXTURE_NOW)] now: u64,
+    #[props(default)] syncing: bool,
     children: Element,
 ) -> Element {
-    DashboardState::provide(
+    let mut state = DashboardState::provide(
         use_signal(|| filter),
         use_signal(|| None),
         use_signal(|| selected),
         use_signal(|| page),
         use_signal(|| summary),
+        use_signal(|| now),
         use_callback(|_| {}),
     );
+    use_hook(move || {
+        if syncing {
+            state.begin_sync();
+        }
+    });
     rsx! {
         ToastProvider { {children} }
     }
