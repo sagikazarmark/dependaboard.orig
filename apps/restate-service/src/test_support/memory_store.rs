@@ -58,7 +58,14 @@ impl Tables {
             .collect()
     }
 
-    fn retain_repos(&mut self, installation_id: u64, live: &[u64], synced_before: u64) -> u64 {
+    /// Drops the installation's stale repositories and their pull requests, as the
+    /// store's FK cascade does; resolves to the pull requests' keys in key order.
+    fn retain_repos(
+        &mut self,
+        installation_id: u64,
+        live: &[u64],
+        synced_before: u64,
+    ) -> Vec<PrKey> {
         let stale = self
             .repositories
             .values()
@@ -72,8 +79,7 @@ impl Tables {
         for repository_id in &stale {
             self.repositories.remove(repository_id);
         }
-        self.cascade(&stale);
-        stale.len() as u64
+        self.cascade(&stale)
     }
 }
 
@@ -193,7 +199,7 @@ impl PrStore for MemoryPrStore {
         installation_id: u64,
         repos: &[RepoRecord],
         synced_before: u64,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<Vec<PrKey>, StoreError> {
         let mut tables = self.tables.lock().unwrap();
         for repo in repos {
             tables.repositories.insert(repo.repository_id, repo.clone());
@@ -210,7 +216,7 @@ impl PrStore for MemoryPrStore {
         installation_id: u64,
         live: &[u64],
         synced_before: u64,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<Vec<PrKey>, StoreError> {
         Ok(self
             .tables
             .lock()
@@ -330,5 +336,47 @@ mod tests {
             Some(2),
             "a pull request reads back with its repository's installation, as the JOIN gives it"
         );
+    }
+
+    #[tokio::test]
+    async fn replacing_the_installation_repositories_reports_the_pull_requests_that_left_with_them()
+    {
+        let store = MemoryPrStore::default();
+        for repository_id in [7, 8] {
+            store
+                .upsert_repo(&RepoRecord {
+                    repository_id,
+                    synced_at: 100,
+                    ..repository()
+                })
+                .await
+                .unwrap();
+        }
+        store.upsert_pr(&pull(7, 9, 0)).await.unwrap();
+        store.upsert_pr(&pull(7, 3, 0)).await.unwrap();
+        store.upsert_pr(&pull(8, 1, 0)).await.unwrap();
+
+        let cascaded = store
+            .replace_installation_repos(
+                1,
+                &[RepoRecord {
+                    repository_id: 8,
+                    synced_at: 500,
+                    ..repository()
+                }],
+                200,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(cascaded, vec![PrKey::new(7, 3), PrKey::new(7, 9)]);
+        assert!(store.get_repo(7).await.unwrap().is_none());
+        assert!(store.get_pr(&PrKey::new(7, 9)).await.unwrap().is_none());
+        assert_eq!(
+            store.get_repo(8).await.unwrap().map(|repo| repo.synced_at),
+            Some(500),
+            "the repository that stayed carries the fresh listing"
+        );
+        assert!(store.get_pr(&PrKey::new(8, 1)).await.unwrap().is_some());
     }
 }

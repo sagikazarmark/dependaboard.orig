@@ -4,7 +4,7 @@
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use dependaboard_core::{Operation, PrKey, unix_seconds};
+use dependaboard_core::{Operation, PrKey, RepoRecord, unix_seconds};
 use dependaboard_store::PrStore;
 use restate_sdk::prelude::*;
 
@@ -319,8 +319,106 @@ async fn run_scheduler_tick<E: SchedulerTickEffects>(
     Ok(SchedulerTickOutcome::Swept { repositories })
 }
 
-/// Re-enumerates the installation's repositories and fans a reconcile out to each; resolves
-/// to how many.
+/// Side effects an installation sweep asks of Restate, GitHub and the store, abstracted
+/// so `run_installation_sync` can be exercised against a recording fake without a runtime.
+trait InstallationSyncEffects {
+    /// Enumerates every repository the installation grants access to: complete, or an
+    /// error. A partial listing must never become the authoritative set.
+    fn list_repositories(&mut self) -> impl Future<Output = HandlerResult<Vec<RepoRecord>>> + Send;
+    /// Makes `repositories` the installation's set in the projection, upserting them and
+    /// dropping the rest; resolves to the pull requests that went with the dropped ones.
+    fn replace_repositories(
+        &mut self,
+        repositories: &[RepoRecord],
+    ) -> impl Future<Output = HandlerResult<Vec<PrKey>>> + Send;
+    /// Fans a reconcile out to the repository's `RepoSync` object.
+    fn reconcile_repository(&mut self, repository: RepoRecord);
+    /// Retires the pull request's durable state, so its object stops serving a snapshot
+    /// the projection no longer has. Unfenced: once a repository is out of the
+    /// installation the App receives no webhooks for it, so nothing can reopen these.
+    fn close_pull_request(&mut self, key: &PrKey);
+}
+
+struct RestateSyncEffects<'a, 'ctx> {
+    ctx: &'a ObjectContext<'ctx>,
+    github: &'a GithubApiHandle,
+    store: &'a Arc<dyn PrStore>,
+    reconcile_start: u64,
+}
+
+impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
+    async fn list_repositories(&mut self) -> HandlerResult<Vec<RepoRecord>> {
+        let github = self.github.clone();
+        let repositories = run_github_step(&mut RestateGithubStep {
+            ctx: self.ctx,
+            name: "list-installation-repositories",
+            operation: Operation::Read,
+            known_resource: false,
+            call: move || {
+                let github = github.clone();
+                async move { github.list_installation_repositories().await }
+            },
+        })
+        .await?;
+        read_result(repositories)
+    }
+
+    async fn replace_repositories(
+        &mut self,
+        repositories: &[RepoRecord],
+    ) -> HandlerResult<Vec<PrKey>> {
+        let store = self.store.clone();
+        let installation_id = self.github.installation_id();
+        let reconcile_start = self.reconcile_start;
+        let repositories = repositories.to_vec();
+        let cascaded = self
+            .ctx
+            .run(move || async move {
+                Ok(Json::from(
+                    store
+                        .replace_installation_repos(installation_id, &repositories, reconcile_start)
+                        .await
+                        .map_err(store_failure)?,
+                ))
+            })
+            .retry_policy(store_retry_policy())
+            .name("replace-installation-repositories")
+            .await?;
+        Ok(cascaded.into_inner())
+    }
+
+    fn reconcile_repository(&mut self, repository: RepoRecord) {
+        self.ctx
+            .object_client::<RepoSyncClient>(repository.repository_id.to_string())
+            .reconcile(Json::from(repository))
+            .send();
+    }
+
+    fn close_pull_request(&mut self, key: &PrKey) {
+        close_pull_request(self.ctx, key, ClosedRequest::default());
+    }
+}
+
+/// Re-enumerates the installation's repositories, makes the projection match, retires the
+/// durable state of every pull request that left with a repository, then fans a reconcile
+/// out to each repository that remains. Resolves to how many were fanned out to.
+async fn run_installation_sync<E: InstallationSyncEffects>(
+    restate: &mut E,
+) -> HandlerResult<usize> {
+    let repositories = restate.list_repositories().await?;
+    let cascaded = restate.replace_repositories(&repositories).await?;
+    for key in &cascaded {
+        restate.close_pull_request(key);
+    }
+    let count = repositories.len();
+    for repository in repositories {
+        restate.reconcile_repository(repository);
+    }
+    Ok(count)
+}
+
+/// One installation sweep bound to Restate; resolves to how many repositories it fanned
+/// out to.
 async fn perform_installation_sync(
     ctx: &ObjectContext<'_>,
     github: &GithubApiHandle,
@@ -330,39 +428,13 @@ async fn perform_installation_sync(
         .run(|| async { Ok(unix_seconds()) })
         .name("installation-reconcile-clock")
         .await?;
-    let list_client = github.clone();
-    let repositories = run_github_step(&mut RestateGithubStep {
+    let mut restate = RestateSyncEffects {
         ctx,
-        name: "list-installation-repositories",
-        operation: Operation::Read,
-        known_resource: false,
-        call: move || {
-            let github = list_client.clone();
-            async move { github.list_installation_repositories().await }
-        },
-    })
-    .await?;
-    let repositories = read_result(repositories)?;
-    let stored = repositories.clone();
-    let installation_id = github.installation_id();
-    let store = store.clone();
-    ctx.run(move || async move {
-        store
-            .replace_installation_repos(installation_id, &stored, reconcile_start)
-            .await
-            .map_err(store_failure)?;
-        Ok(())
-    })
-    .retry_policy(store_retry_policy())
-    .name("replace-installation-repositories")
-    .await?;
-    let count = repositories.len();
-    for repository in repositories {
-        ctx.object_client::<RepoSyncClient>(repository.repository_id.to_string())
-            .reconcile(Json::from(repository))
-            .send();
-    }
-    Ok(count)
+        github,
+        store,
+        reconcile_start,
+    };
+    run_installation_sync(&mut restate).await
 }
 
 /// Side effects a purge asks of Restate and the store, abstracted so
@@ -704,5 +776,139 @@ mod tests {
             restate.closed.is_empty(),
             "the projection still holds the rows, so their objects keep their state"
         );
+    }
+
+    fn installed_repository(repository_id: u64) -> RepoRecord {
+        RepoRecord {
+            repository_id,
+            installation_id: 1,
+            owner: "acme".to_owned(),
+            repo: format!("repo-{repository_id}"),
+            merge_method: None,
+            synced_at: 0,
+        }
+    }
+
+    /// Stands in for Restate, GitHub and the store during an installation sweep and
+    /// records what the sweep asked of them.
+    #[derive(Default)]
+    struct RecordedSweep {
+        repositories: Vec<RepoRecord>,
+        listing_failure: Option<HandlerError>,
+        /// What the projection reports cascading when the repositories are replaced.
+        cascaded: Vec<PrKey>,
+        replace_failure: Option<HandlerError>,
+        replaced: Option<Vec<u64>>,
+        reconciled: Vec<u64>,
+        closed: Vec<PrKey>,
+    }
+
+    impl InstallationSyncEffects for RecordedSweep {
+        async fn list_repositories(&mut self) -> HandlerResult<Vec<RepoRecord>> {
+            match self.listing_failure.take() {
+                Some(error) => Err(error),
+                None => Ok(self.repositories.clone()),
+            }
+        }
+
+        async fn replace_repositories(
+            &mut self,
+            repositories: &[RepoRecord],
+        ) -> HandlerResult<Vec<PrKey>> {
+            self.replaced = Some(
+                repositories
+                    .iter()
+                    .map(|repository| repository.repository_id)
+                    .collect(),
+            );
+            match self.replace_failure.take() {
+                Some(error) => Err(error),
+                None => Ok(self.cascaded.clone()),
+            }
+        }
+
+        fn reconcile_repository(&mut self, repository: RepoRecord) {
+            self.reconciled.push(repository.repository_id);
+        }
+
+        fn close_pull_request(&mut self, key: &PrKey) {
+            self.closed.push(key.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sweep_retires_the_durable_state_of_every_pull_request_that_left_with_its_repository()
+    {
+        let mut restate = RecordedSweep {
+            repositories: vec![installed_repository(7), installed_repository(9)],
+            cascaded: vec![PrKey::new(8, 1), PrKey::new(8, 4), PrKey::new(12, 2)],
+            ..Default::default()
+        };
+
+        let swept = run_installation_sync(&mut restate).await.unwrap();
+
+        assert_eq!(swept, 2);
+        assert_eq!(
+            restate.replaced,
+            Some(vec![7, 9]),
+            "the listing is the installation's authoritative repository set"
+        );
+        assert_eq!(
+            restate.closed,
+            vec![PrKey::new(8, 1), PrKey::new(8, 4), PrKey::new(12, 2)],
+            "no pull request of a repository that left the installation may keep a snapshot"
+        );
+        assert_eq!(
+            restate.reconciled,
+            vec![7, 9],
+            "the repositories that remain are swept as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_replace_retires_nothing_and_reconciles_nothing() {
+        let mut restate = RecordedSweep {
+            repositories: vec![installed_repository(7)],
+            cascaded: vec![PrKey::new(8, 1)],
+            replace_failure: Some(TerminalError::new("projection store is read-only").into()),
+            ..Default::default()
+        };
+
+        let outcome = run_installation_sync(&mut restate).await;
+
+        assert!(
+            outcome.is_err(),
+            "the failed replace stays visible to Restate"
+        );
+        assert!(
+            restate.closed.is_empty(),
+            "the projection still holds the rows, so their objects keep their state"
+        );
+        assert!(
+            restate.reconciled.is_empty(),
+            "repositories are reconciled only once their rows are in place"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_never_reaches_the_projection() {
+        let mut restate = RecordedSweep {
+            repositories: vec![installed_repository(7)],
+            listing_failure: Some(
+                TerminalError::new("GitHub read failed with HTTP 401: Bad credentials").into(),
+            ),
+            cascaded: vec![PrKey::new(8, 1)],
+            ..Default::default()
+        };
+
+        let outcome = run_installation_sync(&mut restate).await;
+
+        assert!(outcome.is_err());
+        assert_eq!(
+            restate.replaced, None,
+            "an unknown live set must not delete anything"
+        );
+        assert!(restate.closed.is_empty());
+        assert!(restate.reconciled.is_empty());
     }
 }

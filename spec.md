@@ -468,6 +468,8 @@ capture reconcile_start
 enumerate ALL repos (complete, successful pagination)
   → in one transaction: upsert every live RepoRecord
                         + retain_repos(live_ids, synced_before: reconcile_start)
+                          → returns the PR keys the cascade removed
+  → send PullRequest.closed to each of those
   → then fan out RepoSync.reconcile for the live set
 ```
 
@@ -486,7 +488,10 @@ installation, the next enumeration simply never calls `RepoSync` for it — so i
 survive forever, invisible to every reconcile. `RepoSync` can't fix this; it only ever
 sees repos it was told about. `InstallationSync` has to diff the live repo set and
 cascade-delete the rest. Same completeness and timestamp rules as below: only after a
-fully successful enumeration, and only rows synced before the enumeration started.
+fully successful enumeration, and only rows synced before the enumeration started. And
+the same object-state rule as `RepoSync.reconcile` below: `retain_repos` reports the PR
+keys the cascade removed, and `sync_now` sends `PullRequest.closed` to each, so no
+object keeps serving a snapshot for a repository the App no longer sees.
 
 **Installation lifecycle is not all one event.** Mapping every `installation.*` action to
 "go enumerate GitHub" is wrong, because for half of them the App has just lost the access
@@ -521,9 +526,9 @@ be subscribed to.
   `closed` carries `reconcile_start` and the object stands down when its
   `last_synced_at >= reconcile_start` — the same boundary, applied on the object side.
   `purge()` does the same over everything the installation delete removed, unfenced:
-  the App has lost the installation, so nothing can reopen those.
-  *Not yet covered:* `retain_repos` (a repo leaving the installation) cascades PR rows
-  without retiring their objects.
+  the App has lost the installation, so nothing can reopen those. So does `sync_now`
+  over everything `retain_repos` cascaded when a repository left the installation,
+  also unfenced: the App receives no webhooks for a repository it no longer sees.
 - **`retain_prs` runs only after every page has been fetched successfully.** A listing
   that fails on page 3 of 5 must abort the whole reconcile, not treat two pages as the
   authoritative live set — otherwise a transient API error silently deletes most of a
@@ -761,8 +766,9 @@ pub trait PrStore {
     async fn list_prs(&self, f: &PrFilter, page: Page) -> Result<Vec<PrRecord>>;
     async fn upsert_repo(&self, repo: &RepoRecord) -> Result<()>;
     /// Drop repos (and cascade their PRs) no longer in the installation.
-    /// Same `synced_before` guard as retain_prs, for the same race.
-    async fn retain_repos(&self, installation_id: u64, live: &[u64], synced_before: u64) -> Result<u64>;
+    /// Same `synced_before` guard as retain_prs, for the same race. Returns the
+    /// cascaded PR keys so `sync_now` can retire their object state too.
+    async fn retain_repos(&self, installation_id: u64, live: &[u64], synced_before: u64) -> Result<Vec<PrKey>>;
     /// Drop every repo of a deleted installation and its PRs; returns the PR keys so
     /// `purge()` can retire their object state.
     async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>>;
@@ -880,7 +886,10 @@ group (it probably should).
 
 **`retain_repos` cascades.** With the FK above, deleting a repository row removes its PRs
 in one statement — which is what makes the §2 installation-level reconciliation actually
-enforceable rather than aspirational.
+enforceable rather than aspirational. The cascade is silent, though: a `DELETE FROM
+repositories` cannot `RETURNING` the PR rows it takes with it. To report them, delete the
+stale repositories' PRs first with `RETURNING`, then the repositories, both inside the
+sync's transaction — the same shape `purge_installation` uses.
 
 **Keep `synced_at` separate from `updated_at`.** They answer different questions: one is
 "when did this PR last change on GitHub", the other is "how much do I trust this row".
