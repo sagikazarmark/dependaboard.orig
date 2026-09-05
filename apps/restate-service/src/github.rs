@@ -390,6 +390,38 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_refused_after_the_pull_request_was_verified_is_that_targets_rejection() {
+        // The verify read went through and the merge itself came back 403: the client flags
+        // the refusal as coming from a known resource, and the step journals it as this
+        // target's rejection rather than as a failure worth the batch's attention.
+        let response = GithubErrorResponse {
+            status: 403,
+            message: "Resource not accessible by integration".to_owned(),
+            ..Default::default()
+        };
+
+        let attempt = journal_github_result::<()>(
+            Err(GithubError::Http {
+                response: response.clone(),
+                known_resource: true,
+            }),
+            Operation::Merge,
+            false,
+            1_000,
+        )
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            attempt,
+            Attempt::Settled(Settled::Rejected {
+                reason: RejectReason::Forbidden,
+                response,
+            })
+        );
+    }
+
+    #[test]
     fn a_fatal_response_is_journaled_verbatim() {
         let response = GithubErrorResponse {
             status: 401,

@@ -955,11 +955,19 @@ pub fn classify_github_error(
         (404, _) if known_resource => Classification::Rejected(RejectReason::NotFound),
         (404, _) => Classification::Fatal,
         (403, Operation::Comment) => Classification::Rejected(RejectReason::Forbidden),
+        // The read that verified the target went through with the same credentials, so
+        // GitHub is refusing this write on this pull request (branch protection, a
+        // repository the installation can see but not push to), not the configuration.
+        (401 | 403, Operation::Merge | Operation::UpdateBranch) if known_resource => {
+            Classification::Rejected(RejectReason::Forbidden)
+        }
         (405, Operation::Merge) if message.contains("merge method") => {
             Classification::Rejected(RejectReason::MergeMethodDisallowed)
         }
         (405 | 409 | 422, Operation::Merge) => Classification::Rejected(RejectReason::NotMergeable),
         (422, Operation::UpdateBranch) => Classification::Rejected(RejectReason::NotMergeable),
+        // Refused before anything was read: the credentials or the installation's access
+        // are wrong for every target, not just this one.
         (401 | 403, _) => Classification::Fatal,
         _ => Classification::Fatal,
     }
@@ -1483,5 +1491,44 @@ mod tests {
             classify_github_error(&response, Operation::Read, true, 1_000),
             Classification::Rejected(RejectReason::NotFound)
         );
+    }
+
+    #[test]
+    fn a_write_refused_on_a_pull_request_just_read_is_that_targets_rejection() {
+        // The read that verified the target went through with the same credentials, so
+        // the refusal is about this pull request, not the configuration: one merge
+        // forbidden by branch protection must not fail the other ninety-nine.
+        for status in [401, 403] {
+            let response = GithubErrorResponse {
+                status,
+                message: "Resource not accessible by integration".to_owned(),
+                ..Default::default()
+            };
+            for operation in [Operation::Merge, Operation::UpdateBranch] {
+                assert_eq!(
+                    classify_github_error(&response, operation, true, 1_000),
+                    Classification::Rejected(RejectReason::Forbidden),
+                    "{status} on {operation} of a known pull request"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_write_refused_before_anything_was_read_is_a_configuration_failure() {
+        for status in [401, 403] {
+            let response = GithubErrorResponse {
+                status,
+                message: "Bad credentials".to_owned(),
+                ..Default::default()
+            };
+            for operation in [Operation::Merge, Operation::UpdateBranch, Operation::Read] {
+                assert_eq!(
+                    classify_github_error(&response, operation, false, 1_000),
+                    Classification::Fatal,
+                    "{status} on {operation} with nothing verified"
+                );
+            }
+        }
     }
 }
