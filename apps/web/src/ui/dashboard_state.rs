@@ -40,6 +40,16 @@ impl<T: Clone> Remote<T> {
             _ => None,
         }
     }
+
+    /// The same answer with `f` applied to what was loaded; still loading, or
+    /// failed, is passed on as it is.
+    pub(crate) fn map<U>(&self, f: impl FnOnce(&T) -> U) -> Remote<U> {
+        match self {
+            Self::Loading => Remote::Loading,
+            Self::Failed(error) => Remote::Failed(error.clone()),
+            Self::Loaded(answer) => Remote::Loaded(f(answer)),
+        }
+    }
 }
 
 /// The rows for the filter and cursor in force.
@@ -341,6 +351,24 @@ impl DashboardState {
         if *self.selected.peek() != Selection::default() {
             self.selected.set(Selection::default());
         }
+    }
+
+    /// Takes `rows` out of the selection and leaves the rest standing. The
+    /// rows a bulk action is queued with leave this way, whether that is the
+    /// whole selection from the bar or the one pull request open in the
+    /// drawer. Taking a row out edits the selection as
+    /// [`Self::toggle_selected`] does, so the cap note goes with it.
+    pub(crate) fn deselect(&mut self, rows: &[PrRecord]) {
+        let picked = self.selected.peek();
+        if !rows.iter().any(|row| picked.rows.contains_key(&row.id)) {
+            return;
+        }
+        drop(picked);
+        let mut selected = self.selected.write();
+        for row in rows {
+            selected.rows.remove(&row.id);
+        }
+        selected.capped_from = None;
     }
 
     /// The selected rows, newest update first as the table lists them. A row
@@ -676,6 +704,51 @@ mod tests {
                 None,
                 "every matching row fit, so nothing was cut short"
             );
+        });
+    }
+
+    /// A bulk action's rows leave the selection when it is queued, and only
+    /// they do: one pull request merged from its drawer leaves the rest of
+    /// the selection standing. A row that was never selected is nothing to
+    /// take out. Like any other edit, it forgets that the selection was the
+    /// first so many matching.
+    #[test]
+    fn deselecting_takes_out_only_the_rows_named_and_forgets_the_cap_note() {
+        let (dom, mut state) = mount();
+
+        dom.in_runtime(|| {
+            state.toggle_selected(serde_row());
+            state.toggle_selected(off_page_row());
+            assert_eq!(state.selected_count(), 3);
+
+            state.deselect(&[grouped_row()]);
+            assert!(!state.is_selected("7#9"));
+            assert!(state.is_selected("8#12"));
+            assert!(state.is_selected("8#13"));
+            assert_eq!(state.selected_count(), 2);
+
+            state.deselect(&[grouped_row()]);
+            assert_eq!(state.selected_count(), 2, "nothing to take out");
+
+            state.select_matching(
+                PrFilter::default(),
+                DashboardPage {
+                    rows: vec![serde_row(), off_page_row()],
+                    total: 52,
+                    next_cursor: Some("more".to_owned()),
+                },
+            );
+            assert_eq!(state.capped_from(), Some(52));
+            state.deselect(&[serde_row()]);
+            assert_eq!(state.selected_count(), 1);
+            assert_eq!(
+                state.capped_from(),
+                None,
+                "a selection with a row taken out is no longer the first so many matching"
+            );
+
+            state.deselect(&[off_page_row()]);
+            assert_eq!(state.selected_count(), 0);
         });
     }
 

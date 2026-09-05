@@ -9,6 +9,7 @@ use crate::components::alert_dialog::{
     AlertDialog, AlertDialogAction, AlertDialogActions, AlertDialogCancel, AlertDialogDescription,
     AlertDialogDescriptionAppearance, AlertDialogTitle, AlertDialogTitleAppearance,
 };
+use crate::ui::dashboard_state::Remote;
 use crate::ui::format::{pull_requests, repositories as repository_phrase};
 use crate::ui::{PendingAction, repository_count};
 
@@ -21,13 +22,16 @@ use crate::ui::{PendingAction, repository_count};
 /// for a merge, how many are not green, since the check status on the
 /// dashboard is the read model's last word and not a gate.
 ///
-/// `repositories` is the dashboard's repository list, consulted for a merge
-/// so the dialog can name the repositories that disallow the configured
-/// merge method and the method each will use instead.
+/// `repositories` is the dashboard's repository list as the summary has it,
+/// consulted for a merge so the dialog can name the repositories that
+/// disallow the configured merge method and the method each will use
+/// instead. Until the list is in hand — still being read, or failed — the
+/// dialog cannot say which method a merge would use, and withholds the
+/// confirm rather than claim the configured one everywhere.
 #[component]
 pub(crate) fn ConfirmModal(
     pending: Option<PendingAction>,
-    repositories: Vec<RepoRecord>,
+    repositories: Remote<Vec<RepoRecord>>,
     oncancel: EventHandler<()>,
     onconfirm: EventHandler<PendingAction>,
 ) -> Element {
@@ -47,7 +51,7 @@ pub(crate) fn ConfirmModal(
                     let count = pull_requests(pending.rows.len() as u64);
                     let span = repository_phrase(repository_count(&pending.rows));
                     let not_green = not_green_count(&pending.rows);
-                    let overrides = merge_method_overrides(&pending.rows, &repositories);
+                    let withheld = action == BulkActionKind::Merge && repositories.loaded().is_none();
                     rsx! {
                         span { class: "eyebrow", "Durable bulk action" }
                         AlertDialogTitle { appearance: AlertDialogTitleAppearance::None,
@@ -64,23 +68,7 @@ pub(crate) fn ConfirmModal(
                                         " The check status here is the read model's last word, not a gate: unless branch protection requires the checks, GitHub merges them as they are."
                                     }
                                 }
-                                if overrides.is_empty() {
-                                    div { class: "notice", "Uses the configured merge method." }
-                                } else {
-                                    div { class: "notice",
-                                        "Uses the configured merge method where the repository allows it."
-                                        ul { class: "merge-method-overrides",
-                                            for (repository, method) in overrides {
-                                                li { key: "{repository}",
-                                                    code { "{repository}" }
-                                                    " disallows it and will use "
-                                                    code { "{method}" }
-                                                    "."
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                                MergeMethodNotice { rows: pending.rows.clone(), repositories: repositories.clone() }
                             },
                             BulkActionKind::Rebase => rsx! {
                                 div { class: "notice", "Rebase is requested by an idempotent @dependabot comment using the configured user token." }
@@ -95,8 +83,52 @@ pub(crate) fn ConfirmModal(
                             AlertDialogCancel { class: "btn-ghost btn-sm", "Cancel" }
                             AlertDialogAction {
                                 class: "btn-sm confirm-button",
+                                disabled: withheld,
                                 on_click: move |_| onconfirm.call(pending.clone()),
                                 "Queue {action}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What a merge of `rows` says about merge methods: which repositories will
+/// not use the configured one, or why that cannot be said yet.
+#[component]
+fn MergeMethodNotice(rows: Vec<PrRecord>, repositories: Remote<Vec<RepoRecord>>) -> Element {
+    match &repositories {
+        Remote::Loading => rsx! {
+            div { class: "notice",
+                "The merge method each repository allows is still being read; the merge can be queued once it is known."
+            }
+        },
+        Remote::Failed(error) => rsx! {
+            div { class: "notice merge-methods-unknown",
+                strong { "The merge method each repository allows could not be read." }
+                " "
+                code { "{error}" }
+                " Retry it from the sidebar before merging: without it, the dialog cannot say which method each repository would use."
+            }
+        },
+        Remote::Loaded(repositories) => {
+            let overrides = merge_method_overrides(&rows, repositories);
+            rsx! {
+                if overrides.is_empty() {
+                    div { class: "notice", "Uses the configured merge method." }
+                } else {
+                    div { class: "notice",
+                        "Uses the configured merge method where the repository allows it."
+                        ul { class: "merge-method-overrides",
+                            for (repository, method) in overrides {
+                                li { key: "{repository}",
+                                    code { "{repository}" }
+                                    " disallows it and will use "
+                                    code { "{method}" }
+                                    "."
+                                }
                             }
                         }
                     }
@@ -152,6 +184,7 @@ mod tests {
     use dependaboard_core::{CheckStatus, MergeMethod, PrRecord, RepoRecord};
 
     use super::*;
+    use crate::ui::dashboard_state::Remote;
     use crate::ui::test_support::grouped_row;
 
     fn repository(id: u64, repo: &str, merge_method: Option<MergeMethod>) -> RepoRecord {
@@ -179,11 +212,19 @@ mod tests {
         rows: Vec<PrRecord>,
         repositories: Vec<RepoRecord>,
     ) -> String {
+        render_with(action, rows, Remote::Loaded(repositories))
+    }
+
+    fn render_with(
+        action: BulkActionKind,
+        rows: Vec<PrRecord>,
+        repositories: Remote<Vec<RepoRecord>>,
+    ) -> String {
         #[component]
         fn Fixture(
             action: BulkActionKind,
             rows: Vec<PrRecord>,
-            repositories: Vec<RepoRecord>,
+            repositories: Remote<Vec<RepoRecord>>,
         ) -> Element {
             rsx! {
                 ConfirmModal {
@@ -207,6 +248,67 @@ mod tests {
         // after the first render, so one more pass is what puts it in the DOM.
         dom.render_immediate_to_vec();
         dioxus::ssr::render(&dom)
+    }
+
+    /// Which merge method each repository will use is read off the summary.
+    /// Until that is in hand — still being read, or failed — the dialog
+    /// cannot say, and rather than claim every repository uses the configured
+    /// method, it says why it cannot and withholds the confirm. A rebase or
+    /// branch update has no merge method to speak of and goes ahead.
+    #[test]
+    fn a_merge_is_withheld_with_its_reason_while_the_merge_methods_are_unknown() {
+        let web = repository(8, "web", Some(MergeMethod::Merge));
+
+        let loading = render_with(
+            BulkActionKind::Merge,
+            vec![row_in(&web, 2)],
+            Remote::Loading,
+        );
+        assert!(
+            loading.contains("merge method each repository allows is still being read"),
+            "{loading}"
+        );
+        assert_eq!(
+            loading.matches("disabled=true").count(),
+            1,
+            "the confirm alone is withheld: {loading}"
+        );
+        assert!(
+            !loading.contains("Uses the configured merge method"),
+            "{loading}"
+        );
+
+        let failed = render_with(
+            BulkActionKind::Merge,
+            vec![row_in(&web, 2)],
+            Remote::Failed("the store is away".to_owned()),
+        );
+        assert!(
+            failed.contains("merge method each repository allows could not be read"),
+            "{failed}"
+        );
+        assert!(
+            failed.contains("<code>the store is away</code>"),
+            "{failed}"
+        );
+        assert!(failed.contains("Retry it from the sidebar"), "{failed}");
+        assert_eq!(
+            failed.matches("disabled=true").count(),
+            1,
+            "the confirm alone is withheld: {failed}"
+        );
+        assert!(
+            !failed.contains("Uses the configured merge method"),
+            "{failed}"
+        );
+
+        let rebase = render_with(
+            BulkActionKind::Rebase,
+            vec![row_in(&web, 2)],
+            Remote::Failed("the store is away".to_owned()),
+        );
+        assert!(!rebase.contains("disabled"), "{rebase}");
+        assert!(!rebase.contains("merge method"), "{rebase}");
     }
 
     #[test]

@@ -886,6 +886,19 @@ code,
   white-space: normal;
 }
 
+/* The sidebar's reading and failed states stand where the facets would,
+   sized to the sidebar rather than to the table. */
+.sidebar-state {
+  min-height: 160px;
+  padding: 24px 14px;
+  font-size: 11px;
+  text-align: center;
+}
+
+.sidebar-state strong {
+  font-size: 12px;
+}
+
 .load-more {
   display: flex;
   justify-content: center;
@@ -1142,6 +1155,17 @@ code,
   line-height: 1.5;
 }
 
+/* The drawer's word that its pull request has left the read model. */
+.drawer-gone {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border-left: 2px solid var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 8%, transparent);
+  color: var(--color-warning);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
 .dependency-list {
   border-top: 1px solid var(--line-soft);
 }
@@ -1228,8 +1252,14 @@ code,
   margin-top: 8px;
 }
 
-.notice.not-green strong {
+.notice.not-green strong,
+.notice.merge-methods-unknown strong {
   color: var(--color-warning);
+}
+
+.notice.merge-methods-unknown code {
+  color: var(--color-error);
+  white-space: normal;
 }
 
 .merge-method-overrides {

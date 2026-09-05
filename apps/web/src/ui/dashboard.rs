@@ -119,20 +119,20 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
 
         ConfirmModal {
             pending: pending(),
-            repositories: summary
-                .loaded()
-                .map(|summary| {
-                    summary
-                        .facets
-                        .repositories
-                        .iter()
-                        .map(|facet| facet.repository.clone())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            repositories: (*summary).map(|summary| {
+                summary
+                    .facets
+                    .repositories
+                    .iter()
+                    .map(|facet| facet.repository.clone())
+                    .collect()
+            }),
             oncancel: move |_| pending.set(None),
-            onconfirm: move |action| {
-                state.clear_selection();
+            onconfirm: move |action: PendingAction| {
+                // The rows queued leave the selection; the rest of it stands,
+                // so one pull request merged from its drawer does not drop
+                // the twenty picked for the next batch.
+                state.deselect(&action.rows);
                 queue_batch(
                     action,
                     BatchHost {
