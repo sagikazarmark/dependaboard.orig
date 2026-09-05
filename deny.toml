@@ -1,6 +1,37 @@
 [graph]
 all-features = true
 
+[advisories]
+# An ignore that no longer matches anything is an error, not a warning: when the
+# dependency that pinned a vulnerable crate moves on, the entry below must go with
+# it, or the list stops telling the truth about what is knowingly carried.
+unused-ignored-advisory = "deny"
+ignore = [
+  # libsql 0.9 (and 0.10.0-pre.4 alike) depends on hyper 0.14 with hyper-rustls
+  # 0.25, which pins h2 0.3, rustls 0.22, rustls-webpki 0.102, and
+  # rustls-native-certs 0.7 with rustls-pemfile. Every fix below lives in the
+  # hyper 1 / rustls 0.23 line, which nothing but libsql can adopt for us. All of
+  # it serves one purpose: the store's outbound client connection to the libSQL
+  # remote the operator configured. There is no server here accepting untrusted
+  # peers over these crates, and no certificate chain to validate but the
+  # operator's own database endpoint. Drop these the day libsql moves.
+  { id = "RUSTSEC-2026-0258", reason = "h2 0.3 empty DATA frames: a peer-driven DoS; the only peer is the configured libSQL remote. Fixed in h2 0.4, which needs hyper 1; pinned by libsql." },
+  { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 CRL distribution-point matching; no CRLs are configured. Fixed in 0.103, which needs rustls 0.23; pinned by libsql." },
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 URI name constraints; the only chain validated is the configured libSQL remote's. Fixed in 0.103; pinned by libsql." },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 wildcard name constraints; the only chain validated is the configured libSQL remote's. Fixed in 0.103; pinned by libsql." },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 panic parsing a CRL; no CRLs are configured. Fixed in 0.103; pinned by libsql." },
+  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is unmaintained, succeeded by rustls-pki-types' PEM support in the rustls 0.23 line; pinned by libsql through rustls-native-certs 0.7." },
+
+  # rsa signs the GitHub App JWT (RS256, through jsonwebtoken's rust_crypto
+  # backend) and is pulled a second time by restate-sdk-shared-core, so switching
+  # our own jsonwebtoken to aws-lc-rs would not remove it. No fixed version
+  # exists. The attack recovers a private key by timing many private-key
+  # operations over attacker-chosen input; the only private-key operation here
+  # signs a JWT the service composes itself, on its own token-refresh schedule,
+  # with nothing external choosing the input or observing the timing.
+  { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing side channel; no fix exists. The key only signs the App JWT the service builds itself; no external party chooses the input or observes the timing." },
+]
+
 [licenses]
 allow = [
   "Apache-2.0",
@@ -11,11 +42,18 @@ allow = [
   "ISC",
   "CDLA-Permissive-2.0",
   "CC0-1.0",
+  # const_format, konst, foldhash, slotmap
+  "Zlib",
+  # xxhash-rust
+  "BSL-1.0",
 ]
 
 [bans]
 multiple-versions = "warn"
 wildcards = "warn"
+# The workspace crates depend on each other by path alone. cargo-deny stops
+# calling those wildcards once the depending crate is marked `publish = false`.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

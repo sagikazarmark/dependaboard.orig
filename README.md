@@ -487,6 +487,7 @@ cargo test -p dependaboard-core --all-features
 cargo test -p dependaboard-web --features server --no-default-features
 cargo check -p dependaboard-web --target wasm32-unknown-unknown
 cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check
 npm run css:build
 docker compose config --quiet
 dx build --package dependaboard-web --platform web
