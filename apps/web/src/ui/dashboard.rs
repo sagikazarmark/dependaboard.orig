@@ -1,9 +1,11 @@
 //! The dashboard page: filters, the pull request table, selection, and the
-//! bulk-action flow from confirmation through progress.
+//! bulk-action flow from confirmation through progress. The filter, cursor,
+//! and open pull request live in the URL as well, so a view can be shared and
+//! survives a refresh.
 
 use std::collections::BTreeSet;
 
-use dependaboard_core::{BatchProgress, Page, PrFilter, PrRecord};
+use dependaboard_core::{BatchProgress, Page, PrRecord};
 use dioxus::prelude::*;
 
 use crate::api::load_dashboard;
@@ -12,25 +14,33 @@ use crate::ui::action_bar::ActionBar;
 use crate::ui::active_batch::{ActiveBatch, queue_batch};
 use crate::ui::confirm_modal::ConfirmModal;
 use crate::ui::dashboard_state::{DashboardState, PageStatus};
-use crate::ui::detail_drawer::OpenDetail;
+use crate::ui::detail_drawer::{OpenDetail, OpenPr};
 use crate::ui::pr_table::PrTable;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::status_bar::StatusBar;
 use crate::ui::top_bar::TopBar;
+use crate::ui::url_state::UrlState;
+use crate::ui::url_sync::{use_url_state, use_url_sync};
 use crate::ui::{PendingAction, sticky};
 
 /// The page. It owns the state the components share, loads the read model
 /// for the filter and cursor in force, and holds what is open over the page:
 /// the pull request drawer, the bulk action awaiting confirmation, and the
-/// batch being followed.
+/// batch being followed. It opens on the state its URL names and keeps the
+/// URL in step from then on.
 #[component]
 pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     let toast = use_toast();
     let aside_open = use_signal(|| true);
-    let filter = use_signal(PrFilter::default);
-    let cursor = use_signal(|| None::<String>);
+    let UrlState {
+        filter: initial_filter,
+        cursor: initial_cursor,
+        pr: initial_pr,
+    } = use_url_state();
+    let filter = use_signal(|| initial_filter);
+    let cursor = use_signal(|| initial_cursor);
     let selected = use_signal(BTreeSet::<String>::new);
-    let mut detail = use_signal(|| None::<PrRecord>);
+    let mut detail = use_signal(|| initial_pr.map(OpenPr::Loading));
     let mut pending = use_signal(|| None::<PendingAction>);
     let active_batch = use_signal(|| None::<BatchProgress>);
     let progress_open = use_signal(|| false);
@@ -46,6 +56,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     let page = use_memo(move || PageStatus::from_resource(dashboard.read().as_ref()));
     let reload = use_callback(move |()| dashboard.restart());
     let mut state = DashboardState::provide(filter, cursor, selected, page, reload);
+    use_url_sync(state, detail);
     let page = page.read();
 
     rsx! {
@@ -53,7 +64,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
 
         div { class: "workspace",
             Sidebar { open: aside_open }
-            PrTable { onopen: move |row: PrRecord| detail.set(Some(row)) }
+            PrTable { onopen: move |row: PrRecord| detail.set(Some(row.into())) }
         }
 
         StatusBar {}
@@ -65,7 +76,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
             onaction: move |action| pending.set(Some(action)),
             onsync: move |result: Result<Option<PrRecord>, String>| match result {
                 Ok(Some(row)) => {
-                    detail.set(Some(row));
+                    detail.set(Some(row.into()));
                     toast.success("Pull request synced".to_owned(), ToastOptions::new());
                     reload.call(());
                 }

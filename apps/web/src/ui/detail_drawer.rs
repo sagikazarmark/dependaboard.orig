@@ -1,9 +1,11 @@
 //! The drawer for one pull request: its projection, durable state, and the
-//! per-row rebase, merge, and sync actions.
+//! per-row rebase, merge, and sync actions. A pull request a link names by
+//! key alone has its row read here before the drawer opens.
 
 use std::time::Duration;
 
-use dependaboard_core::{BulkActionKind, PrRecord, PrState, unix_seconds};
+use dependaboard_core::{BulkActionKind, PrKey, PrRecord, PrState, unix_seconds};
+use dioxus::logger::tracing;
 use dioxus::prelude::*;
 
 use crate::api::{load_pr_projection, load_pr_status, request_pr_sync};
@@ -20,22 +22,71 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 /// [`SYNC_TIMEOUT`] in polls.
 const SYNC_POLLS: u64 = SYNC_TIMEOUT.as_secs() / POLL_INTERVAL.as_secs();
 
+/// The pull request whose drawer is open. A row the user clicked is in hand
+/// at once; a link names the pull request by key alone, and the drawer waits
+/// for its row to be read.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum OpenPr {
+    Loading(PrKey),
+    Loaded(Box<PrRecord>),
+}
+
+impl OpenPr {
+    pub(crate) fn key(&self) -> PrKey {
+        match self {
+            Self::Loading(key) => key.clone(),
+            Self::Loaded(row) => row.key(),
+        }
+    }
+}
+
+impl From<PrRecord> for OpenPr {
+    fn from(row: PrRecord) -> Self {
+        Self::Loaded(Box::new(row))
+    }
+}
+
 /// The drawer for the pull request in `detail`, if one is open. The drawer is
 /// keyed by the pull request, so opening another one mounts a fresh drawer,
 /// which reads that pull request's durable state; the key is honoured because
 /// the drawer sits in an `if` body, which Dioxus diffs as a keyed list.
+///
+/// A pull request still [`OpenPr::Loading`] has its row read here. The drawer
+/// opens once the row is in hand; if the pull request has gone since the link
+/// was made, or cannot be read, nothing opens.
 #[component]
 pub(crate) fn OpenDetail(
-    mut detail: Signal<Option<PrRecord>>,
+    mut detail: Signal<Option<OpenPr>>,
     onaction: EventHandler<PendingAction>,
     onsync: EventHandler<Result<Option<PrRecord>, String>>,
 ) -> Element {
+    use_effect(move || {
+        let Some(OpenPr::Loading(key)) = &*detail.read() else {
+            return;
+        };
+        let key = key.clone();
+        spawn(async move {
+            let row = load_pr_projection(key.repository_id, key.number).await;
+            // The user may have opened another pull request, or moved on,
+            // while the row was in flight; then it is not theirs to see.
+            if *detail.peek() != Some(OpenPr::Loading(key.clone())) {
+                return;
+            }
+            detail.set(match row {
+                Ok(row) => row.map(OpenPr::from),
+                Err(error) => {
+                    tracing::warn!(%error, %key, "the linked pull request could not be read");
+                    None
+                }
+            });
+        });
+    });
     let open = detail.read();
     rsx! {
-        if let Some(row) = &*open {
+        if let Some(OpenPr::Loaded(row)) = &*open {
             DetailDrawer {
                 key: "{row.id}",
-                row: row.clone(),
+                row: (**row).clone(),
                 onclose: move |_| detail.set(None),
                 onaction,
                 onsync,
@@ -311,7 +362,7 @@ mod tests {
         assert_eq!(closed, "", "{closed}");
 
         fn Open() -> Element {
-            let detail = use_signal(|| Some(grouped_row()));
+            let detail = use_signal(|| Some(OpenPr::from(grouped_row())));
             rsx! {
                 OpenDetail { detail, onaction: move |_| {}, onsync: move |_| {} }
             }
@@ -331,7 +382,7 @@ mod tests {
     #[test]
     fn opening_another_pull_request_mounts_a_fresh_drawer() {
         fn Fixture() -> Element {
-            let detail = use_context_provider(|| Signal::new(Some(grouped_row())));
+            let detail = use_context_provider(|| Signal::new(Some(OpenPr::from(grouped_row()))));
             rsx! {
                 OpenDetail { detail, onaction: move |_| {}, onsync: move |_| {} }
             }
@@ -347,10 +398,10 @@ mod tests {
             })
             .expect("the drawer was mounted");
         let mut detail = dom
-            .in_runtime(|| consume_context_from_scope::<Signal<Option<PrRecord>>>(ScopeId::APP))
+            .in_runtime(|| consume_context_from_scope::<Signal<Option<OpenPr>>>(ScopeId::APP))
             .expect("the fixture provides the open pull request");
 
-        dom.in_runtime(|| detail.set(Some(serde_row())));
+        dom.in_runtime(|| detail.set(Some(OpenPr::from(serde_row()))));
         let mutations = dom.render_immediate_to_vec();
 
         let scrim_left = mutations.edits.iter().any(|edit| {

@@ -963,6 +963,7 @@ dependencies = [
  "dependaboard-store",
  "dioxus",
  "dioxus-primitives",
+ "form_urlencoded",
  "gloo-timers",
  "octoevents",
  "reqwest 0.13.4",

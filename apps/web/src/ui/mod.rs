@@ -20,6 +20,8 @@ mod status_bar;
 #[cfg(all(test, feature = "server"))]
 mod test_support;
 mod top_bar;
+mod url_state;
+mod url_sync;
 
 use std::time::Duration;
 

@@ -9,6 +9,9 @@ license.workspace = true
 dependaboard-core = { path = "../../crates/core" }
 dioxus = { workspace = true }
 dioxus-primitives = { workspace = true }
+# Already in the browser bundle through dioxus-fullstack; used for the
+# dashboard's query string.
+form_urlencoded = "1.2.2"
 serde.workspace = true
 uuid.workspace = true
 

@@ -82,12 +82,34 @@ impl DashboardState {
         self.filter.read()
     }
 
+    /// The cursor of the page in force; `None` is the first page.
+    pub(crate) fn cursor(&self) -> ReadableRef<'_, Signal<Option<String>>> {
+        self.cursor.read()
+    }
+
     /// Applies `change` to the filter, restarts paging, and drops the
     /// selection, which belonged to the rows the old filter showed.
     pub(crate) fn update_filter(&mut self, change: impl FnOnce(&mut PrFilter)) {
         change(&mut self.filter.write());
         self.cursor.set(None);
         self.selected.write().clear();
+    }
+
+    /// Moves to `filter` and `cursor` together, as the browser's back and
+    /// forward do, dropping the selection, which was made on the page being
+    /// left. The cursor is kept as given: it belongs to `filter`'s paging.
+    /// Only what differs is written, so landing where the dashboard already
+    /// is does not ask the read model again.
+    pub(crate) fn navigate(&mut self, filter: PrFilter, cursor: Option<String>) {
+        if *self.filter.peek() != filter {
+            self.filter.set(filter);
+        }
+        if *self.cursor.peek() != cursor {
+            self.cursor.set(cursor);
+        }
+        if !self.selected.peek().is_empty() {
+            self.selected.write().clear();
+        }
     }
 
     /// Adds `value` to the facet `facet` selects, or removes it if it is
@@ -202,13 +224,10 @@ mod tests {
 
     /// A dashboard state on the app scope: the fixture page loaded, on its
     /// second page, with one row selected, so the tests can see both reset.
-    /// The cursor signal is provided alongside, since the state itself only
-    /// lets the cursor be moved, not read.
     fn Fixture() -> Element {
-        let cursor = use_context_provider(|| Signal::new(Some("page-2".to_owned())));
         DashboardState::provide(
             use_signal(PrFilter::default),
-            cursor,
+            use_signal(|| Some("page-2".to_owned())),
             use_signal(|| BTreeSet::from(["7#9".to_owned()])),
             use_signal(|| PageStatus::Loaded(loaded_page())),
             use_callback(|_| {}),
@@ -216,62 +235,55 @@ mod tests {
         rsx! {}
     }
 
-    fn mount() -> (VirtualDom, DashboardState, Signal<Option<String>>) {
+    fn mount() -> (VirtualDom, DashboardState) {
         let mut dom = VirtualDom::new(Fixture);
         dom.rebuild_in_place();
-        let (state, cursor) = dom.in_runtime(|| {
-            (
-                consume_context_from_scope::<DashboardState>(ScopeId::APP),
-                consume_context_from_scope::<Signal<Option<String>>>(ScopeId::APP),
-            )
-        });
-        (
-            dom,
-            state.expect("the fixture provides the dashboard state"),
-            cursor.expect("the fixture provides the cursor"),
-        )
+        let state = dom
+            .in_runtime(|| consume_context_from_scope::<DashboardState>(ScopeId::APP))
+            .expect("the fixture provides the dashboard state");
+        (dom, state)
     }
 
     #[test]
     fn toggling_a_facet_adds_it_then_removes_it_restarting_paging_each_time() {
-        let (dom, mut state, cursor) = mount();
+        let (dom, mut state) = mount();
 
         dom.in_runtime(|| {
             state.toggle_filter(|filter| &mut filter.check_statuses, CheckStatus::Failure);
             assert_eq!(state.filter().check_statuses, vec![CheckStatus::Failure]);
-            assert_eq!(*cursor.read(), None);
+            assert_eq!(*state.cursor(), None);
             assert_eq!(state.selected_count(), 0);
 
             state.load_next("page-2".to_owned());
             state.toggle_filter(|filter| &mut filter.check_statuses, CheckStatus::Failure);
             assert!(state.filter().check_statuses.is_empty());
-            assert_eq!(*cursor.read(), None);
+            assert_eq!(*state.cursor(), None);
         });
     }
 
     #[test]
     fn changing_or_clearing_the_filter_restarts_paging_and_drops_the_selection() {
-        let (dom, mut state, cursor) = mount();
+        let (dom, mut state) = mount();
 
         dom.in_runtime(|| {
             state.update_filter(|filter| filter.needs_attention = true);
             assert!(state.filter().needs_attention);
-            assert_eq!(*cursor.read(), None);
+            assert_eq!(*state.cursor(), None);
             assert_eq!(state.selected_count(), 0);
 
             state.load_next("page-2".to_owned());
             state.toggle_selected("7#9".to_owned());
-            assert_eq!(*cursor.read(), Some("page-2".to_owned()));
+            assert_eq!(*state.cursor(), Some("page-2".to_owned()));
             state.clear_filters();
             assert_eq!(*state.filter(), PrFilter::default());
-            assert_eq!(*cursor.read(), None);
+            assert_eq!(*state.cursor(), None);
             assert_eq!(state.selected_count(), 0);
         });
     }
 
     #[test]
     fn a_row_toggles_in_and_out_of_the_selection() {
-        let (dom, mut state, _) = mount();
+        let (dom, mut state) = mount();
 
         dom.in_runtime(|| {
             assert!(state.is_selected("7#9"));
@@ -283,11 +295,36 @@ mod tests {
         });
     }
 
+    /// Back and forward land on a filter and a cursor together: the cursor
+    /// belongs to that filter's paging, so it is kept rather than reset, and
+    /// the selection, made on the page being left, is dropped.
+    #[test]
+    fn navigating_sets_the_filter_and_cursor_together_and_drops_the_selection() {
+        let (dom, mut state) = mount();
+
+        dom.in_runtime(|| {
+            let filter = PrFilter {
+                check_statuses: vec![CheckStatus::Failure],
+                ..PrFilter::default()
+            };
+            state.navigate(filter.clone(), Some("page-3".to_owned()));
+            assert_eq!(*state.filter(), filter);
+            assert_eq!(*state.cursor(), Some("page-3".to_owned()));
+            assert_eq!(state.selected_count(), 0);
+
+            state.toggle_selected("7#9".to_owned());
+            state.navigate(PrFilter::default(), None);
+            assert_eq!(*state.filter(), PrFilter::default());
+            assert_eq!(*state.cursor(), None);
+            assert_eq!(state.selected_count(), 0);
+        });
+    }
+
     /// With some of the page selected, "visible" selects the rest; only once
     /// every row is selected does it deselect them all.
     #[test]
     fn toggling_the_visible_rows_selects_them_all_before_it_clears_them() {
-        let (dom, mut state, _) = mount();
+        let (dom, mut state) = mount();
 
         dom.in_runtime(|| {
             assert!(!state.all_visible_selected());
@@ -305,7 +342,7 @@ mod tests {
     /// a selected id the page no longer shows is not a target.
     #[test]
     fn the_targets_are_the_selected_rows_the_page_still_shows() {
-        let (dom, mut state, _) = mount();
+        let (dom, mut state) = mount();
 
         dom.in_runtime(|| {
             state.toggle_selected("8#12".to_owned());

@@ -23,9 +23,9 @@ bytes = "1.10.1"
 chrono = { version = "0.4.41", default-features = false, features = ["clock", "serde"] }
 dioxus = { version = "0.7.10", features = ["fullstack"] }
 # Pinned to the revision the dioxus-daisyui-components registry installs against.
-# The default `router` feature is off: the app has no routes, and it is the only
-# thing that pulls dioxus-router into the browser bundle. Re-enable it if the
-# URL-state work (#33) adopts the router instead of driving history directly.
+# The default `router` feature is off: the app has no routes — the dashboard
+# drives the browser history directly (apps/web/src/ui/url_sync.rs) — and it is
+# the only thing that pulls dioxus-router into the browser bundle.
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", rev = "bf007c15d0cf4d04d3181cc46cf12325aa773955", version = "0.0.1", default-features = false }
 http = "1.3.1"
 jsonwebtoken = { version = "10.1.0", features = ["rust_crypto"] }
