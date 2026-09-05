@@ -394,6 +394,12 @@ The read model changes behind the dashboard's back — webhooks land, the hourly
 
 The global **Sync** button is one-way — Restate takes the request and the sweep runs on its own — so the glyph spins from the click until the rows reload, which the poll brings about within a second of the sweep's first write. The poll runs every second while a sync is being followed and gives up after a minute, reloading once, if nothing reaches the store.
 
+### Selection and the batch limit
+
+A row's box selects it; the box in the table header selects or clears every row on the page, and shows a mixed mark while only some are selected. **Select all N matching** in the result bar selects everything the filter matches, pages beyond the current one included: the server resolves the filter to its newest rows, up to the batch limit of 100 pull requests, and returns the total alongside, so when a filter matches more than one batch takes, the action bar says how many it took and why. The selection belongs to the filter, not the page: **Load next** and the browser's back and forward keep it, changing a filter drops it. A selection that outgrows the limit — rows picked one by one on later pages can do that — has its actions withheld until it is trimmed, rather than being refused by the server after confirmation.
+
+The confirmation dialog counts the pull requests and the repositories they span for every action. For a merge it also counts the rows whose last known check rollup is not green, and says that the count is the read model's last word, not a gate: the dashboard does not re-verify checks before merging (see `spec.md`), so required checks are enforced by branch protection or not at all.
+
 ### Restate ingress visibility
 
 Every Restate handler is reachable through the ingress unless marked private, and `BulkAction.run` can merge pull requests, so only the entry points the web app and the bootstrap need are public. Everything else is `ingress_private`, reachable only from another handler.

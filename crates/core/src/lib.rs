@@ -13,7 +13,13 @@ pub use dependabot_metadata::parse_dependabot_metadata;
 pub const DEPENDABOT_LOGIN: &str = "dependabot[bot]";
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
 pub const MAX_PAGE_SIZE: u32 = 100;
+/// How many pull requests one bulk action may take. The dashboard resolves
+/// "select all matching" to a page of this size, so it must fit in a page.
 pub const MAX_BATCH_TARGETS: usize = 100;
+const _: () = assert!(
+    MAX_BATCH_TARGETS <= MAX_PAGE_SIZE as usize,
+    "a batch's worth of rows must fit in one page"
+);
 /// How many of the ranked labels the dashboard's label facet shows.
 pub const LABEL_FACET_LIMIT: usize = 8;
 /// How many labels a dashboard row shows before folding the rest into a count.
@@ -176,6 +182,13 @@ pub enum CheckStatus {
 
 impl CheckStatus {
     pub const ALL: [Self; 4] = [Self::Success, Self::Failure, Self::Pending, Self::None];
+
+    /// Whether the rollup passed. The dashboard's "green": a rendering hint
+    /// read from the projection, not an authorization to merge, which only
+    /// branch protection gives.
+    pub fn is_green(self) -> bool {
+        matches!(self, Self::Success)
+    }
 }
 
 impl fmt::Display for CheckStatus {
@@ -1202,6 +1215,20 @@ mod tests {
                 state.is_conflicting(),
                 state == Mergeable::Dirty,
                 "{state:?}"
+            );
+        }
+    }
+
+    /// "Green" is the dashboard's word for a passing rollup. Pending is not
+    /// green yet, and no checks at all is not green either: nothing has
+    /// vouched for the head.
+    #[test]
+    fn only_a_passing_rollup_is_green() {
+        for status in CheckStatus::ALL {
+            assert_eq!(
+                status.is_green(),
+                status == CheckStatus::Success,
+                "{status:?}"
             );
         }
     }

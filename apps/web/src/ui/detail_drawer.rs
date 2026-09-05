@@ -13,7 +13,7 @@ use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
 use crate::ui::side_panel::SidePanel;
-use crate::ui::{POLL_INTERVAL, PendingAction, pr_target, sleep, user_facing};
+use crate::ui::{POLL_INTERVAL, PendingAction, sleep, user_facing};
 
 /// How long the drawer waits for a manual sync to complete before it stops
 /// polling for it.
@@ -117,11 +117,11 @@ pub(crate) fn DetailDrawer(
     let durable_state = DurableStatus::from_resource(status.read().as_ref());
     let sync_repository_id = row.repository_id;
     let sync_number = row.number;
-    let target = pr_target(&row);
+    let subject = row.clone();
     let request = use_callback(move |action: BulkActionKind| {
         onaction.call(PendingAction {
             action,
-            targets: vec![target.clone()],
+            rows: vec![subject.clone()],
         });
     });
     rsx! {

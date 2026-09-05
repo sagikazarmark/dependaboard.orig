@@ -1,35 +1,62 @@
 //! The pull request table: the result bar, the filter chips, the rows for the
-//! page in force, and the way to the next page.
+//! page in force, and the way to the next page. The header's box selects the
+//! page; the result bar's link selects everything the filter matches, pages
+//! beyond this one included.
 
 use dependaboard_core::{DEFAULT_PAGE_SIZE, PrRecord};
 use dioxus::prelude::*;
 
+use crate::api::load_matching;
 use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
+use crate::components::toast::use_toast;
 use crate::ui::dashboard_state::{PageStatus, use_dashboard};
 use crate::ui::filters::{ActiveFilters, filter_count};
-use crate::ui::format::pull_requests;
+use crate::ui::format::{Checkbox, pull_requests};
 use crate::ui::pr_row::PrRow;
+use crate::ui::{sticky, user_facing};
 
 /// The table; `onopen` receives the row whose drawer the user asked for.
 #[component]
 pub(crate) fn PrTable(onopen: EventHandler<PrRecord>) -> Element {
     let mut state = use_dashboard();
+    let toast = use_toast();
+    // Whether "select all matching" is waiting on the read model.
+    let mut selecting = use_signal(|| false);
     let status = state.page.read();
     let page = status.loaded();
     let rows: &[PrRecord] = page.map(|page| page.rows.as_slice()).unwrap_or_default();
     let total = page.map(|page| page.total).unwrap_or_default();
     let active_filter_count = filter_count(&state.filter());
-    let all_visible_selected = state.all_visible_selected();
+    let header_box = Checkbox::of(state.visible_selected_count(), rows.len());
     let now = state.now();
+    let select_matching = move |_| {
+        let filter = state.filter().clone();
+        selecting.set(true);
+        spawn(async move {
+            match load_matching(filter.clone()).await {
+                Ok(matching) => state.select_matching(filter, matching),
+                Err(error) => toast.error(
+                    format!(
+                        "Could not select the matching pull requests: {}",
+                        user_facing(&error)
+                    ),
+                    sticky(),
+                ),
+            }
+            selecting.set(false);
+        });
+    };
     rsx! {
         main { class: "content",
             div { class: "resultbar",
                 span { class: "mono", "{pull_requests(total)}" }
-                button {
-                    disabled: rows.is_empty(),
-                    onclick: move |_| state.toggle_visible(),
-                    if all_visible_selected { "clear visible" } else { "select visible" }
+                if !rows.is_empty() {
+                    button {
+                        disabled: selecting(),
+                        onclick: select_matching,
+                        if selecting() { "selecting..." } else { "select all {total} matching" }
+                    }
                 }
                 span { class: "result-spacer" }
                 span { class: "muted mono desktop-only", "updated recently first" }
@@ -39,7 +66,13 @@ pub(crate) fn PrTable(onopen: EventHandler<PrRecord>) -> Element {
             }
             div { class: "table-scroll",
                 div { class: "pr-grid table-head",
-                    span {}
+                    button {
+                        class: header_box.class(),
+                        aria_label: "select every pull request on this page",
+                        disabled: rows.is_empty(),
+                        onclick: move |_| state.toggle_visible(),
+                        "{header_box.mark()}"
+                    }
                     span { "PR" }
                     span { "Dependency" }
                     span { "Repository" }
@@ -71,7 +104,7 @@ pub(crate) fn PrTable(onopen: EventHandler<PrRecord>) -> Element {
                                 row: row.clone(),
                                 checked: state.is_selected(&row.id),
                                 now,
-                                oncheck: move |id| state.toggle_selected(id),
+                                oncheck: move |row| state.toggle_selected(row),
                                 onopen,
                             }
                         }
@@ -113,18 +146,18 @@ fn EmptyState(filtered: bool) -> Element {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
-    use crate::ui::test_support::{DashboardFixture, loaded_page, render};
+    use crate::ui::test_support::{DashboardFixture, grouped_row, loaded_page, render, serde_row};
 
+    /// With one of the two rows selected, the header's box is mixed, and
+    /// the result bar offers the whole filter, pages beyond this one included.
     #[test]
     fn the_table_lists_the_page_marks_the_selection_and_offers_the_next_page() {
         fn Fixture() -> Element {
             rsx! {
                 DashboardFixture {
                     page: PageStatus::Loaded(loaded_page()),
-                    selected: BTreeSet::from(["8#12".to_owned()]),
+                    selected: vec![serde_row()],
                     PrTable { onopen: move |_| {} }
                 }
             }
@@ -132,7 +165,12 @@ mod tests {
         let html = render(Fixture);
 
         assert!(html.contains("52 pull requests"), "{html}");
-        assert!(html.contains(">select visible</button>"), "{html}");
+        assert!(html.contains(">select all 52 matching</button>"), "{html}");
+        assert_eq!(
+            html.matches(r#"class="selection-box mixed""#).count(),
+            1,
+            "the header's box alone is mixed: {html}"
+        );
         assert_eq!(
             html.matches(r#"class="pr-grid pr-row"#).count(),
             2,
@@ -147,20 +185,43 @@ mod tests {
         assert!(!html.contains("active-filters"), "{html}");
     }
 
+    /// The header's box stands for the page: unchecked while none of its rows
+    /// is selected, checked once every one is.
     #[test]
-    fn selecting_every_visible_row_turns_the_button_into_a_clear() {
-        fn Fixture() -> Element {
+    fn the_header_box_is_checked_once_every_visible_row_is_selected() {
+        fn Unselected() -> Element {
             rsx! {
                 DashboardFixture {
                     page: PageStatus::Loaded(loaded_page()),
-                    selected: BTreeSet::from(["7#9".to_owned(), "8#12".to_owned()]),
                     PrTable { onopen: move |_| {} }
                 }
             }
         }
-        let html = render(Fixture);
+        let none = render(Unselected);
+        assert_eq!(
+            none.matches(r#"class="selection-box""#).count(),
+            3,
+            "the header's box and both rows' are unchecked: {none}"
+        );
+        assert!(!none.contains("selection-box checked"), "{none}");
+        assert!(!none.contains("selection-box mixed"), "{none}");
 
-        assert!(html.contains(">clear visible</button>"), "{html}");
+        fn Selected() -> Element {
+            rsx! {
+                DashboardFixture {
+                    page: PageStatus::Loaded(loaded_page()),
+                    selected: vec![grouped_row(), serde_row()],
+                    PrTable { onopen: move |_| {} }
+                }
+            }
+        }
+        let all = render(Selected);
+        assert_eq!(
+            all.matches(r#"class="selection-box checked""#).count(),
+            3,
+            "the header's box and both rows' are checked: {all}"
+        );
+        assert!(!all.contains("selection-box mixed"), "{all}");
     }
 
     #[test]
@@ -174,6 +235,10 @@ mod tests {
         assert!(loading.contains("Reading the projection"), "{loading}");
         assert!(loading.contains("0 pull requests"), "{loading}");
         assert!(!loading.contains("Load next"), "{loading}");
+        assert!(
+            !loading.contains("select all"),
+            "nothing to select yet: {loading}"
+        );
 
         fn Failed() -> Element {
             rsx! {

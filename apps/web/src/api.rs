@@ -41,6 +41,27 @@ pub(crate) async fn load_summary(filter: PrFilter) -> Result<DashboardSummary, S
         .map_err(store_failure)
 }
 
+/// Every row `filter` matches, as far as one bulk action can take them: the
+/// newest [`MAX_BATCH_TARGETS`], in the table's order, with the total so the
+/// dashboard can say when the limit cut the set short. This is what "select
+/// all matching" resolves to, server side, so the selection need not have
+/// paged through the rows to hold them.
+///
+/// [`MAX_BATCH_TARGETS`]: dependaboard_core::MAX_BATCH_TARGETS
+#[server(state: Extension<ServerState>)]
+pub(crate) async fn load_matching(filter: PrFilter) -> Result<DashboardPage, ServerFnError> {
+    let batch = Page {
+        limit: u32::try_from(dependaboard_core::MAX_BATCH_TARGETS)
+            .expect("the batch limit fits in a page"),
+        after: None,
+    };
+    state
+        .store
+        .list_prs(&filter, batch)
+        .await
+        .map_err(store_failure)
+}
+
 /// The read model's revision: a counter that moves whenever a row changes.
 /// Cheap enough for the dashboard to poll, so it can reload the rows only
 /// when the answer has moved since it last asked.

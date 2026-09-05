@@ -93,7 +93,6 @@ pub(crate) fn use_url_sync(mut state: DashboardState, mut detail: Signal<Option<
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::BTreeSet;
     use std::rc::Rc;
     use std::sync::Arc;
 
@@ -102,7 +101,7 @@ mod tests {
     use dioxus::history::{History, MemoryHistory};
 
     use super::*;
-    use crate::ui::dashboard_state::{PageStatus, SummaryStatus};
+    use crate::ui::dashboard_state::{PageStatus, Selection, SummaryStatus};
     use crate::ui::test_support::{FIXTURE_NOW, grouped_row, loaded_page, loaded_summary};
 
     /// A browser history: in memory, and firing `popstate` — the callback
@@ -174,7 +173,7 @@ mod tests {
         let state = DashboardState::provide(
             use_signal(|| filter),
             use_signal(|| cursor),
-            use_signal(BTreeSet::new),
+            use_signal(Selection::default),
             use_signal(|| PageStatus::Loaded(loaded_page())),
             use_signal(|| SummaryStatus::Loaded(loaded_summary())),
             use_signal(|| FIXTURE_NOW),
@@ -327,7 +326,8 @@ mod tests {
 
     /// Back and forward move the dashboard through the states it has been
     /// in: the filter, the page, and the drawer follow the address bar, and
-    /// the browser is not told about a move it made itself.
+    /// the browser is not told about a move it made itself. The selection
+    /// goes with the filter: back a page keeps it, back a filter drops it.
     #[test]
     fn back_and_forward_move_the_dashboard_through_its_history() {
         let mut mounted = Mounted::at("/");
@@ -336,7 +336,7 @@ mod tests {
         });
         mounted.act(|state, _| state.load_next(cursor()));
         mounted.act(|state, detail| {
-            state.toggle_selected("7#9".to_owned());
+            state.toggle_selected(grouped_row());
             detail.set(Some(OpenPr::from(grouped_row())));
         });
 
@@ -354,13 +354,14 @@ mod tests {
         mounted.settle();
         assert_eq!(mounted.cursor(), None);
         assert_eq!(mounted.filter().check_statuses, vec![CheckStatus::Failure]);
-        assert_eq!(mounted.dom.in_runtime(|| mounted.state.selected_count()), 0);
+        assert_eq!(mounted.dom.in_runtime(|| mounted.state.selected_count()), 1);
 
         mounted.history.go_back();
         mounted.settle();
         assert_eq!(mounted.filter(), PrFilter::default());
         assert_eq!(mounted.route(), "/");
         assert!(!mounted.history.can_go_back());
+        assert_eq!(mounted.dom.in_runtime(|| mounted.state.selected_count()), 0);
 
         mounted.history.go_forward();
         mounted.settle();

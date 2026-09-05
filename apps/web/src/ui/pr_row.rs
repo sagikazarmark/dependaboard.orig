@@ -6,16 +6,16 @@ use dioxus::prelude::*;
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
 
 /// One row; `now` is the dashboard's clock, which the row's age and staleness
-/// are read against.
+/// are read against. `oncheck` receives the row when its box is clicked.
 #[component]
 pub(crate) fn PrRow(
     row: PrRecord,
     checked: bool,
     now: u64,
-    oncheck: EventHandler<String>,
+    oncheck: EventHandler<PrRecord>,
     onopen: EventHandler<PrRecord>,
 ) -> Element {
-    let id = row.id.clone();
+    let picked = row.clone();
     let opened = row.clone();
     let dependency = row
         .dependency
@@ -33,7 +33,7 @@ pub(crate) fn PrRow(
         div { class: row_class, onclick: move |_| onopen.call(opened.clone()),
             button {
                 class: if checked { "selection-box checked" } else { "selection-box" },
-                onclick: move |event| { event.stop_propagation(); oncheck.call(id.clone()); },
+                onclick: move |event| { event.stop_propagation(); oncheck.call(picked.clone()); },
                 if checked { "x" }
             }
             code { class: "pr-number", "#{row.number}" }

@@ -45,6 +45,54 @@ pub(crate) fn pull_requests(count: u64) -> String {
     }
 }
 
+/// `count` as a phrase: "1 repository", "3 repositories".
+pub(crate) fn repositories(count: usize) -> String {
+    match count {
+        1 => "1 repository".to_owned(),
+        count => format!("{count} repositories"),
+    }
+}
+
+/// The state of a checkbox that speaks for a set of things: none of them
+/// selected, some, or every one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Checkbox {
+    Unchecked,
+    /// Some of the set is selected, not all.
+    Mixed,
+    Checked,
+}
+
+impl Checkbox {
+    /// The box over a set of `total` things, `selected` of which are picked.
+    /// An empty set is never checked: there is nothing to have selected.
+    pub(crate) fn of(selected: usize, total: usize) -> Self {
+        if selected == 0 {
+            Self::Unchecked
+        } else if selected == total {
+            Self::Checked
+        } else {
+            Self::Mixed
+        }
+    }
+
+    pub(crate) fn class(self) -> &'static str {
+        match self {
+            Self::Unchecked => "selection-box",
+            Self::Mixed => "selection-box mixed",
+            Self::Checked => "selection-box checked",
+        }
+    }
+
+    pub(crate) fn mark(self) -> &'static str {
+        match self {
+            Self::Unchecked => "",
+            Self::Mixed => "-",
+            Self::Checked => "x",
+        }
+    }
+}
+
 /// How long before `now` the `timestamp` was, in the largest whole unit down
 /// to a minute: "now", "5m", "3h", "2d", "1w". Pure in `now` so a component
 /// can show the time against the dashboard's ticking clock.
@@ -68,6 +116,26 @@ mod tests {
         assert_eq!(pull_requests(0), "0 pull requests");
         assert_eq!(pull_requests(1), "1 pull request");
         assert_eq!(pull_requests(12), "12 pull requests");
+    }
+
+    #[test]
+    fn a_repository_count_reads_as_a_phrase() {
+        assert_eq!(repositories(0), "0 repositories");
+        assert_eq!(repositories(1), "1 repository");
+        assert_eq!(repositories(3), "3 repositories");
+    }
+
+    /// A box over a set is checked once the whole set is selected, mixed
+    /// while only part of it is, and unchecked otherwise; an empty set is
+    /// never "all selected".
+    #[test]
+    fn a_checkbox_over_a_set_is_checked_only_when_the_whole_set_is_selected() {
+        assert_eq!(Checkbox::of(0, 3), Checkbox::Unchecked);
+        assert_eq!(Checkbox::of(1, 3), Checkbox::Mixed);
+        assert_eq!(Checkbox::of(3, 3), Checkbox::Checked);
+        assert_eq!(Checkbox::of(0, 0), Checkbox::Unchecked);
+        assert_eq!(Checkbox::Mixed.class(), "selection-box mixed");
+        assert_eq!(Checkbox::Checked.mark(), "x");
     }
 
     /// The largest whole unit of time since the timestamp, down to a minute;

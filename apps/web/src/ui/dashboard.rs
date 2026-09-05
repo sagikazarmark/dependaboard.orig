@@ -4,8 +4,6 @@
 //! survives a refresh. The rows keep themselves current: the page follows the
 //! read model's revision and reloads when it moves.
 
-use std::collections::BTreeSet;
-
 use dependaboard_core::{BatchProgress, Page, PrRecord};
 use dioxus::prelude::*;
 
@@ -14,7 +12,7 @@ use crate::components::toast::{ToastOptions, use_toast};
 use crate::ui::action_bar::ActionBar;
 use crate::ui::active_batch::{ActiveBatch, queue_batch};
 use crate::ui::confirm_modal::ConfirmModal;
-use crate::ui::dashboard_state::{DashboardState, PageStatus, SummaryStatus};
+use crate::ui::dashboard_state::{DashboardState, PageStatus, Selection, SummaryStatus};
 use crate::ui::detail_drawer::{OpenDetail, OpenPr};
 use crate::ui::live::{use_clock, use_live_refresh, use_visibility};
 use crate::ui::pr_table::PrTable;
@@ -46,7 +44,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     } = use_url_state();
     let filter = use_signal(|| initial_filter);
     let cursor = use_signal(|| initial_cursor);
-    let selected = use_signal(BTreeSet::<String>::new);
+    let selected = use_signal(Selection::default);
     let mut detail = use_signal(|| initial_pr.map(OpenPr::Loading));
     let mut pending = use_signal(|| None::<PendingAction>);
     let active_batch = use_signal(|| None::<BatchProgress>);

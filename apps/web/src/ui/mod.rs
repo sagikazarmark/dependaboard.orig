@@ -25,6 +25,7 @@ mod top_bar;
 mod url_state;
 mod url_sync;
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use dependaboard_core::{BulkActionKind, PrRecord, PrTarget};
@@ -38,13 +39,22 @@ use crate::ui::dashboard::Dashboard;
 
 /// A bulk action the user has asked for but not yet confirmed.
 ///
-/// The targets are resolved when the request is made, so the head SHAs the
+/// The rows are resolved when the request is made, so the head SHAs the
 /// confirmation dialog talks about are the ones that get submitted, and the
 /// dialog's cancel and confirm paths do not depend on each other's ordering.
+/// They are kept as rows rather than targets so the dialog can also say what
+/// state they are in.
 #[derive(Clone, PartialEq)]
 pub(crate) struct PendingAction {
     pub(crate) action: BulkActionKind,
-    pub(crate) targets: Vec<PrTarget>,
+    pub(crate) rows: Vec<PrRecord>,
+}
+
+impl PendingAction {
+    /// The rows as the targets the batch submits.
+    pub(crate) fn targets(&self) -> Vec<PrTarget> {
+        self.rows.iter().map(pr_target).collect()
+    }
 }
 
 /// Errors stay until dismissed; every other toast auto-dismisses.
@@ -114,6 +124,15 @@ pub(crate) fn pr_target(row: &PrRecord) -> PrTarget {
         title: row.title.clone(),
         html_url: row.html_url.clone(),
     }
+}
+
+/// How many distinct repositories `rows` belong to: what a bulk action over
+/// them fans out across.
+pub(crate) fn repository_count<'a>(rows: impl IntoIterator<Item = &'a PrRecord>) -> usize {
+    rows.into_iter()
+        .map(|row| row.repository_id)
+        .collect::<BTreeSet<_>>()
+        .len()
 }
 
 /// How often the dashboard asks the server about work it is waiting on.

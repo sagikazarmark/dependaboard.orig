@@ -39,12 +39,14 @@ pub(crate) fn ActiveBatch(
 /// carries each poll's answer and the drawer opens on it, the outcome becomes
 /// a toast, and a batch that ran to completion reloads the page.
 pub(crate) fn queue_batch(
-    PendingAction { action, targets }: PendingAction,
+    pending: PendingAction,
     mut progress: Signal<Option<BatchProgress>>,
     mut open: Signal<bool>,
     toast: Toasts,
     mut state: DashboardState,
 ) {
+    let action = pending.action;
+    let targets = pending.targets();
     let batch_id = new_batch_id();
     progress.set(Some(BatchProgress::queued(&batch_id, action, &targets)));
     open.set(true);

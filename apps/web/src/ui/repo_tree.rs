@@ -10,6 +10,7 @@ use dependaboard_core::RepoFacet;
 use dioxus::prelude::*;
 
 use crate::ui::dashboard_state::use_dashboard;
+use crate::ui::format::Checkbox;
 
 /// The tree for `repositories`, the store's repository facet: every
 /// repository in owner then name order, each with its count under the other
@@ -118,33 +119,6 @@ struct RepoItem {
     selected: bool,
 }
 
-/// The state of an owner's checkbox, over the repositories in its scope.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Checkbox {
-    Unchecked,
-    /// Some of the repositories are selected, not all.
-    Mixed,
-    Checked,
-}
-
-impl Checkbox {
-    fn class(self) -> &'static str {
-        match self {
-            Self::Unchecked => "selection-box",
-            Self::Mixed => "selection-box mixed",
-            Self::Checked => "selection-box checked",
-        }
-    }
-
-    fn mark(self) -> &'static str {
-        match self {
-            Self::Unchecked => "",
-            Self::Mixed => "-",
-            Self::Checked => "x",
-        }
-    }
-}
-
 impl OwnerGroup {
     fn new(owner: &str) -> Self {
         Self {
@@ -156,14 +130,9 @@ impl OwnerGroup {
         }
     }
 
+    /// The owner's checkbox, over the repositories in its scope.
     fn checkbox(&self) -> Checkbox {
-        if self.selected == 0 {
-            Checkbox::Unchecked
-        } else if self.selected == self.scope.len() {
-            Checkbox::Checked
-        } else {
-            Checkbox::Mixed
-        }
+        Checkbox::of(self.selected, self.scope.len())
     }
 
     /// What the row says after the owner: how many repositories are shown, or

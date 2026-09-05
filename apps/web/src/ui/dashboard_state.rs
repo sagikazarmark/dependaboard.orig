@@ -3,15 +3,16 @@
 //!
 //! The filter, cursor, and selection are only changed through the methods
 //! here, so that a filter change always restarts paging and drops the
-//! selection, whichever control made it, and the selection is always read
-//! against the page in force.
+//! selection, whichever control made it. The selection remembers each row as
+//! it was picked, so it can span pages: "select all matching" fills it from
+//! the read model, and loading the next page leaves it standing.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
-use dependaboard_core::{DashboardPage, DashboardSummary, PrFilter, PrTarget};
+use dependaboard_core::{DashboardPage, DashboardSummary, PrFilter, PrRecord};
 use dioxus::prelude::*;
 
-use crate::ui::{pr_target, user_facing};
+use crate::ui::{repository_count, user_facing};
 
 /// What the dashboard has heard from the read model in answer to one
 /// question.
@@ -48,6 +49,38 @@ pub(crate) type PageStatus = Remote<DashboardPage>;
 /// filter: moving to the next page does not ask again.
 pub(crate) type SummaryStatus = Remote<DashboardSummary>;
 
+/// The rows picked for a bulk action.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Selection {
+    /// Each row by its id, as it was when picked.
+    rows: BTreeMap<String, PrRecord>,
+    /// How many rows the filter matched when "select all matching" filled
+    /// the selection and the batch limit left some of them out; `None` while
+    /// the selection holds everything it was asked to.
+    capped_from: Option<u64>,
+}
+
+impl Selection {
+    /// A selection of `rows`, as a test fixture starts with.
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn of(rows: impl IntoIterator<Item = PrRecord>) -> Self {
+        Self {
+            rows: rows.into_iter().map(|row| (row.id.clone(), row)).collect(),
+            capped_from: None,
+        }
+    }
+
+    /// This selection as "select all matching" would have left it when the
+    /// filter matched `total` rows and the batch limit kept only these.
+    #[cfg(all(test, feature = "server"))]
+    pub(crate) fn cut_short_from(self, total: u64) -> Self {
+        Self {
+            capped_from: Some(total),
+            ..self
+        }
+    }
+}
+
 /// The dashboard's shared state, provided as a context by [`Dashboard`] and
 /// read by its components through [`use_dashboard`].
 ///
@@ -56,8 +89,8 @@ pub(crate) type SummaryStatus = Remote<DashboardSummary>;
 pub(crate) struct DashboardState {
     filter: Signal<PrFilter>,
     cursor: Signal<Option<String>>,
-    /// The ids of the rows picked for a bulk action.
-    selected: Signal<BTreeSet<String>>,
+    /// The rows picked for a bulk action.
+    selected: Signal<Selection>,
     /// The read model's rows for the filter and cursor in force.
     pub(crate) page: ReadSignal<PageStatus>,
     /// The read model's facets and freshness for the filter in force.
@@ -81,7 +114,7 @@ impl DashboardState {
     pub(crate) fn provide(
         filter: Signal<PrFilter>,
         cursor: Signal<Option<String>>,
-        selected: Signal<BTreeSet<String>>,
+        selected: Signal<Selection>,
         page: impl Into<ReadSignal<PageStatus>>,
         summary: impl Into<ReadSignal<SummaryStatus>>,
         now: impl Into<ReadSignal<u64>>,
@@ -144,27 +177,26 @@ impl DashboardState {
     }
 
     /// Applies `change` to the filter, restarts paging, and drops the
-    /// selection, which belonged to the rows the old filter showed.
+    /// selection, which belonged to the rows the old filter matched.
     pub(crate) fn update_filter(&mut self, change: impl FnOnce(&mut PrFilter)) {
         change(&mut self.filter.write());
         self.cursor.set(None);
-        self.selected.write().clear();
+        self.clear_selection();
     }
 
     /// Moves to `filter` and `cursor` together, as the browser's back and
-    /// forward do, dropping the selection, which was made on the page being
-    /// left. The cursor is kept as given: it belongs to `filter`'s paging.
-    /// Only what differs is written, so landing where the dashboard already
-    /// is does not ask the read model again.
+    /// forward do. The cursor is kept as given: it belongs to `filter`'s
+    /// paging. The selection goes with the filter: a different filter drops
+    /// it, another page of the same filter keeps it. Only what differs is
+    /// written, so landing where the dashboard already is does not ask the
+    /// read model again.
     pub(crate) fn navigate(&mut self, filter: PrFilter, cursor: Option<String>) {
         if *self.filter.peek() != filter {
             self.filter.set(filter);
+            self.clear_selection();
         }
         if *self.cursor.peek() != cursor {
             self.cursor.set(cursor);
-        }
-        if !self.selected.peek().is_empty() {
-            self.selected.write().clear();
         }
     }
 
@@ -202,41 +234,60 @@ impl DashboardState {
         self.update_filter(|filter| *filter = PrFilter::default());
     }
 
-    /// Moves to the page after `cursor`, dropping the selection with the rows
-    /// it belonged to.
+    /// Moves to the page after `cursor`. The selection stays: it belongs to
+    /// the filter, not the page, so rows picked across pages add up.
     pub(crate) fn load_next(&mut self, cursor: String) {
         self.cursor.set(Some(cursor));
-        self.selected.write().clear();
     }
 
     /// Whether the row `id` is selected.
     pub(crate) fn is_selected(&self, id: &str) -> bool {
-        self.selected.read().contains(id)
+        self.selected.read().rows.contains_key(id)
     }
 
     pub(crate) fn selected_count(&self) -> usize {
-        self.selected.read().len()
+        self.selected.read().rows.len()
     }
 
-    /// Whether the page in force has rows and every one of them is selected.
-    pub(crate) fn all_visible_selected(&self) -> bool {
+    /// How many repositories the selected rows span.
+    pub(crate) fn selected_repository_count(&self) -> usize {
+        repository_count(self.selected.read().rows.values())
+    }
+
+    /// How many of the page in force's rows are selected.
+    pub(crate) fn visible_selected_count(&self) -> usize {
         let page = self.page.read();
         let selected = self.selected.read();
-        page.loaded().is_some_and(|page| {
-            !page.rows.is_empty() && page.rows.iter().all(|row| selected.contains(&row.id))
+        page.loaded().map_or(0, |page| {
+            page.rows
+                .iter()
+                .filter(|row| selected.rows.contains_key(&row.id))
+                .count()
         })
     }
 
-    /// Selects the row `id`, or deselects it if it is selected.
-    pub(crate) fn toggle_selected(&mut self, id: String) {
+    /// Whether the page in force has rows and every one of them is selected.
+    fn all_visible_selected(&self) -> bool {
+        let page = self.page.read();
+        page.loaded().is_some_and(|page| {
+            !page.rows.is_empty() && self.visible_selected_count() == page.rows.len()
+        })
+    }
+
+    /// Selects `row`, or deselects it if it is selected. A selection edited
+    /// by hand is no longer "the first so many matching", so the cap note
+    /// goes.
+    pub(crate) fn toggle_selected(&mut self, row: PrRecord) {
         let mut selected = self.selected.write();
-        if !selected.insert(id.clone()) {
-            selected.remove(&id);
+        if selected.rows.remove(&row.id).is_none() {
+            selected.rows.insert(row.id.clone(), row);
         }
+        selected.capped_from = None;
     }
 
     /// Selects every row of the page in force, or deselects them all if every
-    /// one is already selected.
+    /// one is already selected, forgetting the cap note as
+    /// [`Self::toggle_selected`] does.
     pub(crate) fn toggle_visible(&mut self) {
         let clear = self.all_visible_selected();
         let page = self.page.read();
@@ -246,31 +297,75 @@ impl DashboardState {
         let mut selected = self.selected.write();
         for row in &page.rows {
             if clear {
-                selected.remove(&row.id);
+                selected.rows.remove(&row.id);
             } else {
-                selected.insert(row.id.clone());
+                selected.rows.insert(row.id.clone(), row.clone());
             }
         }
+        selected.capped_from = None;
+    }
+
+    /// Replaces the selection with `matching`, the read model's answer to
+    /// "every row `filter` matches, as many as one batch takes". When its
+    /// total says the filter matches more rows than it holds, the batch limit
+    /// cut the set short, and the selection remembers the total so the bar
+    /// can say so.
+    ///
+    /// The answer took a round trip, and the filter may have moved on
+    /// meanwhile, dropping the selection with it; an answer for a filter no
+    /// longer in force is ignored rather than put back a selection that does
+    /// not belong to what is on screen.
+    pub(crate) fn select_matching(&mut self, filter: PrFilter, matching: DashboardPage) {
+        if *self.filter.peek() != filter {
+            return;
+        }
+        let capped = (matching.rows.len() as u64) < matching.total;
+        self.selected.set(Selection {
+            rows: matching
+                .rows
+                .into_iter()
+                .map(|row| (row.id.clone(), row))
+                .collect(),
+            capped_from: capped.then_some(matching.total),
+        });
+    }
+
+    /// How many rows the filter matched when "select all matching" filled the
+    /// selection and the batch limit left some of them out; `None` while the
+    /// selection holds everything it was asked to.
+    pub(crate) fn capped_from(&self) -> Option<u64> {
+        self.selected.read().capped_from
     }
 
     pub(crate) fn clear_selection(&mut self) {
-        self.selected.write().clear();
+        if *self.selected.peek() != Selection::default() {
+            self.selected.set(Selection::default());
+        }
     }
 
-    /// The selected rows of the page in force as bulk-action targets, in page
-    /// order. A selected id the page no longer shows is not among them.
-    pub(crate) fn selected_targets(&self) -> Vec<PrTarget> {
+    /// The selected rows, newest update first as the table lists them. A row
+    /// the page in force still shows is taken from the page, so the head SHA
+    /// a bulk action captures is the one on screen; a row the page no longer
+    /// shows is remembered as it was when picked.
+    pub(crate) fn selected_rows(&self) -> Vec<PrRecord> {
         let page = self.page.read();
         let selected = self.selected.read();
-        page.loaded()
-            .map(|page| {
-                page.rows
-                    .iter()
-                    .filter(|row| selected.contains(&row.id))
-                    .map(pr_target)
-                    .collect()
+        let mut rows: Vec<PrRecord> = selected
+            .rows
+            .values()
+            .map(|remembered| {
+                page.loaded()
+                    .and_then(|page| page.rows.iter().find(|row| row.id == remembered.id))
+                    .unwrap_or(remembered)
+                    .clone()
             })
-            .unwrap_or_default()
+            .collect();
+        rows.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        rows
     }
 }
 
@@ -295,7 +390,9 @@ mod tests {
     use dioxus::core::consume_context_from_scope;
 
     use super::*;
-    use crate::ui::test_support::{FIXTURE_NOW, loaded_page, loaded_summary};
+    use crate::ui::test_support::{
+        FIXTURE_NOW, grouped_row, loaded_page, loaded_summary, off_page_row, serde_row,
+    };
 
     /// A dashboard state on the app scope: the fixture page loaded, on its
     /// second page, with one row selected, so the tests can see both reset.
@@ -304,7 +401,7 @@ mod tests {
         DashboardState::provide(
             use_signal(PrFilter::default),
             use_signal(|| Some("page-2".to_owned())),
-            use_signal(|| BTreeSet::from(["7#9".to_owned()])),
+            use_signal(|| Selection::of([grouped_row()])),
             use_signal(|| PageStatus::Loaded(loaded_page())),
             use_signal(|| SummaryStatus::Loaded(loaded_summary())),
             use_signal(|| FIXTURE_NOW),
@@ -409,8 +506,10 @@ mod tests {
         });
     }
 
+    /// A filter change drops the selection; paging within the filter keeps
+    /// it, so rows picked across pages add up to one batch.
     #[test]
-    fn changing_or_clearing_the_filter_restarts_paging_and_drops_the_selection() {
+    fn changing_or_clearing_the_filter_drops_the_selection_and_paging_keeps_it() {
         let (dom, mut state) = mount();
 
         dom.in_runtime(|| {
@@ -419,9 +518,14 @@ mod tests {
             assert_eq!(*state.cursor(), None);
             assert_eq!(state.selected_count(), 0);
 
+            state.toggle_selected(grouped_row());
             state.load_next("page-2".to_owned());
-            state.toggle_selected("7#9".to_owned());
             assert_eq!(*state.cursor(), Some("page-2".to_owned()));
+            assert_eq!(
+                state.selected_count(),
+                1,
+                "the next page keeps the selection"
+            );
             state.clear_filters();
             assert_eq!(*state.filter(), PrFilter::default());
             assert_eq!(*state.cursor(), None);
@@ -435,22 +539,31 @@ mod tests {
 
         dom.in_runtime(|| {
             assert!(state.is_selected("7#9"));
-            state.toggle_selected("7#9".to_owned());
+            state.toggle_selected(grouped_row());
             assert!(!state.is_selected("7#9"));
-            state.toggle_selected("8#12".to_owned());
+            state.toggle_selected(serde_row());
             assert!(state.is_selected("8#12"));
             assert_eq!(state.selected_count(), 1);
         });
     }
 
     /// Back and forward land on a filter and a cursor together: the cursor
-    /// belongs to that filter's paging, so it is kept rather than reset, and
-    /// the selection, made on the page being left, is dropped.
+    /// belongs to that filter's paging, so it is kept rather than reset. The
+    /// selection goes with the filter: landing on another filter drops it,
+    /// landing on another page of the same filter keeps it.
     #[test]
-    fn navigating_sets_the_filter_and_cursor_together_and_drops_the_selection() {
+    fn navigating_sets_the_filter_and_cursor_together_and_drops_the_selection_with_the_filter() {
         let (dom, mut state) = mount();
 
         dom.in_runtime(|| {
+            state.navigate(PrFilter::default(), Some("page-3".to_owned()));
+            assert_eq!(*state.cursor(), Some("page-3".to_owned()));
+            assert_eq!(
+                state.selected_count(),
+                1,
+                "another page of the same filter keeps the selection"
+            );
+
             let filter = PrFilter {
                 check_statuses: vec![CheckStatus::Failure],
                 ..PrFilter::default()
@@ -460,7 +573,7 @@ mod tests {
             assert_eq!(*state.cursor(), Some("page-3".to_owned()));
             assert_eq!(state.selected_count(), 0);
 
-            state.toggle_selected("7#9".to_owned());
+            state.toggle_selected(grouped_row());
             state.navigate(PrFilter::default(), None);
             assert_eq!(*state.filter(), PrFilter::default());
             assert_eq!(*state.cursor(), None);
@@ -469,36 +582,131 @@ mod tests {
     }
 
     /// With some of the page selected, "visible" selects the rest; only once
-    /// every row is selected does it deselect them all.
+    /// every row is selected does it deselect them all. A row off the page
+    /// is neither counted as visible nor touched.
     #[test]
     fn toggling_the_visible_rows_selects_them_all_before_it_clears_them() {
         let (dom, mut state) = mount();
 
         dom.in_runtime(|| {
-            assert!(!state.all_visible_selected());
+            state.toggle_selected(off_page_row());
+            assert_eq!(state.visible_selected_count(), 1);
             state.toggle_visible();
-            assert!(state.all_visible_selected());
-            assert_eq!(state.selected_count(), 2);
+            assert_eq!(state.visible_selected_count(), 2);
+            assert_eq!(state.selected_count(), 3);
             state.toggle_visible();
-            assert_eq!(state.selected_count(), 0);
-            assert!(!state.all_visible_selected());
+            assert_eq!(state.visible_selected_count(), 0);
+            assert_eq!(
+                state.selected_count(),
+                1,
+                "the row off the page stays selected"
+            );
         });
     }
 
-    /// The targets are the selected rows of the page in force, in page
-    /// order, so the confirmation names the head SHAs the batch will submit;
-    /// a selected id the page no longer shows is not a target.
+    /// The rows a bulk action will target, newest update first as the table
+    /// lists them. A row the page still shows is taken from the page, so the
+    /// head SHA the confirmation names is the one on screen; a row the page
+    /// no longer shows is remembered as it was when picked.
     #[test]
-    fn the_targets_are_the_selected_rows_the_page_still_shows() {
+    fn the_selected_rows_are_kept_off_the_page_and_refreshed_from_it_when_on() {
         let (dom, mut state) = mount();
 
         dom.in_runtime(|| {
-            state.toggle_selected("8#12".to_owned());
-            state.toggle_selected("gone".to_owned());
-            let targets = state.selected_targets();
-            let numbers: Vec<u64> = targets.iter().map(|target| target.number).collect();
-            assert_eq!(numbers, vec![9, 12]);
-            assert_eq!(targets[1].expected_sha, "def456");
+            state.toggle_selected(off_page_row());
+            let mut moved_on = serde_row();
+            moved_on.head_sha = "before".to_owned();
+            state.toggle_selected(moved_on);
+
+            let rows = state.selected_rows();
+            let numbers: Vec<u64> = rows.iter().map(|row| row.number).collect();
+            assert_eq!(numbers, vec![9, 12, 13]);
+            assert_eq!(
+                rows[1].head_sha, "def456",
+                "the page's copy of a row it shows wins over the remembered one"
+            );
+            assert_eq!(rows[2].head_sha, "0ff9a6e");
+        });
+    }
+
+    /// "Select all matching" fills the selection from the read model's
+    /// answer, rows on the page or not, in place of whatever was picked
+    /// before; when the batch limit left some of the filter's rows out, it
+    /// remembers how many matched in all so the bar can say so. The note is
+    /// about how the selection was made, so editing it by hand, or dropping
+    /// it, forgets the note.
+    #[test]
+    fn selecting_all_matching_replaces_the_selection_and_notes_when_the_limit_cut_it_short() {
+        let (dom, mut state) = mount();
+
+        dom.in_runtime(|| {
+            assert!(state.is_selected("7#9"));
+            state.select_matching(
+                PrFilter::default(),
+                DashboardPage {
+                    rows: vec![serde_row(), off_page_row()],
+                    total: 52,
+                    next_cursor: Some("more".to_owned()),
+                },
+            );
+            assert!(!state.is_selected("7#9"), "the old selection is replaced");
+            assert!(state.is_selected("8#12"));
+            assert!(state.is_selected("8#13"));
+            assert_eq!(state.selected_count(), 2);
+            assert_eq!(state.capped_from(), Some(52));
+
+            state.toggle_selected(off_page_row());
+            assert_eq!(
+                state.capped_from(),
+                None,
+                "a selection edited by hand is no longer the first so many matching"
+            );
+
+            state.select_matching(
+                PrFilter::default(),
+                DashboardPage {
+                    rows: vec![serde_row()],
+                    total: 1,
+                    next_cursor: None,
+                },
+            );
+            assert_eq!(state.selected_count(), 1);
+            assert_eq!(
+                state.capped_from(),
+                None,
+                "every matching row fit, so nothing was cut short"
+            );
+        });
+    }
+
+    /// The read model answers "select all matching" after a round trip, by
+    /// which time the user may have changed the filter, and with it dropped
+    /// the selection. Rows matched for a filter no longer in force would put
+    /// a selection back that does not belong to what is on screen, so they
+    /// are ignored.
+    #[test]
+    fn a_selection_matched_for_a_filter_no_longer_in_force_is_ignored() {
+        let (dom, mut state) = mount();
+
+        dom.in_runtime(|| {
+            let asked_with = PrFilter::default();
+            state.update_filter(|filter| filter.needs_attention = true);
+            assert_eq!(state.selected_count(), 0);
+
+            state.select_matching(
+                asked_with,
+                DashboardPage {
+                    rows: vec![serde_row()],
+                    total: 1,
+                    next_cursor: None,
+                },
+            );
+            assert_eq!(
+                state.selected_count(),
+                0,
+                "the answer was for another filter"
+            );
+            assert_eq!(state.capped_from(), None);
         });
     }
 }

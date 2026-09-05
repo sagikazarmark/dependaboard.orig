@@ -1,6 +1,6 @@
 //! Shared fixtures for the UI modules' SSR snapshot tests.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use dependaboard_core::{
     CheckStatus, DashboardPage, DashboardSummary, DependencyUpdate, FacetCounts, LabelFacet,
@@ -9,7 +9,7 @@ use dependaboard_core::{
 use dioxus::prelude::*;
 
 use crate::components::toast::ToastProvider;
-use crate::ui::dashboard_state::{DashboardState, PageStatus, SummaryStatus};
+use crate::ui::dashboard_state::{DashboardState, PageStatus, Selection, SummaryStatus};
 
 pub(crate) const GROUPED_ROW_TITLE: &str =
     "build(deps): bump the github-actions group across 1 directory with 3 updates";
@@ -46,12 +46,14 @@ pub(crate) fn grouped_row() -> PrRecord {
         mergeable: Mergeable::Clean,
         labels: vec!["dependencies".to_owned(), "github_actions".to_owned()],
         created_at: 1,
-        updated_at: 1,
+        updated_at: 2,
         synced_at: FIXTURE_NOW,
     }
 }
 
-/// A single-dependency row in a second repository, `acme/web`.
+/// A single-dependency row in a second repository, `acme/web`, updated
+/// before [`grouped_row`], so the fixture page lists them in the store's
+/// order: newest update first.
 pub(crate) fn serde_row() -> PrRecord {
     PrRecord {
         id: "8#12".to_owned(),
@@ -73,7 +75,33 @@ pub(crate) fn serde_row() -> PrRecord {
         head_sha: "def456".to_owned(),
         check_status: CheckStatus::Success,
         labels: vec!["dependencies".to_owned(), "rust".to_owned()],
+        updated_at: 1,
         ..grouped_row()
+    }
+}
+
+/// A row in `acme/web` that [`loaded_page`] does not show: one of the further
+/// fifty the fixture page's total speaks of, older than the rows it shows.
+pub(crate) fn off_page_row() -> PrRecord {
+    PrRecord {
+        id: "8#13".to_owned(),
+        number: 13,
+        title: "build(deps): bump tokio from 1.40.0 to 1.41.0".to_owned(),
+        html_url: "https://github.example/acme/web/pull/13".to_owned(),
+        dependency: Some("tokio".to_owned()),
+        from_version: Some("1.40.0".to_owned()),
+        to_version: Some("1.41.0".to_owned()),
+        dependencies: vec![DependencyUpdate {
+            name: "tokio".to_owned(),
+            from_version: Some("1.40.0".to_owned()),
+            to_version: Some("1.41.0".to_owned()),
+            update_type: UpdateType::Minor,
+        }],
+        update_type: UpdateType::Minor,
+        head_sha: "0ff9a6e".to_owned(),
+        check_status: CheckStatus::Pending,
+        updated_at: 0,
+        ..serde_row()
     }
 }
 
@@ -132,14 +160,16 @@ pub(crate) fn loaded_summary() -> DashboardSummary {
 
 /// Mounts `children` where the dashboard's components expect to be: under a
 /// toast provider and a dashboard state with `filter` in force, `page` and
-/// `summary` as the read model's answers, `selected` picked, the clock at
+/// `summary` as the read model's answers, `selected` picked (cut short by
+/// the batch limit from `capped_from` matching rows, if given), the clock at
 /// `now`, and a manual sync in flight if `syncing`. Reloads go nowhere.
 #[component]
 pub(crate) fn DashboardFixture(
     #[props(default)] filter: PrFilter,
     #[props(default = PageStatus::Loading)] page: PageStatus,
     #[props(default = SummaryStatus::Loading)] summary: SummaryStatus,
-    #[props(default)] selected: BTreeSet<String>,
+    #[props(default)] selected: Vec<PrRecord>,
+    #[props(default)] capped_from: Option<u64>,
     #[props(default = FIXTURE_NOW)] now: u64,
     #[props(default)] syncing: bool,
     children: Element,
@@ -147,7 +177,13 @@ pub(crate) fn DashboardFixture(
     let mut state = DashboardState::provide(
         use_signal(|| filter),
         use_signal(|| None),
-        use_signal(|| selected),
+        use_signal(|| {
+            let selection = Selection::of(selected);
+            match capped_from {
+                Some(total) => selection.cut_short_from(total),
+                None => selection,
+            }
+        }),
         use_signal(|| page),
         use_signal(|| summary),
         use_signal(|| now),

@@ -161,6 +161,10 @@ Skip it if branch protection is your authoritative gate — GitHub enforces requ
 server-side regardless. Add it if your notion of green is stricter than the repo's
 required checks, which it may well be.
 
+The MVP skips it and says so where it matters: the merge confirmation counts the selected
+rows whose cached rollup is not green and tells the user that count is the read model's
+last word, not a gate. The gate is branch protection.
+
 ### `BulkAction` — workflow, key = batch UUIDv7
 
 Workflow rather than object: a batch has a definite lifecycle and you want to query its
@@ -522,6 +526,11 @@ enumeration that finds live PRs is exactly the set you diff against.
 
 ```
 Table render      UI → server fn → PrStore::list(filter, page)
+
+Select all        UI → server fn → PrStore::list(filter, page of MAX_BATCH_TARGETS)
+matching               the selection is resolved server side, newest update first,
+                       and capped at one batch's worth; the total comes back with the
+                       rows so the UI can say when the filter matched more than it took
 
 Bulk action       UI → server fn → Restate ingress
                        POST /restate/send/BulkAction/{batch_id}/run
