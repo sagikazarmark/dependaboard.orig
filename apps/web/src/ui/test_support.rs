@@ -3,13 +3,15 @@
 use std::collections::BTreeMap;
 
 use dependaboard_core::{
-    CheckStatus, DashboardPage, DashboardSummary, DependencyUpdate, FacetCounts, LabelFacet,
-    Mergeable, PrFilter, PrRecord, RepoFacet, RepoRecord, UpdateType,
+    ActionOutcome, BatchProgress, BulkActionKind, CheckStatus, DashboardPage, DashboardSummary,
+    DependencyUpdate, FacetCounts, LabelFacet, Mergeable, PrFilter, PrRecord, RepoFacet,
+    RepoRecord, UpdateType,
 };
 use dioxus::prelude::*;
 
 use crate::components::toast::ToastProvider;
 use crate::ui::dashboard_state::{DashboardState, PageStatus, Selection, SummaryStatus};
+use crate::ui::pr_target;
 
 pub(crate) const GROUPED_ROW_TITLE: &str =
     "build(deps): bump the github-actions group across 1 directory with 3 updates";
@@ -113,6 +115,20 @@ pub(crate) fn loaded_page() -> DashboardPage {
         total: 52,
         next_cursor: Some("page-2".to_owned()),
     }
+}
+
+/// A merge of [`grouped_row`] and [`serde_row`] with the first one already
+/// merged and the second still queued.
+pub(crate) fn half_done_merge() -> BatchProgress {
+    let targets = [pr_target(&grouped_row()), pr_target(&serde_row())];
+    let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+    progress.record(
+        &targets[0].key(),
+        ActionOutcome::Succeeded {
+            detail: "merged".to_owned(),
+        },
+    );
+    progress
 }
 
 /// The facets around [`loaded_page`]: two `acme` repositories with pull

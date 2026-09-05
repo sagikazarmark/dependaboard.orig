@@ -10,7 +10,7 @@ use dioxus::prelude::*;
 use crate::api::{load_dashboard, load_summary};
 use crate::components::toast::{ToastOptions, use_toast};
 use crate::ui::action_bar::ActionBar;
-use crate::ui::active_batch::{ActiveBatch, queue_batch};
+use crate::ui::active_batch::{ActiveBatch, BatchHost, queue_batch};
 use crate::ui::confirm_modal::ConfirmModal;
 use crate::ui::dashboard_state::{DashboardState, PageStatus, Selection, SummaryStatus};
 use crate::ui::detail_drawer::{OpenDetail, OpenPr};
@@ -127,7 +127,15 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
             oncancel: move |_| pending.set(None),
             onconfirm: move |action| {
                 state.clear_selection();
-                queue_batch(action, active_batch, progress_open, toast, state);
+                queue_batch(
+                    action,
+                    BatchHost {
+                        progress: active_batch,
+                        open: progress_open,
+                        toast,
+                        state,
+                    },
+                );
             },
         }
     }

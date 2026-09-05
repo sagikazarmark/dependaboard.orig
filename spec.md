@@ -200,6 +200,23 @@ whole fan-out finishes, `progress()` returns nothing useful for the entire durat
 the batch — which is exactly when the user is watching it. Write each outcome as it
 lands.
 
+**Retrying rejected targets is a new batch, refreshed first.** A rejection is the last
+word on the request *as it was sent*; most often the head moved, and the fix is to send
+the target again with the head it has now. The drawer offers **Retry rejected** once a
+batch has finished with a rejected target. The UI syncs each rejected pull request
+through `DashboardIngress.sync_pull_request` — all at once, awaiting each completion id
+as the drawer's own **Sync** does — reads the rows back, and queues them as a new batch
+of the same kind under a fresh UUIDv7: the old id has run and cannot run again. A target
+rejected as `NotFound`, or whose row is gone by the time it is refreshed, is left out;
+so is one whose refresh failed, since sending it with the SHA it was just rejected over
+would only reject it again. The targets left out are named in a notice, and the rest go
+on. The refresh can take a while; a retry that finds another batch queued in the meantime
+stands down rather than take the drawer from the one running. The confirmation dialog's
+promise that moved pull requests are "rejected, not silently retried against new code"
+stands: the retry is the user's, and the SHAs it carries are the ones the dashboard shows
+at the time. Nothing here is a Restate concern: the retry composes the public handlers
+the dashboard already uses.
+
 ### Error taxonomy — decide this before writing any handler
 
 This is the most important implementation detail on the page. Restate's default retry

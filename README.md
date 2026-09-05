@@ -364,7 +364,7 @@ Confirm the App is installed on the expected repositories, `GITHUB_INSTALLATION_
 
 **Merge is rejected**
 
-Confirm the repository allows at least one of squash, merge, and rebase, required checks and branch protection permit the merge, and the GitHub App still has Pull requests and Contents write access. The per-repository method is resolved at repository sync, so after changing a repository's merge settings or `GITHUB_MERGE_METHOD`, run **Sync** (or wait for the next reconciliation) before merging.
+Confirm the repository allows at least one of squash, merge, and rebase, required checks and branch protection permit the merge, and the GitHub App still has Pull requests and Contents write access. The per-repository method is resolved at repository sync, so after changing a repository's merge settings or `GITHUB_MERGE_METHOD`, run **Sync** (or wait for the next reconciliation) before merging. A rejection that reads "head moved" is not a configuration problem: the pull request was pushed to after the table showed it, and **Retry rejected** in the batch drawer sends it again with its current head.
 
 **Rebase comments return 403**
 
@@ -372,7 +372,7 @@ Confirm the fine-grained PAT has Pull requests read/write access, its user can w
 
 **Update branch is rejected**
 
-Update branch merges the base into the pull request's head branch under the App's identity, so it needs the same Contents write access as merge and a head branch the App may push to; a stale head SHA or a pull request GitHub reports as not mergeable is rejected rather than retried. Note that Dependabot stops rebasing a pull request once another commit lands on it, so prefer **Request rebase** when a PAT is configured.
+Update branch merges the base into the pull request's head branch under the App's identity, so it needs the same Contents write access as merge and a head branch the App may push to; a stale head SHA or a pull request GitHub reports as not mergeable is rejected rather than retried on its own — the batch drawer's **Retry rejected** sends the rejected ones again with their current heads. Note that Dependabot stops rebasing a pull request once another commit lands on it, so prefer **Request rebase** when a PAT is configured.
 
 **Restate fails after a Compose recreation**
 
@@ -399,6 +399,10 @@ The global **Sync** button is one-way — Restate takes the request and the swee
 A row's box selects it; the box in the table header selects or clears every row on the page, and shows a mixed mark while only some are selected. **Select all N matching** in the result bar selects everything the filter matches, pages beyond the current one included: the server resolves the filter to its newest rows, up to the batch limit of 100 pull requests, and returns the total alongside, so when a filter matches more than one batch takes, the action bar says how many it took and why. The selection belongs to the filter, not the page: **Load next** and the browser's back and forward keep it, changing a filter drops it. A selection that outgrows the limit — rows picked one by one on later pages can do that — has its actions withheld until it is trimmed, rather than being refused by the server after confirmation.
 
 The confirmation dialog counts the pull requests and the repositories they span for every action. For a merge it also counts the rows whose last known check rollup is not green, and says that the count is the read model's last word, not a gate: the dashboard does not re-verify checks before merging (see `spec.md`), so required checks are enforced by branch protection or not at all.
+
+### Retrying a batch's rejected targets
+
+A batch that finishes with rejected pull requests — a head that moved between the table and the click, a merge GitHub would not do, an identity it would not let — offers **Retry rejected** in its drawer. The dashboard syncs each rejected pull request again, waits for the refreshed rows, and queues them as a new batch of the same kind carrying their current head SHAs; the new batch takes the drawer over as any queued one does. A pull request rejected as no longer open, or gone by the time it is refreshed, is left out, as is one whose refresh failed: a toast names each one and why, and the rest go on. A batch whose rejections are all of pull requests that are no longer open has nothing to retry and offers none.
 
 ### Restate ingress visibility
 

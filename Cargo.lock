@@ -965,6 +965,7 @@ dependencies = [
  "dioxus",
  "dioxus-primitives",
  "form_urlencoded",
+ "futures-util",
  "gloo-timers",
  "octoevents",
  "reqwest 0.13.4",

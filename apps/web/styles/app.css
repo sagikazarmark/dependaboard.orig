@@ -1168,20 +1168,26 @@ code,
   border-bottom: 1px solid var(--line-soft);
 }
 
-.drawer-sync {
+.drawer-sync,
+.retry-rejected-button {
   min-height: 28px;
-  margin-left: auto;
   border: 1px solid var(--line);
   color: var(--color-base-content);
   background: color-mix(in srgb, var(--color-primary) 8%, transparent);
   font-size: 11px;
 }
 
-.drawer-sync:not(:disabled):hover {
+.drawer-sync {
+  margin-left: auto;
+}
+
+.drawer-sync:not(:disabled):hover,
+.retry-rejected-button:not(:disabled):hover {
   background: color-mix(in srgb, var(--color-primary) 14%, transparent);
 }
 
-.drawer-sync:disabled {
+.drawer-sync:disabled,
+.retry-rejected-button:disabled {
   color: var(--muted);
   cursor: default;
 }
@@ -1256,6 +1262,14 @@ code,
 .progress-list {
   flex: 1;
   overflow-y: auto;
+}
+
+/* The retry sits under the list, pinned to the drawer's foot. */
+.progress-footer {
+  display: flex;
+  justify-content: flex-end;
+  padding: 12px 18px;
+  border-top: 1px solid var(--line);
 }
 
 .progress-row {

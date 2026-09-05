@@ -804,6 +804,14 @@ impl BatchProgress {
         self.succeeded + self.rejected + self.failed
     }
 
+    /// The targets GitHub, or the guard, said no to, each with the reason, in batch order.
+    pub fn rejected_targets(&self) -> impl Iterator<Item = (&PrTarget, &RejectReason)> {
+        self.targets.iter().filter_map(|item| match &item.state {
+            TargetProgressState::Rejected { reason } => Some((&item.target, reason)),
+            _ => None,
+        })
+    }
+
     /// Moves the target to `state` and keeps the tally in step with it. A key the batch
     /// does not contain changes nothing: the tally must only ever count targets.
     fn set_state(&mut self, key: &str, state: TargetProgressState) {
@@ -1430,6 +1438,35 @@ mod tests {
         assert!(
             !progress.completed,
             "a stray outcome must not count towards the batch's own targets"
+        );
+    }
+
+    #[test]
+    fn the_rejected_targets_are_listed_with_their_reasons_and_nothing_else_is() {
+        let targets = [batch_target(1), batch_target(2), batch_target(3)];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        progress.record(
+            &targets[0].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::Forbidden,
+            },
+        );
+        progress.record_failure(&targets[1].key(), "boom");
+        progress.record(
+            &targets[2].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::NotFound,
+            },
+        );
+
+        let rejected = progress
+            .rejected_targets()
+            .map(|(target, reason)| (target.number, reason.clone()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rejected,
+            [(1, RejectReason::Forbidden), (3, RejectReason::NotFound)]
         );
     }
 

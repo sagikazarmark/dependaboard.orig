@@ -2,8 +2,6 @@
 //! per-row rebase, merge, and sync actions. A pull request a link names by
 //! key alone has its row read here before the drawer opens.
 
-use std::time::Duration;
-
 use dependaboard_core::{BulkActionKind, PrKey, PrRecord, PrState};
 use dioxus::logger::tracing;
 use dioxus::prelude::*;
@@ -12,15 +10,9 @@ use crate::api::{load_pr_projection, load_pr_status, request_pr_sync};
 use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
+use crate::ui::pr_sync::wait_for_pr_sync_completion;
 use crate::ui::side_panel::SidePanel;
-use crate::ui::{POLL_INTERVAL, PendingAction, sleep, user_facing};
-
-/// How long the drawer waits for a manual sync to complete before it stops
-/// polling for it.
-const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// [`SYNC_TIMEOUT`] in polls.
-const SYNC_POLLS: u64 = SYNC_TIMEOUT.as_secs() / POLL_INTERVAL.as_secs();
+use crate::ui::{PendingAction, user_facing};
 
 /// The pull request whose drawer is open. A row the user clicked is in hand
 /// at once; a link names the pull request by key alone, and the drawer waits
@@ -313,46 +305,6 @@ fn DurableState(status: DurableStatus, now: u64) -> Element {
     }
 }
 
-async fn wait_for_pr_sync_completion(
-    repository_id: u64,
-    number: u64,
-    completion_id: String,
-) -> Result<Option<PrRecord>, String> {
-    let mut last_error = None;
-    for _ in 0..SYNC_POLLS {
-        sleep(POLL_INTERVAL).await;
-        match load_pr_status(repository_id, number).await {
-            Ok(state) if sync_id_completed(state.as_ref(), &completion_id) => {
-                match load_pr_projection(repository_id, number).await {
-                    Ok(row) => return Ok(row),
-                    Err(error) => last_error = Some(user_facing(&error)),
-                }
-            }
-            Ok(_) => match load_pr_projection(repository_id, number).await {
-                Ok(None) => return Ok(None),
-                Ok(Some(_)) => last_error = None,
-                Err(error) => last_error = Some(user_facing(&error)),
-            },
-            Err(error) => last_error = Some(user_facing(&error)),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        format!(
-            "the sync did not complete within {} seconds",
-            SYNC_TIMEOUT.as_secs()
-        )
-    }))
-}
-
-fn sync_id_completed(state: Option<&PrState>, completion_id: &str) -> bool {
-    state.is_some_and(|state| {
-        state
-            .completed_sync_ids
-            .iter()
-            .any(|completed| completed == completion_id)
-    })
-}
-
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use dependaboard_core::Mergeable;
@@ -503,15 +455,5 @@ mod tests {
             DurableStatus::Gone
         );
         assert_eq!(DurableStatus::from_resource(None), DurableStatus::Loading);
-    }
-
-    #[test]
-    fn pull_request_sync_completes_only_for_its_request_id() {
-        let mut state = PrState::default();
-        assert!(!sync_id_completed(Some(&state), "sync-123"));
-        state.complete_sync("sync-456".to_owned());
-        assert!(!sync_id_completed(Some(&state), "sync-123"));
-        state.complete_sync("sync-123".to_owned());
-        assert!(sync_id_completed(Some(&state), "sync-123"));
     }
 }

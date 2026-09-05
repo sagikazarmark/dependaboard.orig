@@ -12,6 +12,9 @@ dioxus-primitives = { workspace = true }
 # Already in the browser bundle through dioxus-fullstack; used for the
 # dashboard's query string.
 form_urlencoded = "1.2.2"
+# Already in the browser bundle through dioxus; used to refresh a batch's
+# rejected targets all at once.
+futures-util = { version = "0.3.31", default-features = false, features = ["alloc"] }
 serde.workspace = true
 uuid.workspace = true
 
