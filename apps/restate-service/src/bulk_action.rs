@@ -3,12 +3,13 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    num::NonZeroUsize,
     time::Duration,
 };
 
 use dependaboard_core::{
     BatchProgress, BulkActionKind, BulkRequest, CommandRequest, DependabotCommand,
-    MAX_BATCH_TARGETS, MergeRequest, TargetProgressState, valid_batch_id,
+    MAX_BATCH_TARGETS, MergeRequest, PrTarget, TargetProgressState, valid_batch_id,
 };
 use restate_sdk::prelude::*;
 
@@ -18,7 +19,8 @@ use crate::{
 };
 
 const BATCH_PROGRESS: &str = "progress";
-const MAX_CONCURRENT: usize = 3;
+/// How many pull requests one merge round sends to GitHub at once.
+const MAX_CONCURRENT: NonZeroUsize = NonZeroUsize::new(3).unwrap();
 
 pub(crate) struct BulkAction;
 
@@ -111,19 +113,7 @@ async fn run_merge_batch(
     request: &BulkRequest,
     progress: &mut BatchProgress,
 ) -> HandlerResult<()> {
-    let mut by_repository: BTreeMap<u64, VecDeque<_>> = BTreeMap::new();
-    for target in &request.targets {
-        by_repository
-            .entry(target.repository_id)
-            .or_default()
-            .push_back(target.clone());
-    }
-    while by_repository.values().any(|targets| !targets.is_empty()) {
-        let round = by_repository
-            .values_mut()
-            .filter_map(VecDeque::pop_front)
-            .take(MAX_CONCURRENT)
-            .collect::<Vec<_>>();
+    for round in plan_merge_rounds(&request.targets, MAX_CONCURRENT) {
         for target in &round {
             mark_running(progress, &target.key());
         }
@@ -162,6 +152,34 @@ async fn run_merge_batch(
         }
     }
     Ok(())
+}
+
+/// Splits a merge batch into the rounds `run_merge_batch` sends to GitHub together.
+///
+/// Two pull requests in one repository never share a round: merging the first moves the
+/// base branch under the second, so they go one round after another in batch order. Each
+/// round takes the next pull request from up to `max_concurrent` repositories, visiting
+/// repositories in id order. Every target lands in exactly one round.
+fn plan_merge_rounds(targets: &[PrTarget], max_concurrent: NonZeroUsize) -> Vec<Vec<PrTarget>> {
+    let mut by_repository: BTreeMap<u64, VecDeque<PrTarget>> = BTreeMap::new();
+    for target in targets {
+        by_repository
+            .entry(target.repository_id)
+            .or_default()
+            .push_back(target.clone());
+    }
+    let mut rounds = Vec::new();
+    loop {
+        let round = by_repository
+            .values_mut()
+            .filter_map(VecDeque::pop_front)
+            .take(max_concurrent.get())
+            .collect::<Vec<_>>();
+        if round.is_empty() {
+            return rounds;
+        }
+        rounds.push(round);
+    }
 }
 
 fn mark_running(progress: &mut BatchProgress, key: &str) {
@@ -212,6 +230,15 @@ mod tests {
     use super::*;
     use crate::test_support::target;
 
+    /// A merge target for pull request `number` in repository `repository_id`.
+    fn pull(repository_id: u64, number: u64) -> PrTarget {
+        PrTarget {
+            repository_id,
+            number,
+            ..target()
+        }
+    }
+
     #[test]
     fn batch_validation_rejects_duplicate_targets() {
         let target = target();
@@ -221,5 +248,53 @@ mod tests {
             user_id: UserId::new("dashboard"),
         };
         assert!(validate_batch_request(&dependaboard_core::new_batch_id(), &request).is_err());
+    }
+
+    #[test]
+    fn pull_requests_in_different_repositories_merge_in_the_same_round() {
+        let rounds = plan_merge_rounds(&[pull(7, 1), pull(8, 1), pull(9, 1)], MAX_CONCURRENT);
+
+        assert_eq!(rounds, vec![vec![pull(7, 1), pull(8, 1), pull(9, 1)]]);
+    }
+
+    #[test]
+    fn pull_requests_in_one_repository_merge_one_round_after_another_in_batch_order() {
+        let rounds = plan_merge_rounds(
+            &[pull(7, 5), pull(7, 2), pull(8, 1), pull(7, 9)],
+            MAX_CONCURRENT,
+        );
+
+        assert_eq!(
+            rounds,
+            vec![
+                vec![pull(7, 5), pull(8, 1)],
+                vec![pull(7, 2)],
+                vec![pull(7, 9)],
+            ],
+            "merging one pull request moves the base under the next, so a repository never merges two at once"
+        );
+    }
+
+    #[test]
+    fn no_round_sends_more_pull_requests_than_the_concurrency_bound() {
+        let one_per_repository = (1..=5)
+            .map(|repository_id| pull(repository_id, 1))
+            .collect::<Vec<_>>();
+
+        let rounds = plan_merge_rounds(&one_per_repository, NonZeroUsize::new(2).unwrap());
+
+        assert_eq!(
+            rounds,
+            vec![
+                vec![pull(1, 1), pull(2, 1)],
+                vec![pull(3, 1), pull(4, 1)],
+                vec![pull(5, 1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_batch_plans_no_rounds() {
+        assert!(plan_merge_rounds(&[], MAX_CONCURRENT).is_empty());
     }
 }

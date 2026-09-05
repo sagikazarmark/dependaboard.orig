@@ -1,16 +1,15 @@
 //! The `RepoSync` virtual object: one per repository, sweeping its open Dependabot pull
 //! requests and fanning commit-status changes out to the pull requests they touch.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::Arc};
 
 use dependaboard_core::{Operation, PrKey, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds};
-use dependaboard_github::{GithubApi, GithubClient};
-use dependaboard_store::{LibSqlPrStore, PrStore};
+use dependaboard_store::PrStore;
 use restate_sdk::prelude::*;
 use tracing::warn;
 
 use crate::{
-    github::{RestateGithubStep, read_result, run_github_step},
+    github::{GithubApiHandle, RestateGithubStep, read_result, run_github_step},
     handler::traced,
     pull_request::{ClosedRequest, PullRequestClient, close_pull_request, request_key, short_sha},
     store::{store_failure, store_retry_policy},
@@ -42,8 +41,8 @@ trait RepoReconcileEffects {
 
 struct RestateReconcileEffects<'a, 'ctx> {
     ctx: &'a ObjectContext<'ctx>,
-    github: &'a GithubClient,
-    store: &'a LibSqlPrStore,
+    github: &'a GithubApiHandle,
+    store: &'a Arc<dyn PrStore>,
     repository: RepoRecord,
     reconcile_start: u64,
 }
@@ -167,8 +166,8 @@ async fn run_repo_reconcile<E: RepoReconcileEffects>(restate: &mut E) -> Handler
 
 #[derive(Clone)]
 pub(crate) struct RepoSync {
-    pub(crate) github: GithubClient,
-    pub(crate) store: LibSqlPrStore,
+    pub(crate) github: GithubApiHandle,
+    pub(crate) store: Arc<dyn PrStore>,
 }
 
 #[restate_sdk::object(ingress_private)]

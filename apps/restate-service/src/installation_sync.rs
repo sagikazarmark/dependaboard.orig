@@ -1,16 +1,15 @@
 //! The `InstallationSync` virtual object: one per GitHub App installation, running the
 //! perpetual reconcile chain and fanning each sweep out to every repository.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use dependaboard_core::{Operation, PrKey, unix_seconds};
-use dependaboard_github::{GithubApi, GithubClient};
-use dependaboard_store::{LibSqlPrStore, PrStore};
+use dependaboard_store::PrStore;
 use restate_sdk::prelude::*;
 
 use crate::{
-    github::{RestateGithubStep, read_result, run_github_step},
+    github::{GithubApiHandle, RestateGithubStep, read_result, run_github_step},
     handler::{HandlerOutcome, traced},
     pull_request::{ClosedRequest, close_pull_request},
     repo_sync::RepoSyncClient,
@@ -23,8 +22,8 @@ const SCHEDULER_TICK_PENDING: &str = "scheduler_tick_pending";
 
 #[derive(Clone)]
 pub(crate) struct InstallationSync {
-    pub(crate) github: GithubClient,
-    pub(crate) store: LibSqlPrStore,
+    pub(crate) github: GithubApiHandle,
+    pub(crate) store: Arc<dyn PrStore>,
     pub(crate) interval: Duration,
 }
 
@@ -135,8 +134,7 @@ impl InstallationSync {
     #[handler]
     async fn sync_now(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
         traced("InstallationSync/sync_now", ctx.key(), async {
-            let repositories =
-                perform_installation_sync(&ctx, self.github.clone(), self.store.clone()).await?;
+            let repositories = perform_installation_sync(&ctx, &self.github, &self.store).await?;
             Ok(format!("fanned out to {repositories} repositories"))
         })
         .await
@@ -146,9 +144,8 @@ impl InstallationSync {
     #[handler]
     async fn pause(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
         traced("InstallationSync/pause", ctx.key(), async {
-            ctx.clear(SCHEDULER_STARTED);
-            ctx.clear(SCHEDULER_TICK_PENDING);
-            invalidate_scheduler_generation(&ctx).await?;
+            let state = read_scheduler_state(&ctx).await?;
+            write_scheduler_state(&ctx, scheduler_pause_transition(state)?);
             Ok(())
         })
         .await
@@ -157,9 +154,8 @@ impl InstallationSync {
     #[handler]
     async fn purge(&self, ctx: ObjectContext<'_>) -> HandlerResult<()> {
         traced("InstallationSync/purge", ctx.key(), async {
-            ctx.clear(SCHEDULER_STARTED);
-            ctx.clear(SCHEDULER_TICK_PENDING);
-            invalidate_scheduler_generation(&ctx).await?;
+            let state = read_scheduler_state(&ctx).await?;
+            write_scheduler_state(&ctx, scheduler_pause_transition(state)?);
             let installation_id = ctx
                 .key()
                 .parse::<u64>()
@@ -222,7 +218,6 @@ fn write_scheduler_state(ctx: &ObjectContext<'_>, state: SchedulerState) {
     ctx.set(SCHEDULER_TICK_PENDING, state.tick_pending);
 }
 
-/// What `tick` must do, decided before any side effect runs.
 /// Decides whether `start` must (re)arm the chain, and with which generation.
 ///
 /// `None` means a tick is already queued or delayed for the current generation, so
@@ -260,6 +255,20 @@ fn scheduler_tick_transition(
     Ok(Some(SchedulerState::armed(generation)))
 }
 
+/// Stops the chain: `pause` and `purge` both end here.
+///
+/// Bumping the generation is what actually stops it. The tick the chain has queued or
+/// delayed inside Restate cannot be recalled, so it arrives later carrying the old
+/// generation, and `scheduler_tick_transition` drops it. Clearing `started` keeps
+/// `start` honest about re-arming, and clearing `tick_pending` lets it.
+fn scheduler_pause_transition(state: SchedulerState) -> HandlerResult<SchedulerState> {
+    Ok(SchedulerState {
+        started: false,
+        tick_pending: false,
+        generation: next_scheduler_generation(state.generation)?,
+    })
+}
+
 /// Side effects a tick asks of Restate, abstracted so `run_scheduler_tick` can be
 /// exercised against a recording fake without a runtime.
 trait SchedulerTickEffects {
@@ -271,8 +280,8 @@ trait SchedulerTickEffects {
 
 struct RestateTickEffects<'a, 'ctx> {
     ctx: &'a ObjectContext<'ctx>,
-    github: &'a GithubClient,
-    store: &'a LibSqlPrStore,
+    github: &'a GithubApiHandle,
+    store: &'a Arc<dyn PrStore>,
     interval: Duration,
 }
 
@@ -289,7 +298,7 @@ impl SchedulerTickEffects for RestateTickEffects<'_, '_> {
     }
 
     async fn sweep(&mut self) -> HandlerResult<usize> {
-        perform_installation_sync(self.ctx, self.github.clone(), self.store.clone()).await
+        perform_installation_sync(self.ctx, self.github, self.store).await
     }
 }
 
@@ -310,19 +319,12 @@ async fn run_scheduler_tick<E: SchedulerTickEffects>(
     Ok(SchedulerTickOutcome::Swept { repositories })
 }
 
-async fn invalidate_scheduler_generation(ctx: &ObjectContext<'_>) -> HandlerResult<()> {
-    let generation =
-        next_scheduler_generation(ctx.get::<u64>(SCHEDULER_GENERATION).await?.unwrap_or(0))?;
-    ctx.set(SCHEDULER_GENERATION, generation);
-    Ok(())
-}
-
 /// Re-enumerates the installation's repositories and fans a reconcile out to each; resolves
 /// to how many.
 async fn perform_installation_sync(
     ctx: &ObjectContext<'_>,
-    github: GithubClient,
-    store: LibSqlPrStore,
+    github: &GithubApiHandle,
+    store: &Arc<dyn PrStore>,
 ) -> HandlerResult<usize> {
     let reconcile_start = ctx
         .run(|| async { Ok(unix_seconds()) })
@@ -343,6 +345,7 @@ async fn perform_installation_sync(
     let repositories = read_result(repositories)?;
     let stored = repositories.clone();
     let installation_id = github.installation_id();
+    let store = store.clone();
     ctx.run(move || async move {
         store
             .replace_installation_repos(installation_id, &stored, reconcile_start)
@@ -375,7 +378,7 @@ trait InstallationPurgeEffects {
 
 struct RestatePurgeEffects<'a, 'ctx> {
     ctx: &'a ObjectContext<'ctx>,
-    store: &'a LibSqlPrStore,
+    store: &'a Arc<dyn PrStore>,
     installation_id: u64,
 }
 
@@ -603,6 +606,29 @@ mod tests {
         assert_eq!(
             scheduler_start_transition(SchedulerState::default()).unwrap(),
             Some(SchedulerState::armed(1))
+        );
+    }
+
+    #[test]
+    fn pausing_kills_the_tick_in_flight_and_lets_start_arm_a_fresh_chain() {
+        let paused = scheduler_pause_transition(SchedulerState::armed(42)).unwrap();
+
+        assert_eq!(
+            paused,
+            SchedulerState {
+                started: false,
+                tick_pending: false,
+                generation: 43,
+            }
+        );
+        assert_eq!(
+            scheduler_tick_transition(paused, SchedulerTick(Some(42))).unwrap(),
+            None,
+            "the tick the chain had in flight carries the old generation and dies on arrival"
+        );
+        assert_eq!(
+            scheduler_start_transition(paused).unwrap(),
+            Some(SchedulerState::armed(44))
         );
     }
 

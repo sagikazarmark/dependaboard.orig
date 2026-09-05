@@ -1,20 +1,22 @@
 //! The `PullRequest` virtual object: one per Dependabot pull request, owning its canonical
 //! snapshot, its action history, and every GitHub mutation made on its behalf.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use dependaboard_core::{
-    ActionLog, ActionOutcome, CommandRequest, MergeRequest, Operation, PrKey, PrState,
-    RejectReason, SyncRequest, UpdateBranchRequest, unix_seconds,
+    ActionLog, ActionOutcome, CommandRequest, MergeMethod, MergeRequest, Operation, PrKey,
+    PrRecord, PrState, PrTarget, RejectReason, SyncRequest, UpdateBranchRequest, unix_seconds,
 };
-use dependaboard_github::{GithubApi, GithubClient};
-use dependaboard_store::{LibSqlPrStore, PrStore};
+use dependaboard_store::{PrStore, StoreError};
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    github::{RestateGithubStep, Settled, action_result, read_result, rejected, run_github_step},
+    github::{
+        GithubApiHandle, RestateGithubStep, Settled, action_result, read_result, rejected,
+        run_github_step,
+    },
     handler::{HandlerOutcome, traced, traced_read},
     store::{store_failure, store_retry_policy},
 };
@@ -23,8 +25,8 @@ const PR_STATE: &str = "pr_state";
 
 #[derive(Clone)]
 pub(crate) struct PullRequest {
-    pub(crate) github: GithubClient,
-    pub(crate) store: LibSqlPrStore,
+    pub(crate) github: GithubApiHandle,
+    pub(crate) store: Arc<dyn PrStore>,
     pub(crate) debounce: Duration,
 }
 
@@ -249,34 +251,18 @@ impl PullRequest {
                 .await?
                 .map(Json::into_inner)
                 .unwrap_or_default();
-            let Some(snapshot) = state.snapshot.as_ref() else {
-                return Ok(Json::from(rejected(RejectReason::NotFound)));
-            };
-            if !target_matches_snapshot(&request.target, snapshot) {
-                return Ok(Json::from(rejected(RejectReason::NotFound)));
-            }
-            if snapshot.head_sha != request.target.expected_sha {
-                return Ok(Json::from(rejected(RejectReason::StaleSha {
-                    expected: request.target.expected_sha,
-                    actual: snapshot.head_sha.clone(),
-                })));
+            if let Err(reason) = guard_target(state.snapshot.as_ref(), &request.target) {
+                return Ok(Json::from(rejected(reason)));
             }
 
-            // The repository's row carries the method its last sync resolved when it
-            // disallows the configured preference. A missing row (the repository was
-            // purged mid-batch) or a row from before the column reads as no override,
-            // and the client falls back to the preference, as before.
             let store = self.store.clone();
             let repository_id = request.target.repository_id;
             let merge_method = ctx
                 .run(move || async move {
-                    Ok(Json::from(
-                        store
-                            .get_repo(repository_id)
-                            .await
-                            .map_err(store_failure)?
-                            .and_then(|repository| repository.merge_method),
-                    ))
+                    repository_merge_method(store.as_ref(), repository_id)
+                        .await
+                        .map(Json::from)
+                        .map_err(store_failure)
                 })
                 .retry_policy(store_retry_policy())
                 .name("read-repository-merge-method")
@@ -339,17 +325,8 @@ impl PullRequest {
                 .await?
                 .map(Json::into_inner)
                 .unwrap_or_default();
-            let Some(snapshot) = state.snapshot.as_ref() else {
-                return Ok(Json::from(rejected(RejectReason::NotFound)));
-            };
-            if !target_matches_snapshot(&request.target, snapshot) {
-                return Ok(Json::from(rejected(RejectReason::NotFound)));
-            }
-            if snapshot.head_sha != request.target.expected_sha {
-                return Ok(Json::from(rejected(RejectReason::StaleSha {
-                    expected: request.target.expected_sha,
-                    actual: snapshot.head_sha.clone(),
-                })));
+            if let Err(reason) = guard_target(state.snapshot.as_ref(), &request.target) {
+                return Ok(Json::from(rejected(reason)));
             }
 
             let github = self.github.clone();
@@ -395,17 +372,8 @@ impl PullRequest {
                 .await?
                 .map(Json::into_inner)
                 .unwrap_or_default();
-            let Some(snapshot) = state.snapshot.as_ref() else {
-                return Ok(Json::from(rejected(RejectReason::NotFound)));
-            };
-            if !target_matches_snapshot(&request.target, snapshot) {
-                return Ok(Json::from(rejected(RejectReason::NotFound)));
-            }
-            if snapshot.head_sha != request.target.expected_sha {
-                return Ok(Json::from(rejected(RejectReason::StaleSha {
-                    expected: request.target.expected_sha,
-                    actual: snapshot.head_sha.clone(),
-                })));
+            if let Err(reason) = guard_target(state.snapshot.as_ref(), &request.target) {
+                return Ok(Json::from(rejected(reason)));
             }
 
             let github = self.github.clone();
@@ -486,6 +454,21 @@ fn closed_retires(state: Option<&PrState>, request: ClosedRequest) -> bool {
     !last_synced_at.is_some_and(|last| last >= synced_before)
 }
 
+/// The merge method a repository's row says to use instead of the configured preference.
+///
+/// The row carries the method its last sync resolved when the repository disallows the
+/// preference. A missing row (the repository was purged mid-batch) or a row from before
+/// the column reads as no override, and the client falls back to the preference.
+async fn repository_merge_method(
+    store: &dyn PrStore,
+    repository_id: u64,
+) -> Result<Option<MergeMethod>, StoreError> {
+    Ok(store
+        .get_repo(repository_id)
+        .await?
+        .and_then(|repository| repository.merge_method))
+}
+
 fn outcome_detail(outcome: &ActionOutcome) -> String {
     match outcome {
         ActionOutcome::Succeeded { detail } => detail.clone(),
@@ -513,10 +496,27 @@ pub(crate) fn close_pull_request<'ctx>(
         .send();
 }
 
-fn target_matches_snapshot(
-    target: &dependaboard_core::PrTarget,
-    snapshot: &dependaboard_core::PrRecord,
-) -> bool {
+/// Checks a mutation's target against the object's canonical snapshot before anything is
+/// sent to GitHub.
+///
+/// The dashboard acts on what it last saw; the snapshot is what the object knows now. With
+/// no snapshot, or a snapshot of a different pull request than the target names, there is
+/// nothing to act on. A target whose expected head has since moved is stale, and the
+/// rejection names both SHAs so the dashboard can show what changed.
+fn guard_target(snapshot: Option<&PrRecord>, target: &PrTarget) -> Result<(), RejectReason> {
+    let snapshot = snapshot
+        .filter(|snapshot| target_matches_snapshot(target, snapshot))
+        .ok_or(RejectReason::NotFound)?;
+    if snapshot.head_sha != target.expected_sha {
+        return Err(RejectReason::StaleSha {
+            expected: target.expected_sha.clone(),
+            actual: snapshot.head_sha.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn target_matches_snapshot(target: &PrTarget, snapshot: &PrRecord) -> bool {
     target.repository_id == snapshot.repository_id
         && target.owner == snapshot.owner
         && target.repo == snapshot.repo
@@ -529,11 +529,11 @@ pub(crate) fn short_sha(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use dependaboard_core::{CheckStatus, Mergeable, PrRecord, UpdateType};
+    use dependaboard_core::RepoRecord;
     use restate_sdk::service::Discoverable;
 
     use super::*;
-    use crate::test_support::target;
+    use crate::test_support::{MemoryPrStore, repository, snapshot, target};
 
     #[test]
     fn pull_request_exposes_only_status_through_ingress() {
@@ -558,33 +558,73 @@ mod tests {
     }
 
     #[test]
-    fn target_routing_must_match_the_canonical_snapshot() {
-        let snapshot = PrRecord {
-            id: "7#9".to_owned(),
-            repository_id: 7,
-            installation_id: 1,
-            owner: "acme".to_owned(),
-            repo: "api".to_owned(),
-            number: 9,
-            title: "Bump serde".to_owned(),
-            html_url: "https://github.com/acme/api/pull/9".to_owned(),
-            dependency: Some("serde".to_owned()),
-            from_version: None,
-            to_version: None,
-            dependencies: Vec::new(),
-            update_type: UpdateType::Unknown,
-            head_sha: "abc123".to_owned(),
-            check_status: CheckStatus::None,
-            mergeable: Mergeable::Unknown,
-            labels: Vec::new(),
-            created_at: 0,
-            updated_at: 0,
-            synced_at: 0,
-        };
-        assert!(target_matches_snapshot(&target(), &snapshot));
-        let mut wrong = target();
-        wrong.repo = "other".to_owned();
-        assert!(!target_matches_snapshot(&wrong, &snapshot));
+    fn a_target_taken_from_the_current_snapshot_passes_the_guard() {
+        assert_eq!(guard_target(Some(&snapshot()), &target()), Ok(()));
+    }
+
+    #[test]
+    fn a_target_the_object_holds_no_snapshot_for_is_not_found() {
+        assert_eq!(
+            guard_target(None, &target()),
+            Err(RejectReason::NotFound),
+            "nothing has been synced yet: there is nothing to act on"
+        );
+        let mut other_repository = target();
+        other_repository.repo = "other".to_owned();
+        assert_eq!(
+            guard_target(Some(&snapshot()), &other_repository),
+            Err(RejectReason::NotFound),
+            "the snapshot belongs to a different pull request than the target names"
+        );
+    }
+
+    #[test]
+    fn a_target_whose_head_has_moved_is_stale_and_names_both_shas() {
+        let mut before_a_push = target();
+        before_a_push.expected_sha = "def456".to_owned();
+
+        assert_eq!(
+            guard_target(Some(&snapshot()), &before_a_push),
+            Err(RejectReason::StaleSha {
+                expected: "def456".to_owned(),
+                actual: "abc123".to_owned(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_merge_uses_the_method_its_repository_resolved_at_its_last_sync() {
+        let store = MemoryPrStore::default();
+        store
+            .upsert_repo(&RepoRecord {
+                merge_method: Some(MergeMethod::Rebase),
+                ..repository()
+            })
+            .await
+            .unwrap();
+        store
+            .upsert_repo(&RepoRecord {
+                repository_id: 8,
+                ..repository()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repository_merge_method(&store, 7).await.unwrap(),
+            Some(MergeMethod::Rebase),
+            "the repository disallows the configured preference"
+        );
+        assert_eq!(
+            repository_merge_method(&store, 8).await.unwrap(),
+            None,
+            "the preference is allowed there, or the row predates the column"
+        );
+        assert_eq!(
+            repository_merge_method(&store, 9).await.unwrap(),
+            None,
+            "a repository purged mid-batch has no row; the merge falls back to the preference"
+        );
     }
 
     #[test]

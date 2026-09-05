@@ -1,18 +1,43 @@
 //! Wraps a GitHub call as a journaled Restate step: classifies what GitHub said, waits out
 //! rate limits durably, and maps the settled result onto handler results and outcomes.
 
-use std::time::Duration;
+use std::{ops::Deref, sync::Arc, time::Duration};
 
 use dependaboard_core::{
     ActionOutcome, Classification, GithubErrorResponse, Operation, RejectReason,
     classify_github_error, unix_seconds,
 };
-use dependaboard_github::GithubError;
+use dependaboard_github::{GithubApi, GithubError};
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::handler::RetryableServiceError;
+
+/// The GitHub API a component calls, behind the [`GithubApi`] trait so a test can hand it
+/// a scripted fake.
+///
+/// A struct around the `Arc<dyn GithubApi>` rather than the bare `Arc`: handlers capture
+/// the API in the closures Restate journals, and rustc cannot prove such a closure
+/// `'static` when its captured type carries a region (even the implicit `'static` of a
+/// trait object) and the proof runs through the opaque handler future. A type with no
+/// lifetime parameters needs no such proof.
+#[derive(Clone)]
+pub(crate) struct GithubApiHandle(Arc<dyn GithubApi>);
+
+impl GithubApiHandle {
+    pub(crate) fn new(api: Arc<dyn GithubApi>) -> Self {
+        Self(api)
+    }
+}
+
+impl Deref for GithubApiHandle {
+    type Target = dyn GithubApi;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
+}
 
 /// How many consecutive rate-limit waits one GitHub step honours before failing terminally.
 ///
