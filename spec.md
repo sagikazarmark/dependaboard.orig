@@ -170,12 +170,20 @@ progress from the UI.
 run(BulkRequest { action, targets: Vec<PrTarget> })
   ├─ for each target (bounded concurrency; merges grouped per repo, see below):
   │     ctx.object_client::<PullRequest>(key).call(action)
-  │       → ActionOutcome
+  │       → ActionOutcome, or a TerminalError the callee gave up with
   │     write the outcome into workflow state AS IT COMPLETES
-  └─ terminal state: Completed { succeeded, rejected }
+  └─ terminal state: Completed { succeeded, rejected, failed }
 
 progress() -> BatchProgress    // shared handler, UI polls this
 ```
+
+**A target that fails terminally does not stop the batch.** The callee's `TerminalError`
+is recorded against that target as `Failed` with its reason and the batch carries on;
+the workflow completes with the tally, never with an error, once any target was
+attempted. One pull request's problem is not a reason to leave the other ninety-nine
+queued. This holds for configuration-wide fatals too (bad credentials, a 404 on a
+resource never read): every target gets its own verdict rather than the batch aborting
+on a guess about which failures are shared, so the drawer shows the same reason on each.
 
 **Update progress per target, not after `collect`.** If state is only written once the
 whole fan-out finishes, `progress()` returns nothing useful for the entire duration of
@@ -245,8 +253,14 @@ fn classify(
 Rough shape: any status with `x-ratelimit-remaining: 0` or a secondary-limit message is
 `Retryable` regardless of code; 5xx and transport errors are `Retryable`; 409, and 405
 with a merge-method message, are `Rejected` — *except* the base-branch 405 below; 404 on
-an operation you've just successfully read is `Rejected`, but 404 across many targets at
-once is a configuration `Fatal` worth failing the batch over. DB constraint violations
+an operation you've just successfully read is `Rejected`, but 404 on a resource never
+read is a configuration `Fatal`. The same read-first logic governs a refused write: a
+403 on a merge or branch update *after* the pull request was read with the same
+credentials is `Rejected(Forbidden)` — branch protection, a repository the installation
+can see but not push to — while a 401 is `Fatal` whatever came before it, because the
+client has already refreshed the token and retried once by the time it surfaces. A
+`Fatal` fails the `PullRequest` handler terminally; inside a batch that is one target
+marked failed, not an aborted batch (see `BulkAction` above). DB constraint violations
 (see the FK race in `InstallationSync`) are `Retryable`, not `Fatal`.
 
 **One 405 is special-cased, and it's the one bulk merging hits most.**

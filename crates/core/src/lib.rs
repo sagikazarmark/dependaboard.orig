@@ -987,7 +987,9 @@ pub fn classify_github_error(
         // The read that verified the target went through with the same credentials, so
         // GitHub is refusing this write on this pull request (branch protection, a
         // repository the installation can see but not push to), not the configuration.
-        (401 | 403, Operation::Merge | Operation::UpdateBranch) if known_resource => {
+        // A 401 is different: the client has already refreshed the token and retried
+        // once, so bad credentials are bad for every target and stay fatal below.
+        (403, Operation::Merge | Operation::UpdateBranch) if known_resource => {
             Classification::Rejected(RejectReason::Forbidden)
         }
         (405, Operation::Merge) if message.contains("merge method") => {
@@ -1618,19 +1620,36 @@ mod tests {
         // The read that verified the target went through with the same credentials, so
         // the refusal is about this pull request, not the configuration: one merge
         // forbidden by branch protection must not fail the other ninety-nine.
-        for status in [401, 403] {
-            let response = GithubErrorResponse {
-                status,
-                message: "Resource not accessible by integration".to_owned(),
-                ..Default::default()
-            };
-            for operation in [Operation::Merge, Operation::UpdateBranch] {
-                assert_eq!(
-                    classify_github_error(&response, operation, true, 1_000),
-                    Classification::Rejected(RejectReason::Forbidden),
-                    "{status} on {operation} of a known pull request"
-                );
-            }
+        let response = GithubErrorResponse {
+            status: 403,
+            message: "Resource not accessible by integration".to_owned(),
+            ..Default::default()
+        };
+        for operation in [Operation::Merge, Operation::UpdateBranch] {
+            assert_eq!(
+                classify_github_error(&response, operation, true, 1_000),
+                Classification::Rejected(RejectReason::Forbidden),
+                "403 on {operation} of a known pull request"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_credentials_are_a_configuration_failure_even_on_a_pull_request_just_read() {
+        // The client has already refreshed the token and retried once before a 401 gets
+        // here, so the fresh token was refused too: the credentials are wrong for every
+        // target, and the one just read is no exception.
+        let response = GithubErrorResponse {
+            status: 401,
+            message: "Bad credentials".to_owned(),
+            ..Default::default()
+        };
+        for operation in [Operation::Merge, Operation::UpdateBranch] {
+            assert_eq!(
+                classify_github_error(&response, operation, true, 1_000),
+                Classification::Fatal,
+                "401 on {operation} of a known pull request"
+            );
         }
     }
 
