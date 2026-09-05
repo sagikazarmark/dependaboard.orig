@@ -30,7 +30,7 @@ struct MetadataDependency {
 
 pub fn parse_dependabot_metadata(message: &str, title: &str) -> Vec<DependencyUpdate> {
     let yaml_updates = metadata_block(message)
-        .and_then(|yaml| serde_yml::from_str::<DependabotMetadata>(yaml).ok())
+        .and_then(|yaml| serde_norway::from_str::<DependabotMetadata>(yaml).ok())
         .map(|metadata| {
             metadata
                 .updated_dependencies

@@ -8,7 +8,7 @@ license.workspace = true
 [features]
 # Parsing Dependabot's commit metadata pulls in regex, semver and a YAML
 # parser. Only the GitHub sync path needs it; the browser bundle leaves it out.
-dependabot-metadata = ["dep:regex", "dep:semver", "dep:serde_yml"]
+dependabot-metadata = ["dep:regex", "dep:semver", "dep:serde_norway"]
 
 [dependencies]
 base64.workspace = true
@@ -16,7 +16,7 @@ regex = { workspace = true, optional = true }
 semver = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-serde_yml = { workspace = true, optional = true }
+serde_norway = { workspace = true, optional = true }
 thiserror.workspace = true
 uuid.workspace = true
 web-time.workspace = true
