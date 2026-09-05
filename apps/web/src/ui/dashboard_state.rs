@@ -1,5 +1,5 @@
 //! The state the dashboard's components share: the filter in force, the page
-//! cursor, the selection, and the read model's answer.
+//! cursor, the selection, and the read model's answers.
 //!
 //! The filter, cursor, and selection are only changed through the methods
 //! here, so that a filter change always restarts paging and drops the
@@ -8,37 +8,45 @@
 
 use std::collections::BTreeSet;
 
-use dependaboard_core::{DashboardPage, PrFilter, PrTarget};
+use dependaboard_core::{DashboardPage, DashboardSummary, PrFilter, PrTarget};
 use dioxus::prelude::*;
 
 use crate::ui::{pr_target, user_facing};
 
-/// What the dashboard has heard from the read model.
+/// What the dashboard has heard from the read model in answer to one
+/// question.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum PageStatus {
+pub(crate) enum Remote<T> {
     /// The first answer has not arrived yet.
     Loading,
     /// The read model could not be loaded; the text is what the user sees.
     Failed(String),
-    Loaded(DashboardPage),
+    Loaded(T),
 }
 
-impl PageStatus {
-    pub(crate) fn from_resource(value: Option<&Result<DashboardPage, ServerFnError>>) -> Self {
+impl<T: Clone> Remote<T> {
+    pub(crate) fn from_resource(value: Option<&Result<T, ServerFnError>>) -> Self {
         match value {
             None => Self::Loading,
             Some(Err(error)) => Self::Failed(user_facing(error)),
-            Some(Ok(page)) => Self::Loaded(page.clone()),
+            Some(Ok(answer)) => Self::Loaded(answer.clone()),
         }
     }
 
-    pub(crate) fn loaded(&self) -> Option<&DashboardPage> {
+    pub(crate) fn loaded(&self) -> Option<&T> {
         match self {
-            Self::Loaded(page) => Some(page),
+            Self::Loaded(answer) => Some(answer),
             _ => None,
         }
     }
 }
+
+/// The rows for the filter and cursor in force.
+pub(crate) type PageStatus = Remote<DashboardPage>;
+
+/// The facets and freshness for the filter in force. Asked for once per
+/// filter: moving to the next page does not ask again.
+pub(crate) type SummaryStatus = Remote<DashboardSummary>;
 
 /// The dashboard's shared state, provided as a context by [`Dashboard`] and
 /// read by its components through [`use_dashboard`].
@@ -50,21 +58,25 @@ pub(crate) struct DashboardState {
     cursor: Signal<Option<String>>,
     /// The ids of the rows picked for a bulk action.
     selected: Signal<BTreeSet<String>>,
-    /// The read model's answer for the filter and cursor in force.
+    /// The read model's rows for the filter and cursor in force.
     pub(crate) page: ReadSignal<PageStatus>,
+    /// The read model's facets and freshness for the filter in force.
+    pub(crate) summary: ReadSignal<SummaryStatus>,
     /// Asks the read model again for the same filter and cursor.
     pub(crate) reload: Callback<()>,
 }
 
 impl DashboardState {
-    /// Provides the state to the calling component's subtree. `page` is
-    /// boxed once, here, since every conversion to a [`ReadSignal`] takes a
-    /// slot in the scope for as long as the scope lives.
+    /// Provides the state to the calling component's subtree. `page` and
+    /// `summary` are boxed once, here, since every conversion to a
+    /// [`ReadSignal`] takes a slot in the scope for as long as the scope
+    /// lives.
     pub(crate) fn provide(
         filter: Signal<PrFilter>,
         cursor: Signal<Option<String>>,
         selected: Signal<BTreeSet<String>>,
         page: impl Into<ReadSignal<PageStatus>>,
+        summary: impl Into<ReadSignal<SummaryStatus>>,
         reload: Callback<()>,
     ) -> Self {
         use_context_provider(|| Self {
@@ -72,6 +84,7 @@ impl DashboardState {
             cursor,
             selected,
             page: page.into(),
+            summary: summary.into(),
             reload,
         })
     }
@@ -120,6 +133,25 @@ impl DashboardState {
         value: T,
     ) {
         self.update_filter(|filter| toggle_value(facet(filter), value));
+    }
+
+    /// Selects every one of `repos` (as `owner/repo`) in the repository
+    /// filter, or deselects every one of them if `select` is false, as
+    /// [`Self::update_filter`] does. A repository already as asked is left
+    /// where it is, so the rest of the filter keeps its order.
+    pub(crate) fn select_repos(&mut self, repos: impl IntoIterator<Item = String>, select: bool) {
+        self.update_filter(|filter| {
+            for repo in repos {
+                let present = filter.repos.iter().position(|candidate| candidate == &repo);
+                match (present, select) {
+                    (None, true) => filter.repos.push(repo),
+                    (Some(index), false) => {
+                        filter.repos.remove(index);
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 
     /// Drops every filter, as [`Self::update_filter`] does.
@@ -220,7 +252,7 @@ mod tests {
     use dioxus::core::consume_context_from_scope;
 
     use super::*;
-    use crate::ui::test_support::loaded_page;
+    use crate::ui::test_support::{loaded_page, loaded_summary};
 
     /// A dashboard state on the app scope: the fixture page loaded, on its
     /// second page, with one row selected, so the tests can see both reset.
@@ -230,6 +262,7 @@ mod tests {
             use_signal(|| Some("page-2".to_owned())),
             use_signal(|| BTreeSet::from(["7#9".to_owned()])),
             use_signal(|| PageStatus::Loaded(loaded_page())),
+            use_signal(|| SummaryStatus::Loaded(loaded_summary())),
             use_callback(|_| {}),
         );
         rsx! {}
@@ -257,6 +290,36 @@ mod tests {
             state.load_next("page-2".to_owned());
             state.toggle_filter(|filter| &mut filter.check_statuses, CheckStatus::Failure);
             assert!(state.filter().check_statuses.is_empty());
+            assert_eq!(*state.cursor(), None);
+        });
+    }
+
+    /// The owner checkbox selects or deselects several repositories at once.
+    /// Selecting keeps a repository that is already selected in place and
+    /// appends the others; deselecting removes only the ones named, so a
+    /// repository under another owner is untouched. Both restart paging.
+    #[test]
+    fn selecting_several_repos_adds_the_missing_ones_and_deselecting_removes_only_them() {
+        let (dom, mut state) = mount();
+
+        dom.in_runtime(|| {
+            state.update_filter(|filter| filter.repos = vec!["beta/api".to_owned()]);
+            state.load_next("page-2".to_owned());
+
+            state.select_repos(["acme/api".to_owned(), "acme/web".to_owned()], true);
+            assert_eq!(state.filter().repos, ["beta/api", "acme/api", "acme/web"]);
+            assert_eq!(*state.cursor(), None);
+
+            state.select_repos(["acme/web".to_owned(), "acme/api".to_owned()], true);
+            assert_eq!(
+                state.filter().repos,
+                ["beta/api", "acme/api", "acme/web"],
+                "selecting again changes nothing"
+            );
+
+            state.load_next("page-2".to_owned());
+            state.select_repos(["acme/api".to_owned(), "acme/web".to_owned()], false);
+            assert_eq!(state.filter().repos, ["beta/api"]);
             assert_eq!(*state.cursor(), None);
         });
     }

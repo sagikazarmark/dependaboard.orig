@@ -481,7 +481,24 @@ pub struct LabelFacet {
     pub count: u64,
 }
 
-/// Sidebar facet counts for the whole read model.
+/// One entry of the repository facet: a repository and how many of its open
+/// pull requests the facet's scope (see [`FacetCounts`]) takes in. Every
+/// repository the read model knows is listed, so a count of zero is possible.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoFacet {
+    pub repository: RepoRecord,
+    pub count: u64,
+}
+
+/// Sidebar facet counts, scoped to a [`PrFilter`].
+///
+/// Each facet counts the pull requests that match every part of the filter
+/// except its own dimension: the check facet ignores `check_statuses`, the
+/// update-type facet `update_types`, the label facet `labels`, and the
+/// repository facet `repos`. So a facet's count says how many pull requests
+/// choosing that value alone would show, given the other filters in force,
+/// and the values already chosen keep their counts instead of hiding the
+/// alternatives.
 ///
 /// `checks` and `update_types` are closed sets, so they are keyed by their
 /// enums: the UI walks `CheckStatus::ALL` / `UpdateType::ALL` and looks each
@@ -490,11 +507,15 @@ pub struct LabelFacet {
 /// `labels` is an open set ranked by popularity, so it is an ordered sequence:
 /// descending count, ties broken by case-insensitive label name. Consumers
 /// that truncate must keep this order rather than re-sorting by key.
+///
+/// `repositories` lists every repository, in owner then name order compared
+/// case-insensitively, so the UI can group them by owner without re-sorting.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FacetCounts {
     pub checks: BTreeMap<CheckStatus, u64>,
     pub update_types: BTreeMap<UpdateType, u64>,
     pub labels: Vec<LabelFacet>,
+    pub repositories: Vec<RepoFacet>,
 }
 
 impl FacetCounts {
@@ -510,13 +531,24 @@ impl FacetCounts {
     }
 }
 
+/// One page of the dashboard's rows for a filter and cursor. `total` counts
+/// every row the filter matches, not just this page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DashboardPage {
     pub rows: Vec<PrRecord>,
     pub total: u64,
     pub next_cursor: Option<String>,
-    pub repositories: Vec<RepoRecord>,
+}
+
+/// What the dashboard shows around the rows for a filter: the facet counts
+/// scoped to it and when the read model last heard from GitHub. It does not
+/// depend on the page cursor, so paging through a filter need not recompute
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DashboardSummary {
     pub facets: FacetCounts,
+    /// The newest `synced_at` of any pull request in the read model, whatever
+    /// the filter; absent until the first sync lands.
     pub last_synced_at: Option<u64>,
 }
 
@@ -1000,6 +1032,17 @@ mod tests {
                     count: 1,
                 },
             ],
+            repositories: vec![RepoFacet {
+                repository: RepoRecord {
+                    repository_id: 7,
+                    installation_id: 1,
+                    owner: "acme".to_owned(),
+                    repo: "api".to_owned(),
+                    merge_method: None,
+                    synced_at: 0,
+                },
+                count: 5,
+            }],
         };
 
         let json = serde_json::to_string(&facets).unwrap();
@@ -1008,6 +1051,10 @@ mod tests {
         assert!(json.contains(r#""update_types":{"minor":4}"#), "{json}");
         assert!(
             json.contains(r#""labels":[{"label":"rust","count":4},{"label":"go","count":2}"#),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""repositories":[{"repository":{"repository_id":7"#),
             "{json}"
         );
         assert_eq!(serde_json::from_str::<FacetCounts>(&json).unwrap(), facets);
@@ -1019,6 +1066,7 @@ mod tests {
             checks: BTreeMap::from([(CheckStatus::Success, 3)]),
             update_types: BTreeMap::from([(UpdateType::Minor, 4)]),
             labels: Vec::new(),
+            repositories: Vec::new(),
         };
 
         assert_eq!(facets.check_count(CheckStatus::Success), 3);

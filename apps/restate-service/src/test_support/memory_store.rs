@@ -4,7 +4,9 @@
 use std::{collections::BTreeMap, sync::Mutex};
 
 use async_trait::async_trait;
-use dependaboard_core::{DashboardPage, Page, PrFilter, PrKey, PrRecord, RepoRecord};
+use dependaboard_core::{
+    DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord, RepoRecord,
+};
 use dependaboard_store::{PrStore, StoreError};
 
 /// Rows keyed the way the schema keys them: pull requests by `(repository_id, number)`
@@ -14,7 +16,8 @@ use dependaboard_store::{PrStore, StoreError};
 /// first (libSQL rejects the foreign key; this panics, since only a test can get it wrong),
 /// deleting a repository takes its pull requests with it, and a pull request reads back
 /// with its repository's `installation_id`, as the store's `JOIN` gives it. What the
-/// service never asks of the store, the dashboard listing, is not implemented.
+/// service never asks of the store, the dashboard listing and its summary, is not
+/// implemented.
 #[derive(Default)]
 pub(crate) struct MemoryPrStore {
     tables: Mutex<Tables>,
@@ -136,6 +139,12 @@ impl PrStore for MemoryPrStore {
     async fn list_prs(&self, _filter: &PrFilter, _page: Page) -> Result<DashboardPage, StoreError> {
         unimplemented!(
             "the Restate service never lists the projection; the dashboard reads it through the web app"
+        )
+    }
+
+    async fn dashboard_summary(&self, _filter: &PrFilter) -> Result<DashboardSummary, StoreError> {
+        unimplemented!(
+            "the Restate service never summarises the projection; the dashboard reads it through the web app"
         )
     }
 

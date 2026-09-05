@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time:
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    CursorError, DashboardPage, FacetCounts, LabelFacet, Mergeable, Page, PageCursor, PrFilter,
-    PrKey, PrRecord, RepoRecord, unix_seconds,
+    CursorError, DashboardPage, DashboardSummary, FacetCounts, LabelFacet, Mergeable, Page,
+    PageCursor, PrFilter, PrKey, PrRecord, RepoFacet, RepoRecord, unix_seconds,
 };
 use libsql::{Builder, Row, Value};
 use secrecy::{ExposeSecret, SecretString};
@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, MutexGuard};
 mod filter;
 mod migrations;
 
-use filter::filter_sql;
+use filter::{Facet, filter_sql, without_facet};
 
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
@@ -110,7 +110,14 @@ pub trait PrStore: Send + Sync {
         live: &[u64],
         synced_before: u64,
     ) -> Result<Vec<PrKey>, StoreError>;
+    /// One keyset page of the pull requests `filter` matches, newest update
+    /// first, plus how many match in all.
     async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage, StoreError>;
+    /// What frames the rows for `filter`: every facet's counts, each scoped to
+    /// the filter minus its own dimension, and the read model's freshness. It
+    /// does not depend on paging, so a caller moving to the next page need not
+    /// ask again.
+    async fn dashboard_summary(&self, filter: &PrFilter) -> Result<DashboardSummary, StoreError>;
     async fn prs_for_sha(&self, repository_id: u64, sha: &str)
     -> Result<Vec<PrRecord>, StoreError>;
     async fn upsert_repo(&self, repo: &RepoRecord) -> Result<(), StoreError>;
@@ -253,19 +260,24 @@ impl PrStore for LibSqlPrStore {
             .encode()
         });
 
-        let repositories = list_repositories(&connection).await?;
-        let facets = facet_counts(&connection).await?;
+        Ok(DashboardPage {
+            rows,
+            total,
+            next_cursor,
+        })
+    }
+
+    async fn dashboard_summary(&self, filter: &PrFilter) -> Result<DashboardSummary, StoreError> {
+        let connection = self.connection().await;
+        let now = unix_seconds();
+        let facets = facet_counts(&connection, filter, now).await?;
         let last_synced_at = scalar_optional_u64(
             &connection,
             "SELECT MAX(synced_at) FROM pull_requests",
             Vec::new(),
         )
         .await?;
-        Ok(DashboardPage {
-            rows,
-            total,
-            next_cursor,
-            repositories,
+        Ok(DashboardSummary {
             facets,
             last_synced_at,
         })
@@ -442,40 +454,99 @@ fn repo_from_row(row: Row) -> Result<RepoRecord, StoreError> {
     })
 }
 
-async fn list_repositories(connection: &libsql::Connection) -> Result<Vec<RepoRecord>, StoreError> {
-    let mut rows = connection
-        .query(&format!("{} ORDER BY owner, repo", select_repo_sql()), ())
-        .await?;
-    let mut repositories = Vec::new();
-    while let Some(row) = rows.next().await? {
-        repositories.push(repo_from_row(row)?);
-    }
-    Ok(repositories)
+async fn facet_counts(
+    connection: &libsql::Connection,
+    filter: &PrFilter,
+    now: u64,
+) -> Result<FacetCounts, StoreError> {
+    let (checks_where, checks_params) = facet_scope(filter, Facet::Checks, now)?;
+    let checks = enum_counts(
+        connection,
+        &format!(
+            "SELECT p.check_status, COUNT(*) FROM pull_requests p {checks_where} GROUP BY p.check_status"
+        ),
+        checks_params,
+    )
+    .await?;
+
+    let (types_where, types_params) = facet_scope(filter, Facet::UpdateTypes, now)?;
+    let update_types = enum_counts(
+        connection,
+        &format!(
+            "SELECT p.update_type, COUNT(*) FROM pull_requests p {types_where} GROUP BY p.update_type"
+        ),
+        types_params,
+    )
+    .await?;
+
+    // Ties fall back to case-insensitive name order; the GROUP BY stays
+    // exact because the label filter matches labels byte for byte.
+    let (labels_where, labels_params) = facet_scope(filter, Facet::Labels, now)?;
+    let labels = grouped_counts(
+        connection,
+        &format!(
+            "SELECT lbl.value, COUNT(*) FROM pull_requests p, json_each(p.labels) lbl {labels_where} GROUP BY lbl.value ORDER BY COUNT(*) DESC, lbl.value COLLATE NOCASE"
+        ),
+        labels_params,
+    )
+    .await?
+    .into_iter()
+    .map(|(label, count)| LabelFacet { label, count })
+    .collect();
+
+    let (repos_where, repos_params) = facet_scope(filter, Facet::Repositories, now)?;
+    let repositories = repository_facets(connection, &repos_where, repos_params).await?;
+
+    Ok(FacetCounts {
+        checks,
+        update_types,
+        labels,
+        repositories,
+    })
 }
 
-async fn facet_counts(connection: &libsql::Connection) -> Result<FacetCounts, StoreError> {
-    Ok(FacetCounts {
-        checks: enum_counts(
-            connection,
-            "SELECT check_status, COUNT(*) FROM pull_requests GROUP BY check_status",
+/// The `WHERE` clause a facet counts within: `filter` minus the facet's own
+/// dimension, as [`filter_sql`] renders it.
+fn facet_scope(
+    filter: &PrFilter,
+    facet: Facet,
+    now: u64,
+) -> Result<(String, Vec<Value>), StoreError> {
+    filter_sql(&without_facet(filter, facet), None, now)
+}
+
+/// Every repository, with how many of its pull requests satisfy `where_sql`
+/// (a clause from [`filter_sql`] over `pull_requests p`), in owner then name
+/// order, case-insensitively, so consecutive entries share an owner. The
+/// clause is used as is, on a grouped subquery, so its shape stays
+/// [`filter_sql`]'s business.
+async fn repository_facets(
+    connection: &libsql::Connection,
+    where_sql: &str,
+    params: Vec<Value>,
+) -> Result<Vec<RepoFacet>, StoreError> {
+    let mut rows = connection
+        .query(
+            &format!(
+                "SELECT r.repository_id, r.installation_id, r.owner, r.repo, r.merge_method, r.synced_at, \
+                 COALESCE(c.matching, 0) \
+                 FROM repositories r \
+                 LEFT JOIN (SELECT p.repository_id, COUNT(*) AS matching FROM pull_requests p {where_sql} GROUP BY p.repository_id) c \
+                 ON c.repository_id = r.repository_id \
+                 ORDER BY r.owner COLLATE NOCASE, r.repo COLLATE NOCASE"
+            ),
+            params,
         )
-        .await?,
-        update_types: enum_counts(
-            connection,
-            "SELECT update_type, COUNT(*) FROM pull_requests GROUP BY update_type",
-        )
-        .await?,
-        // Ties fall back to case-insensitive name order; the GROUP BY stays
-        // exact because the label filter matches labels byte for byte.
-        labels: grouped_counts(
-            connection,
-            "SELECT value, COUNT(*) FROM pull_requests, json_each(labels) GROUP BY value ORDER BY COUNT(*) DESC, value COLLATE NOCASE",
-        )
-        .await?
-        .into_iter()
-        .map(|(label, count)| LabelFacet { label, count })
-        .collect(),
-    })
+        .await?;
+    let mut facets = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let count = unsigned(row.get::<i64>(6)?)?;
+        facets.push(RepoFacet {
+            repository: repo_from_row(row)?,
+            count,
+        });
+    }
+    Ok(facets)
 }
 
 /// Groups by a column that persists an enum's `Display` form and keys the
@@ -484,11 +555,12 @@ async fn facet_counts(connection: &libsql::Connection) -> Result<FacetCounts, St
 async fn enum_counts<T>(
     connection: &libsql::Connection,
     sql: &str,
+    params: Vec<Value>,
 ) -> Result<BTreeMap<T, u64>, StoreError>
 where
     T: FromStr + Ord,
 {
-    grouped_counts(connection, sql)
+    grouped_counts(connection, sql, params)
         .await?
         .into_iter()
         .map(|(key, count)| Ok((stored_enum(key)?, count)))
@@ -500,8 +572,9 @@ where
 async fn grouped_counts(
     connection: &libsql::Connection,
     sql: &str,
+    params: Vec<Value>,
 ) -> Result<Vec<(String, u64)>, StoreError> {
-    let mut rows = connection.query(sql, ()).await?;
+    let mut rows = connection.query(sql, params).await?;
     let mut counts = Vec::new();
     while let Some(row) = rows.next().await? {
         counts.push((row.get(0)?, unsigned(row.get::<i64>(1)?)?));
@@ -1047,21 +1120,30 @@ mod tests {
             store.upsert_pr(&record).await.unwrap();
         }
 
-        let result = store
-            .list_prs(&PrFilter::default(), Page::default())
-            .await
-            .unwrap();
+        let summary = store.dashboard_summary(&PrFilter::default()).await.unwrap();
 
-        let ranked = result
+        assert_eq!(
+            ranked_labels(&summary),
+            [("rust", 4), ("go", 2), ("Security", 2), ("dependencies", 1)]
+        );
+    }
+
+    fn ranked_labels(summary: &DashboardSummary) -> Vec<(&str, u64)> {
+        summary
             .facets
             .labels
             .iter()
             .map(|facet| (facet.label.as_str(), facet.count))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            ranked,
-            [("rust", 4), ("go", 2), ("Security", 2), ("dependencies", 1)]
-        );
+            .collect()
+    }
+
+    fn repository_counts(summary: &DashboardSummary) -> Vec<(u64, u64)> {
+        summary
+            .facets
+            .repositories
+            .iter()
+            .map(|facet| (facet.repository.repository_id, facet.count))
+            .collect()
     }
 
     #[tokio::test]
@@ -1076,69 +1158,225 @@ mod tests {
         failing_major.update_type = UpdateType::Major;
         store.upsert_pr(&failing_major).await.unwrap();
 
-        let result = store
-            .list_prs(&PrFilter::default(), Page::default())
-            .await
-            .unwrap();
+        let summary = store.dashboard_summary(&PrFilter::default()).await.unwrap();
 
         assert_eq!(
-            result.facets.checks,
+            summary.facets.checks,
             BTreeMap::from([(CheckStatus::Success, 3), (CheckStatus::Failure, 1)])
         );
         assert_eq!(
-            result.facets.update_types,
+            summary.facets.update_types,
             BTreeMap::from([(UpdateType::Minor, 3), (UpdateType::Major, 1)])
         );
     }
 
-    #[tokio::test]
-    async fn facets_and_repositories_span_the_whole_read_model_while_rows_honor_the_filter() {
-        let (_directory, store) = test_store().await;
+    /// Four pull requests over two repositories, differing in check, update
+    /// type, and labels, so every facet has something to hide and something
+    /// to keep.
+    async fn facet_fixture() -> (TempDir, LibSqlPrStore) {
+        let (directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
         store.upsert_repo(&repo(2, 10)).await.unwrap();
-        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
-        let mut failing = pr(2, 2, 10);
-        failing.check_status = CheckStatus::Failure;
-        failing.labels = vec!["go".to_owned()];
-        store.upsert_pr(&failing).await.unwrap();
+        let mut passing_minor_rust = pr(1, 1, 10);
+        passing_minor_rust.labels = vec!["dependencies".to_owned(), "rust".to_owned()];
+        let mut failing_major_go = pr(1, 2, 10);
+        failing_major_go.check_status = CheckStatus::Failure;
+        failing_major_go.update_type = UpdateType::Major;
+        failing_major_go.labels = vec!["dependencies".to_owned(), "go".to_owned()];
+        let mut failing_minor_rust = pr(2, 3, 10);
+        failing_minor_rust.check_status = CheckStatus::Failure;
+        failing_minor_rust.labels = vec!["dependencies".to_owned(), "rust".to_owned()];
+        let mut passing_patch_security = pr(2, 4, 10);
+        passing_patch_security.update_type = UpdateType::Patch;
+        passing_patch_security.labels = vec!["security".to_owned()];
+        for record in [
+            passing_minor_rust,
+            failing_major_go,
+            failing_minor_rust,
+            passing_patch_security,
+        ] {
+            store.upsert_pr(&record).await.unwrap();
+        }
+        (directory, store)
+    }
 
-        let result = store
-            .list_prs(
-                &PrFilter {
-                    check_statuses: vec![CheckStatus::Failure],
-                    ..Default::default()
-                },
-                Page::default(),
-            )
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn each_facet_counts_within_the_other_filters_but_not_its_own() {
+        let (_directory, store) = facet_fixture().await;
+        let filter = PrFilter {
+            check_statuses: vec![CheckStatus::Failure],
+            labels: vec!["rust".to_owned()],
+            ..Default::default()
+        };
 
-        assert_eq!(result.total, 1);
+        let page = store.list_prs(&filter, Page::default()).await.unwrap();
+        let summary = store.dashboard_summary(&filter).await.unwrap();
+
+        // The rows honour every filter: only #3 is failing and rust.
+        assert_eq!(page.total, 1);
         assert_eq!(
-            result.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
-            [2]
+            page.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [3]
         );
-        // The sidebar must keep offering the filters that would widen the view.
+        // Checks ignore the check filter and keep the label filter: the rust
+        // pull requests are #1 (passing) and #3 (failing), so the sidebar
+        // still offers the check that would widen the view.
         assert_eq!(
-            result.facets.checks,
+            summary.facets.checks,
             BTreeMap::from([(CheckStatus::Success, 1), (CheckStatus::Failure, 1)])
         );
+        // Update types keep both filters: only #3 is left, and it is minor.
         assert_eq!(
-            result
-                .facets
-                .labels
-                .iter()
-                .map(|facet| (facet.label.as_str(), facet.count))
-                .collect::<Vec<_>>(),
-            [("dependencies", 1), ("go", 1), ("rust", 1)]
+            summary.facets.update_types,
+            BTreeMap::from([(UpdateType::Minor, 1)])
+        );
+        // Labels ignore the label filter and keep the check filter: the
+        // failing pull requests are #2 and #3.
+        assert_eq!(
+            ranked_labels(&summary),
+            [("dependencies", 2), ("go", 1), ("rust", 1)]
+        );
+        // Repositories keep both filters: #3 lives in repo-2, and repo-1 is
+        // still listed, at zero.
+        assert_eq!(repository_counts(&summary), [(1, 0), (2, 1)]);
+    }
+
+    #[tokio::test]
+    async fn the_repository_facet_ignores_the_repository_filter_and_the_rest_keep_it() {
+        let (_directory, store) = facet_fixture().await;
+        let filter = PrFilter {
+            repos: vec!["acme/repo-1".to_owned()],
+            check_statuses: vec![CheckStatus::Failure],
+            ..Default::default()
+        };
+
+        let summary = store.dashboard_summary(&filter).await.unwrap();
+
+        // Without the repository filter, the failing pull requests are #2 in
+        // repo-1 and #3 in repo-2: choosing repo-2 instead would show one.
+        assert_eq!(repository_counts(&summary), [(1, 1), (2, 1)]);
+        // Every other facet is scoped to repo-1, whose only failing pull
+        // request is #2, a major update labelled dependencies and go.
+        assert_eq!(
+            summary.facets.update_types,
+            BTreeMap::from([(UpdateType::Major, 1)])
+        );
+        assert_eq!(ranked_labels(&summary), [("dependencies", 1), ("go", 1)]);
+        // Checks are scoped to repo-1 with the check filter dropped: #1
+        // passes and #2 fails.
+        assert_eq!(
+            summary.facets.checks,
+            BTreeMap::from([(CheckStatus::Success, 1), (CheckStatus::Failure, 1)])
+        );
+    }
+
+    /// The search box and the "needs attention" view are not facets, so they
+    /// narrow every facet.
+    #[tokio::test]
+    async fn the_query_scopes_every_facet() {
+        let (_directory, store) = facet_fixture().await;
+        let mut tokio_update = pr(2, 5, 10);
+        tokio_update.title = "Bump tokio from 1.0.0 to 1.1.0".to_owned();
+        tokio_update.dependency = Some("tokio".to_owned());
+        tokio_update.check_status = CheckStatus::Pending;
+        tokio_update.labels = vec!["async".to_owned()];
+        store.upsert_pr(&tokio_update).await.unwrap();
+        let filter = PrFilter {
+            query: Some("tokio".to_owned()),
+            ..Default::default()
+        };
+
+        let summary = store.dashboard_summary(&filter).await.unwrap();
+
+        assert_eq!(
+            summary.facets.checks,
+            BTreeMap::from([(CheckStatus::Pending, 1)])
         );
         assert_eq!(
-            result
+            summary.facets.update_types,
+            BTreeMap::from([(UpdateType::Minor, 1)])
+        );
+        assert_eq!(ranked_labels(&summary), [("async", 1)]);
+        assert_eq!(repository_counts(&summary), [(1, 0), (2, 1)]);
+    }
+
+    #[tokio::test]
+    async fn repository_facets_list_every_repository_grouped_by_owner_with_scoped_counts() {
+        let (_directory, store) = test_store().await;
+        // Owners arrive out of order and in mixed case; the facet must come
+        // back with each owner's repositories together, owners and names
+        // compared case-insensitively, and a repository without a matching
+        // pull request listed at zero rather than dropped.
+        let repositories = [
+            (3, "beta", "api"),
+            (2, "acme", "web"),
+            (1, "acme", "API"),
+            (4, "Zed", "tools"),
+        ];
+        for (id, owner, name) in repositories {
+            store
+                .upsert_repo(&RepoRecord {
+                    owner: owner.to_owned(),
+                    repo: name.to_owned(),
+                    ..repo(id, 10)
+                })
+                .await
+                .unwrap();
+        }
+        // acme/API has two major updates and a minor one; beta/api one major;
+        // the other two repositories have no pull requests at all.
+        let pull_requests = [
+            (1, 1, "acme", "API", UpdateType::Major),
+            (1, 2, "acme", "API", UpdateType::Major),
+            (1, 3, "acme", "API", UpdateType::Minor),
+            (3, 1, "beta", "api", UpdateType::Major),
+        ];
+        for (id, number, owner, name, update_type) in pull_requests {
+            store
+                .upsert_pr(&PrRecord {
+                    owner: owner.to_owned(),
+                    repo: name.to_owned(),
+                    update_type,
+                    ..pr(id, number, 10)
+                })
+                .await
+                .unwrap();
+        }
+        let filter = PrFilter {
+            update_types: vec![UpdateType::Major],
+            ..Default::default()
+        };
+
+        let summary = store.dashboard_summary(&filter).await.unwrap();
+
+        assert_eq!(
+            summary
+                .facets
                 .repositories
                 .iter()
-                .map(|repo| repo.repository_id)
+                .map(|facet| {
+                    (
+                        facet.repository.owner.as_str(),
+                        facet.repository.repo.as_str(),
+                        facet.count,
+                    )
+                })
                 .collect::<Vec<_>>(),
-            [1, 2]
+            [
+                ("acme", "API", 2),
+                ("acme", "web", 0),
+                ("beta", "api", 1),
+                ("Zed", "tools", 0),
+            ]
+        );
+        assert_eq!(
+            summary.facets.repositories[0].repository,
+            RepoRecord {
+                owner: "acme".to_owned(),
+                repo: "API".to_owned(),
+                ..repo(1, 10)
+            },
+            "the facet carries the whole repository row"
         );
     }
 
@@ -1146,10 +1384,7 @@ mod tests {
     async fn last_synced_at_is_the_newest_sync_or_absent_when_empty() {
         let (_directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
-        let empty = store
-            .list_prs(&PrFilter::default(), Page::default())
-            .await
-            .unwrap();
+        let empty = store.dashboard_summary(&PrFilter::default()).await.unwrap();
         assert_eq!(empty.last_synced_at, None);
 
         store.upsert_pr(&pr(1, 1, 300)).await.unwrap();
@@ -1157,18 +1392,17 @@ mod tests {
         store.upsert_pr(&pr(1, 3, 500)).await.unwrap();
 
         let synced = store
-            .list_prs(
+            .dashboard_summary(
                 // The freshness stamp is for the whole projection, not the
                 // rows the filter happens to leave visible.
                 &PrFilter {
                     query: Some("no such pull request".to_owned()),
                     ..Default::default()
                 },
-                Page::default(),
             )
             .await
             .unwrap();
-        assert_eq!(synced.total, 0);
+        assert_eq!(synced.facets.checks, BTreeMap::new());
         assert_eq!(synced.last_synced_at, Some(700));
     }
 
@@ -1333,14 +1567,15 @@ mod tests {
             })
         );
         let repositories = store
-            .list_prs(&PrFilter::default(), Page::default())
+            .dashboard_summary(&PrFilter::default())
             .await
             .unwrap()
+            .facets
             .repositories;
         assert_eq!(
             repositories
                 .iter()
-                .map(|repository| repository.repository_id)
+                .map(|facet| facet.repository.repository_id)
                 .collect::<Vec<_>>(),
             vec![3],
             "only the other installation's repository survives"
@@ -1378,14 +1613,18 @@ mod tests {
         assert_eq!(store.get_repo(2).await.unwrap(), Some(repo(2, 10)));
         assert_eq!(store.get_repo(3).await.unwrap(), None);
         let listed = store
-            .list_prs(&PrFilter::default(), Page::default())
+            .dashboard_summary(&PrFilter::default())
             .await
             .unwrap()
+            .facets
             .repositories;
         assert_eq!(
             listed
                 .iter()
-                .map(|repository| (repository.repository_id, repository.merge_method))
+                .map(|facet| (
+                    facet.repository.repository_id,
+                    facet.repository.merge_method
+                ))
                 .collect::<Vec<_>>(),
             [(1, Some(MergeMethod::Rebase)), (2, None)]
         );
@@ -1471,14 +1710,17 @@ mod tests {
             sync.await.unwrap().unwrap();
         }
 
-        let page = store
-            .list_prs(&PrFilter::default(), Page::default())
-            .await
-            .unwrap();
-        let mut survivors = page
+        let summary = store.dashboard_summary(&PrFilter::default()).await.unwrap();
+        let mut survivors = summary
+            .facets
             .repositories
             .iter()
-            .map(|repo| (repo.installation_id, repo.repository_id))
+            .map(|facet| {
+                (
+                    facet.repository.installation_id,
+                    facet.repository.repository_id,
+                )
+            })
             .collect::<Vec<_>>();
         survivors.sort_unstable();
         // Every round retires the previous round's repo, so exactly the last

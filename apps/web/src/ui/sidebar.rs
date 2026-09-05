@@ -1,20 +1,24 @@
 //! The filter sidebar: search, the facets, the ranked labels, and the
-//! repositories, each toggling one dimension of the dashboard's filter.
+//! repository tree, each toggling one dimension of the dashboard's filter.
+//! The counts come from the summary, scoped to the filter in force minus the
+//! facet's own dimension, so each says how many pull requests choosing it
+//! would show.
 
-use dependaboard_core::{CheckStatus, UpdateType};
+use dependaboard_core::{CheckStatus, FacetCounts, UpdateType};
 use dioxus::prelude::*;
 
 use crate::ui::dashboard_state::use_dashboard;
 use crate::ui::filters::{FacetButton, FilterSection, LabelFacets, filter_count};
 use crate::ui::format::{status_class, status_label, update_class};
+use crate::ui::repo_tree::RepoTree;
 use crate::ui::search_box::SearchBox;
 
 /// The sidebar; `open` says whether it is shown or folded away.
 #[component]
 pub(crate) fn Sidebar(open: Signal<bool>) -> Element {
     let mut state = use_dashboard();
-    let status = state.page.read();
-    let page = status.loaded();
+    let status = state.summary.read();
+    let facets: Option<&FacetCounts> = status.loaded().map(|summary| &summary.facets);
     let active_filter_count = filter_count(&state.filter());
     rsx! {
         aside {
@@ -35,7 +39,7 @@ pub(crate) fn Sidebar(open: Signal<bool>) -> Element {
                     FacetButton {
                         key: "check-{status}",
                         label: status_label(status),
-                        count: page.map_or(0, |page| page.facets.check_count(status)),
+                        count: facets.map_or(0, |facets| facets.check_count(status)),
                         active: state.filter().check_statuses.contains(&status),
                         tone: status_class(status),
                         onclick: move |_| state.toggle_filter(|filter| &mut filter.check_statuses, status),
@@ -49,7 +53,7 @@ pub(crate) fn Sidebar(open: Signal<bool>) -> Element {
                     FacetButton {
                         key: "type-{update_type}",
                         label: update_type.to_string(),
-                        count: page.map_or(0, |page| page.facets.update_type_count(update_type)),
+                        count: facets.map_or(0, |facets| facets.update_type_count(update_type)),
                         active: state.filter().update_types.contains(&update_type),
                         tone: update_class(update_type),
                         onclick: move |_| state.toggle_filter(|filter| &mut filter.update_types, update_type),
@@ -59,31 +63,14 @@ pub(crate) fn Sidebar(open: Signal<bool>) -> Element {
 
             FilterSection { title: "Labels" }
             LabelFacets {
-                labels: page.map(|page| page.facets.labels.clone()).unwrap_or_default(),
+                labels: facets.map(|facets| facets.labels.clone()).unwrap_or_default(),
                 active: state.filter().labels.clone(),
                 ontoggle: move |label| state.toggle_filter(|filter| &mut filter.labels, label),
             }
 
             FilterSection { title: "Accounts & repositories" }
-            div { class: "repo-list",
-                if let Some(page) = page {
-                    for repository in &page.repositories {
-                        {
-                            let full_name = format!("{}/{}", repository.owner, repository.repo);
-                            let selected = state.filter().repos.contains(&full_name);
-                            rsx! {
-                                button {
-                                    key: "{repository.repository_id}",
-                                    class: if selected { "repo-filter active" } else { "repo-filter" },
-                                    onclick: move |_| state.toggle_filter(|filter| &mut filter.repos, full_name.clone()),
-                                    span { class: "selection-box", if selected { "x" } }
-                                    span { class: "repo-owner", "{repository.owner}/" }
-                                    span { "{repository.repo}" }
-                                }
-                            }
-                        }
-                    }
-                }
+            RepoTree {
+                repositories: facets.map(|facets| facets.repositories.clone()).unwrap_or_default(),
             }
         }
     }
@@ -94,8 +81,8 @@ mod tests {
     use dependaboard_core::PrFilter;
 
     use super::*;
-    use crate::ui::dashboard_state::PageStatus;
-    use crate::ui::test_support::{DashboardFixture, loaded_page, render};
+    use crate::ui::dashboard_state::SummaryStatus;
+    use crate::ui::test_support::{DashboardFixture, loaded_summary, render};
 
     #[test]
     fn the_sidebar_marks_the_facets_and_repositories_the_filter_has_set() {
@@ -107,7 +94,7 @@ mod tests {
             };
             let open = use_signal(|| true);
             rsx! {
-                DashboardFixture { filter, page: PageStatus::Loaded(loaded_page()),
+                DashboardFixture { filter, summary: SummaryStatus::Loaded(loaded_summary()),
                     Sidebar { open }
                 }
             }
@@ -132,13 +119,17 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains(r#"<span class="repo-owner">acme/</span><span>web</span>"#),
+            html.contains(r#"<span class="owner-name">acme</span>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<span class="repo-name">web</span><code>21</code>"#),
             "{html}"
         );
     }
 
     #[test]
-    fn a_folded_sidebar_says_so_while_the_page_is_still_loading() {
+    fn a_folded_sidebar_says_so_while_the_summary_is_still_loading() {
         fn Fixture() -> Element {
             let open = use_signal(|| false);
             rsx! {
@@ -154,5 +145,6 @@ mod tests {
         assert!(html.contains("0 active"), "{html}");
         assert_eq!(html.matches("<code>0</code>").count(), 8, "{html}");
         assert!(!html.contains("repo-filter"), "{html}");
+        assert!(!html.contains("owner-group"), "{html}");
     }
 }

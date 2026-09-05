@@ -13,6 +13,7 @@ mod format;
 mod pr_row;
 mod pr_table;
 mod progress_drawer;
+mod repo_tree;
 mod search_box;
 mod side_panel;
 mod sidebar;

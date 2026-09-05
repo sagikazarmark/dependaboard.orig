@@ -3,7 +3,8 @@
 //! the store and Restate through [`crate::server::state::ServerState`].
 
 use dependaboard_core::{
-    BatchProgress, BulkActionKind, DashboardPage, Page, PrFilter, PrRecord, PrState, PrTarget,
+    BatchProgress, BulkActionKind, DashboardPage, DashboardSummary, Page, PrFilter, PrRecord,
+    PrState, PrTarget,
 };
 use dioxus::prelude::*;
 
@@ -16,6 +17,8 @@ use {
     std::collections::BTreeSet,
 };
 
+/// One page of rows for `filter`. Paging through a filter calls this alone;
+/// the facets around the rows come from [`load_summary`], once per filter.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_dashboard(
     filter: PrFilter,
@@ -24,6 +27,16 @@ pub(crate) async fn load_dashboard(
     state
         .store
         .list_prs(&filter, page)
+        .await
+        .map_err(store_failure)
+}
+
+/// The facet counts scoped to `filter` and the read model's freshness.
+#[server(state: Extension<ServerState>)]
+pub(crate) async fn load_summary(filter: PrFilter) -> Result<DashboardSummary, ServerFnError> {
+    state
+        .store
+        .dashboard_summary(&filter)
         .await
         .map_err(store_failure)
 }

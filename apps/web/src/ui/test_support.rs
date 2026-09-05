@@ -3,13 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use dependaboard_core::{
-    CheckStatus, DashboardPage, DependencyUpdate, FacetCounts, LabelFacet, Mergeable, PrFilter,
-    PrRecord, RepoRecord, UpdateType, unix_seconds,
+    CheckStatus, DashboardPage, DashboardSummary, DependencyUpdate, FacetCounts, LabelFacet,
+    Mergeable, PrFilter, PrRecord, RepoFacet, RepoRecord, UpdateType, unix_seconds,
 };
 use dioxus::prelude::*;
 
 use crate::components::toast::ToastProvider;
-use crate::ui::dashboard_state::{DashboardState, PageStatus};
+use crate::ui::dashboard_state::{DashboardState, PageStatus, SummaryStatus};
 
 pub(crate) const GROUPED_ROW_TITLE: &str =
     "build(deps): bump the github-actions group across 1 directory with 3 updates";
@@ -73,26 +73,40 @@ pub(crate) fn serde_row() -> PrRecord {
     }
 }
 
-/// The read model's answer for two open pull requests, one per repository,
+/// The read model's rows for two open pull requests, one per repository,
 /// with a further page to load.
 pub(crate) fn loaded_page() -> DashboardPage {
-    let rows = vec![grouped_row(), serde_row()];
-    let repositories = rows
-        .iter()
-        .map(|row| RepoRecord {
-            repository_id: row.repository_id,
-            installation_id: row.installation_id,
-            owner: row.owner.clone(),
-            repo: row.repo.clone(),
-            merge_method: None,
-            synced_at: 0,
-        })
-        .collect();
     DashboardPage {
-        rows,
+        rows: vec![grouped_row(), serde_row()],
         total: 52,
         next_cursor: Some("page-2".to_owned()),
-        repositories,
+    }
+}
+
+/// The facets around [`loaded_page`]: two `acme` repositories with pull
+/// requests, a third, `acme/docs`, without any, and a repository under a
+/// second owner, `beta/api`.
+pub(crate) fn loaded_summary() -> DashboardSummary {
+    let repositories = [
+        (7, "acme", "api", 31),
+        (9, "acme", "docs", 0),
+        (8, "acme", "web", 21),
+        (10, "beta", "api", 3),
+    ]
+    .into_iter()
+    .map(|(repository_id, owner, repo, count)| RepoFacet {
+        repository: RepoRecord {
+            repository_id,
+            installation_id: 1,
+            owner: owner.to_owned(),
+            repo: repo.to_owned(),
+            merge_method: None,
+            synced_at: 0,
+        },
+        count,
+    })
+    .collect();
+    DashboardSummary {
         facets: FacetCounts {
             checks: BTreeMap::from([(CheckStatus::Failure, 31), (CheckStatus::Success, 21)]),
             update_types: BTreeMap::from([(UpdateType::Minor, 40), (UpdateType::Patch, 12)]),
@@ -106,18 +120,21 @@ pub(crate) fn loaded_page() -> DashboardPage {
                     count: 12,
                 },
             ],
+            repositories,
         },
         last_synced_at: Some(unix_seconds()),
     }
 }
 
 /// Mounts `children` where the dashboard's components expect to be: under a
-/// toast provider and a dashboard state with `filter` in force, `page` as the
-/// read model's answer, and `selected` picked. Reloads go nowhere.
+/// toast provider and a dashboard state with `filter` in force, `page` and
+/// `summary` as the read model's answers, and `selected` picked. Reloads go
+/// nowhere.
 #[component]
 pub(crate) fn DashboardFixture(
     #[props(default)] filter: PrFilter,
     #[props(default = PageStatus::Loading)] page: PageStatus,
+    #[props(default = SummaryStatus::Loading)] summary: SummaryStatus,
     #[props(default)] selected: BTreeSet<String>,
     children: Element,
 ) -> Element {
@@ -126,6 +143,7 @@ pub(crate) fn DashboardFixture(
         use_signal(|| None),
         use_signal(|| selected),
         use_signal(|| page),
+        use_signal(|| summary),
         use_callback(|_| {}),
     );
     rsx! {

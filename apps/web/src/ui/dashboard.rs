@@ -8,12 +8,12 @@ use std::collections::BTreeSet;
 use dependaboard_core::{BatchProgress, Page, PrRecord};
 use dioxus::prelude::*;
 
-use crate::api::load_dashboard;
+use crate::api::{load_dashboard, load_summary};
 use crate::components::toast::{ToastOptions, use_toast};
 use crate::ui::action_bar::ActionBar;
 use crate::ui::active_batch::{ActiveBatch, queue_batch};
 use crate::ui::confirm_modal::ConfirmModal;
-use crate::ui::dashboard_state::{DashboardState, PageStatus};
+use crate::ui::dashboard_state::{DashboardState, PageStatus, SummaryStatus};
 use crate::ui::detail_drawer::{OpenDetail, OpenPr};
 use crate::ui::pr_table::PrTable;
 use crate::ui::sidebar::Sidebar;
@@ -28,6 +28,10 @@ use crate::ui::{PendingAction, sticky};
 /// the pull request drawer, the bulk action awaiting confirmation, and the
 /// batch being followed. It opens on the state its URL names and keeps the
 /// URL in step from then on.
+///
+/// The rows and the facets are two requests: the rows follow the filter and
+/// the cursor, the facets the filter alone, so loading the next page leaves
+/// the facets as they are.
 #[component]
 pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     let toast = use_toast();
@@ -45,7 +49,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     let active_batch = use_signal(|| None::<BatchProgress>);
     let progress_open = use_signal(|| false);
 
-    let mut dashboard = use_resource(move || {
+    let mut rows = use_resource(move || {
         let filter = filter();
         let page = Page {
             after: cursor(),
@@ -53,11 +57,19 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
         };
         async move { load_dashboard(filter, page).await }
     });
-    let page = use_memo(move || PageStatus::from_resource(dashboard.read().as_ref()));
-    let reload = use_callback(move |()| dashboard.restart());
-    let mut state = DashboardState::provide(filter, cursor, selected, page, reload);
+    let mut summary = use_resource(move || {
+        let filter = filter();
+        async move { load_summary(filter).await }
+    });
+    let page = use_memo(move || PageStatus::from_resource(rows.read().as_ref()));
+    let summary_status = use_memo(move || SummaryStatus::from_resource(summary.read().as_ref()));
+    let reload = use_callback(move |()| {
+        rows.restart();
+        summary.restart();
+    });
+    let mut state = DashboardState::provide(filter, cursor, selected, page, summary_status, reload);
     use_url_sync(state, detail);
-    let page = page.read();
+    let summary = summary_status.read();
 
     rsx! {
         TopBar { dark, aside_open }
@@ -93,7 +105,17 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
 
         ConfirmModal {
             pending: pending(),
-            repositories: page.loaded().map(|page| page.repositories.clone()).unwrap_or_default(),
+            repositories: summary
+                .loaded()
+                .map(|summary| {
+                    summary
+                        .facets
+                        .repositories
+                        .iter()
+                        .map(|facet| facet.repository.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
             oncancel: move |_| pending.set(None),
             onconfirm: move |action| {
                 state.clear_selection();

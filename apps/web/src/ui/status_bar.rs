@@ -9,8 +9,8 @@ use crate::ui::format::relative_time;
 #[component]
 pub(crate) fn StatusBar() -> Element {
     let state = use_dashboard();
-    let status = state.page.read();
-    let last_synced_at = status.loaded().and_then(|page| page.last_synced_at);
+    let summary = state.summary.read();
+    let last_synced_at = summary.loaded().and_then(|summary| summary.last_synced_at);
     rsx! {
         footer { class: "statusbar",
             span { class: "status-dot" }
@@ -28,8 +28,8 @@ pub(crate) fn StatusBar() -> Element {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-    use crate::ui::dashboard_state::PageStatus;
-    use crate::ui::test_support::{DashboardFixture, loaded_page, render};
+    use crate::ui::dashboard_state::SummaryStatus;
+    use crate::ui::test_support::{DashboardFixture, loaded_summary, render};
 
     #[test]
     fn the_status_bar_dates_the_last_event_once_there_has_been_one() {
@@ -46,7 +46,7 @@ mod tests {
 
         fn Loaded() -> Element {
             rsx! {
-                DashboardFixture { page: PageStatus::Loaded(loaded_page()), StatusBar {} }
+                DashboardFixture { summary: SummaryStatus::Loaded(loaded_summary()), StatusBar {} }
             }
         }
         let loaded = render(Loaded);

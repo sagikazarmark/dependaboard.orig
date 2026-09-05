@@ -122,6 +122,30 @@ fn escape_like(text: &str) -> String {
         .replace('_', r"\_")
 }
 
+/// A sidebar facet: one dimension of [`PrFilter`] that is counted rather
+/// than merely applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Facet {
+    Checks,
+    UpdateTypes,
+    Labels,
+    Repositories,
+}
+
+/// `filter` with `facet`'s own dimension dropped, so its counts reflect every
+/// other filter in force and a value already chosen keeps showing the
+/// alternatives.
+pub(crate) fn without_facet(filter: &PrFilter, facet: Facet) -> PrFilter {
+    let mut scoped = filter.clone();
+    match facet {
+        Facet::Checks => scoped.check_statuses.clear(),
+        Facet::UpdateTypes => scoped.update_types.clear(),
+        Facet::Labels => scoped.labels.clear(),
+        Facet::Repositories => scoped.repos.clear(),
+    }
+    scoped
+}
+
 #[cfg(test)]
 mod tests {
     use dependaboard_core::{CheckStatus, UpdateType};
@@ -306,6 +330,57 @@ mod tests {
             "WHERE (p.check_status IN ('failure', 'none') OR p.mergeable IN (?1) OR p.update_type = 'major' OR p.synced_at < ?2)"
         );
         assert_eq!(params, [text("dirty"), Value::Integer(7_300)]);
+    }
+
+    /// A facet counts against every other dimension of the filter, so
+    /// dropping its own leaves the rest, the free-text query and the view
+    /// included, exactly as they were.
+    #[test]
+    fn dropping_a_facets_dimension_leaves_every_other_field_alone() {
+        let filter = PrFilter {
+            query: Some("serde".to_owned()),
+            owner: Some("acme".to_owned()),
+            repos: vec!["acme/api".to_owned()],
+            update_types: vec![UpdateType::Minor],
+            check_statuses: vec![CheckStatus::Success],
+            labels: vec!["rust".to_owned()],
+            dependency: Some("serde".to_owned()),
+            needs_attention: true,
+        };
+
+        let expectations = [
+            (
+                Facet::Checks,
+                PrFilter {
+                    check_statuses: Vec::new(),
+                    ..filter.clone()
+                },
+            ),
+            (
+                Facet::UpdateTypes,
+                PrFilter {
+                    update_types: Vec::new(),
+                    ..filter.clone()
+                },
+            ),
+            (
+                Facet::Labels,
+                PrFilter {
+                    labels: Vec::new(),
+                    ..filter.clone()
+                },
+            ),
+            (
+                Facet::Repositories,
+                PrFilter {
+                    repos: Vec::new(),
+                    ..filter.clone()
+                },
+            ),
+        ];
+        for (facet, expected) in expectations {
+            assert_eq!(without_facet(&filter, facet), expected, "{facet:?}");
+        }
     }
 
     #[test]
