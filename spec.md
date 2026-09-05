@@ -1,7 +1,7 @@
 # Dependabot Dashboard — MVP Architecture
 
 Scope: one GitHub App installation, one org, single user. Filterable table of open
-Dependabot PRs. Two bulk actions: merge, rebase.
+Dependabot PRs. Three bulk actions: merge, rebase, update branch.
 
 ---
 
@@ -99,7 +99,7 @@ refresh. It also makes the webhook Worker trivially boring, which is the point.
 | `closed(synced_before?)` | exclusive | PR merged or closed: clear the object's state keys, `delete_pr()` from the read model. A sweep passes the instant its listing started; the object stands down if it has synced since (reopened behind the sweep). Webhooks pass nothing: unconditional. |
 | `merge(MergeRequest)` | exclusive | Guard `expected_sha == snapshot.sha`; `PUT /pulls/{n}/merge` with an explicit `merge_method`; on success `delete_pr()`. |
 | `command(DependabotCommand)` | exclusive | Post `@dependabot <cmd>` + attribution footer. **User token required** — see §6. Fire-and-forget. |
-| `update_branch()` | exclusive | `PUT /pulls/{n}/update-branch` with `expected_head_sha`. App-identity alternative to rebase. |
+| `update_branch()` | exclusive | `PUT /pulls/{n}/update-branch` with `expected_head_sha`. App-identity alternative to rebase; on success, one-way self-send of `sync` so the row catches up before the webhook does. |
 | `status()` | **shared** | Read-only, for UI drill-down without blocking actions. |
 
 **Concurrency.** The exclusive handlers serialise per PR, so "only one action at a time"
@@ -176,6 +176,12 @@ run(BulkRequest { action, targets: Vec<PrTarget> })
 
 progress() -> BatchProgress    // shared handler, UI polls this
 ```
+
+`action` is one of `merge`, `rebase`, `update_branch`, each dispatched to the
+`PullRequest` handler of the same name (`rebase` to `command`). The per-target semantics
+are the same for all three — the `expected_sha` guard, `Succeeded`/`Rejected`/`Failed`
+verdicts, progress written as each lands — and only the scheduling differs, see "Bound the
+fan-out" below.
 
 **A target that fails terminally does not stop the batch.** The callee's `TerminalError`
 is recorded against that target as `Failed` with its reason and the batch carries on;
@@ -325,9 +331,11 @@ const MAX_CONCURRENT: usize = 3;   // comments: consider 1 + a short delay
 
 Start conservative and raise it if you never see a 403 with a `retry-after`. For merge
 batches, additionally group targets by repository and run same-repo merges sequentially
-(concurrency applies *across* repos) — this sidesteps the base-branch 405 above. Getting
-the App secondary-rate-limited across hundreds of repos is a much worse failure than a
-batch taking two minutes.
+(concurrency applies *across* repos) — this sidesteps the base-branch 405 above. Branch
+updates share the merge bound but not the grouping: `update-branch` writes only to the
+pull request's own head branch, so two in one repository cannot collide and go out in the
+same round, in batch order. Getting the App secondary-rate-limited across hundreds of
+repos is a much worse failure than a batch taking two minutes.
 
 **Generate the batch id client-side, before the call.** The id matters less as a format
 than as an idempotency key. If the UI calls the server, the server mints an id, and the

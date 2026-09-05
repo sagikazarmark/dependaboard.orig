@@ -36,6 +36,12 @@ pub(crate) fn ActionBar(onrequest: EventHandler<PendingAction>) -> Element {
             }
             Button {
                 size: ButtonSize::Sm,
+                class: "update-branch-button",
+                onclick: move |_| request(BulkActionKind::UpdateBranch),
+                "Update branch"
+            }
+            Button {
+                size: ButtonSize::Sm,
                 class: "merge-button",
                 onclick: move |_| request(BulkActionKind::Merge),
                 "Merge selected"
@@ -68,7 +74,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bar_counts_the_selection_and_offers_both_actions() {
+    fn the_bar_counts_the_selection_and_offers_every_action() {
         fn Fixture() -> Element {
             rsx! {
                 DashboardFixture {
@@ -82,6 +88,7 @@ mod tests {
 
         assert!(html.contains("2 selected"), "{html}");
         assert!(html.contains("Request rebase"), "{html}");
+        assert!(html.contains("Update branch"), "{html}");
         assert!(html.contains("Merge selected"), "{html}");
     }
 }

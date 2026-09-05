@@ -1,5 +1,5 @@
-//! The `BulkAction` workflow: one per dashboard batch, driving a merge or rebase across
-//! many pull requests and exposing its progress to the dashboard.
+//! The `BulkAction` workflow: one per dashboard batch, driving a merge, rebase, or branch
+//! update across many pull requests and exposing its progress to the dashboard.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -9,7 +9,7 @@ use std::{
 
 use dependaboard_core::{
     ActionOutcome, BatchProgress, BulkActionKind, BulkRequest, CommandRequest, DependabotCommand,
-    MAX_BATCH_TARGETS, MergeRequest, PrTarget, UserId, valid_batch_id,
+    MAX_BATCH_TARGETS, MergeRequest, PrTarget, UpdateBranchRequest, UserId, valid_batch_id,
 };
 use restate_sdk::prelude::*;
 use tracing::warn;
@@ -20,7 +20,7 @@ use crate::{
 };
 
 const BATCH_PROGRESS: &str = "progress";
-/// How many pull requests one merge round sends to GitHub at once.
+/// How many pull requests one merge or branch-update round sends to GitHub at once.
 const MAX_CONCURRENT: NonZeroUsize = NonZeroUsize::new(3).unwrap();
 /// How long a rebase batch waits between two Dependabot comments, so a run of them does
 /// not trip GitHub's secondary rate limit on content creation.
@@ -56,6 +56,13 @@ trait BulkActionEffects {
         targets: &[PrTarget],
         landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
     ) -> impl Future<Output = Result<(), TerminalError>> + Send;
+    /// Sends one round of branch updates to GitHub at once, landing outcomes the way
+    /// `merge_round` does.
+    fn update_branch_round(
+        &mut self,
+        targets: &[PrTarget],
+        landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
+    ) -> impl Future<Output = Result<(), TerminalError>> + Send;
     /// Asks Dependabot to rebase one pull request; resolves once the comment is posted.
     fn rebase(
         &mut self,
@@ -70,6 +77,28 @@ struct RestateBulkAction<'a, 'ctx> {
     user_id: UserId,
 }
 
+impl RestateBulkAction<'_, '_> {
+    fn pull_request(&self, target: &PrTarget) -> PullRequestClient<'_> {
+        self.ctx.object_client::<PullRequestClient>(target.key())
+    }
+}
+
+/// Awaits every call of one round, handing each outcome to `landed` with the call's index
+/// as it arrives.
+async fn land_round<C>(
+    calls: impl IntoIterator<Item = C>,
+    mut landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
+) -> Result<(), TerminalError>
+where
+    C: CallFuture<Response = Json<ActionOutcome>> + Send,
+{
+    let mut calls = calls.into_iter().collect::<DurableFuturesUnordered<_>>();
+    while let Some((index, outcome)) = calls.next().await? {
+        landed(index, outcome.map(Json::into_inner));
+    }
+    Ok(())
+}
+
 impl BulkActionEffects for RestateBulkAction<'_, '_> {
     fn batch_id(&self) -> &str {
         self.ctx.key()
@@ -78,29 +107,37 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
     async fn merge_round(
         &mut self,
         targets: &[PrTarget],
-        mut landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
+        landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
     ) -> Result<(), TerminalError> {
-        let mut calls = DurableFuturesUnordered::new();
-        for target in targets {
-            calls.push(
-                self.ctx
-                    .object_client::<PullRequestClient>(target.key())
-                    .merge(Json::from(MergeRequest {
-                        batch_id: self.ctx.key().to_owned(),
-                        target: target.clone(),
-                    }))
-                    .call(),
-            );
-        }
-        while let Some((index, outcome)) = calls.next().await? {
-            landed(index, outcome.map(Json::into_inner));
-        }
-        Ok(())
+        let calls = targets.iter().map(|target| {
+            self.pull_request(target)
+                .merge(Json::from(MergeRequest {
+                    batch_id: self.ctx.key().to_owned(),
+                    target: target.clone(),
+                }))
+                .call()
+        });
+        land_round(calls, landed).await
+    }
+
+    async fn update_branch_round(
+        &mut self,
+        targets: &[PrTarget],
+        landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
+    ) -> Result<(), TerminalError> {
+        let calls = targets.iter().map(|target| {
+            self.pull_request(target)
+                .update_branch(Json::from(UpdateBranchRequest {
+                    batch_id: self.ctx.key().to_owned(),
+                    target: target.clone(),
+                }))
+                .call()
+        });
+        land_round(calls, landed).await
     }
 
     async fn rebase(&mut self, target: &PrTarget) -> Result<ActionOutcome, TerminalError> {
-        self.ctx
-            .object_client::<PullRequestClient>(target.key())
+        self.pull_request(target)
             .command(Json::from(CommandRequest {
                 batch_id: self.ctx.key().to_owned(),
                 target: target.clone(),
@@ -119,11 +156,13 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
 
 /// Drives every target of the batch to a terminal state and resolves to the final tally.
 ///
-/// Merges go out in the rounds `plan_merge_rounds` lays out; rebases go one at a time with
-/// a pause between comments. `publish` is called with each change in progress, so the
-/// dashboard sees every target settle as it happens rather than when the batch is over.
-/// A target that fails terminally is recorded as failed with its reason and the batch
-/// carries on: one pull request's problem is not a reason to leave the rest queued.
+/// Merges go out in the rounds `plan_merge_rounds` lays out. Branch updates go out
+/// [`MAX_CONCURRENT`] at a time in batch order: updating one head branch moves nothing
+/// under another, so same-repository targets need no serialising. Rebases go one at a
+/// time with a pause between comments. `publish` is called with each change in progress,
+/// so the dashboard sees every target settle as it happens rather than when the batch is
+/// over. A target that fails terminally is recorded as failed with its reason and the
+/// batch carries on: one pull request's problem is not a reason to leave the rest queued.
 async fn run_bulk_action<E: BulkActionEffects>(
     restate: &mut E,
     request: &BulkRequest,
@@ -134,12 +173,20 @@ async fn run_bulk_action<E: BulkActionEffects>(
     match request.action {
         BulkActionKind::Merge => {
             for round in plan_merge_rounds(&request.targets, MAX_CONCURRENT) {
-                for target in &round {
-                    progress.start(&target.key());
-                }
-                publish(&progress);
+                start_round(&mut progress, &round, &mut publish);
                 restate
                     .merge_round(&round, |index, outcome| {
+                        settle(&mut progress, &round[index], outcome);
+                        publish(&progress);
+                    })
+                    .await?;
+            }
+        }
+        BulkActionKind::UpdateBranch => {
+            for round in request.targets.chunks(MAX_CONCURRENT.get()) {
+                start_round(&mut progress, round, &mut publish);
+                restate
+                    .update_branch_round(round, |index, outcome| {
                         settle(&mut progress, &round[index], outcome);
                         publish(&progress);
                     })
@@ -160,6 +207,19 @@ async fn run_bulk_action<E: BulkActionEffects>(
         }
     }
     Ok(progress)
+}
+
+/// Marks every target of a round as running and publishes once for the round, so the
+/// dashboard shows the whole round in flight together.
+fn start_round(
+    progress: &mut BatchProgress,
+    round: &[PrTarget],
+    publish: &mut impl FnMut(&BatchProgress),
+) {
+    for target in round {
+        progress.start(&target.key());
+    }
+    publish(progress);
 }
 
 /// Records how one target's action ended. A terminal failure is that target's alone: it is
@@ -303,9 +363,30 @@ mod tests {
         }
     }
 
+    fn updated() -> ActionOutcome {
+        ActionOutcome::Succeeded {
+            detail: "Updating pull request branch.".to_owned(),
+        }
+    }
+
+    fn commented() -> ActionOutcome {
+        ActionOutcome::Succeeded {
+            detail: "@dependabot rebase posted".to_owned(),
+        }
+    }
+
     fn forbidden() -> ActionOutcome {
         ActionOutcome::Rejected {
             reason: RejectReason::Forbidden,
+        }
+    }
+
+    fn stale() -> ActionOutcome {
+        ActionOutcome::Rejected {
+            reason: RejectReason::StaleSha {
+                expected: "abc123".to_owned(),
+                actual: "def456".to_owned(),
+            },
         }
     }
 
@@ -316,13 +397,15 @@ mod tests {
     /// Stands in for the `PullRequest` objects a batch calls and records what it sent them.
     ///
     /// Each pull request answers with its scripted outcome, or succeeds when none is
-    /// scripted. A merge round lands its outcomes in reverse order of sending, so a batch
-    /// that confused the round's indices would record outcomes against the wrong targets.
+    /// scripted. A round lands its outcomes in reverse order of sending, so a batch that
+    /// confused the round's indices would record outcomes against the wrong targets.
     #[derive(Default)]
     struct RecordedBulkAction {
         answers: BTreeMap<u64, Result<ActionOutcome, TerminalError>>,
         /// Pull request numbers in the order their actions were sent.
         sent: Vec<u64>,
+        /// The pull request numbers of each concurrent round, in the order sent.
+        rounds: Vec<Vec<u64>>,
         pauses: u32,
     }
 
@@ -336,11 +419,30 @@ mod tests {
             }
         }
 
-        fn answer(&mut self, target: &PrTarget) -> Result<ActionOutcome, TerminalError> {
+        fn answer(
+            &mut self,
+            target: &PrTarget,
+            succeeded: ActionOutcome,
+        ) -> Result<ActionOutcome, TerminalError> {
             self.sent.push(target.number);
-            self.answers
-                .remove(&target.number)
-                .unwrap_or_else(|| Ok(merged()))
+            self.answers.remove(&target.number).unwrap_or(Ok(succeeded))
+        }
+
+        fn round(
+            &mut self,
+            targets: &[PrTarget],
+            succeeded: ActionOutcome,
+            mut landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>),
+        ) {
+            self.rounds
+                .push(targets.iter().map(|target| target.number).collect());
+            let outcomes = targets
+                .iter()
+                .map(|target| self.answer(target, succeeded.clone()))
+                .collect::<Vec<_>>();
+            for (index, outcome) in outcomes.into_iter().enumerate().rev() {
+                landed(index, outcome);
+            }
         }
     }
 
@@ -352,20 +454,23 @@ mod tests {
         async fn merge_round(
             &mut self,
             targets: &[PrTarget],
-            mut landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
+            landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
         ) -> Result<(), TerminalError> {
-            let outcomes = targets
-                .iter()
-                .map(|target| self.answer(target))
-                .collect::<Vec<_>>();
-            for (index, outcome) in outcomes.into_iter().enumerate().rev() {
-                landed(index, outcome);
-            }
+            self.round(targets, merged(), landed);
+            Ok(())
+        }
+
+        async fn update_branch_round(
+            &mut self,
+            targets: &[PrTarget],
+            landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
+        ) -> Result<(), TerminalError> {
+            self.round(targets, updated(), landed);
             Ok(())
         }
 
         async fn rebase(&mut self, target: &PrTarget) -> Result<ActionOutcome, TerminalError> {
-            self.answer(target)
+            self.answer(target, commented())
         }
 
         async fn pause(&mut self) -> Result<(), TerminalError> {
@@ -535,6 +640,79 @@ mod tests {
         assert_eq!(
             restate.pauses, 3,
             "one pause between each pair of comments and none after the last"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mixed_update_branch_batch_settles_each_target_on_its_own_and_never_pauses() {
+        // Four pull requests in one repository: a stale head is rejected, a GitHub 500 is
+        // failed, and neither stops the other two from having their branches updated.
+        let request = request(
+            BulkActionKind::UpdateBranch,
+            vec![pull(7, 1), pull(7, 2), pull(7, 3), pull(7, 4)],
+        );
+        let mut restate = RecordedBulkAction::answering([(2, Err(github_500())), (3, Ok(stale()))]);
+
+        let (progress, _) = run(&mut restate, &request).await;
+
+        assert_eq!(restate.sent, vec![1, 2, 3, 4]);
+        assert!(progress.completed);
+        assert_eq!(
+            (progress.succeeded, progress.rejected, progress.failed),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            state_of(&progress, 1),
+            &TargetProgressState::Succeeded {
+                detail: "Updating pull request branch.".to_owned()
+            }
+        );
+        assert_eq!(
+            state_of(&progress, 2),
+            &TargetProgressState::Failed {
+                detail: "GitHub mutation failed with HTTP 500: Internal Server Error".to_owned()
+            }
+        );
+        assert_eq!(
+            state_of(&progress, 3),
+            &TargetProgressState::Rejected {
+                reason: RejectReason::StaleSha {
+                    expected: "abc123".to_owned(),
+                    actual: "def456".to_owned(),
+                }
+            }
+        );
+        assert_eq!(
+            restate.pauses, 0,
+            "branch updates are App mutations, not comments, so they need no spacing"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_updates_go_out_in_rounds_of_the_concurrency_bound_in_batch_order() {
+        // Updating one head branch moves nothing under another, so unlike merges, pull
+        // requests in one repository share a round.
+        let request = request(
+            BulkActionKind::UpdateBranch,
+            vec![pull(7, 1), pull(7, 2), pull(7, 3), pull(7, 4), pull(8, 5)],
+        );
+        let mut restate = RecordedBulkAction::default();
+
+        let (progress, published) = run(&mut restate, &request).await;
+
+        assert_eq!(restate.rounds, vec![vec![1, 2, 3], vec![4, 5]]);
+        assert_eq!(
+            (progress.succeeded, progress.rejected, progress.failed),
+            (5, 0, 0)
+        );
+        let running_after_first_round_started = published[1]
+            .targets
+            .iter()
+            .filter(|target| target.state == TargetProgressState::Running)
+            .count();
+        assert_eq!(
+            running_after_first_round_started, 3,
+            "the dashboard sees the whole round in flight, not one target at a time"
         );
     }
 

@@ -936,6 +936,7 @@ code,
 }
 
 .rebase-button,
+.update-branch-button,
 .merge-button,
 .confirm-button {
   min-height: 28px;

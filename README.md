@@ -1,6 +1,6 @@
 # Dependaboard
 
-A focused operational dashboard for open Dependabot pull requests. Dependaboard combines a Dioxus fullstack UI, a libSQL read model, GitHub App authentication, and Restate workflows for durable merge, rebase, webhook, and reconciliation processing.
+A focused operational dashboard for open Dependabot pull requests. Dependaboard combines a Dioxus fullstack UI, a libSQL read model, GitHub App authentication, and Restate workflows for durable merge, rebase, branch update, webhook, and reconciliation processing.
 
 ## Quickstart
 
@@ -370,6 +370,10 @@ Confirm the repository allows at least one of squash, merge, and rebase, require
 
 Confirm the fine-grained PAT has Pull requests read/write access, its user can write to the repository, and `DASHBOARD_USERNAME` is that user's GitHub login.
 
+**Update branch is rejected**
+
+Update branch merges the base into the pull request's head branch under the App's identity, so it needs the same Contents write access as merge and a head branch the App may push to; a stale head SHA or a pull request GitHub reports as not mergeable is rejected rather than retried. Note that Dependabot stops rebasing a pull request once another commit lands on it, so prefer **Request rebase** when a PAT is configured.
+
 **Restate fails after a Compose recreation**
 
 The Compose file fixes `RESTATE_NODE_NAME=dependaboard` so the current project's named volume remains valid across container recreation. If the volume came from an older configuration with a different node name, reset it once with `docker compose down -v`.
@@ -398,7 +402,7 @@ Every Restate handler is reachable through the ingress unless marked private, an
 |---|---|
 | `WebhookIngress.dispatch` — verified GitHub deliveries, forwarded by the web edge | `PullRequest.sync`, `.closed`, `.merge`, `.command`, `.update_branch` |
 | `DashboardIngress.sync_installation`, `.sync_pull_request` — the dashboard's **Sync** buttons | `InstallationSync.*` |
-| `BulkAction.run`, `.progress` — batch merges and rebases | `RepoSync.*` |
+| `BulkAction.run`, `.progress` — batch merges, rebases, and branch updates | `RepoSync.*` |
 | `PullRequest.status` — the read the detail drawer polls | |
 | `SchedulerIngress.start` — arms the reconcile chain at startup | |
 
@@ -485,8 +489,9 @@ Automated tests do not possess GitHub credentials. Before relying on a deploymen
 5. Close a Dependabot pull request while the Restate service is down, bring it back, wait for the next `RepoSync/reconcile`, and confirm the row is gone, `PullRequest/status` returns no state, and the detail drawer reports the pull request as no longer open.
 6. Queue a merge and confirm GitHub records the App installation as actor and uses `GITHUB_MERGE_METHOD`. In a repository that disallows that method, confirm the dialog names the repository with the method it will use, and that the merge succeeds with it.
 7. Queue a rebase and confirm the PAT user authors one marked, attributed `@dependabot rebase` comment.
-8. Restart the Restate service during an in-flight batch and confirm target progress resumes.
-9. Inspect Restate inputs, journals, and object state and confirm the PAT value is absent.
+8. Queue a branch update and confirm GitHub records the App installation as the author of the merge commit on the head branch, and that the row's head SHA and checks refresh without a manual sync.
+9. Restart the Restate service during an in-flight batch and confirm target progress resumes.
+10. Inspect Restate inputs, journals, and object state and confirm the PAT value is absent.
 
 ## License
 

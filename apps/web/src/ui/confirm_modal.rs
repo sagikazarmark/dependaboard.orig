@@ -48,26 +48,34 @@ pub(crate) fn ConfirmModal(
                         AlertDialogDescription { appearance: AlertDialogDescriptionAppearance::None,
                             "The selected head SHAs are captured now. Moved or ineligible pull requests will be rejected, not silently retried against new code."
                         }
-                        if action == BulkActionKind::Merge {
-                            if overrides.is_empty() {
-                                div { class: "notice", "Uses the configured merge method." }
-                            } else {
-                                div { class: "notice",
-                                    "Uses the configured merge method where the repository allows it."
-                                    ul { class: "merge-method-overrides",
-                                        for (repository, method) in overrides {
-                                            li { key: "{repository}",
-                                                code { "{repository}" }
-                                                " disallows it and will use "
-                                                code { "{method}" }
-                                                "."
+                        match action {
+                            BulkActionKind::Merge => rsx! {
+                                if overrides.is_empty() {
+                                    div { class: "notice", "Uses the configured merge method." }
+                                } else {
+                                    div { class: "notice",
+                                        "Uses the configured merge method where the repository allows it."
+                                        ul { class: "merge-method-overrides",
+                                            for (repository, method) in overrides {
+                                                li { key: "{repository}",
+                                                    code { "{repository}" }
+                                                    " disallows it and will use "
+                                                    code { "{method}" }
+                                                    "."
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
-                        } else {
-                            div { class: "notice", "Rebase is requested by an idempotent @dependabot comment using the configured user token." }
+                            },
+                            BulkActionKind::Rebase => rsx! {
+                                div { class: "notice", "Rebase is requested by an idempotent @dependabot comment using the configured user token." }
+                            },
+                            BulkActionKind::UpdateBranch => rsx! {
+                                div { class: "notice",
+                                    "The App merges the base branch into the pull request, so checks re-run against it. Dependabot stops rebasing a pull request once another commit lands on it."
+                                }
+                            },
                         }
                         AlertDialogActions {
                             AlertDialogCancel { class: "btn-ghost btn-sm", "Cancel" }
@@ -211,6 +219,26 @@ mod tests {
         let html = render(BulkActionKind::Rebase, vec![target_in(&web, 2)], vec![web]);
 
         assert!(html.contains("@dependabot"), "{html}");
+        assert!(!html.contains("merge method"), "{html}");
+    }
+
+    #[test]
+    fn a_branch_update_explains_it_is_the_app_merging_the_base_in_not_a_dependabot_rebase() {
+        let web = repository(8, "web", Some(MergeMethod::Merge));
+        let html = render(
+            BulkActionKind::UpdateBranch,
+            vec![target_in(&web, 2)],
+            vec![web],
+        );
+
+        assert!(html.contains("update branch 1 pull request?"), "{html}");
+        assert!(html.contains("Queue update branch"), "{html}");
+        assert!(
+            html.contains("merges the base branch into the pull request"),
+            "{html}"
+        );
+        assert!(html.contains("stops rebasing"), "{html}");
+        assert!(!html.contains("@dependabot"), "{html}");
         assert!(!html.contains("merge method"), "{html}");
     }
 

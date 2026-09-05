@@ -589,6 +589,9 @@ impl FromStr for MergeMethod {
 pub enum BulkActionKind {
     Merge,
     Rebase,
+    /// `PUT /pulls/{n}/update-branch`: merges the base into the head under the App's
+    /// identity, the alternative to a rebase when no user token is configured.
+    UpdateBranch,
 }
 
 impl fmt::Display for BulkActionKind {
@@ -596,6 +599,7 @@ impl fmt::Display for BulkActionKind {
         f.write_str(match self {
             Self::Merge => "merge",
             Self::Rebase => "rebase",
+            Self::UpdateBranch => "update branch",
         })
     }
 }
@@ -1302,6 +1306,26 @@ mod tests {
             id: "4#5".to_owned(),
         };
         assert_eq!(PageCursor::decode(&cursor.encode()).unwrap(), cursor);
+    }
+
+    #[test]
+    fn a_bulk_action_kind_travels_in_snake_case_and_reads_as_plain_words() {
+        // The wire form is what the dashboard posts to `BulkAction/run`; the display form
+        // is what it puts in the confirm dialog title and the progress pill.
+        let kinds = [
+            (BulkActionKind::Merge, r#""merge""#, "merge"),
+            (BulkActionKind::Rebase, r#""rebase""#, "rebase"),
+            (
+                BulkActionKind::UpdateBranch,
+                r#""update_branch""#,
+                "update branch",
+            ),
+        ];
+        for (kind, wire, display) in kinds {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<BulkActionKind>(wire).unwrap(), kind);
+            assert_eq!(kind.to_string(), display);
+        }
     }
 
     #[test]

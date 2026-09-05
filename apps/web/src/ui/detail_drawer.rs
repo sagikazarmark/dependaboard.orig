@@ -156,6 +156,12 @@ pub(crate) fn DetailDrawer(
                     }
                     Button {
                         size: ButtonSize::Sm,
+                        class: "update-branch-button",
+                        onclick: move |_| request(BulkActionKind::UpdateBranch),
+                        "Update branch"
+                    }
+                    Button {
+                        size: ButtonSize::Sm,
                         class: "merge-button",
                         onclick: move |_| request(BulkActionKind::Merge),
                         "Merge"
@@ -444,6 +450,22 @@ mod tests {
             html.contains(r#"<span class="status-badge">has_hooks</span>"#),
             "{html}"
         );
+    }
+
+    #[test]
+    fn detail_drawer_offers_rebase_update_branch_and_merge_for_its_pull_request() {
+        let mut dom = VirtualDom::new(DrawerFixture);
+        dom.rebuild_in_place();
+        let html = dioxus::ssr::render(&dom);
+
+        for (class, label) in [
+            ("rebase-button", ">Rebase<"),
+            ("update-branch-button", ">Update branch<"),
+            ("merge-button", ">Merge<"),
+        ] {
+            assert!(html.contains(class), "{class}: {html}");
+            assert!(html.contains(label), "{label}: {html}");
+        }
     }
 
     fn render_durable_state(status: DurableStatus) -> String {
