@@ -21,6 +21,17 @@ pub(crate) fn store_retry_policy() -> RunRetryPolicy {
         .max_duration(Duration::from_secs(5 * 60))
 }
 
+/// The same backoff without the budget, for a projection write nothing would redo: a
+/// finished batch's record is written by the one run its workflow key gets, so giving up
+/// would lose the record for good. The step retries until the store takes it; the batch's
+/// progress is already published, so the dashboard is not kept waiting on it.
+pub(crate) fn persistent_store_retry_policy() -> RunRetryPolicy {
+    RunRetryPolicy::new()
+        .initial_delay(Duration::from_millis(100))
+        .exponentiation_factor(2.0)
+        .max_delay(Duration::from_secs(5))
+}
+
 pub(crate) fn store_failure(error: StoreError) -> HandlerError {
     match error.class() {
         StoreErrorClass::Retryable => RetryableServiceError::Store(error.to_string()).into(),

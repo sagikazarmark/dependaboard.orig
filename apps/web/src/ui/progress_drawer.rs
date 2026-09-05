@@ -1,6 +1,6 @@
 //! The drawer that follows a running bulk action, one row per target.
 
-use dependaboard_core::{BatchProgress, PrTarget, TargetProgressState};
+use dependaboard_core::{BatchProgress, TargetProgressState};
 use dioxus::prelude::*;
 
 use crate::components::button::{Button, ButtonSize};
@@ -36,23 +36,12 @@ pub(crate) fn ProgressDrawer(
             }
             div { class: "progress-list",
                 for item in &progress.targets {
-                    div { class: "progress-row",
-                        span { class: "progress-state {progress_class(&item.state)}" }
-                        div {
-                            if let Some(html_url) = progress_target_url(&item.target) {
-                                a {
-                                    class: "github-pr-link",
-                                    href: html_url,
-                                    target: "_blank",
-                                    rel: "noreferrer",
-                                    strong { "{item.target.owner}/{item.target.repo}#{item.target.number}" }
-                                    span { class: "external-link-glyph", "↗" }
-                                }
-                            } else {
-                                strong { "{item.target.owner}/{item.target.repo}#{item.target.number}" }
-                            }
-                            small { "{progress_detail(&item.state)}" }
-                        }
+                    TargetRow {
+                        owner: item.target.owner.clone(),
+                        repo: item.target.repo.clone(),
+                        number: item.target.number,
+                        html_url: item.target.html_url.clone(),
+                        state: item.state.clone(),
                     }
                 }
             }
@@ -71,8 +60,38 @@ pub(crate) fn ProgressDrawer(
     }
 }
 
-fn progress_target_url(target: &PrTarget) -> Option<&str> {
-    (!target.html_url.is_empty()).then_some(target.html_url.as_str())
+/// One target of a batch: its state as a dot, the pull request as a link to
+/// GitHub when its URL is known (a target recorded before URLs travelled with
+/// it has none), and the state's detail. Shared by the drawer that follows a
+/// running batch and the list of the batches that have run.
+#[component]
+pub(crate) fn TargetRow(
+    owner: String,
+    repo: String,
+    number: u64,
+    html_url: String,
+    state: TargetProgressState,
+) -> Element {
+    rsx! {
+        div { class: "progress-row",
+            span { class: "progress-state {progress_class(&state)}" }
+            div {
+                if html_url.is_empty() {
+                    strong { "{owner}/{repo}#{number}" }
+                } else {
+                    a {
+                        class: "github-pr-link",
+                        href: html_url,
+                        target: "_blank",
+                        rel: "noreferrer",
+                        strong { "{owner}/{repo}#{number}" }
+                        span { class: "external-link-glyph", "↗" }
+                    }
+                }
+                small { "{progress_detail(&state)}" }
+            }
+        }
+    }
 }
 
 fn progress_class(state: &TargetProgressState) -> &'static str {
@@ -101,7 +120,7 @@ mod tests {
 
     use super::*;
     use crate::ui::pr_target;
-    use crate::ui::test_support::{grouped_row, half_done_merge, serde_row};
+    use crate::ui::test_support::{grouped_row, half_done_merge, render, serde_row};
 
     fn render_drawer(progress: BatchProgress, retrying: bool) -> String {
         #[component]
@@ -197,23 +216,45 @@ mod tests {
         assert!(!html.contains(RETRY_BUTTON), "{html}");
     }
 
+    /// A target's row links to the pull request on GitHub when its URL is known;
+    /// a target recorded before URLs travelled with it is named but not linked.
     #[test]
-    fn batch_progress_uses_the_canonical_pull_request_url() {
-        let mut target = PrTarget {
-            repository_id: 7,
-            owner: "acme".to_owned(),
-            repo: "api".to_owned(),
-            number: 9,
-            expected_sha: "abc123".to_owned(),
-            title: "Bump serde".to_owned(),
-            html_url: "https://github.example/acme/api/pull/9".to_owned(),
-        };
-        assert_eq!(
-            progress_target_url(&target),
-            Some("https://github.example/acme/api/pull/9")
+    fn a_target_row_links_to_the_pull_request_only_when_its_url_is_known() {
+        fn Linked() -> Element {
+            rsx! {
+                TargetRow {
+                    owner: "acme",
+                    repo: "api",
+                    number: 9,
+                    html_url: "https://github.example/acme/api/pull/9",
+                    state: TargetProgressState::Queued,
+                }
+            }
+        }
+        let linked = render(Linked);
+        assert!(
+            linked.contains(
+                r#"<a class="github-pr-link" href="https://github.example/acme/api/pull/9" target="_blank" rel="noreferrer"><strong>acme/api#9</strong>"#
+            ),
+            "{linked}"
         );
 
-        target.html_url.clear();
-        assert_eq!(progress_target_url(&target), None);
+        fn Unlinked() -> Element {
+            rsx! {
+                TargetRow {
+                    owner: "acme",
+                    repo: "api",
+                    number: 9,
+                    html_url: "",
+                    state: TargetProgressState::Queued,
+                }
+            }
+        }
+        let unlinked = render(Unlinked);
+        assert!(!unlinked.contains("<a "), "{unlinked}");
+        assert!(
+            unlinked.contains("<strong>acme/api#9</strong>"),
+            "{unlinked}"
+        );
     }
 }

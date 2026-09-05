@@ -4,19 +4,23 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     num::NonZeroUsize,
+    sync::Arc,
     time::Duration,
 };
 
 use dependaboard_core::{
-    ActionOutcome, BatchProgress, BulkActionKind, BulkRequest, CommandRequest, DependabotCommand,
-    MAX_BATCH_TARGETS, MergeRequest, PrTarget, UpdateBranchRequest, UserId, valid_batch_id,
+    ActionOutcome, BatchProgress, BatchRecord, BulkActionKind, BulkRequest, CommandRequest,
+    DependabotCommand, MAX_BATCH_TARGETS, MergeRequest, PrTarget, UpdateBranchRequest, UserId,
+    unix_seconds, valid_batch_id,
 };
+use dependaboard_store::PrStore;
 use restate_sdk::prelude::*;
 use tracing::warn;
 
 use crate::{
     handler::{HandlerOutcome, traced, traced_read},
     pull_request::PullRequestClient,
+    store::{persistent_store_retry_policy, store_failure},
 };
 
 const BATCH_PROGRESS: &str = "progress";
@@ -26,7 +30,10 @@ const MAX_CONCURRENT: NonZeroUsize = NonZeroUsize::new(3).unwrap();
 /// not trip GitHub's secondary rate limit on content creation.
 const COMMENT_SPACING: Duration = Duration::from_millis(350);
 
-pub(crate) struct BulkAction;
+#[derive(Clone)]
+pub(crate) struct BulkAction {
+    pub(crate) store: Arc<dyn PrStore>,
+}
 
 impl HandlerOutcome for Json<BatchProgress> {
     fn outcome(&self) -> String {
@@ -70,10 +77,22 @@ trait BulkActionEffects {
     ) -> impl Future<Output = Result<ActionOutcome, TerminalError>> + Send;
     /// Waits [`COMMENT_SPACING`] durably between two comments.
     fn pause(&mut self) -> impl Future<Output = Result<(), TerminalError>> + Send;
+    /// The wall clock, in Unix seconds, journaled under `step` so a replay reads the
+    /// same moment.
+    fn now(&mut self, step: &'static str) -> impl Future<Output = HandlerResult<u64>> + Send;
+    /// Writes the finished batch to the projection, where it outlives the workflow's
+    /// retention. Written once per batch: the store keeps the first record and Restate
+    /// journals the step, so neither a retry nor a replay writes a second. Nothing would
+    /// redo this write, so it is retried until the store takes it rather than given up.
+    fn record_batch(
+        &mut self,
+        record: &BatchRecord,
+    ) -> impl Future<Output = HandlerResult<()>> + Send;
 }
 
 struct RestateBulkAction<'a, 'ctx> {
     ctx: &'a WorkflowContext<'ctx>,
+    store: &'a Arc<dyn PrStore>,
     user_id: UserId,
 }
 
@@ -152,9 +171,32 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
     async fn pause(&mut self) -> Result<(), TerminalError> {
         self.ctx.sleep(COMMENT_SPACING).await
     }
+
+    async fn now(&mut self, step: &'static str) -> HandlerResult<u64> {
+        Ok(self
+            .ctx
+            .run(|| async { Ok(unix_seconds()) })
+            .name(step)
+            .await?)
+    }
+
+    async fn record_batch(&mut self, record: &BatchRecord) -> HandlerResult<()> {
+        let store = self.store.clone();
+        let record = record.clone();
+        self.ctx
+            .run(move || async move {
+                store.record_batch(&record).await.map_err(store_failure)?;
+                Ok(())
+            })
+            .retry_policy(persistent_store_retry_policy())
+            .name("record-batch")
+            .await?;
+        Ok(())
+    }
 }
 
-/// Drives every target of the batch to a terminal state and resolves to the final tally.
+/// Drives every target of the batch to a terminal state, writes the finished batch to
+/// the projection, and resolves to the final tally.
 ///
 /// Merges go out in the rounds `plan_merge_rounds` lays out. Branch updates go out
 /// [`MAX_CONCURRENT`] at a time in batch order: updating one head branch moves nothing
@@ -163,11 +205,17 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
 /// so the dashboard sees every target settle as it happens rather than when the batch is
 /// over. A target that fails terminally is recorded as failed with its reason and the
 /// batch carries on: one pull request's problem is not a reason to leave the rest queued.
+/// Once every target has settled the batch is recorded, with who asked for it and when
+/// it ran, so its outcome is still there after Restate has forgotten the workflow. The
+/// record is retried until it lands, so the batch still ends with its tally rather than
+/// an error when the store is away for a while; only a store that rejects the record
+/// outright fails it.
 async fn run_bulk_action<E: BulkActionEffects>(
     restate: &mut E,
     request: &BulkRequest,
     mut publish: impl FnMut(&BatchProgress) + Send,
 ) -> HandlerResult<BatchProgress> {
+    let started_at = restate.now("batch-start-clock").await?;
     let mut progress = BatchProgress::queued(restate.batch_id(), request.action, &request.targets);
     publish(&progress);
     match request.action {
@@ -206,6 +254,13 @@ async fn run_bulk_action<E: BulkActionEffects>(
             }
         }
     }
+    let completed_at = restate.now("batch-finish-clock").await?;
+    let record = progress
+        .completed_record(request.user_id.clone(), started_at, completed_at)
+        .ok_or_else(|| {
+            TerminalError::new("every target was attempted, yet the batch is not complete")
+        })?;
+    restate.record_batch(&record).await?;
     Ok(progress)
 }
 
@@ -257,6 +312,7 @@ impl BulkAction {
             validate_batch_request(ctx.key(), &request)?;
             let mut restate = RestateBulkAction {
                 ctx: &ctx,
+                store: &self.store,
                 user_id: request.user_id.clone(),
             };
             let progress = run_bulk_action(&mut restate, &request, |progress| {
@@ -335,7 +391,7 @@ fn validate_batch_request(batch_id: &str, request: &BulkRequest) -> HandlerResul
 
 #[cfg(test)]
 mod tests {
-    use dependaboard_core::{RejectReason, TargetProgressState, UserId};
+    use dependaboard_core::{RejectReason, TargetOutcome, TargetProgressState, UserId};
 
     use super::*;
     use crate::test_support::target;
@@ -398,7 +454,8 @@ mod tests {
     ///
     /// Each pull request answers with its scripted outcome, or succeeds when none is
     /// scripted. A round lands its outcomes in reverse order of sending, so a batch that
-    /// confused the round's indices would record outcomes against the wrong targets.
+    /// confused the round's indices would record outcomes against the wrong targets. The
+    /// clock advances by a minute per reading, so a start and a finish never coincide.
     #[derive(Default)]
     struct RecordedBulkAction {
         answers: BTreeMap<u64, Result<ActionOutcome, TerminalError>>,
@@ -407,7 +464,14 @@ mod tests {
         /// The pull request numbers of each concurrent round, in the order sent.
         rounds: Vec<Vec<u64>>,
         pauses: u32,
+        /// Minutes the clock has been read for, from a fixed epoch.
+        clock_readings: u64,
+        /// Every batch record written to the projection, in order.
+        recorded: Vec<BatchRecord>,
     }
+
+    /// The fake clock's first reading, in Unix seconds.
+    const CLOCK_EPOCH: u64 = 1_700_000_000;
 
     impl RecordedBulkAction {
         fn answering(
@@ -475,6 +539,17 @@ mod tests {
 
         async fn pause(&mut self) -> Result<(), TerminalError> {
             self.pauses += 1;
+            Ok(())
+        }
+
+        async fn now(&mut self, _step: &'static str) -> HandlerResult<u64> {
+            let reading = CLOCK_EPOCH + self.clock_readings * 60;
+            self.clock_readings += 1;
+            Ok(reading)
+        }
+
+        async fn record_batch(&mut self, record: &BatchRecord) -> HandlerResult<()> {
+            self.recorded.push(record.clone());
             Ok(())
         }
     }
@@ -739,6 +814,68 @@ mod tests {
         assert!(
             published.last().is_some_and(|progress| progress.completed),
             "the last publish is the finished batch"
+        );
+    }
+
+    /// Restate forgets the workflow after its retention; the projection is where the
+    /// batch's outcome lives on. It is written once, as the batch's last step, with the
+    /// requester, when the batch started and finished, the tally, and every verdict.
+    #[tokio::test]
+    async fn a_finished_batch_is_recorded_in_the_projection_once_with_its_tally_and_verdicts() {
+        let request = BulkRequest {
+            user_id: UserId::new("alice"),
+            ..request(
+                BulkActionKind::Merge,
+                vec![pull(7, 1), pull(8, 4), pull(9, 2)],
+            )
+        };
+        let mut restate =
+            RecordedBulkAction::answering([(4, Ok(forbidden())), (2, Err(github_500()))]);
+
+        let (progress, _) = run(&mut restate, &request).await;
+
+        assert_eq!(restate.recorded.len(), 1, "{:?}", restate.recorded);
+        let record = &restate.recorded[0];
+        assert_eq!(
+            record,
+            &progress
+                .completed_record(UserId::new("alice"), CLOCK_EPOCH, CLOCK_EPOCH + 60)
+                .expect("the batch has finished"),
+            "the record is the finished progress, stamped with who asked and when"
+        );
+        assert_eq!(record.batch_id, "batch-1");
+        assert_eq!(
+            (record.succeeded, record.rejected, record.failed),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            record
+                .targets
+                .iter()
+                .map(|target| (target.number, target.outcome.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    1,
+                    TargetOutcome::Succeeded {
+                        detail: "merged".to_owned()
+                    }
+                ),
+                (
+                    4,
+                    TargetOutcome::Rejected {
+                        reason: RejectReason::Forbidden
+                    }
+                ),
+                (
+                    2,
+                    TargetOutcome::Failed {
+                        detail: "GitHub mutation failed with HTTP 500: Internal Server Error"
+                            .to_owned()
+                    }
+                ),
+            ],
+            "every target in batch order with its own verdict"
         );
     }
 

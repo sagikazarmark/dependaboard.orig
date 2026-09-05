@@ -171,12 +171,13 @@ Workflow rather than object: a batch has a definite lifecycle and you want to qu
 progress from the UI.
 
 ```
-run(BulkRequest { action, targets: Vec<PrTarget> })
+run(BulkRequest { action, targets: Vec<PrTarget>, user_id })
   ├─ for each target (bounded concurrency; merges grouped per repo, see below):
   │     ctx.object_client::<PullRequest>(key).call(action)
   │       → ActionOutcome, or a TerminalError the callee gave up with
   │     write the outcome into workflow state AS IT COMPLETES
-  └─ terminal state: Completed { succeeded, rejected, failed }
+  ├─ terminal state: Completed { succeeded, rejected, failed }
+  └─ ctx.run: PrStore::record_batch(kind, requester, started/completed at, per-target verdicts)
 
 progress() -> BatchProgress    // shared handler, UI polls this
 ```
@@ -190,7 +191,9 @@ fan-out" below.
 **A target that fails terminally does not stop the batch.** The callee's `TerminalError`
 is recorded against that target as `Failed` with its reason and the batch carries on;
 the workflow completes with the tally, never with an error, once any target was
-attempted. One pull request's problem is not a reason to leave the other ninety-nine
+attempted — the recording step that follows retries until the store takes it rather
+than giving up, so a store outage delays the workflow's end without failing it. One pull
+request's problem is not a reason to leave the other ninety-nine
 queued. This holds for configuration-wide fatals too (bad credentials, a 404 on a
 resource never read): every target gets its own verdict rather than the batch aborting
 on a guess about which failures are shared, so the drawer shows the same reason on each.
@@ -199,6 +202,18 @@ on a guess about which failures are shared, so the drawer shows the same reason 
 whole fan-out finishes, `progress()` returns nothing useful for the entire duration of
 the batch — which is exactly when the user is watching it. Write each outcome as it
 lands.
+
+**The finished batch is written to libSQL, once.** Workflow state answers "where is the
+batch now"; it is cleared after the workflow's retention (seven days here), and then the
+batch is gone from Restate for good. So the last step of `run` writes the finished batch
+to the projection — kind, requester, when it started and finished, the tally, and every
+target's verdict with the pull request named in full and linked — inside `ctx.run`, so
+a replay does not write it again, against a store write that keeps the first record for
+a batch id, so a retry of the step does not either. The step's retries are unbounded:
+nothing later would redo this write, so giving up would lose the record for good. The
+dashboard's **Batches** button lists what was written, newest first; that list is the
+audit view, and it does not care how old a batch is. A merged pull request leaves
+`pull_requests`, so the targets are copied rather than referenced.
 
 **Retrying rejected targets is a new batch, refreshed first.** A rejection is the last
 word on the request *as it was sent*; most often the head moved, and the fix is to send
@@ -367,10 +382,11 @@ and pass it through as the Restate workflow id — Restate then deduplicates for
 because a workflow id can only run once.
 
 **Set workflow retention deliberately.** Restate clears a workflow's state 24 hours after
-`run` completes by default, after which `progress()` returns nothing. Fine if the UI only
-shows active and recent batches. If "what did yesterday's batch do" is meant to work,
-raise `workflowRetention` explicitly — or write batch outcomes to libSQL, which is the
-better answer if you ever want an audit view.
+`run` completes by default, after which `progress()` returns nothing. The retention here
+is seven days, which covers the dashboard following a batch and reopening one it
+followed recently; "what did last month's batch do" is answered from libSQL, where the
+finished batch is written as the workflow's last step (see `BulkAction` above), not by
+raising the retention further.
 
 **Batch id: UUIDv7, not ULID.** Both are 128-bit with a 48-bit millisecond prefix, so the
 time-ordering you want is identical — UUIDv7's canonical hex sorts lexicographically by
@@ -553,9 +569,14 @@ Bulk action       UI → server fn → Restate ingress
                        POST /restate/send/BulkAction/{batch_id}/run
                      → workflow fans out to PullRequest objects
                      → objects call GitHub API, write through to PrStore
+                     → workflow writes the finished batch: PrStore::record_batch
 
 Progress          UI polls → server fn →
                        POST /restate/call/BulkAction/{batch_id}/progress
+
+Recent batches    UI → server fn → PrStore::recent_batches(limit)
+                       the finished batches, newest first, from the projection rather
+                       than Restate, so they outlive the workflow retention
 
 All ingress endpoints live under `/restate/`: `/restate/call/...` waits for the handler's
 result, `/restate/send/...` returns as soon as the invocation is accepted. Use `send` for
@@ -745,6 +766,11 @@ pub trait PrStore {
     /// Drop every repo of a deleted installation and its PRs; returns the PR keys so
     /// `purge()` can retire their object state.
     async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>>;
+    /// Keep a finished batch for audit. A batch id already recorded is left as it
+    /// was, so the workflow's recording step is safe to run again.
+    async fn record_batch(&self, batch: &BatchRecord) -> Result<()>;
+    /// The most recently finished batches, newest first, targets and verdicts included.
+    async fn recent_batches(&self, limit: u32) -> Result<Vec<BatchRecord>>;
 }
 
 pub struct PrFilter {
@@ -813,6 +839,34 @@ CREATE INDEX idx_pr_filter ON pull_requests(owner, check_status, update_type);
 CREATE INDEX idx_pr_repo   ON pull_requests(repository_id);
 CREATE INDEX idx_pr_sha    ON pull_requests(repository_id, head_sha);  -- webhook SHA lookup
 CREATE INDEX idx_pr_order  ON pull_requests(updated_at DESC, id DESC); -- stable paging
+
+-- Finished bulk actions, for audit; append-only, written once per batch id by the
+-- BulkAction workflow's last step. Not tied to pull_requests: a merged PR leaves that
+-- table, and the record must not go with it.
+CREATE TABLE batches (
+  batch_id     TEXT PRIMARY KEY,   -- the workflow key, a UUIDv7
+  action       TEXT NOT NULL,      -- merge | rebase | update branch
+  requested_by TEXT NOT NULL,      -- the dashboard user who confirmed it
+  started_at   INTEGER NOT NULL,
+  completed_at INTEGER NOT NULL,
+  succeeded    INTEGER NOT NULL,
+  rejected     INTEGER NOT NULL,
+  failed       INTEGER NOT NULL
+);
+CREATE INDEX idx_batch_completed ON batches(completed_at DESC, batch_id DESC);
+
+CREATE TABLE batch_targets (
+  batch_id      TEXT NOT NULL REFERENCES batches(batch_id) ON DELETE CASCADE,
+  position      INTEGER NOT NULL,  -- batch order
+  repository_id INTEGER NOT NULL,
+  owner         TEXT NOT NULL,
+  repo          TEXT NOT NULL,
+  number        INTEGER NOT NULL,
+  title         TEXT NOT NULL,
+  html_url      TEXT NOT NULL,
+  outcome       TEXT NOT NULL,     -- JSON: succeeded { detail } | rejected { reason } | failed { detail }
+  PRIMARY KEY (batch_id, position)
+);
 ```
 
 **Grouped updates need the list, not just the scalars.** The `updated-dependencies` block

@@ -5,19 +5,19 @@ use std::{collections::BTreeMap, sync::Mutex};
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord, RepoRecord,
+    BatchRecord, DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord, RepoRecord,
 };
 use dependaboard_store::{PrStore, StoreError};
 
 /// Rows keyed the way the schema keys them: pull requests by `(repository_id, number)`
-/// (the `id` column is derived from that pair), repositories by id.
+/// (the `id` column is derived from that pair), repositories by id, batches by batch id.
 ///
 /// What the schema enforces, this enforces: a pull request needs its repository's row
 /// first (libSQL rejects the foreign key; this panics, since only a test can get it wrong),
-/// deleting a repository takes its pull requests with it, and a pull request reads back
-/// with its repository's `installation_id`, as the store's `JOIN` gives it. What the
-/// service never asks of the store, the dashboard listing and its summary, is not
-/// implemented.
+/// deleting a repository takes its pull requests with it, a pull request reads back
+/// with its repository's `installation_id`, as the store's `JOIN` gives it, and a batch
+/// recorded twice keeps its first record. What the service never asks of the store, the
+/// dashboard listing, its summary, and the recent batches, is not implemented.
 #[derive(Default)]
 pub(crate) struct MemoryPrStore {
     tables: Mutex<Tables>,
@@ -27,6 +27,7 @@ pub(crate) struct MemoryPrStore {
 struct Tables {
     pull_requests: BTreeMap<(u64, u64), PrRecord>,
     repositories: BTreeMap<u64, RepoRecord>,
+    batches: BTreeMap<String, BatchRecord>,
 }
 
 impl Tables {
@@ -230,6 +231,22 @@ impl PrStore for MemoryPrStore {
             tables.repositories.remove(repository_id);
         }
         Ok(purged)
+    }
+
+    async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .batches
+            .entry(batch.batch_id.clone())
+            .or_insert_with(|| batch.clone());
+        Ok(())
+    }
+
+    async fn recent_batches(&self, _limit: u32) -> Result<Vec<BatchRecord>, StoreError> {
+        unimplemented!(
+            "the Restate service never lists the recorded batches; the dashboard reads them through the web app"
+        )
     }
 }
 

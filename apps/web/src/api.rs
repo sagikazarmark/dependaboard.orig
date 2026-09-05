@@ -3,8 +3,8 @@
 //! the store and Restate through [`crate::server::state::ServerState`].
 
 use dependaboard_core::{
-    BatchProgress, BulkActionKind, DashboardPage, DashboardSummary, Page, PrFilter, PrRecord,
-    PrState, PrTarget,
+    BatchProgress, BatchRecord, BulkActionKind, DashboardPage, DashboardSummary, Page, PrFilter,
+    PrRecord, PrState, PrTarget,
 };
 use dioxus::prelude::*;
 
@@ -117,6 +117,20 @@ pub(crate) async fn load_batch_progress(
         .call(&format!("BulkAction/{batch_id}/progress"))
         .await
         .map_err(restate_unavailable)
+}
+
+/// The `limit` most recently finished batches, newest first, as the projection
+/// keeps them: what was asked, by whom, when, and how each target went. Read
+/// from the store, not Restate, so a batch is still here after the workflow's
+/// retention has cleared its progress. `limit` is held to
+/// [`MAX_RECENT_BATCHES`](dependaboard_core::MAX_RECENT_BATCHES).
+#[server(state: Extension<ServerState>)]
+pub(crate) async fn load_recent_batches(limit: u32) -> Result<Vec<BatchRecord>, ServerFnError> {
+    state
+        .store
+        .recent_batches(limit.clamp(1, dependaboard_core::MAX_RECENT_BATCHES))
+        .await
+        .map_err(store_failure)
 }
 
 #[server(state: Extension<ServerState>)]

@@ -20,6 +20,10 @@ const _: () = assert!(
     MAX_BATCH_TARGETS <= MAX_PAGE_SIZE as usize,
     "a batch's worth of rows must fit in one page"
 );
+/// How far back the dashboard's list of finished batches can be asked to go
+/// in one read. Every batch is on record; this bounds one answer, not the
+/// record.
+pub const MAX_RECENT_BATCHES: u32 = 200;
 /// How many of the ranked labels the dashboard's label facet shows.
 pub const LABEL_FACET_LIMIT: usize = 8;
 /// How many labels a dashboard row shows before folding the rest into a count.
@@ -617,6 +621,19 @@ impl fmt::Display for BulkActionKind {
     }
 }
 
+impl FromStr for BulkActionKind {
+    type Err = ParseEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "merge" => Self::Merge,
+            "rebase" => Self::Rebase,
+            "update branch" => Self::UpdateBranch,
+            _ => return Err(ParseEnumError(value.to_owned())),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrTarget {
     pub repository_id: u64,
@@ -831,6 +848,117 @@ impl BatchProgress {
         target.state = state;
         self.completed = self.settled() == self.targets.len() as u64;
     }
+
+    /// This batch as the projection keeps it once it has run: who asked for it, when it
+    /// started and finished, the tally, and every target's verdict in batch order.
+    /// `None` while any target is still queued or running: there is no record to keep
+    /// of a batch that has not finished.
+    pub fn completed_record(
+        &self,
+        requested_by: UserId,
+        started_at: u64,
+        completed_at: u64,
+    ) -> Option<BatchRecord> {
+        let targets = self
+            .targets
+            .iter()
+            .map(|item| {
+                Some(BatchTargetRecord {
+                    repository_id: item.target.repository_id,
+                    owner: item.target.owner.clone(),
+                    repo: item.target.repo.clone(),
+                    number: item.target.number,
+                    title: item.target.title.clone(),
+                    html_url: item.target.html_url.clone(),
+                    outcome: item.state.outcome()?,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(BatchRecord {
+            batch_id: self.batch_id.clone(),
+            action: self.action,
+            requested_by,
+            started_at,
+            completed_at,
+            succeeded: self.succeeded,
+            rejected: self.rejected,
+            failed: self.failed,
+            targets,
+        })
+    }
+}
+
+/// How one target's action ended, for good: GitHub did it, GitHub or the guard said no,
+/// or the round trip failed terminally. [`TargetProgressState`] without the two states a
+/// target passes through on the way here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetOutcome {
+    Succeeded { detail: String },
+    Rejected { reason: RejectReason },
+    Failed { detail: String },
+}
+
+impl TargetProgressState {
+    /// The verdict this state is, if it is one; `None` while the target is queued or
+    /// running.
+    pub fn outcome(&self) -> Option<TargetOutcome> {
+        match self {
+            Self::Queued | Self::Running => None,
+            Self::Succeeded { detail } => Some(TargetOutcome::Succeeded {
+                detail: detail.clone(),
+            }),
+            Self::Rejected { reason } => Some(TargetOutcome::Rejected {
+                reason: reason.clone(),
+            }),
+            Self::Failed { detail } => Some(TargetOutcome::Failed {
+                detail: detail.clone(),
+            }),
+        }
+    }
+}
+
+impl From<TargetOutcome> for TargetProgressState {
+    fn from(outcome: TargetOutcome) -> Self {
+        match outcome {
+            TargetOutcome::Succeeded { detail } => Self::Succeeded { detail },
+            TargetOutcome::Rejected { reason } => Self::Rejected { reason },
+            TargetOutcome::Failed { detail } => Self::Failed { detail },
+        }
+    }
+}
+
+/// One target of a finished batch as the projection keeps it. The pull request is
+/// named in full, link included, because the row it came from may be gone by the time
+/// anyone reads this: a merged pull request leaves the projection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchTargetRecord {
+    pub repository_id: u64,
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+    pub title: String,
+    pub html_url: String,
+    pub outcome: TargetOutcome,
+}
+
+/// A finished bulk action as the projection keeps it, for the audit view: what was
+/// asked, by whom, when it ran, how it went in all, and how each target went. Restate
+/// forgets a workflow after its retention; this does not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchRecord {
+    pub batch_id: String,
+    pub action: BulkActionKind,
+    pub requested_by: UserId,
+    /// Unix seconds when the workflow started running the batch.
+    pub started_at: u64,
+    /// Unix seconds when the workflow found every target settled and finished the batch.
+    pub completed_at: u64,
+    pub succeeded: u64,
+    pub rejected: u64,
+    pub failed: u64,
+    /// Every target in batch order, each with its verdict.
+    pub targets: Vec<BatchTargetRecord>,
 }
 
 pub fn new_batch_id() -> String {
@@ -1468,6 +1596,98 @@ mod tests {
             rejected,
             [(1, RejectReason::Forbidden), (3, RejectReason::NotFound)]
         );
+    }
+
+    /// The record the projection keeps is the finished batch: who asked, when it ran,
+    /// the tally, and each target's verdict in batch order. Until the last target has
+    /// settled there is no record to keep.
+    #[test]
+    fn a_finished_batch_becomes_a_record_with_every_targets_verdict_and_not_before() {
+        let targets = [batch_target(1), batch_target(2), batch_target(3)];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        let requester = UserId::new("alice");
+        progress.record(
+            &targets[0].key(),
+            ActionOutcome::Succeeded {
+                detail: "merged".to_owned(),
+            },
+        );
+        progress.record(
+            &targets[1].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::Forbidden,
+            },
+        );
+        assert_eq!(
+            progress.completed_record(requester.clone(), 100, 160),
+            None,
+            "one target is still queued"
+        );
+
+        progress.record_failure(&targets[2].key(), "boom");
+
+        assert_eq!(
+            progress.completed_record(requester, 100, 160),
+            Some(BatchRecord {
+                batch_id: "batch-1".to_owned(),
+                action: BulkActionKind::Merge,
+                requested_by: UserId::new("alice"),
+                started_at: 100,
+                completed_at: 160,
+                succeeded: 1,
+                rejected: 1,
+                failed: 1,
+                targets: vec![
+                    BatchTargetRecord {
+                        repository_id: 7,
+                        owner: "acme".to_owned(),
+                        repo: "api".to_owned(),
+                        number: 1,
+                        title: "Bump dependency 1".to_owned(),
+                        html_url: String::new(),
+                        outcome: TargetOutcome::Succeeded {
+                            detail: "merged".to_owned()
+                        },
+                    },
+                    BatchTargetRecord {
+                        repository_id: 7,
+                        owner: "acme".to_owned(),
+                        repo: "api".to_owned(),
+                        number: 2,
+                        title: "Bump dependency 2".to_owned(),
+                        html_url: String::new(),
+                        outcome: TargetOutcome::Rejected {
+                            reason: RejectReason::Forbidden
+                        },
+                    },
+                    BatchTargetRecord {
+                        repository_id: 7,
+                        owner: "acme".to_owned(),
+                        repo: "api".to_owned(),
+                        number: 3,
+                        title: "Bump dependency 3".to_owned(),
+                        html_url: String::new(),
+                        outcome: TargetOutcome::Failed {
+                            detail: "boom".to_owned()
+                        },
+                    },
+                ],
+            })
+        );
+    }
+
+    /// The store keeps the kind in its display form, as it keeps every enum, so the
+    /// display form must read back.
+    #[test]
+    fn a_bulk_action_kind_reads_back_from_its_display_form() {
+        for kind in [
+            BulkActionKind::Merge,
+            BulkActionKind::Rebase,
+            BulkActionKind::UpdateBranch,
+        ] {
+            assert_eq!(kind.to_string().parse::<BulkActionKind>().unwrap(), kind);
+        }
+        assert!("update_branch".parse::<BulkActionKind>().is_err());
     }
 
     #[test]

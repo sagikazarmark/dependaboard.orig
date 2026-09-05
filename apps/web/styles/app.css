@@ -244,6 +244,15 @@ code,
   font-weight: 500;
 }
 
+.batches-button {
+  min-height: 28px;
+  border-color: var(--line);
+  color: var(--color-base-content);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 500;
+}
+
 .sync-glyph {
   display: inline-block;
   color: var(--color-primary);
@@ -1331,6 +1340,73 @@ code,
   font-weight: 400;
 }
 
+/* The recent batches drawer: each batch folds to a headline until opened. */
+.batch-list {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.batches-note {
+  margin: 0;
+  padding: 20px 18px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.batches-error {
+  color: var(--color-error);
+}
+
+.batch-entry {
+  border-bottom: 1px solid var(--line);
+}
+
+.batch-headline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 18px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.batch-headline::-webkit-details-marker {
+  display: none;
+}
+
+.batch-headline:hover {
+  background: color-mix(in srgb, var(--color-base-content) 4%, transparent);
+}
+
+.batch-headline > div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.batch-action {
+  color: var(--color-primary);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.batch-tally,
+.batch-meta {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.batch-meta {
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.batch-entry .progress-list {
+  flex: none;
+  border-top: 1px solid var(--line-soft);
+  background: var(--color-base-100);
+}
+
 /* The toast region is always mounted; only the toasts themselves take clicks. */
 .toast {
   z-index: 50;
@@ -1445,7 +1521,8 @@ code,
     font-size: 10px;
   }
 
-  .sync-button {
+  .sync-button,
+  .batches-button {
     padding-inline: 8px;
   }
 

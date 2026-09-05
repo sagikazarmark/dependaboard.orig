@@ -15,6 +15,7 @@ mod pr_row;
 mod pr_sync;
 mod pr_table;
 mod progress_drawer;
+mod recent_batches;
 mod repo_tree;
 mod retry;
 mod search_box;

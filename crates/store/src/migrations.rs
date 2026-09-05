@@ -38,6 +38,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "projection_revision",
         sql: include_str!("../../../migrations/0004_projection_revision.sql"),
     },
+    Migration {
+        version: 5,
+        name: "batches",
+        sql: include_str!("../../../migrations/0005_batches.sql"),
+    },
 ];
 
 const CREATE_SCHEMA_MIGRATIONS: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (

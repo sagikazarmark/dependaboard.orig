@@ -1,5 +1,5 @@
 //! The bar across the top: the sidebar toggle, the view switch, the theme
-//! button, and the sync button.
+//! button, the recent batches button, and the sync button.
 
 use dioxus::prelude::*;
 
@@ -9,10 +9,15 @@ use crate::components::toast::{ToastOptions, use_toast};
 use crate::ui::dashboard_state::use_dashboard;
 use crate::ui::{sticky, user_facing};
 
-/// The top bar; `dark` is the theme in force and `aside_open` whether the
-/// sidebar is showing, both toggled from here.
+/// The top bar; `dark` is the theme in force, `aside_open` whether the
+/// sidebar is showing, and `batches_open` whether the recent batches drawer
+/// is, all toggled from here.
 #[component]
-pub(crate) fn TopBar(mut dark: Signal<bool>, mut aside_open: Signal<bool>) -> Element {
+pub(crate) fn TopBar(
+    mut dark: Signal<bool>,
+    mut aside_open: Signal<bool>,
+    mut batches_open: Signal<bool>,
+) -> Element {
     let toast = use_toast();
     let mut state = use_dashboard();
     let needs_attention = state.filter().needs_attention;
@@ -49,6 +54,13 @@ pub(crate) fn TopBar(mut dark: Signal<bool>, mut aside_open: Signal<bool>) -> El
                 title: "Toggle color theme",
                 onclick: move |_| dark.toggle(),
                 if dark() { "light" } else { "dark" }
+            }
+            Button {
+                size: ButtonSize::Sm,
+                class: "batches-button",
+                title: "The batches that have run",
+                onclick: move |_| batches_open.toggle(),
+                "Batches"
             }
             // The sync is one-way: Restate takes it and the sweep runs on
             // its own. The glyph spins until the rows reload, which the live
@@ -92,8 +104,9 @@ mod tests {
             };
             let dark = use_signal(|| true);
             let aside_open = use_signal(|| true);
+            let batches_open = use_signal(|| false);
             rsx! {
-                DashboardFixture { filter, TopBar { dark, aside_open } }
+                DashboardFixture { filter, TopBar { dark, aside_open, batches_open } }
             }
         }
         let html = render(Fixture);
@@ -112,6 +125,23 @@ mod tests {
         assert!(!html.contains("disabled"), "{html}");
     }
 
+    /// The batches that have run are a click away from anywhere on the page.
+    #[test]
+    fn the_top_bar_offers_the_recent_batches() {
+        fn Fixture() -> Element {
+            let dark = use_signal(|| true);
+            let aside_open = use_signal(|| true);
+            let batches_open = use_signal(|| false);
+            rsx! {
+                DashboardFixture { TopBar { dark, aside_open, batches_open } }
+            }
+        }
+        let html = render(Fixture);
+
+        assert!(html.contains("batches-button"), "{html}");
+        assert!(html.contains("Batches</button>"), "{html}");
+    }
+
     /// While a manual sync is in flight the glyph spins and the button will
     /// not queue another.
     #[test]
@@ -119,8 +149,9 @@ mod tests {
         fn Fixture() -> Element {
             let dark = use_signal(|| true);
             let aside_open = use_signal(|| true);
+            let batches_open = use_signal(|| false);
             rsx! {
-                DashboardFixture { syncing: true, TopBar { dark, aside_open } }
+                DashboardFixture { syncing: true, TopBar { dark, aside_open, batches_open } }
             }
         }
         let html = render(Fixture);

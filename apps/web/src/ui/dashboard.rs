@@ -16,6 +16,7 @@ use crate::ui::dashboard_state::{DashboardState, PageStatus, Selection, SummaryS
 use crate::ui::detail_drawer::{OpenDetail, OpenPr};
 use crate::ui::live::{use_clock, use_live_refresh, use_visibility};
 use crate::ui::pr_table::PrTable;
+use crate::ui::recent_batches::RecentBatchesDrawer;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::status_bar::StatusBar;
 use crate::ui::top_bar::TopBar;
@@ -25,9 +26,9 @@ use crate::ui::{PendingAction, sticky};
 
 /// The page. It owns the state the components share, loads the read model
 /// for the filter and cursor in force, and holds what is open over the page:
-/// the pull request drawer, the bulk action awaiting confirmation, and the
-/// batch being followed. It opens on the state its URL names and keeps the
-/// URL in step from then on.
+/// the pull request drawer, the bulk action awaiting confirmation, the batch
+/// being followed, and the list of the batches that have run. It opens on the
+/// state its URL names and keeps the URL in step from then on.
 ///
 /// The rows and the facets are two requests: the rows follow the filter and
 /// the cursor, the facets the filter alone, so loading the next page leaves
@@ -37,6 +38,7 @@ use crate::ui::{PendingAction, sticky};
 pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     let toast = use_toast();
     let aside_open = use_signal(|| true);
+    let mut batches_open = use_signal(|| false);
     let UrlState {
         filter: initial_filter,
         cursor: initial_cursor,
@@ -79,7 +81,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     let summary = summary_status.read();
 
     rsx! {
-        TopBar { dark, aside_open }
+        TopBar { dark, aside_open, batches_open }
 
         div { class: "workspace",
             Sidebar { open: aside_open }
@@ -89,6 +91,10 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
         StatusBar {}
 
         ActionBar { onrequest: move |action| pending.set(Some(action)) }
+
+        if batches_open() {
+            RecentBatchesDrawer { onclose: move |_| batches_open.set(false) }
+        }
 
         OpenDetail {
             detail,

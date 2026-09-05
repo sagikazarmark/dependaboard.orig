@@ -2,8 +2,9 @@ use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time:
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    CursorError, DashboardPage, DashboardSummary, FacetCounts, LabelFacet, Mergeable, Page,
-    PageCursor, PrFilter, PrKey, PrRecord, RepoFacet, RepoRecord, unix_seconds,
+    BatchRecord, BatchTargetRecord, CursorError, DashboardPage, DashboardSummary, FacetCounts,
+    LabelFacet, Mergeable, Page, PageCursor, PrFilter, PrKey, PrRecord, RepoFacet, RepoRecord,
+    UserId, unix_seconds,
 };
 use libsql::{Builder, Row, Value};
 use secrecy::{ExposeSecret, SecretString};
@@ -142,6 +143,14 @@ pub trait PrStore: Send + Sync {
     /// reports which pull requests went so the caller can retire their durable
     /// state too.
     async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>, StoreError>;
+    /// Keeps a finished bulk action for the audit view, targets and all. A
+    /// batch already recorded is left as it was: Restate may run the recording
+    /// step again when the first attempt's result was lost, and the first word
+    /// is the one that stands.
+    async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError>;
+    /// The `limit` most recently finished batches, newest first, each with
+    /// every target's verdict in batch order.
+    async fn recent_batches(&self, limit: u32) -> Result<Vec<BatchRecord>, StoreError>;
 }
 
 #[async_trait]
@@ -390,6 +399,134 @@ impl PrStore for LibSqlPrStore {
         transaction.commit().await?;
         Ok(purged)
     }
+
+    async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError> {
+        let connection = self.connection().await;
+        let transaction = connection.transaction().await?;
+        let inserted = transaction
+            .execute(
+                r#"INSERT INTO batches (
+                    batch_id, action, requested_by, started_at, completed_at,
+                    succeeded, rejected, failed
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ON CONFLICT(batch_id) DO NOTHING"#,
+                vec![
+                    Value::Text(batch.batch_id.clone()),
+                    Value::Text(batch.action.to_string()),
+                    Value::Text(batch.requested_by.to_string()),
+                    integer(batch.started_at)?,
+                    integer(batch.completed_at)?,
+                    integer(batch.succeeded)?,
+                    integer(batch.rejected)?,
+                    integer(batch.failed)?,
+                ],
+            )
+            .await?;
+        if inserted == 0 {
+            transaction.rollback().await?;
+            return Ok(());
+        }
+        for (position, target) in batch.targets.iter().enumerate() {
+            transaction
+                .execute(
+                    r#"INSERT INTO batch_targets (
+                        batch_id, position, repository_id, owner, repo, number,
+                        title, html_url, outcome
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                    vec![
+                        Value::Text(batch.batch_id.clone()),
+                        integer(position as u64)?,
+                        integer(target.repository_id)?,
+                        Value::Text(target.owner.clone()),
+                        Value::Text(target.repo.clone()),
+                        integer(target.number)?,
+                        Value::Text(target.title.clone()),
+                        Value::Text(target.html_url.clone()),
+                        Value::Text(serde_json::to_string(&target.outcome)?),
+                    ],
+                )
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn recent_batches(&self, limit: u32) -> Result<Vec<BatchRecord>, StoreError> {
+        let connection = self.connection().await;
+        let mut rows = connection
+            .query(
+                r#"SELECT batch_id, action, requested_by, started_at, completed_at,
+                          succeeded, rejected, failed
+                   FROM batches
+                   ORDER BY completed_at DESC, batch_id DESC
+                   LIMIT ?1"#,
+                vec![Value::Integer(i64::from(limit))],
+            )
+            .await?;
+        let mut batches = Vec::new();
+        while let Some(row) = rows.next().await? {
+            batches.push(batch_from_row(row)?);
+        }
+        if batches.is_empty() {
+            return Ok(batches);
+        }
+        let placeholders = (1..=batches.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut targets = connection
+            .query(
+                &format!(
+                    "SELECT batch_id, repository_id, owner, repo, number, title, html_url, outcome \
+                     FROM batch_targets WHERE batch_id IN ({placeholders}) ORDER BY batch_id, position"
+                ),
+                batches
+                    .iter()
+                    .map(|batch| Value::Text(batch.batch_id.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        let mut by_batch: BTreeMap<String, Vec<BatchTargetRecord>> = BTreeMap::new();
+        while let Some(row) = targets.next().await? {
+            by_batch
+                .entry(row.get(0)?)
+                .or_default()
+                .push(batch_target_from_row(row)?);
+        }
+        for batch in &mut batches {
+            batch.targets = by_batch.remove(&batch.batch_id).unwrap_or_default();
+        }
+        Ok(batches)
+    }
+}
+
+/// A `batches` row, without its targets.
+fn batch_from_row(row: Row) -> Result<BatchRecord, StoreError> {
+    Ok(BatchRecord {
+        batch_id: row.get(0)?,
+        action: stored_enum(row.get(1)?)?,
+        requested_by: UserId::new(row.get::<String>(2)?),
+        started_at: unsigned(row.get::<i64>(3)?)?,
+        completed_at: unsigned(row.get::<i64>(4)?)?,
+        succeeded: unsigned(row.get::<i64>(5)?)?,
+        rejected: unsigned(row.get::<i64>(6)?)?,
+        failed: unsigned(row.get::<i64>(7)?)?,
+        targets: Vec::new(),
+    })
+}
+
+/// A `batch_targets` row as [`recent_batches`](PrStore::recent_batches)
+/// selects it: the batch id in column 0, the target from column 1 on.
+fn batch_target_from_row(row: Row) -> Result<BatchTargetRecord, StoreError> {
+    Ok(BatchTargetRecord {
+        repository_id: unsigned(row.get::<i64>(1)?)?,
+        owner: row.get(2)?,
+        repo: row.get(3)?,
+        number: unsigned(row.get::<i64>(4)?)?,
+        title: row.get(5)?,
+        html_url: row.get(6)?,
+        outcome: serde_json::from_str(&row.get::<String>(7)?)?,
+    })
 }
 
 fn select_pr_sql() -> &'static str {
@@ -792,7 +929,10 @@ fn retryable_sqlite_code(code: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use dependaboard_core::{CheckStatus, DependencyUpdate, MergeMethod, UpdateType};
+    use dependaboard_core::{
+        BatchRecord, BatchTargetRecord, BulkActionKind, CheckStatus, DependencyUpdate, MergeMethod,
+        RejectReason, TargetOutcome, UpdateType, UserId,
+    };
     use tempfile::TempDir;
 
     use super::*;
@@ -1738,6 +1878,134 @@ mod tests {
 
         assert_eq!(deleted, 1);
         assert!(store.get_pr(&PrKey::new(1, 1)).await.unwrap().is_none());
+    }
+
+    /// A finished merge of two pull requests in `acme/repo-1`, asked for by `alice`,
+    /// with the first merged and the second rejected.
+    fn batch(batch_id: &str, completed_at: u64) -> BatchRecord {
+        BatchRecord {
+            batch_id: batch_id.to_owned(),
+            action: BulkActionKind::Merge,
+            requested_by: UserId::new("alice"),
+            started_at: completed_at - 30,
+            completed_at,
+            succeeded: 1,
+            rejected: 1,
+            failed: 0,
+            targets: vec![
+                BatchTargetRecord {
+                    repository_id: 1,
+                    owner: "acme".to_owned(),
+                    repo: "repo-1".to_owned(),
+                    number: 1,
+                    title: "Bump serde from 1.0.0 to 1.1.0".to_owned(),
+                    html_url: "https://github.com/acme/repo-1/pull/1".to_owned(),
+                    outcome: TargetOutcome::Succeeded {
+                        detail: "merged".to_owned(),
+                    },
+                },
+                BatchTargetRecord {
+                    repository_id: 1,
+                    owner: "acme".to_owned(),
+                    repo: "repo-1".to_owned(),
+                    number: 2,
+                    title: "Bump tokio from 1.40.0 to 1.41.0".to_owned(),
+                    html_url: "https://github.com/acme/repo-1/pull/2".to_owned(),
+                    outcome: TargetOutcome::Rejected {
+                        reason: RejectReason::StaleSha {
+                            expected: "abc123".to_owned(),
+                            actual: "def456".to_owned(),
+                        },
+                    },
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_batches_are_kept_whole_and_listed_newest_first_up_to_the_limit() {
+        let (_directory, store) = test_store().await;
+        let older = batch("batch-older", 1_000);
+        let newer = BatchRecord {
+            action: BulkActionKind::Rebase,
+            requested_by: UserId::new("bob"),
+            targets: vec![BatchTargetRecord {
+                number: 5,
+                html_url: "https://github.com/acme/repo-1/pull/5".to_owned(),
+                outcome: TargetOutcome::Failed {
+                    detail: "GitHub mutation failed with HTTP 500".to_owned(),
+                },
+                ..older.targets[0].clone()
+            }],
+            succeeded: 0,
+            rejected: 0,
+            failed: 1,
+            ..batch("batch-newer", 2_000)
+        };
+        store.record_batch(&older).await.unwrap();
+        store.record_batch(&newer).await.unwrap();
+
+        assert_eq!(
+            store.recent_batches(10).await.unwrap(),
+            vec![newer.clone(), older],
+            "every column and every target comes back, targets in batch order"
+        );
+        assert_eq!(store.recent_batches(1).await.unwrap(), vec![newer]);
+        assert_eq!(
+            store.recent_batches(0).await.unwrap(),
+            Vec::<BatchRecord>::new()
+        );
+    }
+
+    /// Restate may run the recording step again when the first attempt's result was
+    /// lost, so recording the same batch twice must leave one record: the first.
+    #[tokio::test]
+    async fn recording_a_batch_again_keeps_the_first_record() {
+        let (_directory, store) = test_store().await;
+        let first = batch("batch-1", 1_000);
+        store.record_batch(&first).await.unwrap();
+        let again = BatchRecord {
+            completed_at: 1_500,
+            succeeded: 2,
+            rejected: 0,
+            targets: vec![first.targets[0].clone()],
+            ..first.clone()
+        };
+
+        store.record_batch(&again).await.unwrap();
+
+        assert_eq!(store.recent_batches(10).await.unwrap(), vec![first]);
+    }
+
+    /// The record is the audit trail, so it outlives what it is about: the pull
+    /// requests it merged leave the projection, the workflow's state is cleared after
+    /// its retention, and the batch is still there with its links.
+    #[tokio::test]
+    async fn a_recorded_batch_outlives_its_pull_requests_and_the_workflows_retention() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 2, 10)).await.unwrap();
+        let thirty_days = 30 * 24 * 60 * 60;
+        let long_ago = batch("batch-1", unix_seconds() - thirty_days);
+        store.record_batch(&long_ago).await.unwrap();
+
+        store.delete_pr(&PrKey::new(1, 1)).await.unwrap();
+        store.purge_installation(9).await.unwrap();
+
+        let listed = store.recent_batches(10).await.unwrap();
+        assert_eq!(listed, vec![long_ago]);
+        assert_eq!(
+            listed[0]
+                .targets
+                .iter()
+                .map(|target| target.html_url.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "https://github.com/acme/repo-1/pull/1",
+                "https://github.com/acme/repo-1/pull/2"
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

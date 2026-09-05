@@ -75,10 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store: store.clone(),
         interval,
     };
-    let repo_sync = RepoSync { github, store };
+    let repo_sync = RepoSync {
+        github,
+        store: store.clone(),
+    };
     let endpoint = Endpoint::builder()
         .bind(pull_request)
-        .bind(BulkAction)
+        .bind(BulkAction { store })
         .bind(WebhookIngress { installation_id })
         .bind(DashboardIngress { installation_id })
         .bind(SchedulerIngress { installation_id })
@@ -247,7 +250,11 @@ mod tests {
             store: store.clone(),
             interval: Duration::from_secs(3600),
         };
-        let repo_sync = RepoSync { github, store };
+        let repo_sync = RepoSync {
+            github,
+            store: store.clone(),
+        };
+        let bulk_action = BulkAction { store };
 
         assert_eq!(pull_request.github.installation_id(), 42);
         assert_eq!(
@@ -259,6 +266,7 @@ mod tests {
             Vec::new()
         );
         assert_eq!(repo_sync.store.get_repo(7).await.unwrap(), None);
+        assert_eq!(bulk_action.store.get_repo(7).await.unwrap(), None);
         assert_eq!(
             scripted.calls(),
             vec![GithubCall::ListInstallationRepositories]

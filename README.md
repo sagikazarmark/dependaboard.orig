@@ -384,7 +384,7 @@ The Compose file fixes `RESTATE_NODE_NAME=dependaboard` so the current project's
 - `apps/restate-service`: Restate virtual objects and workflows. GitHub and libSQL side effects are journaled with `ctx.run`.
 - `crates/core`: shared domain contracts, dependency parsing, check rollups, and GitHub error classification. Dependabot metadata parsing is behind the opt-in `dependabot-metadata` feature so the browser bundle's dependency graph stays free of `regex`, `semver`, and `serde_yml`; only `crates/github` enables it.
 - `crates/github`: GitHub App JWT/token handling, canonical PR reads, merge calls, and idempotent user-authored Dependabot commands. A pull request snapshot is one GraphQL query (it was five or more REST requests: pull request, head commit, paginated check runs, paginated check suites, combined status); only a commit with more than a hundred check contexts or suites costs a further request per extra page. Mutations and installation listing stay on REST.
-- `crates/store`: local or remote libSQL projection behind `PrStore`.
+- `crates/store`: local or remote libSQL projection behind `PrStore`: the pull requests and repositories the dashboard queries, and the finished batches it lists for audit.
 
 Restate owns in-flight truth and retries. libSQL is the cross-PR query model used by the dashboard. The browser never calls Restate directly.
 
@@ -403,6 +403,10 @@ The confirmation dialog counts the pull requests and the repositories they span 
 ### Retrying a batch's rejected targets
 
 A batch that finishes with rejected pull requests — a head that moved between the table and the click, a merge GitHub would not do, an identity it would not let — offers **Retry rejected** in its drawer. The dashboard syncs each rejected pull request again, waits for the refreshed rows, and queues them as a new batch of the same kind carrying their current head SHAs; the new batch takes the drawer over as any queued one does. A pull request rejected as no longer open, or gone by the time it is refreshed, is left out, as is one whose refresh failed: a toast names each one and why, and the rest go on. A batch whose rejections are all of pull requests that are no longer open has nothing to retry and offers none.
+
+### Recent batches
+
+Restate keeps a batch's progress for seven days after it finishes and then clears it. The batch itself is not lost: the workflow's last step writes the finished batch to libSQL — the kind, who asked for it, when it started and finished, the tally, and every target's verdict with the pull request named and linked — once, inside `ctx.run`, against a store write that keeps the first record for a batch id; the step retries until the store takes it, since nothing later would redo it. **Batches** in the top bar opens a drawer listing the twenty most recent, newest first, with **Show older** taking the list further back a page at a time; each batch folds to a headline with its counts and opens to its targets, linked to GitHub, with the reason for every rejection or failure. The list is read from the projection, not Restate, so a batch is still there long after its workflow has been forgotten, and after the pull requests it merged have left the table. The drawer loads when it opens; a batch finishing while it is showing is there the next time it does.
 
 ### Restate ingress visibility
 
@@ -501,7 +505,8 @@ Automated tests do not possess GitHub credentials. Before relying on a deploymen
 7. Queue a rebase and confirm the PAT user authors one marked, attributed `@dependabot rebase` comment.
 8. Queue a branch update and confirm GitHub records the App installation as the author of the merge commit on the head branch, and that the row's head SHA and checks refresh without a manual sync.
 9. Restart the Restate service during an in-flight batch and confirm target progress resumes.
-10. Inspect Restate inputs, journals, and object state and confirm the PAT value is absent.
+10. Once a batch has finished, open **Batches** and confirm it is listed with its counts, requester, and a working link per target; confirm it is still listed after `BulkAction/progress` for its id has stopped returning state.
+11. Inspect Restate inputs, journals, and object state and confirm the PAT value is absent.
 
 ## License
 
