@@ -390,6 +390,46 @@ mod tests {
     }
 
     #[test]
+    fn a_pull_request_gone_since_the_guard_is_that_targets_rejection() {
+        // The object's guard proved the pull request from its snapshot, then the client's
+        // verify read came back 404: the client cannot flag the resource as known (nothing
+        // was read in this call), so the handler must, or a pull request that vanished
+        // between the table and the click fails the target instead of rejecting it.
+        let response = GithubErrorResponse {
+            status: 404,
+            message: "Not Found".to_owned(),
+            ..Default::default()
+        };
+
+        for operation in [
+            Operation::Merge,
+            Operation::Comment,
+            Operation::UpdateBranch,
+        ] {
+            let attempt = journal_github_result::<()>(
+                Err(GithubError::Http {
+                    response: response.clone(),
+                    known_resource: false,
+                }),
+                operation,
+                true,
+                1_000,
+            )
+            .unwrap()
+            .into_inner();
+
+            assert_eq!(
+                attempt,
+                Attempt::Settled(Settled::Rejected {
+                    reason: RejectReason::NotFound,
+                    response: response.clone(),
+                }),
+                "{operation:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_merge_refused_after_the_pull_request_was_verified_is_that_targets_rejection() {
         // The verify read went through and the merge itself came back 403: the client flags
         // the refusal as coming from a known resource, and the step journals it as this

@@ -274,7 +274,7 @@ impl PullRequest {
                 ctx: &ctx,
                 name: "merge-pull-request",
                 operation: Operation::Merge,
-                known_resource: false,
+                known_resource: state.snapshot.is_some(),
                 call: move || {
                     let github = github.clone();
                     let merge_request = merge_request.clone();
@@ -335,7 +335,7 @@ impl PullRequest {
                 ctx: &ctx,
                 name: "post-dependabot-command",
                 operation: Operation::Comment,
-                known_resource: false,
+                known_resource: state.snapshot.is_some(),
                 call: move || {
                     let github = github.clone();
                     let command_request = command_request.clone();
@@ -382,7 +382,7 @@ impl PullRequest {
                 ctx: &ctx,
                 name: "update-pull-request-branch",
                 operation: Operation::UpdateBranch,
-                known_resource: false,
+                known_resource: state.snapshot.is_some(),
                 call: move || {
                     let github = github.clone();
                     let update_request = update_request.clone();
@@ -503,6 +503,11 @@ pub(crate) fn close_pull_request<'ctx>(
 /// no snapshot, or a snapshot of a different pull request than the target names, there is
 /// nothing to act on. A target whose expected head has since moved is stale, and the
 /// rejection names both SHAs so the dashboard can show what changed.
+///
+/// Past the guard the pull request is a known resource — the object read it from GitHub to
+/// get the snapshot — so the mutation's GitHub step is told as much, exactly as `sync`
+/// tells its read. A 404 on the client's verify read then means the pull request has gone
+/// since the table showed it, and the target is rejected as not found rather than failed.
 fn guard_target(snapshot: Option<&PrRecord>, target: &PrTarget) -> Result<(), RejectReason> {
     let snapshot = snapshot
         .filter(|snapshot| target_matches_snapshot(target, snapshot))

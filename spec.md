@@ -296,7 +296,11 @@ Rough shape: any status with `x-ratelimit-remaining: 0` or a secondary-limit mes
 `Retryable` regardless of code; 5xx and transport errors are `Retryable`; 409, and 405
 with a merge-method message, are `Rejected` — *except* the base-branch 405 below; 404 on
 an operation you've just successfully read is `Rejected`, but 404 on a resource never
-read is a configuration `Fatal`. The same read-first logic governs a refused write: a
+read is a configuration `Fatal`. "Read" includes the object's own snapshot: a mutation
+handler passes the snapshot's presence to its GitHub step exactly as `sync` does, so a
+pull request that has gone since the table showed it is `Rejected(NotFound)` — skipped by
+retry, explained by the drawer — not a failure that asks for the operator. The same
+read-first logic governs a refused write: a
 403 on a merge or branch update *after* the pull request was read with the same
 credentials is `Rejected(Forbidden)` — branch protection, a repository the installation
 can see but not push to — while a 401 is `Fatal` whatever came before it, because the
