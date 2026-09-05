@@ -2,7 +2,10 @@
 //! guard's, last word on the request as it was sent, most often because the
 //! head had moved; so before the targets go out again each is synced and its
 //! row read back, and the new batch carries the head SHAs the dashboard now
-//! shows rather than the ones the batch was rejected over.
+//! shows rather than the ones the batch was rejected over. Only rejections a
+//! fresh attempt can cure are sent again: one over the configuration — the
+//! identity GitHub refuses, the merge method the repository disallows — would
+//! be rejected the same way whatever the head, and is left out with that said.
 
 use dependaboard_core::{BatchProgress, PrRecord, PrTarget, RejectReason};
 use futures_util::future::join_all;
@@ -53,6 +56,9 @@ impl Refreshed {
                 let target = &left_out.target;
                 let why = match &left_out.why {
                     LeftOutReason::NoLongerOpen => "is no longer open".to_owned(),
+                    LeftOutReason::WouldBeRejectedAgain(reason) => {
+                        format!("would be rejected again ({reason})")
+                    }
                     LeftOutReason::CouldNotRefresh(error) => {
                         format!("could not be refreshed ({error})")
                     }
@@ -87,25 +93,44 @@ pub(crate) enum LeftOutReason {
     /// The pull request was closed or merged: rejected as not found, or gone
     /// by the time it was refreshed.
     NoLongerOpen,
+    /// The rejection was over the configuration, not the head, and a fresh
+    /// attempt would meet it again; carries the reason.
+    WouldBeRejectedAgain(RejectReason),
     /// The refresh itself failed; carries the error.
     CouldNotRefresh(String),
 }
 
+/// Whether a fresh attempt can cure `reason`. A head that moved is cured by
+/// sending the head the dashboard shows now; GitHub judges mergeability anew
+/// on every attempt, so a base that has since moved or checks that have since
+/// finished can cure that too. The identity GitHub refuses and the merge
+/// method the repository disallows are the same whatever the head, and a
+/// pull request rejected as not found is closed or merged with its row gone.
+fn worth_retrying(reason: &RejectReason) -> bool {
+    match reason {
+        RejectReason::StaleSha { .. } | RejectReason::NotMergeable => true,
+        RejectReason::Forbidden | RejectReason::MergeMethodDisallowed | RejectReason::NotFound => {
+            false
+        }
+    }
+}
+
 /// Whether `progress` has anything for a retry to take: it has run to the
-/// end and rejected a target for a reason other than not found. A pull
-/// request rejected as not found is closed or merged, so a batch whose
-/// rejections are all of that kind has nothing left to send again.
+/// end and rejected a target for a reason a fresh attempt can cure. A batch
+/// whose rejections are all over the configuration, or all of pull requests
+/// no longer open, has nothing left to send again.
 pub(crate) fn can_retry(progress: &BatchProgress) -> bool {
     progress.completed
         && progress
             .rejected_targets()
-            .any(|(_, reason)| *reason != RejectReason::NotFound)
+            .any(|(_, reason)| worth_retrying(reason))
 }
 
 /// Refreshes the targets `progress` rejected, all at once, and sorts them into
 /// the rows to submit again and the targets left out. A target rejected as
 /// not found is left out unrefreshed: its pull request is closed or merged
-/// and its row already gone.
+/// and its row already gone. So is one rejected over the configuration: a
+/// refresh changes nothing GitHub would judge differently.
 pub(crate) async fn refresh_rejected<G: RefreshGateway>(
     gateway: &G,
     progress: &BatchProgress,
@@ -115,6 +140,11 @@ pub(crate) async fn refresh_rejected<G: RefreshGateway>(
     for (target, reason) in progress.rejected_targets() {
         if *reason == RejectReason::NotFound {
             left_out.push(LeftOut::no_longer_open(target));
+        } else if !worth_retrying(reason) {
+            left_out.push(LeftOut {
+                target: target.clone(),
+                why: LeftOutReason::WouldBeRejectedAgain(reason.clone()),
+            });
         } else {
             to_refresh.push(target);
         }
@@ -278,14 +308,18 @@ mod tests {
     async fn a_target_gone_by_the_time_it_is_refreshed_is_left_out_as_no_longer_open() {
         let targets = [pr_target(&serde_row()), pr_target(&off_page_row())];
         let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
-        for target in &targets {
-            progress.record(
-                &target.key(),
-                ActionOutcome::Rejected {
-                    reason: RejectReason::Forbidden,
-                },
-            );
-        }
+        progress.record(
+            &targets[0].key(),
+            ActionOutcome::Rejected {
+                reason: stale(&serde_row()),
+            },
+        );
+        progress.record(
+            &targets[1].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::NotMergeable,
+            },
+        );
         let gateway = Scripted::new([
             (serde_row(), Ok(None)),
             (off_page_row(), Ok(Some(moved_on(&off_page_row())))),
@@ -303,6 +337,94 @@ mod tests {
                 }],
             }
         );
+    }
+
+    /// A rejection over the configuration is not over the head: the identity
+    /// GitHub refused and the merge method the repository disallows are the
+    /// same on the next attempt, so refreshing and resubmitting would only
+    /// reject them again and write a second audit row each. They are left
+    /// out unrefreshed, the notice says why in GitHub's terms, and the ones
+    /// a fresh head can cure go on.
+    #[tokio::test]
+    async fn a_target_rejected_over_the_configuration_is_left_out_without_being_refreshed() {
+        let targets = [
+            pr_target(&grouped_row()),
+            pr_target(&serde_row()),
+            pr_target(&off_page_row()),
+        ];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        progress.record(
+            &targets[0].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::Forbidden,
+            },
+        );
+        progress.record(
+            &targets[1].key(),
+            ActionOutcome::Rejected {
+                reason: stale(&serde_row()),
+            },
+        );
+        progress.record(
+            &targets[2].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::MergeMethodDisallowed,
+            },
+        );
+        // Only the moved one is scripted: refreshing either other is an error.
+        let gateway = Scripted::new([(serde_row(), Ok(Some(moved_on(&serde_row()))))]);
+
+        let refreshed = refresh_rejected(&gateway, &progress).await;
+
+        assert_eq!(
+            refreshed,
+            Refreshed {
+                rows: vec![moved_on(&serde_row())],
+                left_out: vec![
+                    LeftOut {
+                        target: pr_target(&grouped_row()),
+                        why: LeftOutReason::WouldBeRejectedAgain(RejectReason::Forbidden),
+                    },
+                    LeftOut {
+                        target: pr_target(&off_page_row()),
+                        why: LeftOutReason::WouldBeRejectedAgain(
+                            RejectReason::MergeMethodDisallowed
+                        ),
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            refreshed.notice().as_deref(),
+            Some(
+                "Left out of the retry: acme/api#9 would be rejected again (the configured \
+                 identity is not allowed to perform this action); acme/web#13 would be \
+                 rejected again (the repository disallows this merge method)."
+            )
+        );
+    }
+
+    /// The offer follows the same rule as the refresh: a finished batch with
+    /// a rejection a fresh attempt can cure has one; a batch whose rejections
+    /// are all over the configuration, or all of pull requests no longer
+    /// open, has none.
+    #[test]
+    fn a_retry_is_offered_only_for_rejections_a_fresh_attempt_can_cure() {
+        fn finished_with(reason: RejectReason) -> BatchProgress {
+            let targets = [pr_target(&serde_row())];
+            let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+            progress.record(&targets[0].key(), ActionOutcome::Rejected { reason });
+            assert!(progress.completed);
+            progress
+        }
+
+        assert!(can_retry(&finished_with(stale(&serde_row()))));
+        assert!(can_retry(&finished_with(RejectReason::NotMergeable)));
+        assert!(!can_retry(&finished_with(RejectReason::Forbidden)));
+        assert!(!can_retry(&finished_with(
+            RejectReason::MergeMethodDisallowed
+        )));
+        assert!(!can_retry(&finished_with(RejectReason::NotFound)));
     }
 
     /// A refresh that fails is not a reason to send that target out with the

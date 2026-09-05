@@ -263,7 +263,7 @@ mod tests {
                 progress.record(
                     &pr_target(&serde_row()).key(),
                     ActionOutcome::Rejected {
-                        reason: RejectReason::Forbidden,
+                        reason: RejectReason::NotMergeable,
                     },
                 );
                 Some(progress)

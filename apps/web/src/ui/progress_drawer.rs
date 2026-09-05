@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn a_finished_batch_with_a_rejected_target_offers_to_retry_the_rejected_ones() {
-        let html = render_drawer(finished_with_rejection(RejectReason::Forbidden), false);
+        let html = render_drawer(finished_with_rejection(RejectReason::NotMergeable), false);
 
         assert!(html.contains(RETRY_BUTTON), "{html}");
         assert!(html.contains(">Retry rejected<"), "{html}");
@@ -164,7 +164,7 @@ mod tests {
     /// be pressed again until the new batch has taken the drawer over.
     #[test]
     fn while_the_rejected_targets_are_being_refreshed_the_button_says_so_and_is_disabled() {
-        let html = render_drawer(finished_with_rejection(RejectReason::Forbidden), true);
+        let html = render_drawer(finished_with_rejection(RejectReason::NotMergeable), true);
 
         assert!(html.contains(">Refreshing...<"), "{html}");
         assert!(!html.contains(">Retry rejected<"), "{html}");
@@ -214,6 +214,18 @@ mod tests {
         let html = render_drawer(finished_with_rejection(RejectReason::NotFound), false);
 
         assert!(!html.contains(RETRY_BUTTON), "{html}");
+    }
+
+    /// A rejection over the configuration — the identity GitHub refused, the
+    /// merge method the repository disallows — meets the same answer on the
+    /// next attempt; a batch with only those has nothing a retry can cure.
+    #[test]
+    fn a_batch_whose_only_rejections_are_over_the_configuration_offers_no_retry() {
+        for reason in [RejectReason::Forbidden, RejectReason::MergeMethodDisallowed] {
+            let html = render_drawer(finished_with_rejection(reason.clone()), false);
+
+            assert!(!html.contains(RETRY_BUTTON), "{reason:?}: {html}");
+        }
     }
 
     /// A target's row links to the pull request on GitHub when its URL is known;
