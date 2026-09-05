@@ -1,6 +1,15 @@
 //! Shared fixtures for the UI modules' SSR snapshot tests.
 
-use dependaboard_core::{CheckStatus, Mergeable, PrRecord, UpdateType, unix_seconds};
+use std::collections::{BTreeMap, BTreeSet};
+
+use dependaboard_core::{
+    CheckStatus, DashboardPage, DependencyUpdate, FacetCounts, LabelFacet, Mergeable, PrFilter,
+    PrRecord, RepoRecord, UpdateType, unix_seconds,
+};
+use dioxus::prelude::*;
+
+use crate::components::toast::ToastProvider;
+use crate::ui::dashboard_state::{DashboardState, PageStatus};
 
 pub(crate) const GROUPED_ROW_TITLE: &str =
     "build(deps): bump the github-actions group across 1 directory with 3 updates";
@@ -20,7 +29,7 @@ pub(crate) fn grouped_row() -> PrRecord {
         to_version: None,
         dependencies: ["actions/checkout", "actions/cache", "actions/setup-rust"]
             .into_iter()
-            .map(|name| dependaboard_core::DependencyUpdate {
+            .map(|name| DependencyUpdate {
                 name: name.to_owned(),
                 from_version: None,
                 to_version: None,
@@ -36,4 +45,97 @@ pub(crate) fn grouped_row() -> PrRecord {
         updated_at: 1,
         synced_at: unix_seconds(),
     }
+}
+
+/// A single-dependency row in a second repository, `acme/web`.
+pub(crate) fn serde_row() -> PrRecord {
+    PrRecord {
+        id: "8#12".to_owned(),
+        repository_id: 8,
+        repo: "web".to_owned(),
+        number: 12,
+        title: "build(deps): bump serde from 1.0.1 to 1.0.2".to_owned(),
+        html_url: "https://github.example/acme/web/pull/12".to_owned(),
+        dependency: Some("serde".to_owned()),
+        from_version: Some("1.0.1".to_owned()),
+        to_version: Some("1.0.2".to_owned()),
+        dependencies: vec![DependencyUpdate {
+            name: "serde".to_owned(),
+            from_version: Some("1.0.1".to_owned()),
+            to_version: Some("1.0.2".to_owned()),
+            update_type: UpdateType::Patch,
+        }],
+        update_type: UpdateType::Patch,
+        head_sha: "def456".to_owned(),
+        check_status: CheckStatus::Success,
+        labels: vec!["dependencies".to_owned(), "rust".to_owned()],
+        ..grouped_row()
+    }
+}
+
+/// The read model's answer for two open pull requests, one per repository,
+/// with a further page to load.
+pub(crate) fn loaded_page() -> DashboardPage {
+    let rows = vec![grouped_row(), serde_row()];
+    let repositories = rows
+        .iter()
+        .map(|row| RepoRecord {
+            repository_id: row.repository_id,
+            installation_id: row.installation_id,
+            owner: row.owner.clone(),
+            repo: row.repo.clone(),
+            merge_method: None,
+            synced_at: 0,
+        })
+        .collect();
+    DashboardPage {
+        rows,
+        total: 52,
+        next_cursor: Some("page-2".to_owned()),
+        repositories,
+        facets: FacetCounts {
+            checks: BTreeMap::from([(CheckStatus::Failure, 31), (CheckStatus::Success, 21)]),
+            update_types: BTreeMap::from([(UpdateType::Minor, 40), (UpdateType::Patch, 12)]),
+            labels: vec![
+                LabelFacet {
+                    label: "dependencies".to_owned(),
+                    count: 52,
+                },
+                LabelFacet {
+                    label: "rust".to_owned(),
+                    count: 12,
+                },
+            ],
+        },
+        last_synced_at: Some(unix_seconds()),
+    }
+}
+
+/// Mounts `children` where the dashboard's components expect to be: under a
+/// toast provider and a dashboard state with `filter` in force, `page` as the
+/// read model's answer, and `selected` picked. Reloads go nowhere.
+#[component]
+pub(crate) fn DashboardFixture(
+    #[props(default)] filter: PrFilter,
+    #[props(default = PageStatus::Loading)] page: PageStatus,
+    #[props(default)] selected: BTreeSet<String>,
+    children: Element,
+) -> Element {
+    DashboardState::provide(
+        use_signal(|| filter),
+        use_signal(|| None),
+        use_signal(|| selected),
+        use_signal(|| page),
+        use_callback(|_| {}),
+    );
+    rsx! {
+        ToastProvider { {children} }
+    }
+}
+
+/// Renders `app` once, server side.
+pub(crate) fn render(app: fn() -> Element) -> String {
+    let mut dom = VirtualDom::new(app);
+    dom.rebuild_in_place();
+    dioxus::ssr::render(&dom)
 }

@@ -20,6 +20,30 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 /// [`SYNC_TIMEOUT`] in polls.
 const SYNC_POLLS: u64 = SYNC_TIMEOUT.as_secs() / POLL_INTERVAL.as_secs();
 
+/// The drawer for the pull request in `detail`, if one is open. The drawer is
+/// keyed by the pull request, so opening another one mounts a fresh drawer,
+/// which reads that pull request's durable state; the key is honoured because
+/// the drawer sits in an `if` body, which Dioxus diffs as a keyed list.
+#[component]
+pub(crate) fn OpenDetail(
+    mut detail: Signal<Option<PrRecord>>,
+    onaction: EventHandler<PendingAction>,
+    onsync: EventHandler<Result<Option<PrRecord>, String>>,
+) -> Element {
+    let open = detail.read();
+    rsx! {
+        if let Some(row) = &*open {
+            DetailDrawer {
+                key: "{row.id}",
+                row: row.clone(),
+                onclose: move |_| detail.set(None),
+                onaction,
+                onsync,
+            }
+        }
+    }
+}
+
 #[component]
 pub(crate) fn DetailDrawer(
     row: PrRecord,
@@ -270,9 +294,73 @@ fn sync_id_completed(state: Option<&PrState>, completion_id: &str) -> bool {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use dependaboard_core::Mergeable;
+    use dioxus::core::{Mutation, consume_context_from_scope};
 
     use super::*;
-    use crate::ui::test_support::grouped_row;
+    use crate::ui::test_support::{grouped_row, render, serde_row};
+
+    #[test]
+    fn the_drawer_is_there_for_the_open_pull_request_and_gone_when_none_is() {
+        fn Closed() -> Element {
+            let detail = use_signal(|| None);
+            rsx! {
+                OpenDetail { detail, onaction: move |_| {}, onsync: move |_| {} }
+            }
+        }
+        let closed = render(Closed);
+        assert_eq!(closed, "", "{closed}");
+
+        fn Open() -> Element {
+            let detail = use_signal(|| Some(grouped_row()));
+            rsx! {
+                OpenDetail { detail, onaction: move |_| {}, onsync: move |_| {} }
+            }
+        }
+        let open = render(Open);
+        assert!(
+            open.contains(r#"class="side-drawer detail-drawer""#),
+            "{open}"
+        );
+        assert!(open.contains("acme/api#9"), "{open}");
+    }
+
+    /// The drawer reads the pull request's durable state once, when it is
+    /// mounted; so opening another pull request has to mount a fresh drawer
+    /// rather than hand the old one a new row. A fresh drawer shows as the
+    /// old drawer's scrim, the first element mounted, leaving the DOM.
+    #[test]
+    fn opening_another_pull_request_mounts_a_fresh_drawer() {
+        fn Fixture() -> Element {
+            let detail = use_context_provider(|| Signal::new(Some(grouped_row())));
+            rsx! {
+                OpenDetail { detail, onaction: move |_| {}, onsync: move |_| {} }
+            }
+        }
+        let mut dom = VirtualDom::new(Fixture);
+        let mounted = dom.rebuild_to_vec();
+        let scrim = mounted
+            .edits
+            .iter()
+            .find_map(|edit| match edit {
+                Mutation::LoadTemplate { id, .. } => Some(*id),
+                _ => None,
+            })
+            .expect("the drawer was mounted");
+        let mut detail = dom
+            .in_runtime(|| consume_context_from_scope::<Signal<Option<PrRecord>>>(ScopeId::APP))
+            .expect("the fixture provides the open pull request");
+
+        dom.in_runtime(|| detail.set(Some(serde_row())));
+        let mutations = dom.render_immediate_to_vec();
+
+        let scrim_left = mutations.edits.iter().any(|edit| {
+            matches!(
+                edit,
+                Mutation::Remove { id } | Mutation::ReplaceWith { id, .. } if *id == scrim
+            )
+        });
+        assert!(scrim_left, "{mutations:?}");
+    }
 
     fn DrawerFixture() -> Element {
         let mut row = grouped_row();

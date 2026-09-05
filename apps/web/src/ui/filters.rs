@@ -3,6 +3,8 @@
 use dependaboard_core::{LABEL_FACET_LIMIT, LabelFacet, PrFilter};
 use dioxus::prelude::*;
 
+use crate::ui::dashboard_state::use_dashboard;
+
 #[component]
 pub(crate) fn FilterSection(title: &'static str) -> Element {
     rsx! { h2 { class: "filter-title", "{title}" } }
@@ -56,36 +58,36 @@ pub(crate) fn LabelFacets(
     }
 }
 
+/// The chips above the table, one per filter in force, each removing its
+/// filter; and a clear-all.
 #[component]
-pub(crate) fn ActiveFilters(
-    mut filter: Signal<PrFilter>,
-    mut cursor: Signal<Option<String>>,
-) -> Element {
-    let value = filter();
+pub(crate) fn ActiveFilters() -> Element {
+    let mut state = use_dashboard();
+    let value = state.filter().clone();
     rsx! {
         div { class: "active-filters",
             if value.needs_attention {
-                FilterChip { kind: "view", label: "needs attention", onclick: move |_| { filter.write().needs_attention = false; cursor.set(None); } }
+                FilterChip { kind: "view", label: "needs attention", onclick: move |_| state.update_filter(|filter| filter.needs_attention = false) }
             }
             for status in value.check_statuses {
-                FilterChip { key: "chip-check-{status}", kind: "checks", label: status.to_string(), onclick: move |_| { toggle_value(&mut filter.write().check_statuses, status); cursor.set(None); } }
+                FilterChip { key: "chip-check-{status}", kind: "checks", label: status.to_string(), onclick: move |_| state.toggle_filter(|filter| &mut filter.check_statuses, status) }
             }
             for update_type in value.update_types {
-                FilterChip { key: "chip-type-{update_type}", kind: "type", label: update_type.to_string(), onclick: move |_| { toggle_value(&mut filter.write().update_types, update_type); cursor.set(None); } }
+                FilterChip { key: "chip-type-{update_type}", kind: "type", label: update_type.to_string(), onclick: move |_| state.toggle_filter(|filter| &mut filter.update_types, update_type) }
             }
             for repo in value.repos {
                 {
                     let repo_value = repo.clone();
-                    rsx! { FilterChip { key: "chip-repo-{repo}", kind: "repo", label: repo, onclick: move |_| { toggle_value(&mut filter.write().repos, repo_value.clone()); cursor.set(None); } } }
+                    rsx! { FilterChip { key: "chip-repo-{repo}", kind: "repo", label: repo, onclick: move |_| state.toggle_filter(|filter| &mut filter.repos, repo_value.clone()) } }
                 }
             }
             for label in value.labels {
                 {
                     let label_value = label.clone();
-                    rsx! { FilterChip { key: "chip-label-{label}", kind: "label", label, onclick: move |_| { toggle_value(&mut filter.write().labels, label_value.clone()); cursor.set(None); } } }
+                    rsx! { FilterChip { key: "chip-label-{label}", kind: "label", label, onclick: move |_| state.toggle_filter(|filter| &mut filter.labels, label_value.clone()) } }
                 }
             }
-            button { class: "clear-all", onclick: move |_| { filter.set(PrFilter::default()); cursor.set(None); }, "clear all" }
+            button { class: "clear-all", onclick: move |_| state.clear_filters(), "clear all" }
         }
     }
 }
@@ -113,19 +115,12 @@ pub(crate) fn filter_count(filter: &PrFilter) -> usize {
         + usize::from(filter.needs_attention)
 }
 
-pub(crate) fn toggle_value<T: PartialEq>(values: &mut Vec<T>, value: T) {
-    if let Some(index) = values.iter().position(|candidate| candidate == &value) {
-        values.remove(index);
-    } else {
-        values.push(value);
-    }
-}
-
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use dependaboard_core::{CheckStatus, UpdateType};
 
     use super::*;
+    use crate::ui::test_support::{DashboardFixture, render};
 
     fn LabelFacetsFixture() -> Element {
         // Nine labels already ranked by the store, deliberately not in
@@ -190,13 +185,19 @@ mod tests {
     /// `dependency` have no control on the dashboard, so they do not count.
     #[test]
     fn the_active_filter_count_covers_only_filters_the_dashboard_can_set() {
-        #[component]
-        fn Fixture(filter: PrFilter) -> Element {
-            let filter = use_signal(|| filter);
-            let cursor = use_signal(|| None);
-            rsx! { ActiveFilters { filter, cursor } }
+        fn Fixture() -> Element {
+            rsx! {
+                DashboardFixture { filter: full_filter(), ActiveFilters {} }
+            }
         }
-        let filter = PrFilter {
+        let html = render(Fixture);
+
+        assert_eq!(html.matches(r#"class="filter-chip""#).count(), 7, "{html}");
+        assert_eq!(filter_count(&full_filter()), 8);
+    }
+
+    fn full_filter() -> PrFilter {
+        PrFilter {
             query: Some("serde".to_owned()),
             owner: Some("acme".to_owned()),
             repos: vec!["acme/api".to_owned(), "acme/web".to_owned()],
@@ -205,18 +206,6 @@ mod tests {
             labels: vec!["rust".to_owned()],
             dependency: Some("serde".to_owned()),
             needs_attention: true,
-        };
-
-        let mut dom = VirtualDom::new_with_props(
-            Fixture,
-            FixtureProps {
-                filter: filter.clone(),
-            },
-        );
-        dom.rebuild_in_place();
-        let html = dioxus::ssr::render(&dom);
-
-        assert_eq!(html.matches(r#"class="filter-chip""#).count(), 7, "{html}");
-        assert_eq!(filter_count(&filter), 8);
+        }
     }
 }

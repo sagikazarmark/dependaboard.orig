@@ -1,18 +1,25 @@
 //! The dashboard UI: the themed shell, its toast chrome, and the pieces the
 //! page components share.
 
+mod action_bar;
+mod active_batch;
 mod batch;
 mod confirm_modal;
 mod dashboard;
+mod dashboard_state;
 mod detail_drawer;
 mod filters;
 mod format;
 mod pr_row;
+mod pr_table;
 mod progress_drawer;
 mod search_box;
 mod side_panel;
+mod sidebar;
+mod status_bar;
 #[cfg(all(test, feature = "server"))]
 mod test_support;
+mod top_bar;
 
 use std::time::Duration;
 
@@ -20,8 +27,8 @@ use dependaboard_core::{BulkActionKind, PrRecord, PrTarget};
 use dioxus::prelude::*;
 
 use crate::components::toast::{
-    ToastCloseButton, ToastColor, ToastContent, ToastDescription, ToastProps, ToastPropsWithOwner,
-    ToastProvider, ToastTitle, ToastTitleAppearance,
+    ToastCloseButton, ToastColor, ToastContent, ToastDescription, ToastOptions, ToastProps,
+    ToastPropsWithOwner, ToastProvider, ToastTitle, ToastTitleAppearance,
 };
 use crate::ui::dashboard::Dashboard;
 
@@ -34,6 +41,11 @@ use crate::ui::dashboard::Dashboard;
 pub(crate) struct PendingAction {
     pub(crate) action: BulkActionKind,
     pub(crate) targets: Vec<PrTarget>,
+}
+
+/// Errors stay until dismissed; every other toast auto-dismisses.
+pub(crate) fn sticky() -> ToastOptions {
+    ToastOptions::new().permanent(true)
 }
 
 pub(crate) fn App() -> Element {
