@@ -6,7 +6,9 @@ use dioxus::prelude::*;
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
 
 /// One row; `now` is the dashboard's clock, which the row's age and staleness
-/// are read against. `oncheck` receives the row when its box is clicked.
+/// are read against. `oncheck` receives the row when its box is clicked,
+/// `onopen` when the row itself is; `onfilter_dependency` receives the
+/// dependency's name when it is clicked, on a row that updates one dependency.
 #[component]
 pub(crate) fn PrRow(
     row: PrRecord,
@@ -14,13 +16,11 @@ pub(crate) fn PrRow(
     now: u64,
     oncheck: EventHandler<PrRecord>,
     onopen: EventHandler<PrRecord>,
+    onfilter_dependency: EventHandler<String>,
 ) -> Element {
     let picked = row.clone();
     let opened = row.clone();
-    let dependency = row
-        .dependency
-        .clone()
-        .unwrap_or_else(|| format!("{} dependencies", row.dependencies.len()));
+    let dependency = row.dependency.clone();
     let versions = version_label(row.from_version.as_deref(), row.to_version.as_deref());
     let stale = row.is_stale(now);
     let row_class = match (checked, stale) {
@@ -39,7 +39,20 @@ pub(crate) fn PrRow(
             code { class: "pr-number", "#{row.number}" }
             div { class: "dependency-cell",
                 div {
-                    strong { "{dependency}" }
+                    match dependency {
+                        Some(name) => rsx! {
+                            button {
+                                class: "dependency-filter",
+                                aria_label: "show every {name} update",
+                                onclick: {
+                                    let name = name.clone();
+                                    move |event: MouseEvent| { event.stop_propagation(); onfilter_dependency.call(name.clone()); }
+                                },
+                                strong { "{name}" }
+                            }
+                        },
+                        None => rsx! { strong { "{row.dependencies.len()} dependencies" } },
+                    }
                     span { "{versions}" }
                     span { class: "update-chip {update_class(row.update_type)}", "{row.update_type}" }
                 }
@@ -62,7 +75,7 @@ pub(crate) fn PrRow(
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
-    use crate::ui::test_support::{FIXTURE_NOW, GROUPED_ROW_TITLE, grouped_row};
+    use crate::ui::test_support::{FIXTURE_NOW, GROUPED_ROW_TITLE, grouped_row, serde_row};
 
     fn GroupedRowFixture() -> Element {
         rsx! {
@@ -72,6 +85,7 @@ mod tests {
                 now: FIXTURE_NOW,
                 oncheck: move |_| {},
                 onopen: move |_| {},
+                onfilter_dependency: move |_| {},
             }
         }
     }
@@ -86,6 +100,40 @@ mod tests {
         assert!(html.contains("<strong>3 dependencies</strong><span>group update</span>"));
     }
 
+    fn SerdeRowFixture() -> Element {
+        rsx! {
+            PrRow {
+                row: serde_row(),
+                checked: false,
+                now: FIXTURE_NOW,
+                oncheck: move |_| {},
+                onopen: move |_| {},
+                onfilter_dependency: move |_| {},
+            }
+        }
+    }
+
+    /// The dependency's name is the way to every other pull request bumping it, so a
+    /// row with one dependency offers it as a filter. A grouped row has no one name to
+    /// filter by, so it shows its count as plain text.
+    #[test]
+    fn a_single_dependency_is_offered_as_a_filter_and_a_group_is_not() {
+        let mut dom = VirtualDom::new(SerdeRowFixture);
+        dom.rebuild_in_place();
+        let single = dioxus::ssr::render(&dom);
+        let mut dom = VirtualDom::new(GroupedRowFixture);
+        dom.rebuild_in_place();
+        let grouped = dioxus::ssr::render(&dom);
+
+        assert!(
+            single.contains(
+                r#"<button class="dependency-filter" aria-label="show every serde update"><strong>serde</strong></button>"#
+            ),
+            "{single}"
+        );
+        assert!(!grouped.contains("dependency-filter"), "{grouped}");
+    }
+
     fn ManyLabelsFixture() -> Element {
         let mut row = grouped_row();
         row.labels = ["dependencies", "rust", "security", "blocked"]
@@ -98,6 +146,7 @@ mod tests {
                 now: FIXTURE_NOW,
                 oncheck: move |_| {},
                 onopen: move |_| {},
+                onfilter_dependency: move |_| {},
             }
         }
     }

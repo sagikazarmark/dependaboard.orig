@@ -43,6 +43,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "batches",
         sql: include_str!("../../../migrations/0005_batches.sql"),
     },
+    Migration {
+        version: 6,
+        name: "drop_owner_filter_index",
+        sql: include_str!("../../../migrations/0006_drop_owner_filter_index.sql"),
+    },
 ];
 
 const CREATE_SCHEMA_MIGRATIONS: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -251,7 +256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idx_pr_repo_is_dropped_and_idx_pr_number_is_unique() {
+    async fn the_pull_request_indexes_are_the_ones_the_queries_use_and_idx_pr_number_is_unique() {
         let connection = connection().await;
         apply(&connection).await.unwrap();
 
@@ -266,13 +271,13 @@ mod tests {
         indexes.sort_unstable();
 
         // idx_pr_repo (repository_id) is absent: idx_pr_sha and idx_pr_number
-        // both start with repository_id and cover it. The autoindex is the
+        // both start with repository_id and cover it. idx_pr_filter is gone
+        // with the owner filter that alone could use it. The autoindex is the
         // TEXT PRIMARY KEY on id.
         assert_eq!(
             indexes,
             [
                 ("idx_pr_dependency".to_owned(), false),
-                ("idx_pr_filter".to_owned(), false),
                 ("idx_pr_number".to_owned(), true),
                 ("idx_pr_order".to_owned(), false),
                 ("idx_pr_sha".to_owned(), false),

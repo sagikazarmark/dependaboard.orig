@@ -12,9 +12,10 @@ use dioxus::prelude::*;
 use {
     crate::server::{restate::pr_status_path, state::ServerState},
     axum::extract::Extension,
-    dependaboard_core::{BulkRequest, ManualSyncRequest, PrKey, UserId, new_batch_id},
+    dependaboard_core::{
+        BulkRequest, InvalidBatch, ManualSyncRequest, PrKey, UserId, new_batch_id,
+    },
     dependaboard_store::{PrStore, StoreError},
-    std::collections::BTreeSet,
 };
 
 /// One page of rows for `filter`. Paging through a filter calls this alone;
@@ -74,33 +75,31 @@ pub(crate) async fn load_projection_revision() -> Result<u64, ServerFnError> {
         .map_err(store_failure)
 }
 
+/// Asks Restate to run the batch. The batch id is the workflow key, which lets
+/// a workflow run once, and the idempotency key, which lets the browser resend
+/// the same submission after a lost response and be told it was accepted
+/// rather than refused for the workflow already existing.
 #[server(state: Extension<ServerState>, user: Extension<UserId>)]
 pub(crate) async fn submit_batch(
     batch_id: String,
     action: BulkActionKind,
     targets: Vec<PrTarget>,
 ) -> Result<(), ServerFnError> {
-    if !dependaboard_core::valid_batch_id(&batch_id) {
-        return Err(ServerFnError::new("batch id must be a UUIDv7"));
-    }
-    if targets.is_empty() || targets.len() > dependaboard_core::MAX_BATCH_TARGETS {
-        return Err(ServerFnError::new(format!(
-            "batch must contain between 1 and {} targets",
-            dependaboard_core::MAX_BATCH_TARGETS
-        )));
-    }
-    let unique = targets.iter().map(PrTarget::key).collect::<BTreeSet<_>>();
-    if unique.len() != targets.len() {
-        return Err(ServerFnError::new("batch contains duplicate pull requests"));
-    }
     let request = BulkRequest {
         action,
         targets,
         user_id: user.0,
     };
+    request
+        .validate(&batch_id)
+        .map_err(|invalid| ServerFnError::new(invalid.to_string()))?;
     state
         .ingress
-        .send(&format!("BulkAction/{batch_id}/run"), &request, None)
+        .send(
+            &format!("BulkAction/{batch_id}/run"),
+            &request,
+            Some(&batch_id),
+        )
         .await
         .map_err(restate_unavailable)
 }
@@ -110,7 +109,7 @@ pub(crate) async fn load_batch_progress(
     batch_id: String,
 ) -> Result<Option<BatchProgress>, ServerFnError> {
     if !dependaboard_core::valid_batch_id(&batch_id) {
-        return Err(ServerFnError::new("batch id must be a UUIDv7"));
+        return Err(ServerFnError::new(InvalidBatch::BatchId.to_string()));
     }
     state
         .ingress

@@ -1,17 +1,11 @@
 //! The `BulkAction` workflow: one per dashboard batch, driving a merge, rebase, or branch
 //! update across many pull requests and exposing its progress to the dashboard.
 
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    num::NonZeroUsize,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::VecDeque, fmt, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use dependaboard_core::{
     ActionOutcome, BatchProgress, BatchRecord, BulkActionKind, BulkRequest, CommandRequest,
-    DependabotCommand, MAX_BATCH_TARGETS, MergeRequest, PrTarget, UpdateBranchRequest, UserId,
-    unix_seconds, valid_batch_id,
+    DependabotCommand, MergeRequest, PrTarget, UpdateBranchRequest, UserId, unix_seconds,
 };
 use dependaboard_store::PrStore;
 use restate_sdk::prelude::*;
@@ -83,7 +77,9 @@ trait BulkActionEffects {
     /// Writes the finished batch to the projection, where it outlives the workflow's
     /// retention. Written once per batch: the store keeps the first record and Restate
     /// journals the step, so neither a retry nor a replay writes a second. Nothing would
-    /// redo this write, so it is retried until the store takes it rather than given up.
+    /// redo this write, so it is retried until the store takes it rather than given up,
+    /// and once it has been pending past [`RECORD_PENDING_QUIETLY_FOR`] each failed
+    /// attempt is logged, so a wedged store shows in the service log.
     fn record_batch(
         &mut self,
         record: &BatchRecord,
@@ -98,7 +94,8 @@ struct RestateBulkAction<'a, 'ctx> {
 
 impl RestateBulkAction<'_, '_> {
     fn pull_request(&self, target: &PrTarget) -> PullRequestClient<'_> {
-        self.ctx.object_client::<PullRequestClient>(target.key())
+        self.ctx
+            .object_client::<PullRequestClient>(target.key().to_string())
     }
 }
 
@@ -185,7 +182,10 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
         let record = record.clone();
         self.ctx
             .run(move || async move {
-                store.record_batch(&record).await.map_err(store_failure)?;
+                store.record_batch(&record).await.map_err(|error| {
+                    warn_if_record_stuck(&record, unix_seconds(), &error);
+                    store_failure(error)
+                })?;
                 Ok(())
             })
             .retry_policy(persistent_store_retry_policy())
@@ -193,6 +193,30 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
             .await?;
         Ok(())
     }
+}
+
+/// How long a finished batch's record may go unwritten before its failed attempts are
+/// logged. A store away for a few seconds is what the retry is for; a record still
+/// pending past this is a store that has wedged, and an operator should not need the
+/// Restate UI to see it.
+const RECORD_PENDING_QUIETLY_FOR: Duration = Duration::from_secs(30);
+
+/// Logs, at `warn`, a failed attempt to write a finished batch's record, once the record
+/// has been pending for longer than [`RECORD_PENDING_QUIETLY_FOR`] since the batch
+/// finished. `now` is Unix seconds. Restate owns the retrying and re-runs the handler
+/// for each attempt, so no attempt can count the ones before it; the record's age, from
+/// the journaled `completed_at`, is what every attempt knows.
+fn warn_if_record_stuck(record: &BatchRecord, now: u64, cause: &impl fmt::Display) {
+    let pending_for = now.saturating_sub(record.completed_at);
+    if pending_for <= RECORD_PENDING_QUIETLY_FOR.as_secs() {
+        return;
+    }
+    warn!(
+        batch_id = %record.batch_id,
+        pending_for_seconds = pending_for,
+        cause = %cause,
+        "the finished batch's record has not reached the store; still retrying"
+    );
 }
 
 /// Drives every target of the batch to a terminal state, writes the finished batch to
@@ -309,7 +333,9 @@ impl BulkAction {
     ) -> HandlerResult<Json<BatchProgress>> {
         traced("BulkAction/run", ctx.key(), async {
             let request = request.into_inner();
-            validate_batch_request(ctx.key(), &request)?;
+            request
+                .validate(ctx.key())
+                .map_err(|invalid| TerminalError::new(invalid.to_string()))?;
             let mut restate = RestateBulkAction {
                 ctx: &ctx,
                 store: &self.store,
@@ -344,57 +370,51 @@ impl BulkAction {
 ///
 /// Two pull requests in one repository never share a round: merging the first moves the
 /// base branch under the second, so they go one round after another in batch order. Each
-/// round takes the next pull request from up to `max_concurrent` repositories, visiting
-/// repositories in id order. Every target lands in exactly one round.
+/// round takes the next pull request from up to `max_concurrent` repositories, going
+/// round the repositories in the order the batch first names them and picking up where
+/// the last round left off, so no repository waits on another's being drained. Every
+/// target lands in exactly one round.
 fn plan_merge_rounds(targets: &[PrTarget], max_concurrent: NonZeroUsize) -> Vec<Vec<PrTarget>> {
-    let mut by_repository: BTreeMap<u64, VecDeque<PrTarget>> = BTreeMap::new();
+    // Each repository's pull requests in batch order, the repositories in the order the
+    // batch first names them.
+    let mut queues: Vec<(u64, VecDeque<PrTarget>)> = Vec::new();
     for target in targets {
-        by_repository
-            .entry(target.repository_id)
-            .or_default()
-            .push_back(target.clone());
+        match queues
+            .iter_mut()
+            .find(|(repository_id, _)| *repository_id == target.repository_id)
+        {
+            Some((_, queue)) => queue.push_back(target.clone()),
+            None => queues.push((target.repository_id, VecDeque::from([target.clone()]))),
+        }
     }
     let mut rounds = Vec::new();
+    let mut start = 0;
     loop {
-        let round = by_repository
-            .values_mut()
-            .filter_map(VecDeque::pop_front)
-            .take(max_concurrent.get())
-            .collect::<Vec<_>>();
+        let mut round = Vec::new();
+        let mut visited = 0;
+        while visited < queues.len() && round.len() < max_concurrent.get() {
+            let index = (start + visited) % queues.len();
+            if let Some(target) = queues[index].1.pop_front() {
+                round.push(target);
+            }
+            visited += 1;
+        }
         if round.is_empty() {
             return rounds;
         }
+        start = (start + visited) % queues.len();
         rounds.push(round);
     }
 }
 
-fn validate_batch_request(batch_id: &str, request: &BulkRequest) -> HandlerResult<()> {
-    if !valid_batch_id(batch_id) {
-        return Err(TerminalError::new("batch key must be a UUIDv7").into());
-    }
-    if request.targets.is_empty() || request.targets.len() > MAX_BATCH_TARGETS {
-        return Err(TerminalError::new(format!(
-            "batch must contain between 1 and {MAX_BATCH_TARGETS} targets"
-        ))
-        .into());
-    }
-    let mut keys = BTreeSet::new();
-    if request
-        .targets
-        .iter()
-        .any(|target| !keys.insert(target.key()))
-    {
-        return Err(TerminalError::new("batch contains duplicate pull requests").into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use dependaboard_core::{RejectReason, TargetOutcome, TargetProgressState, UserId};
 
     use super::*;
-    use crate::test_support::target;
+    use crate::test_support::{captured_logs, target};
 
     /// A merge target for pull request `number` in repository `repository_id`.
     fn pull(repository_id: u64, number: u64) -> PrTarget {
@@ -893,15 +913,48 @@ mod tests {
         );
     }
 
+    /// A finished one-target batch, completed a minute after the fake clock's epoch.
+    fn finished_record() -> BatchRecord {
+        let targets = [pull(7, 1)];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        progress.record(&targets[0].key(), merged());
+        progress
+            .completed_record(UserId::new("alice"), CLOCK_EPOCH, CLOCK_EPOCH + 60)
+            .expect("the batch has finished")
+    }
+
+    /// Restate retries the record step for as long as it takes and re-runs the handler
+    /// each time, so no attempt can count the ones before it; the record's age since the
+    /// batch finished is what tells a blip from a store that has wedged.
     #[test]
-    fn batch_validation_rejects_duplicate_targets() {
-        let target = target();
-        let request = BulkRequest {
-            action: BulkActionKind::Merge,
-            targets: vec![target.clone(), target],
-            user_id: UserId::new("dashboard"),
-        };
-        assert!(validate_batch_request(&dependaboard_core::new_batch_id(), &request).is_err());
+    fn a_record_still_pending_past_the_grace_period_is_warned_about_with_its_age() {
+        let record = finished_record();
+        let now = record.completed_at + RECORD_PENDING_QUIETLY_FOR.as_secs() + 1;
+
+        let logs = captured_logs(|| {
+            warn_if_record_stuck(&record, now, &"database is locked");
+        });
+
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("batch_id=batch-1"), "{logs}");
+        assert!(logs.contains("pending_for_seconds=31"), "{logs}");
+        assert!(logs.contains("cause=database is locked"), "{logs}");
+    }
+
+    #[test]
+    fn a_record_that_has_only_just_failed_to_land_is_retried_quietly() {
+        let record = finished_record();
+
+        let logs = captured_logs(|| {
+            warn_if_record_stuck(&record, record.completed_at + 5, &"database is locked");
+            warn_if_record_stuck(
+                &record,
+                record.completed_at + RECORD_PENDING_QUIETLY_FOR.as_secs(),
+                &"database is locked",
+            );
+        });
+
+        assert!(logs.is_empty(), "{logs}");
     }
 
     #[test]
@@ -943,6 +996,47 @@ mod tests {
                 vec![pull(1, 1), pull(2, 1)],
                 vec![pull(3, 1), pull(4, 1)],
                 vec![pull(5, 1)],
+            ]
+        );
+    }
+
+    /// Each round picks up where the last left off, so with more repositories than the
+    /// bound, the fourth gets its turn in the second round rather than once the first
+    /// three have nothing left.
+    #[test]
+    fn rounds_go_round_the_repositories_so_none_waits_for_the_others_to_drain() {
+        let two_per_repository = (1..=4)
+            .flat_map(|repository_id| [pull(repository_id, 1), pull(repository_id, 2)])
+            .collect::<Vec<_>>();
+
+        let rounds = plan_merge_rounds(&two_per_repository, MAX_CONCURRENT);
+
+        assert_eq!(
+            rounds,
+            vec![
+                vec![pull(1, 1), pull(2, 1), pull(3, 1)],
+                vec![pull(4, 1), pull(1, 2), pull(2, 2)],
+                vec![pull(3, 2), pull(4, 2)],
+            ]
+        );
+    }
+
+    /// Repositories take their turns in the order the batch first names them, not by
+    /// id, so the user's ordering of the batch is the order the merges go out in.
+    #[test]
+    fn repositories_take_turns_in_the_order_the_batch_first_names_them() {
+        let rounds = plan_merge_rounds(
+            &[pull(9, 1), pull(3, 1), pull(9, 2), pull(3, 2)],
+            NonZeroUsize::new(1).unwrap(),
+        );
+
+        assert_eq!(
+            rounds,
+            vec![
+                vec![pull(9, 1)],
+                vec![pull(3, 1)],
+                vec![pull(9, 2)],
+                vec![pull(3, 2)],
             ]
         );
     }

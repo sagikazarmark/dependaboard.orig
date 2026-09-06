@@ -1,14 +1,12 @@
 //! Shared fixtures for the service's unit tests.
 
 mod memory_store;
-mod scripted_github;
 
 use std::sync::{Arc, Mutex};
 
 use dependaboard_core::{CheckStatus, Mergeable, PrRecord, PrTarget, RepoRecord, UpdateType};
 
 pub(crate) use memory_store::MemoryPrStore;
-pub(crate) use scripted_github::{GithubCall, ScriptedGithub};
 
 /// A merge/command target for pull request 9 in `acme/api`, repository 7.
 pub(crate) fn target() -> PrTarget {

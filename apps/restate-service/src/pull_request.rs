@@ -285,9 +285,7 @@ impl PullRequest {
             let outcome = action_result(result)?;
             if matches!(outcome, ActionOutcome::Succeeded { .. }) {
                 let store = self.store.clone();
-                let key = request.target.key().parse::<PrKey>().map_err(|error| {
-                    TerminalError::new(format!("invalid merge target key: {error}"))
-                })?;
+                let key = request.target.key();
                 ctx.run(move || async move {
                     store.delete_pr(&key).await.map_err(store_failure)?;
                     Ok(())
@@ -402,7 +400,7 @@ impl PullRequest {
             });
             ctx.set(PR_STATE, Json::from(state));
             if matches!(outcome, ActionOutcome::Succeeded { .. }) {
-                ctx.object_client::<PullRequestClient>(request.target.key())
+                ctx.object_client::<PullRequestClient>(request.target.key().to_string())
                     .sync(Json::from(SyncRequest {
                         repository_id: request.target.repository_id,
                         owner: request.target.owner,

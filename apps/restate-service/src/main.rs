@@ -231,47 +231,7 @@ fn resolve_seconds(name: &str, raw: Option<&str>, default: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{GithubCall, MemoryPrStore, ScriptedGithub, captured_logs};
-
-    #[tokio::test]
-    async fn components_take_their_store_and_github_as_trait_objects() {
-        let scripted = Arc::new(ScriptedGithub::new(42));
-        scripted.on_list_installation_repositories(Ok(Vec::new()));
-        let github = GithubApiHandle::new(scripted.clone());
-        let store: Arc<dyn PrStore> = Arc::new(MemoryPrStore::default());
-
-        let pull_request = PullRequest {
-            github: github.clone(),
-            store: store.clone(),
-            debounce: Duration::from_secs(20),
-        };
-        let installation_sync = InstallationSync {
-            github: github.clone(),
-            store: store.clone(),
-            interval: Duration::from_secs(3600),
-        };
-        let repo_sync = RepoSync {
-            github,
-            store: store.clone(),
-        };
-        let bulk_action = BulkAction { store };
-
-        assert_eq!(pull_request.github.installation_id(), 42);
-        assert_eq!(
-            installation_sync
-                .github
-                .list_installation_repositories()
-                .await
-                .unwrap(),
-            Vec::new()
-        );
-        assert_eq!(repo_sync.store.get_repo(7).await.unwrap(), None);
-        assert_eq!(bulk_action.store.get_repo(7).await.unwrap(), None);
-        assert_eq!(
-            scripted.calls(),
-            vec![GithubCall::ListInstallationRepositories]
-        );
-    }
+    use crate::test_support::captured_logs;
 
     #[test]
     fn scheduler_start_request_has_no_input_payload() {

@@ -766,6 +766,25 @@ code,
   font-weight: 500;
 }
 
+/* The dependency's name, as the way to every other update of it: reads as the
+   name until hovered, so the cell looks the same on a grouped row. */
+.dependency-filter {
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.dependency-filter strong {
+  display: block;
+}
+
+.dependency-filter:hover strong {
+  text-decoration: underline;
+}
+
 .dependency-cell > div > span:not(.update-chip) {
   color: var(--muted);
   white-space: nowrap;

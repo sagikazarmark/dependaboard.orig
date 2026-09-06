@@ -1,4 +1,10 @@
-use std::{cmp::Ordering, collections::BTreeMap, fmt, str::FromStr, time::Duration};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    str::FromStr,
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -62,7 +68,7 @@ impl fmt::Display for UserId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PrKey {
     pub repository_id: u64,
     pub number: u64,
@@ -427,10 +433,12 @@ impl PrRecord {
     }
 }
 
+/// What the dashboard narrows the pull requests by. Every field is one the
+/// dashboard's controls can set and its URL carries; the store applies them
+/// all together.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrFilter {
     pub query: Option<String>,
-    pub owner: Option<String>,
     #[serde(default)]
     pub repos: Vec<String>,
     #[serde(default)]
@@ -439,6 +447,8 @@ pub struct PrFilter {
     pub check_statuses: Vec<CheckStatus>,
     #[serde(default)]
     pub labels: Vec<String>,
+    /// One dependency by name, case-insensitively: a pull request updating it
+    /// alone, or as one of a group.
     pub dependency: Option<String>,
     #[serde(default)]
     pub needs_attention: bool,
@@ -647,8 +657,8 @@ pub struct PrTarget {
 }
 
 impl PrTarget {
-    pub fn key(&self) -> String {
-        PrKey::new(self.repository_id, self.number).to_string()
+    pub fn key(&self) -> PrKey {
+        PrKey::new(self.repository_id, self.number)
     }
 }
 
@@ -657,6 +667,36 @@ pub struct BulkRequest {
     pub action: BulkActionKind,
     pub targets: Vec<PrTarget>,
     pub user_id: UserId,
+}
+
+impl BulkRequest {
+    /// Whether this request may run as batch `batch_id`. The web API checks it before
+    /// asking Restate, and the workflow checks it again on its way in, so a batch that
+    /// reaches Restate by another route is held to the same rules.
+    pub fn validate(&self, batch_id: &str) -> Result<(), InvalidBatch> {
+        if !valid_batch_id(batch_id) {
+            return Err(InvalidBatch::BatchId);
+        }
+        if self.targets.is_empty() || self.targets.len() > MAX_BATCH_TARGETS {
+            return Err(InvalidBatch::TargetCount);
+        }
+        let mut keys = BTreeSet::new();
+        if self.targets.iter().any(|target| !keys.insert(target.key())) {
+            return Err(InvalidBatch::DuplicateTargets);
+        }
+        Ok(())
+    }
+}
+
+/// Why a batch request cannot run. Each message is meant for the user who submitted it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum InvalidBatch {
+    #[error("batch id must be a UUIDv7")]
+    BatchId,
+    #[error("batch must contain between 1 and {MAX_BATCH_TARGETS} targets")]
+    TargetCount,
+    #[error("batch contains duplicate pull requests")]
+    DuplicateTargets,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -793,12 +833,12 @@ impl BatchProgress {
         }
     }
     /// The target's action has been sent.
-    pub fn start(&mut self, key: &str) {
+    pub fn start(&mut self, key: &PrKey) {
         self.set_state(key, TargetProgressState::Running);
     }
 
     /// The target's action completed: GitHub did it, or said no for good.
-    pub fn record(&mut self, key: &str, outcome: ActionOutcome) {
+    pub fn record(&mut self, key: &PrKey, outcome: ActionOutcome) {
         let state = match outcome {
             ActionOutcome::Succeeded { detail } => TargetProgressState::Succeeded { detail },
             ActionOutcome::Rejected { reason } => TargetProgressState::Rejected { reason },
@@ -807,7 +847,7 @@ impl BatchProgress {
     }
 
     /// The target's action failed terminally without an outcome; `detail` says why.
-    pub fn record_failure(&mut self, key: &str, detail: impl Into<String>) {
+    pub fn record_failure(&mut self, key: &PrKey, detail: impl Into<String>) {
         self.set_state(
             key,
             TargetProgressState::Failed {
@@ -830,15 +870,20 @@ impl BatchProgress {
     }
 
     /// Moves the target to `state` and keeps the tally in step with it. A key the batch
-    /// does not contain changes nothing: the tally must only ever count targets.
-    fn set_state(&mut self, key: &str, state: TargetProgressState) {
+    /// does not contain changes nothing: the tally must only ever count targets. Nor does
+    /// a target that has already settled: its verdict is final, and counting a second one
+    /// would let the tally reach the target count while a target is still queued.
+    fn set_state(&mut self, key: &PrKey, state: TargetProgressState) {
         let Some(target) = self
             .targets
             .iter_mut()
-            .find(|target| target.target.key() == key)
+            .find(|target| target.target.key() == *key)
         else {
             return;
         };
+        if target.state.outcome().is_some() {
+            return;
+        }
         match &state {
             TargetProgressState::Succeeded { .. } => self.succeeded += 1,
             TargetProgressState::Rejected { .. } => self.rejected += 1,
@@ -1499,6 +1544,58 @@ mod tests {
         assert!(!valid_batch_id("not-a-uuid"));
     }
 
+    fn bulk_request(targets: Vec<PrTarget>) -> BulkRequest {
+        BulkRequest {
+            action: BulkActionKind::Merge,
+            targets,
+            user_id: UserId::new("alice"),
+        }
+    }
+
+    /// The one check both the web API and the workflow run before taking a batch: the id
+    /// is a UUIDv7, the target count is within bounds, and no pull request is named twice.
+    #[test]
+    fn a_batch_request_is_checked_for_its_id_its_size_and_repeated_targets() {
+        let full = (1..=MAX_BATCH_TARGETS as u64).map(batch_target).collect();
+        assert_eq!(bulk_request(full).validate(&new_batch_id()), Ok(()));
+        assert_eq!(
+            bulk_request(vec![batch_target(1)]).validate("550e8400-e29b-41d4-a716-446655440000"),
+            Err(InvalidBatch::BatchId)
+        );
+        assert_eq!(
+            bulk_request(Vec::new()).validate(&new_batch_id()),
+            Err(InvalidBatch::TargetCount)
+        );
+        let too_many = (1..=MAX_BATCH_TARGETS as u64 + 1)
+            .map(batch_target)
+            .collect();
+        assert_eq!(
+            bulk_request(too_many).validate(&new_batch_id()),
+            Err(InvalidBatch::TargetCount)
+        );
+        assert_eq!(
+            bulk_request(vec![batch_target(1), batch_target(2), batch_target(1)])
+                .validate(&new_batch_id()),
+            Err(InvalidBatch::DuplicateTargets)
+        );
+    }
+
+    #[test]
+    fn an_invalid_batch_says_what_is_wrong_with_it() {
+        assert_eq!(
+            InvalidBatch::BatchId.to_string(),
+            "batch id must be a UUIDv7"
+        );
+        assert_eq!(
+            InvalidBatch::TargetCount.to_string(),
+            "batch must contain between 1 and 100 targets"
+        );
+        assert_eq!(
+            InvalidBatch::DuplicateTargets.to_string(),
+            "batch contains duplicate pull requests"
+        );
+    }
+
     /// A target for pull request `number` in repository 7.
     fn batch_target(number: u64) -> PrTarget {
         PrTarget {
@@ -1553,6 +1650,45 @@ mod tests {
             }
         );
         assert!(progress.completed);
+    }
+
+    /// A verdict is final. Were a second one counted, the tally would reach the target
+    /// count before the last target had settled, and the batch would read as complete
+    /// with a target still queued.
+    #[test]
+    fn a_target_already_settled_keeps_its_first_verdict_and_is_counted_once() {
+        let targets = [batch_target(1), batch_target(2)];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        progress.record(
+            &targets[0].key(),
+            ActionOutcome::Succeeded {
+                detail: "merged".to_owned(),
+            },
+        );
+
+        progress.record(
+            &targets[0].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::Forbidden,
+            },
+        );
+        progress.record_failure(&targets[0].key(), "boom");
+        progress.start(&targets[0].key());
+
+        assert_eq!(
+            progress.targets[0].state,
+            TargetProgressState::Succeeded {
+                detail: "merged".to_owned()
+            }
+        );
+        assert_eq!(
+            (progress.succeeded, progress.rejected, progress.failed),
+            (1, 0, 0)
+        );
+        assert!(
+            !progress.completed,
+            "the second target is still queued; a double count must not finish the batch"
+        );
     }
 
     #[test]

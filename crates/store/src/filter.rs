@@ -34,10 +34,6 @@ pub(crate) fn filter_sql(
             r"(LOWER(p.owner || '/' || p.repo || ' ' || p.title) LIKE {binding} ESCAPE '\' OR EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE LOWER(json_extract(d.value, '$.name')) LIKE {binding} ESCAPE '\'))"
         ));
     }
-    if let Some(owner) = filter.owner.as_ref().filter(|owner| !owner.is_empty()) {
-        let binding = bind(Value::Text(owner.clone()));
-        clauses.push(format!("p.owner = {binding}"));
-    }
     if !filter.repos.is_empty() {
         let bindings = filter
             .repos
@@ -183,7 +179,6 @@ mod tests {
     fn blank_text_fields_are_ignored() {
         let filter = PrFilter {
             query: Some("   ".to_owned()),
-            owner: Some(String::new()),
             dependency: Some("\t".to_owned()),
             ..Default::default()
         };
@@ -208,7 +203,7 @@ mod tests {
     #[test]
     fn cursor_binds_after_the_filter_parameters() {
         let filter = PrFilter {
-            owner: Some("acme".to_owned()),
+            repos: vec!["acme/api".to_owned()],
             ..Default::default()
         };
 
@@ -216,22 +211,9 @@ mod tests {
 
         assert_eq!(
             sql,
-            "WHERE p.owner = ?1 AND (p.updated_at < ?2 OR (p.updated_at = ?2 AND p.id < ?3))"
+            "WHERE (p.owner || '/' || p.repo) IN (?1) AND (p.updated_at < ?2 OR (p.updated_at = ?2 AND p.id < ?3))"
         );
-        assert_eq!(params, [text("acme"), Value::Integer(500), text("1#7")]);
-    }
-
-    #[test]
-    fn owner_matches_exactly() {
-        let filter = PrFilter {
-            owner: Some("Acme".to_owned()),
-            ..Default::default()
-        };
-
-        let (sql, params) = filter_sql(&filter, None, NOW).unwrap();
-
-        assert_eq!(sql, "WHERE p.owner = ?1");
-        assert_eq!(params, [text("Acme")]);
+        assert_eq!(params, [text("acme/api"), Value::Integer(500), text("1#7")]);
     }
 
     #[test]
@@ -357,7 +339,6 @@ mod tests {
     fn dropping_a_facets_dimension_leaves_every_other_field_alone() {
         let filter = PrFilter {
             query: Some("serde".to_owned()),
-            owner: Some("acme".to_owned()),
             repos: vec!["acme/api".to_owned()],
             update_types: vec![UpdateType::Minor],
             check_statuses: vec![CheckStatus::Success],
@@ -405,7 +386,6 @@ mod tests {
     fn all_fields_and_a_cursor_number_their_parameters_in_clause_order() {
         let filter = PrFilter {
             query: Some("serde".to_owned()),
-            owner: Some("acme".to_owned()),
             repos: vec!["acme/api".to_owned()],
             update_types: vec![UpdateType::Minor],
             check_statuses: vec![CheckStatus::Success],
@@ -420,14 +400,13 @@ mod tests {
             sql,
             [
                 r"WHERE (LOWER(p.owner || '/' || p.repo || ' ' || p.title) LIKE ?1 ESCAPE '\' OR EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE LOWER(json_extract(d.value, '$.name')) LIKE ?1 ESCAPE '\'))",
-                "p.owner = ?2",
-                "(p.owner || '/' || p.repo) IN (?3)",
-                "p.update_type IN (?4)",
-                "p.check_status IN (?5)",
-                "EXISTS (SELECT 1 FROM json_each(p.labels) l WHERE l.value = ?6)",
-                "(p.dependency = ?7 OR (p.dependency IS NULL AND EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE json_extract(d.value, '$.name') = ?7 COLLATE NOCASE)))",
-                "(p.check_status IN (?8, ?9) OR p.mergeable IN (?10) OR p.update_type = ?11 OR p.synced_at < ?12)",
-                "(p.updated_at < ?13 OR (p.updated_at = ?13 AND p.id < ?14))",
+                "(p.owner || '/' || p.repo) IN (?2)",
+                "p.update_type IN (?3)",
+                "p.check_status IN (?4)",
+                "EXISTS (SELECT 1 FROM json_each(p.labels) l WHERE l.value = ?5)",
+                "(p.dependency = ?6 OR (p.dependency IS NULL AND EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE json_extract(d.value, '$.name') = ?6 COLLATE NOCASE)))",
+                "(p.check_status IN (?7, ?8) OR p.mergeable IN (?9) OR p.update_type = ?10 OR p.synced_at < ?11)",
+                "(p.updated_at < ?12 OR (p.updated_at = ?12 AND p.id < ?13))",
             ]
             .join(" AND ")
         );
@@ -435,7 +414,6 @@ mod tests {
             params,
             [
                 text("%serde%"),
-                text("acme"),
                 text("acme/api"),
                 text("minor"),
                 text("success"),

@@ -602,8 +602,10 @@ still work, but Restate says new code should use these.)
 
 Submitting the same workflow id twice fails with "Previously accepted" — which is exactly
 the deduplication the client-generated batch id is there to exploit. Exploiting it means
-handling it: the UI's retry path must treat "Previously accepted" as *success* — swallow
-the error and go poll `progress()` for that batch id — not surface it as a failure.
+the resend must not read as a failure: send the batch id as the request's
+`idempotency-key` as well as the workflow key, and Restate answers a repeat with the
+original acceptance instead of the refusal. The server function then has no error to
+swallow and no message to sniff; a 409 that does arrive is a real one and is reported.
 Otherwise the idempotency mechanism converts a recovered connection blip into a
 user-visible error for a batch that is running fine.
 
@@ -791,7 +793,6 @@ pub trait PrStore {
 }
 
 pub struct PrFilter {
-    pub owner: Option<String>,
     pub repos: Vec<String>,
     pub update_types: Vec<UpdateType>,     // Major | Minor | Patch | Unknown
     pub check_status: Option<CheckStatus>, // Success | Failure | Pending | None
@@ -852,10 +853,10 @@ CREATE TABLE pull_requests (
   synced_at      INTEGER NOT NULL    -- when WE last fetched; drives staleness UI
                                      -- and scopes reconciliation deletes (synced_before)
 );
-CREATE INDEX idx_pr_filter ON pull_requests(owner, check_status, update_type);
-CREATE INDEX idx_pr_repo   ON pull_requests(repository_id);
-CREATE INDEX idx_pr_sha    ON pull_requests(repository_id, head_sha);  -- webhook SHA lookup
-CREATE INDEX idx_pr_order  ON pull_requests(updated_at DESC, id DESC); -- stable paging
+CREATE UNIQUE INDEX idx_pr_number ON pull_requests(repository_id, number);
+CREATE INDEX idx_pr_sha        ON pull_requests(repository_id, head_sha);  -- webhook SHA lookup
+CREATE INDEX idx_pr_order      ON pull_requests(updated_at DESC, id DESC); -- stable paging
+CREATE INDEX idx_pr_dependency ON pull_requests(dependency);               -- the dependency filter
 
 -- Finished bulk actions, for audit; append-only, written once per batch id by the
 -- BulkAction workflow's last step. Not tied to pull_requests: a merged PR leaves that

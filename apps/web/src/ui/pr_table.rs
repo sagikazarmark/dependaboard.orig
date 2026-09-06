@@ -106,6 +106,7 @@ pub(crate) fn PrTable(onopen: EventHandler<PrRecord>) -> Element {
                                 now,
                                 oncheck: move |row| state.toggle_selected(row),
                                 onopen,
+                                onfilter_dependency: move |name| state.update_filter(|filter| filter.dependency = Some(name)),
                             }
                         }
                     },

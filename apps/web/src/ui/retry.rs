@@ -168,7 +168,7 @@ pub(crate) async fn refresh_rejected<G: RefreshGateway>(
 mod tests {
     use std::collections::BTreeMap;
 
-    use dependaboard_core::{ActionOutcome, BulkActionKind, RejectReason};
+    use dependaboard_core::{ActionOutcome, BulkActionKind, PrKey, RejectReason};
 
     use super::*;
     use crate::ui::pr_target;
@@ -177,7 +177,7 @@ mod tests {
     /// A server whose answer to each target's refresh is scripted by key. A
     /// target the script does not name fails its refresh, so a target that
     /// should never have been refreshed shows up as left out with that error.
-    struct Scripted(BTreeMap<String, Result<Option<PrRecord>, String>>);
+    struct Scripted(BTreeMap<PrKey, Result<Option<PrRecord>, String>>);
 
     impl Scripted {
         fn new(

@@ -87,6 +87,9 @@ pub(crate) fn ActiveFilters() -> Element {
                     rsx! { FilterChip { key: "chip-label-{label}", kind: "label", label, onclick: move |_| state.toggle_filter(|filter| &mut filter.labels, label_value.clone()) } }
                 }
             }
+            if let Some(dependency) = value.dependency {
+                FilterChip { kind: "dependency", label: dependency, onclick: move |_| state.update_filter(|filter| filter.dependency = None) }
+            }
             button { class: "clear-all", onclick: move |_| state.clear_filters(), "clear all" }
         }
     }
@@ -103,15 +106,15 @@ fn FilterChip(kind: &'static str, label: String, onclick: EventHandler<MouseEven
     }
 }
 
-/// How many filters the dashboard's controls have set. `PrFilter` also carries
-/// `owner` and `dependency`, which nothing on the dashboard sets, so they are
-/// not counted.
+/// How many filters the dashboard's controls have set: one per chip, plus the
+/// search box for the query.
 pub(crate) fn filter_count(filter: &PrFilter) -> usize {
     usize::from(filter.query.is_some())
         + filter.repos.len()
         + filter.update_types.len()
         + filter.check_statuses.len()
         + filter.labels.len()
+        + usize::from(filter.dependency.is_some())
         + usize::from(filter.needs_attention)
 }
 
@@ -181,10 +184,10 @@ mod tests {
     }
 
     /// The count in the sidebar promises controls the user can clear: one chip
-    /// per facet value plus the search box for the query. `owner` and
-    /// `dependency` have no control on the dashboard, so they do not count.
+    /// per facet value, the dependency's included, plus the search box for the
+    /// query.
     #[test]
-    fn the_active_filter_count_covers_only_filters_the_dashboard_can_set() {
+    fn the_active_filter_count_covers_every_filter_the_dashboard_can_set() {
         fn Fixture() -> Element {
             rsx! {
                 DashboardFixture { filter: full_filter(), ActiveFilters {} }
@@ -192,14 +195,23 @@ mod tests {
         }
         let html = render(Fixture);
 
-        assert_eq!(html.matches(r#"class="filter-chip""#).count(), 7, "{html}");
-        assert_eq!(filter_count(&full_filter()), 8);
+        assert_eq!(html.matches(r#"class="filter-chip""#).count(), 8, "{html}");
+        assert!(
+            html.contains(
+                r#"<button class="filter-chip"><span>dependency</span>serde<b>x</b></button>"#
+            ),
+            "{html}"
+        );
+        assert_eq!(
+            filter_count(&full_filter()),
+            9,
+            "the chips and the search box"
+        );
     }
 
     fn full_filter() -> PrFilter {
         PrFilter {
             query: Some("serde".to_owned()),
-            owner: Some("acme".to_owned()),
             repos: vec!["acme/api".to_owned(), "acme/web".to_owned()],
             update_types: vec![UpdateType::Major],
             check_statuses: vec![CheckStatus::Failure, CheckStatus::None],

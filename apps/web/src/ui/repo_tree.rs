@@ -160,11 +160,13 @@ impl OwnerGroup {
 }
 
 /// Groups `repositories` under their owners, in the order they arrive, which
-/// the store makes owner then name order. A repository is shown when it has
-/// pull requests to show or is `selected` (as `owner/repo`): a selected one
-/// never disappears from under the user. When `query` is not blank, only
-/// repositories whose `owner/repo` contains it, case-insensitively, are
-/// shown. An owner with nothing to show is left out.
+/// the store makes owner then name order, case-insensitively. Owners are
+/// matched the same way, GitHub's being case-insensitive, so two spellings of
+/// one owner make one group, named as it was first spelled. A repository is
+/// shown when it has pull requests to show or is `selected` (as `owner/repo`):
+/// a selected one never disappears from under the user. When `query` is not
+/// blank, only repositories whose `owner/repo` contains it, case-insensitively,
+/// are shown. An owner with nothing to show is left out.
 fn owner_groups(repositories: &[RepoFacet], selected: &[String], query: &str) -> Vec<OwnerGroup> {
     let query = query.trim().to_lowercase();
     let searching = !query.is_empty();
@@ -175,7 +177,7 @@ fn owner_groups(repositories: &[RepoFacet], selected: &[String], query: &str) ->
         let is_selected = selected.contains(&full_name);
         let group = match groups
             .iter()
-            .position(|group| group.owner == repository.owner)
+            .position(|group| group.owner.eq_ignore_ascii_case(&repository.owner))
         {
             Some(index) => &mut groups[index],
             None => {
@@ -261,6 +263,36 @@ mod tests {
         assert_eq!(groups[0].meta(), "2/3 · 52");
         assert!(groups[0].repositories[1].selected);
         assert!(!groups[0].repositories[0].selected);
+    }
+
+    /// GitHub owners are case-insensitive and the store orders them so, so two spellings
+    /// of one owner arrive together and belong to one group; the filter still names each
+    /// repository the way the store spells it.
+    #[test]
+    fn an_owner_spelled_in_two_cases_is_one_group() {
+        let mut repositories = fixture_repositories();
+        let mut tools = repositories[0].clone();
+        tools.repository.repository_id = 11;
+        tools.repository.owner = "Acme".to_owned();
+        tools.repository.repo = "tools".to_owned();
+        tools.count = 4;
+        repositories.insert(3, tools);
+
+        let groups = owner_groups(&repositories, &[], "");
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| (group.owner.as_str(), names(group)))
+                .collect::<Vec<_>>(),
+            [("acme", vec!["api", "web", "tools"]), ("beta", vec!["api"])]
+        );
+        assert_eq!(
+            groups[0].scope,
+            ["acme/api", "acme/docs", "acme/web", "Acme/tools"],
+            "the owner's box selects each repository as the store spells it"
+        );
+        assert_eq!(groups[0].meta(), "3 repos · 56");
     }
 
     /// Without a search the box stands for every repository of the owner, so

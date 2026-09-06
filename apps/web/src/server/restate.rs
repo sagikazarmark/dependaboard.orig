@@ -37,8 +37,9 @@ impl RestateIngress {
 
     /// Enqueues a one-way invocation, returning once Restate has accepted it.
     ///
-    /// With an `idempotency_key`, Restate collapses repeats of the same key
-    /// into the original invocation instead of running the handler again.
+    /// With an `idempotency_key`, Restate answers a repeat of the same key with
+    /// the original acceptance instead of running the handler again, or, for a
+    /// workflow, instead of refusing the second submission.
     pub(crate) async fn send<T: Serialize + ?Sized>(
         &self,
         path: &str,
@@ -49,7 +50,7 @@ impl RestateIngress {
         if let Some(key) = idempotency_key {
             request = request.header("idempotency-key", key);
         }
-        self.accept(path, request).await
+        self.accept(request).await
     }
 
     /// Enqueues a one-way invocation of a handler that takes no input.
@@ -57,7 +58,7 @@ impl RestateIngress {
     /// Restate rejects any body for such a handler, even an empty JSON one, so
     /// the request carries neither a body nor a content type.
     pub(crate) async fn send_empty(&self, path: &str) -> Result<(), String> {
-        self.accept(path, self.post("send", path)).await
+        self.accept(self.post("send", path)).await
     }
 
     /// An authenticated POST to `/restate/{route}/{path}`, for `route` being
@@ -73,19 +74,13 @@ impl RestateIngress {
     }
 
     /// Sends a one-way invocation and reads Restate's answer as accepted or not.
-    async fn accept(&self, path: &str, request: reqwest::RequestBuilder) -> Result<(), String> {
+    async fn accept(&self, request: reqwest::RequestBuilder) -> Result<(), String> {
         let response = request.send().await.map_err(|error| error.to_string())?;
         if response.status().is_success() {
             return Ok(());
         }
         let status = response.status();
         let detail = response.text().await.unwrap_or_default();
-        if status.as_u16() == 409
-            && path.starts_with("BulkAction/")
-            && detail.to_ascii_lowercase().contains("previously accepted")
-        {
-            return Ok(());
-        }
         Err(format!("Restate returned {status}: {detail}"))
     }
 
@@ -198,5 +193,40 @@ mod tests {
     #[test]
     fn pull_request_status_path_encodes_the_object_key_separator() {
         assert_eq!(pr_status_path(7, 9), "PullRequest/7%239/status");
+    }
+
+    /// A batch is submitted under its id as the idempotency key, so a repeat of the same
+    /// submission is answered with the original acceptance. A 409 therefore means what
+    /// Restate says it means, and is reported rather than read as "already accepted".
+    #[tokio::test]
+    async fn a_conflict_from_restate_is_an_error_even_for_a_batch() {
+        async fn restate_ingress() -> impl IntoResponse {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({
+                    "code": 409,
+                    "message": "The invocation was previously accepted",
+                    "source": "ingress"
+                })),
+            )
+        }
+
+        let address = serve(axum::Router::new().route(
+            "/restate/send/BulkAction/batch-1/run",
+            post(restate_ingress),
+        ))
+        .await;
+
+        let result = ingress_at(address)
+            .send(
+                "BulkAction/batch-1/run",
+                &serde_json::json!({}),
+                Some("batch-1"),
+            )
+            .await;
+
+        let error = result.expect_err("a conflict is not an acceptance");
+        assert!(error.contains("409"), "{error}");
+        assert!(error.contains("previously accepted"), "{error}");
     }
 }

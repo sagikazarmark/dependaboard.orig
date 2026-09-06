@@ -1,5 +1,10 @@
 //! An in-memory [`PrStore`] that keeps the libSQL schema's constraints, so handler logic
 //! that takes the trait can run against a projection without a database.
+//!
+//! It implements the writes and the lookups the Restate service makes, and only those:
+//! the dashboard's reads (`list_prs`, `dashboard_summary`, `projection_revision`,
+//! `recent_batches`) are `unimplemented!`, so this is not a drop-in store for a test of
+//! the web app, which reads the projection through those.
 
 use std::{collections::BTreeMap, sync::Mutex};
 
@@ -17,7 +22,8 @@ use dependaboard_store::{PrStore, StoreError};
 /// deleting a repository takes its pull requests with it, a pull request reads back
 /// with its repository's `installation_id`, as the store's `JOIN` gives it, and a batch
 /// recorded twice keeps its first record. What the service never asks of the store, the
-/// dashboard listing, its summary, and the recent batches, is not implemented.
+/// dashboard listing, its summary, the revision counter, and the recent batches, is not
+/// implemented and panics if called.
 #[derive(Default)]
 pub(crate) struct MemoryPrStore {
     tables: Mutex<Tables>,

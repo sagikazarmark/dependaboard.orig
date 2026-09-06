@@ -21,6 +21,7 @@ const REPO: &str = "repo";
 const UPDATE_TYPE: &str = "type";
 const CHECK: &str = "check";
 const LABEL: &str = "label";
+const DEPENDENCY: &str = "dep";
 const AFTER: &str = "after";
 const PR: &str = "pr";
 
@@ -42,13 +43,15 @@ impl UrlState {
         for (name, value) in form_urlencoded::parse(query.as_bytes()) {
             let value = value.as_ref();
             let text = || (!value.is_empty()).then(|| value.to_owned());
+            let trimmed_text = || (!value.trim().is_empty()).then(|| value.to_owned());
             match name.as_ref() {
                 VIEW => state.filter.needs_attention = value == ATTENTION,
-                QUERY => state.filter.query = (!value.trim().is_empty()).then(|| value.to_owned()),
+                QUERY => state.filter.query = trimmed_text(),
                 REPO => push_unique(&mut state.filter.repos, text()),
                 UPDATE_TYPE => push_unique(&mut state.filter.update_types, value.parse().ok()),
                 CHECK => push_unique(&mut state.filter.check_statuses, value.parse().ok()),
                 LABEL => push_unique(&mut state.filter.labels, text()),
+                DEPENDENCY => state.filter.dependency = trimmed_text(),
                 AFTER => {
                     state.cursor = PageCursor::decode(value).is_ok().then(|| value.to_owned());
                 }
@@ -80,6 +83,9 @@ impl UrlState {
         }
         for label in &self.filter.labels {
             query.append_pair(LABEL, label);
+        }
+        if let Some(dependency) = &self.filter.dependency {
+            query.append_pair(DEPENDENCY, dependency);
         }
         if let Some(cursor) = &self.cursor {
             query.append_pair(AFTER, cursor);
@@ -147,8 +153,8 @@ mod tests {
                 update_types: vec![UpdateType::Major, UpdateType::Patch],
                 check_statuses: vec![CheckStatus::Failure],
                 labels: vec!["rust".to_owned()],
+                dependency: Some("serde_json".to_owned()),
                 needs_attention: true,
-                ..PrFilter::default()
             },
             cursor: Some(cursor()),
             pr: Some(PrKey::new(7, 9)),
@@ -175,7 +181,7 @@ mod tests {
             route,
             format!(
                 "/?view=attention&q=serde+json&repo=acme%2Fapi&repo=acme%2Fweb\
-                 &type=major&type=patch&check=failure&label=rust&after={}&pr=7%239",
+                 &type=major&type=patch&check=failure&label=rust&dep=serde_json&after={}&pr=7%239",
                 cursor()
             )
         );
@@ -193,7 +199,7 @@ mod tests {
     #[test]
     fn values_the_dashboard_could_not_have_set_are_dropped() {
         let route = "/?view=bogus&q=+++&repo=&repo=acme%2Fapi&repo=acme%2Fapi&type=huge&type=minor\
-                     &check=flaky&label=&label=rust&after=not-a-cursor&pr=7&utm_source=slack#top";
+                     &check=flaky&label=&label=rust&dep=+&after=not-a-cursor&pr=7&utm_source=slack#top";
 
         let state = UrlState::from_route(route);
 
