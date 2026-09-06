@@ -1,7 +1,7 @@
 //! Translates a [`PrFilter`] into a SQL `WHERE` clause over `pull_requests p`
 //! plus the positional parameters it binds.
 
-use dependaboard_core::{Mergeable, PageCursor, PrFilter, STALE_AFTER};
+use dependaboard_core::{CheckStatus, Mergeable, PageCursor, PrFilter, STALE_AFTER, UpdateType};
 use libsql::Value;
 
 use crate::{StoreError, integer};
@@ -88,15 +88,23 @@ pub(crate) fn filter_sql(
         ));
     }
     if filter.needs_attention {
+        // Every enum here binds its `Display` form, like the facet filters
+        // above, so a renamed variant cannot leave a stale literal behind.
+        let failing = [CheckStatus::Failure, CheckStatus::None]
+            .into_iter()
+            .map(|status| bind(Value::Text(status.to_string())))
+            .collect::<Vec<_>>()
+            .join(", ");
         let conflicting = Mergeable::ALL
             .into_iter()
             .filter(|state| state.is_conflicting())
             .map(|state| bind(Value::Text(state.to_string())))
             .collect::<Vec<_>>()
             .join(", ");
+        let major = bind(Value::Text(UpdateType::Major.to_string()));
         let stale_before = bind(integer(now.saturating_sub(STALE_AFTER.as_secs()))?);
         clauses.push(format!(
-            "(p.check_status IN ('failure', 'none') OR p.mergeable IN ({conflicting}) OR p.update_type = 'major' OR p.synced_at < {stale_before})"
+            "(p.check_status IN ({failing}) OR p.mergeable IN ({conflicting}) OR p.update_type = {major} OR p.synced_at < {stale_before})"
         ));
     }
     if let Some(cursor) = cursor {
@@ -148,8 +156,6 @@ pub(crate) fn without_facet(filter: &PrFilter, facet: Facet) -> PrFilter {
 
 #[cfg(test)]
 mod tests {
-    use dependaboard_core::{CheckStatus, UpdateType};
-
     use super::*;
 
     const NOW: u64 = 10_000;
@@ -315,8 +321,11 @@ mod tests {
         assert_eq!(params, [text(r"%50\%\_off\\now%")]);
     }
 
+    /// Every enum the view compares against is bound in its persisted form,
+    /// the same way the facet filters bind theirs, so renaming a variant
+    /// cannot leave a stale literal behind in the SQL.
     #[test]
-    fn needs_attention_binds_the_stale_threshold_from_now() {
+    fn needs_attention_binds_its_enum_values_and_the_stale_threshold_from_now() {
         let filter = PrFilter {
             needs_attention: true,
             ..Default::default()
@@ -327,9 +336,18 @@ mod tests {
         // STALE_AFTER is 45 minutes, so 10 000 - 2 700.
         assert_eq!(
             sql,
-            "WHERE (p.check_status IN ('failure', 'none') OR p.mergeable IN (?1) OR p.update_type = 'major' OR p.synced_at < ?2)"
+            "WHERE (p.check_status IN (?1, ?2) OR p.mergeable IN (?3) OR p.update_type = ?4 OR p.synced_at < ?5)"
         );
-        assert_eq!(params, [text("dirty"), Value::Integer(7_300)]);
+        assert_eq!(
+            params,
+            [
+                text("failure"),
+                text("none"),
+                text("dirty"),
+                text("major"),
+                Value::Integer(7_300)
+            ]
+        );
     }
 
     /// A facet counts against every other dimension of the filter, so
@@ -408,8 +426,8 @@ mod tests {
                 "p.check_status IN (?5)",
                 "EXISTS (SELECT 1 FROM json_each(p.labels) l WHERE l.value = ?6)",
                 "(p.dependency = ?7 OR (p.dependency IS NULL AND EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE json_extract(d.value, '$.name') = ?7 COLLATE NOCASE)))",
-                "(p.check_status IN ('failure', 'none') OR p.mergeable IN (?8) OR p.update_type = 'major' OR p.synced_at < ?9)",
-                "(p.updated_at < ?10 OR (p.updated_at = ?10 AND p.id < ?11))",
+                "(p.check_status IN (?8, ?9) OR p.mergeable IN (?10) OR p.update_type = ?11 OR p.synced_at < ?12)",
+                "(p.updated_at < ?13 OR (p.updated_at = ?13 AND p.id < ?14))",
             ]
             .join(" AND ")
         );
@@ -423,7 +441,10 @@ mod tests {
                 text("success"),
                 text("rust"),
                 text("serde"),
+                text("failure"),
+                text("none"),
                 text("dirty"),
+                text("major"),
                 Value::Integer(7_300),
                 Value::Integer(500),
                 text("1#7"),

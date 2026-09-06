@@ -255,22 +255,24 @@ impl PrStore for LibSqlPrStore {
 
     async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage, StoreError> {
         let connection = self.connection().await;
+        // The count and the page are one answer, so they read one snapshot:
+        // a sync landing between them must not leave a total that disagrees
+        // with the rows.
+        let transaction = connection.transaction().await?;
         let now = unix_seconds();
         let (where_sql, params) = filter_sql(filter, None, now)?;
-        let total = scalar_u64(&connection, &count_sql(&where_sql), params).await?;
+        let total = scalar_u64(&transaction, &count_sql(&where_sql), params).await?;
 
         let cursor = page.after.as_deref().map(PageCursor::decode).transpose()?;
         let (page_where, mut page_params) = filter_sql(filter, cursor.as_ref(), now)?;
         let limit = page.normalized_limit() as usize;
         let limit_index = page_params.len() + 1;
         page_params.push(integer((limit + 1) as u64)?);
-        let mut query_rows = connection
+        let page_rows = transaction
             .query(&page_sql(&page_where, limit_index), page_params)
             .await?;
-        let mut rows = Vec::with_capacity(limit + 1);
-        while let Some(row) = query_rows.next().await? {
-            rows.push(pr_from_row(row)?);
-        }
+        let mut rows = collect_prs(page_rows).await?;
+        transaction.commit().await?;
         let has_more = rows.len() > limit;
         rows.truncate(limit);
         let next_cursor = has_more.then(|| rows.last()).flatten().map(|record| {
@@ -290,14 +292,19 @@ impl PrStore for LibSqlPrStore {
 
     async fn dashboard_summary(&self, filter: &PrFilter) -> Result<DashboardSummary, StoreError> {
         let connection = self.connection().await;
+        // Every facet frames the same rows, so they all count one snapshot:
+        // a sync landing between them must not leave facets that do not add
+        // up to each other.
+        let transaction = connection.transaction().await?;
         let now = unix_seconds();
-        let facets = facet_counts(&connection, filter, now).await?;
+        let facets = facet_counts(&transaction, filter, now).await?;
         let last_synced_at = scalar_optional_u64(
-            &connection,
+            &transaction,
             "SELECT MAX(synced_at) FROM pull_requests",
             Vec::new(),
         )
         .await?;
+        transaction.commit().await?;
         Ok(DashboardSummary {
             facets,
             last_synced_at,
@@ -320,7 +327,7 @@ impl PrStore for LibSqlPrStore {
         sha: &str,
     ) -> Result<Vec<PrRecord>, StoreError> {
         let connection = self.connection().await;
-        let mut rows = connection
+        let rows = connection
             .query(
                 &format!(
                     "{} WHERE p.repository_id = ?1 AND p.head_sha = ?2",
@@ -329,11 +336,7 @@ impl PrStore for LibSqlPrStore {
                 vec![integer(repository_id)?, Value::Text(sha.to_owned())],
             )
             .await?;
-        let mut records = Vec::new();
-        while let Some(row) = rows.next().await? {
-            records.push(pr_from_row(row)?);
-        }
-        Ok(records)
+        collect_prs(rows).await
     }
 
     async fn upsert_repo(&self, repo: &RepoRecord) -> Result<(), StoreError> {
@@ -580,6 +583,17 @@ fn pr_from_row(row: Row) -> Result<PrRecord, StoreError> {
         updated_at: unsigned(row.get::<i64>(18)?)?,
         synced_at: unsigned(row.get::<i64>(19)?)?,
     })
+}
+
+/// Drains the rows of a [`select_pr_sql`] query, in the order the database
+/// produced them. Taking the rows by value means nothing of the statement
+/// outlives the call, so a caller can end its transaction right after.
+async fn collect_prs(mut rows: libsql::Rows) -> Result<Vec<PrRecord>, StoreError> {
+    let mut records = Vec::new();
+    while let Some(row) = rows.next().await? {
+        records.push(pr_from_row(row)?);
+    }
+    Ok(records)
 }
 
 /// Parses a column that persists an enum's `Display` form. Unrecognised text
@@ -953,7 +967,11 @@ fn retryable_database_error(error: &libsql::Error) -> bool {
 
 fn retryable_sqlite_code(code: i32) -> bool {
     // Extended SQLite result codes retain the primary result in the low byte.
-    matches!(code & 0xff, 5 | 6 | 10) || matches!(code, 787 | 1555 | 2067) // foreign key, primary key, unique
+    // Contention (BUSY, LOCKED, IOERR) clears on its own. Of the constraint
+    // codes only the foreign key one does: a pull request can race the sync
+    // that inserts its repository. A primary key or unique violation is a
+    // programming error, and retrying it would only delay the report.
+    matches!(code & 0xff, 5 | 6 | 10) || code == 787 // SQLITE_CONSTRAINT_FOREIGNKEY
 }
 
 #[cfg(test)]
@@ -1589,6 +1607,61 @@ mod tests {
         assert_eq!(synced.last_synced_at, Some(700));
     }
 
+    /// Watches the store's connection and records, for every `SELECT` SQLite
+    /// compiles from now on, whether a transaction was open at the time.
+    /// SQLite authorises subqueries as `SELECT`s of their own, so a statement
+    /// with a subquery is recorded more than once. The hook holds a clone of
+    /// the connection it is installed on; the cycle is fine for a test, whose
+    /// connection is dropped with its temporary directory anyway.
+    async fn watch_selects(store: &LibSqlPrStore) -> Arc<std::sync::Mutex<Vec<bool>>> {
+        let connection = store.connection().await.clone();
+        let in_transaction = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&in_transaction);
+        let watched = connection.clone();
+        connection
+            .authorizer(Some(Arc::new(move |context: &libsql::AuthContext| {
+                if context.action == libsql::AuthAction::Select {
+                    recorded.lock().unwrap().push(!watched.is_autocommit());
+                }
+                libsql::Authorization::Allow
+            })))
+            .unwrap();
+        in_transaction
+    }
+
+    /// A page is a count and some rows; a summary is several facets over one
+    /// filter. Each is one answer, so a sync landing between its statements
+    /// must not show in it: every statement reads inside the same
+    /// transaction, and the transaction is over when the answer is.
+    #[tokio::test]
+    async fn a_page_and_a_summary_each_read_inside_one_transaction() {
+        let (_directory, store) = test_store().await;
+        let selects = watch_selects(&store).await;
+
+        store
+            .list_prs(&PrFilter::default(), Page::default())
+            .await
+            .unwrap();
+        let page_selects = std::mem::take(&mut *selects.lock().unwrap());
+        store.dashboard_summary(&PrFilter::default()).await.unwrap();
+        let summary_selects = std::mem::take(&mut *selects.lock().unwrap());
+
+        // A page is two statements, a summary five; subqueries add to the
+        // count but never subtract from it.
+        assert!(
+            page_selects.len() >= 2 && page_selects.iter().all(|open| *open),
+            "every SELECT of a page reads inside its transaction: {page_selects:?}"
+        );
+        assert!(
+            summary_selects.len() >= 5 && summary_selects.iter().all(|open| *open),
+            "every SELECT of a summary reads inside its transaction: {summary_selects:?}"
+        );
+        assert!(
+            store.connection().await.is_autocommit(),
+            "a finished read leaves no transaction behind"
+        );
+    }
+
     /// The dashboard polls the revision to learn whether anything it shows
     /// has changed, so every write that changes a row moves it — the rows a
     /// repository delete takes with it included — and reads and writes that
@@ -1665,6 +1738,35 @@ mod tests {
 
         store.purge_installation(9).await.unwrap();
         follower.advanced("purging the installation").await;
+    }
+
+    /// Migration 0004 promises that a repository delete which cascades to its
+    /// pull requests moves the revision as surely as an upsert. The store
+    /// never issues such a delete — it removes the pull requests first so it
+    /// can report them — so exercise the cascade itself: one tick for the
+    /// repository row and one for each pull request that went with it.
+    #[tokio::test]
+    async fn a_cascading_repository_delete_advances_the_projection_revision() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 2, 10)).await.unwrap();
+        let before = store.projection_revision().await.unwrap();
+
+        store
+            .connection()
+            .await
+            .execute(
+                "DELETE FROM repositories WHERE repository_id = ?1",
+                vec![integer(1).unwrap()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.get_repo(1).await.unwrap(), None);
+        assert_eq!(store.get_pr(&PrKey::new(1, 1)).await.unwrap(), None);
+        assert_eq!(store.get_pr(&PrKey::new(1, 2)).await.unwrap(), None);
+        assert_eq!(store.projection_revision().await.unwrap(), before + 3);
     }
 
     #[tokio::test]
@@ -1767,9 +1869,33 @@ mod tests {
             "{error}"
         );
         assert_eq!(
+            error.class(),
+            StoreErrorClass::Terminal,
+            "a duplicate is a bug, and a fresh attempt would write the same row"
+        );
+        assert_eq!(
             store.get_pr(&PrKey::new(1, 7)).await.unwrap(),
             Some(pr(1, 7, 10))
         );
+    }
+
+    /// The classification tells the foreign key race apart from other
+    /// constraint violations by SQLite's extended result code, which only
+    /// works if libSQL hands that over rather than the bare primary code (19,
+    /// SQLITE_CONSTRAINT, which is terminal). A real violation pins it: a
+    /// pull request whose repository has not landed yet is a race with the
+    /// repository sync, and worth another try.
+    #[tokio::test]
+    async fn a_pull_request_arriving_before_its_repository_is_worth_retrying() {
+        let (_directory, store) = test_store().await;
+
+        let error = store.upsert_pr(&pr(1, 1, 10)).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("FOREIGN KEY constraint failed"),
+            "{error}"
+        );
+        assert_eq!(error.class(), StoreErrorClass::Retryable);
     }
 
     #[tokio::test]
@@ -2166,14 +2292,15 @@ mod tests {
     }
 
     #[test]
-    fn classifies_structured_sqlite_contention_and_constraints_as_retryable() {
-        for code in [5, 6, 10, 5 | (2 << 8), 787, 1555, 2067] {
+    fn classifies_structured_sqlite_contention_and_the_foreign_key_race_as_retryable() {
+        for code in [5, 6, 10, 5 | (2 << 8), 787] {
             let error = StoreError::Database(libsql::Error::SqliteFailure(code, "busy".into()));
-            assert_eq!(error.class(), StoreErrorClass::Retryable);
+            assert_eq!(error.class(), StoreErrorClass::Retryable, "code {code}");
         }
+        // A remote server reports the primary and extended codes separately.
         let remote = StoreError::Database(libsql::Error::RemoteSqliteFailure(
-            1,
-            19 | (8 << 8),
+            19,
+            19 | (3 << 8),
             "constraint".into(),
         ));
         assert_eq!(remote.class(), StoreErrorClass::Retryable);
@@ -2186,6 +2313,19 @@ mod tests {
         let generic_constraint =
             StoreError::Database(libsql::Error::SqliteFailure(19, "constraint".into()));
         assert_eq!(generic_constraint.class(), StoreErrorClass::Terminal);
+        // Primary key and unique violations are programming errors: a fresh
+        // attempt would hit the same row.
+        for code in [1555, 2067] {
+            let error =
+                StoreError::Database(libsql::Error::SqliteFailure(code, "constraint".into()));
+            assert_eq!(error.class(), StoreErrorClass::Terminal, "code {code}");
+        }
+        let remote_unique = StoreError::Database(libsql::Error::RemoteSqliteFailure(
+            19,
+            19 | (8 << 8),
+            "constraint".into(),
+        ));
+        assert_eq!(remote_unique.class(), StoreErrorClass::Terminal);
         assert_eq!(
             StoreError::IntegerOverflow.class(),
             StoreErrorClass::Terminal

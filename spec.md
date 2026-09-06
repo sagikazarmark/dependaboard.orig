@@ -311,8 +311,10 @@ credentials is `Rejected(Forbidden)` — branch protection, a repository the ins
 can see but not push to — while a 401 is `Fatal` whatever came before it, because the
 client has already refreshed the token and retried once by the time it surfaces. A
 `Fatal` fails the `PullRequest` handler terminally; inside a batch that is one target
-marked failed, not an aborted batch (see `BulkAction` above). DB constraint violations
-(see the FK race in `InstallationSync`) are `Retryable`, not `Fatal`.
+marked failed, not an aborted batch (see `BulkAction` above). Of the DB constraint
+violations, only the foreign key one (see the FK race in `InstallationSync`) is
+`Retryable`: a primary key or unique violation is a programming error that a fresh
+attempt would hit again, so it is `Fatal`.
 
 **One 405 is special-cased, and it's the one bulk merging hits most.**
 `PUT /pulls/{n}/merge` returns 405 `"Base branch was modified. Review and try the merge
