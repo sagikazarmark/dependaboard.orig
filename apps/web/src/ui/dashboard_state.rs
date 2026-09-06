@@ -59,6 +59,21 @@ pub(crate) type PageStatus = Remote<DashboardPage>;
 /// filter: moving to the next page does not ask again.
 pub(crate) type SummaryStatus = Remote<DashboardSummary>;
 
+/// The dashboard's line to the read model, as the live refresh's polls find
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Connection {
+    /// The polls are being answered: the rows are being kept current.
+    Online,
+    /// Enough polls in a row got no revision — the server is away, or
+    /// cannot reach the store — that the rows are as they were at the last
+    /// answer; see [`DISCONNECT_THRESHOLD`](crate::ui::live::DISCONNECT_THRESHOLD).
+    Disconnected,
+    /// The server refused the credentials the browser holds. It is reached,
+    /// and will keep refusing until the user signs in again.
+    SignedOut,
+}
+
 /// The rows picked for a bulk action.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Selection {
@@ -112,6 +127,11 @@ pub(crate) struct DashboardState {
     /// Whether a manual sync is in flight: asked for, and not yet seen to
     /// reach the pull requests.
     syncing: Signal<bool>,
+    /// The line to the server, as the live refresh's polls last found it.
+    connection: Signal<Connection>,
+    /// When a poll was last answered, in Unix seconds; `None` before the
+    /// first. The age of the rows on screen once the line is down.
+    refreshed_at: Signal<Option<u64>>,
     /// Asks the read model again for the same filter and cursor.
     reload: Callback<()>,
 }
@@ -120,7 +140,8 @@ impl DashboardState {
     /// Provides the state to the calling component's subtree. `page`,
     /// `summary`, and `now` are boxed once, here, since every conversion to a
     /// [`ReadSignal`] takes a slot in the scope for as long as the scope
-    /// lives. No manual sync is in flight to begin with.
+    /// lives. No manual sync is in flight to begin with, and the line to the
+    /// server counts as online until a poll finds otherwise.
     pub(crate) fn provide(
         filter: Signal<PrFilter>,
         cursor: Signal<Option<String>>,
@@ -131,6 +152,8 @@ impl DashboardState {
         reload: Callback<()>,
     ) -> Self {
         let syncing = use_signal(|| false);
+        let connection = use_signal(|| Connection::Online);
+        let refreshed_at = use_signal(|| None);
         use_context_provider(|| Self {
             filter,
             cursor,
@@ -139,6 +162,8 @@ impl DashboardState {
             summary: summary.into(),
             now: now.into(),
             syncing,
+            connection,
+            refreshed_at,
             reload,
         })
     }
@@ -178,6 +203,40 @@ impl DashboardState {
     pub(crate) fn end_sync(&mut self) {
         if *self.syncing.peek() {
             self.syncing.set(false);
+        }
+    }
+
+    /// The line to the server, as the polls last found it. Reading it in a
+    /// component subscribes the component to its changes.
+    pub(crate) fn connection(&self) -> Connection {
+        *self.connection.read()
+    }
+
+    /// When a poll was last answered, in Unix seconds; `None` before the
+    /// first. It stands through the misses that follow, so once the line is
+    /// down it is the age of the rows on screen.
+    pub(crate) fn refreshed_at(&self) -> Option<u64> {
+        *self.refreshed_at.read()
+    }
+
+    /// A poll was answered at `now`: the line is online, whatever the polls
+    /// before it found.
+    pub(crate) fn poll_answered(&mut self, now: u64) {
+        self.refreshed_at.set(Some(now));
+        self.set_connection(Connection::Online);
+    }
+
+    /// A poll got no revision, and the polls in a row say the line is
+    /// `connection`.
+    pub(crate) fn poll_missed(&mut self, connection: Connection) {
+        self.set_connection(connection);
+    }
+
+    /// Only a change is written, so a poll that finds the line as it was
+    /// wakes no component.
+    fn set_connection(&mut self, connection: Connection) {
+        if *self.connection.peek() != connection {
+            self.connection.set(connection);
         }
     }
 
@@ -490,6 +549,37 @@ mod tests {
         let (dom, state) = mount();
 
         dom.in_runtime(|| assert_eq!(state.now(), FIXTURE_NOW));
+    }
+
+    /// The line to the server is what the polls last found it to be, and the
+    /// date beside it is of the last poll that was answered, standing through
+    /// the misses that follow: it is the age of the rows on screen.
+    #[test]
+    fn the_line_follows_the_polls_and_dates_the_last_one_answered() {
+        let (dom, mut state) = mount();
+
+        dom.in_runtime(|| {
+            assert_eq!(state.connection(), Connection::Online);
+            assert_eq!(state.refreshed_at(), None);
+
+            state.poll_answered(FIXTURE_NOW);
+            assert_eq!(state.refreshed_at(), Some(FIXTURE_NOW));
+
+            state.poll_missed(Connection::Disconnected);
+            assert_eq!(state.connection(), Connection::Disconnected);
+            assert_eq!(
+                state.refreshed_at(),
+                Some(FIXTURE_NOW),
+                "a miss does not move the date"
+            );
+
+            state.poll_missed(Connection::SignedOut);
+            assert_eq!(state.connection(), Connection::SignedOut);
+
+            state.poll_answered(FIXTURE_NOW + 60);
+            assert_eq!(state.connection(), Connection::Online);
+            assert_eq!(state.refreshed_at(), Some(FIXTURE_NOW + 60));
+        });
     }
 
     #[test]

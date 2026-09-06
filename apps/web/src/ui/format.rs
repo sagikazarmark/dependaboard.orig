@@ -3,6 +3,8 @@
 
 use dependaboard_core::{CheckStatus, UpdateType};
 
+use crate::ui::dashboard_state::Connection;
+
 pub(crate) fn status_label(status: CheckStatus) -> &'static str {
     match status {
         CheckStatus::Success => "Passing",
@@ -107,6 +109,34 @@ pub(crate) fn relative_time(now: u64, timestamp: u64) -> String {
     }
 }
 
+/// [`relative_time`] as the end of a sentence: "moments ago", "5m ago". A
+/// clock that ticks once a minute can stand behind an event by nearly that
+/// long, so the first minute is "moments" rather than a claim of "now".
+pub(crate) fn ago(now: u64, timestamp: u64) -> String {
+    match relative_time(now, timestamp).as_str() {
+        "now" => "moments ago".to_owned(),
+        age => format!("{age} ago"),
+    }
+}
+
+/// The footer's dot for the line to the read model: green only while the
+/// polls are answered.
+pub(crate) fn connection_class(connection: Connection) -> &'static str {
+    match connection {
+        Connection::Online => "status-dot",
+        Connection::Disconnected | Connection::SignedOut => "status-dot offline",
+    }
+}
+
+/// The footer's word for the line to the read model.
+pub(crate) fn connection_label(connection: Connection) -> &'static str {
+    match connection {
+        Connection::Online => "connected",
+        Connection::Disconnected => "disconnected",
+        Connection::SignedOut => "signed out",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,6 +166,35 @@ mod tests {
         assert_eq!(Checkbox::of(0, 0), Checkbox::Unchecked);
         assert_eq!(Checkbox::Mixed.class(), "selection-box mixed");
         assert_eq!(Checkbox::Checked.mark(), "x");
+    }
+
+    /// An age in a sentence keeps the units of [`relative_time`], and says
+    /// "moments" rather than "now" for the first minute: the sentence it goes
+    /// in is about something being out of date.
+    #[test]
+    fn an_age_reads_as_a_phrase() {
+        assert_eq!(ago(1000, 1000), "moments ago");
+        assert_eq!(ago(1000, 941), "moments ago");
+        assert_eq!(ago(1000, 700), "5m ago");
+        assert_eq!(ago(1000, 1500), "moments ago", "a clock behind the event");
+        assert_eq!(ago(3 * 86_400, 0), "3d ago");
+    }
+
+    /// The footer's dot and word for each state of the line.
+    #[test]
+    fn the_line_has_a_dot_and_a_word() {
+        assert_eq!(connection_class(Connection::Online), "status-dot");
+        assert_eq!(connection_label(Connection::Online), "connected");
+        assert_eq!(
+            connection_class(Connection::Disconnected),
+            "status-dot offline"
+        );
+        assert_eq!(connection_label(Connection::Disconnected), "disconnected");
+        assert_eq!(
+            connection_class(Connection::SignedOut),
+            "status-dot offline"
+        );
+        assert_eq!(connection_label(Connection::SignedOut), "signed out");
     }
 
     /// The largest whole unit of time since the timestamp, down to a minute;

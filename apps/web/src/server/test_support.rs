@@ -166,9 +166,20 @@ impl Dashboard {
     /// Calls `name` the way the dashboard's own scripts do: with the
     /// credentials, from the dashboard's origin, `arguments` as the JSON body.
     pub(crate) fn call(&self, name: &str, arguments: serde_json::Value) -> reqwest::RequestBuilder {
+        self.call_as(name, PASSWORD, arguments)
+    }
+
+    /// [`Self::call`] with `password` in place of the one the server expects:
+    /// what a tab left open across a rotation sends.
+    pub(crate) fn call_as(
+        &self,
+        name: &str,
+        password: &str,
+        arguments: serde_json::Value,
+    ) -> reqwest::RequestBuilder {
         reqwest::Client::new()
             .post(self.server_fn(name))
-            .basic_auth(USERNAME, Some(PASSWORD))
+            .basic_auth(USERNAME, Some(password))
             .header("sec-fetch-site", "same-origin")
             .json(&arguments)
     }

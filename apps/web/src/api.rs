@@ -4,7 +4,7 @@
 
 use dependaboard_core::{
     BatchProgress, BatchRecord, BulkActionKind, DashboardPage, DashboardSummary, Page, PrFilter,
-    PrRecord, PrState, ProjectionRevision, SubmittedTarget,
+    PrRecord, PrState, ProjectionRevision, SubmittedTarget, UserId,
 };
 use dioxus::prelude::*;
 
@@ -13,8 +13,7 @@ use {
     crate::server::{restate::pr_status_path, state::ServerState},
     axum::extract::Extension,
     dependaboard_core::{
-        BulkRequest, InvalidBatch, ManualSyncRequest, PrKey, PrTarget, UserId, new_batch_id,
-        validate_batch,
+        BulkRequest, InvalidBatch, ManualSyncRequest, PrKey, PrTarget, new_batch_id, validate_batch,
     },
     dependaboard_store::{PrStore, StoreError},
 };
@@ -76,6 +75,15 @@ pub(crate) async fn load_projection_revision() -> Result<ProjectionRevision, Ser
         .projection_revision()
         .await
         .map_err(store_failure)
+}
+
+/// Who the auth edge let this request through as. The browser holds the
+/// credentials but cannot read them, so this is how the dashboard learns
+/// whose name to show; the answer is the identity a batch will be recorded
+/// under.
+#[server(user: Extension<UserId>)]
+pub(crate) async fn load_signed_in_user() -> Result<UserId, ServerFnError> {
+    Ok(user.0)
 }
 
 /// Asks Restate to run the batch. The batch id is the workflow key, which lets
@@ -303,6 +311,42 @@ mod tests {
     /// The body of the one request Restate was sent, which went to `path`.
     fn the_one_request(dashboard: &Dashboard, path: &str) -> serde_json::Value {
         serde_json::from_slice(&dashboard.the_one_forward(path).body).unwrap()
+    }
+
+    /// The dashboard says who is signed in by asking the server, which
+    /// answers with the identity the auth edge validated. Credentials the
+    /// edge no longer accepts — the password was rotated under an open tab —
+    /// are refused before any server function runs, with the same challenge
+    /// the page gets, and that is the 401 the browser turns into "sign in
+    /// again".
+    #[tokio::test]
+    async fn the_signed_in_user_is_the_one_the_auth_edge_validated() {
+        let dashboard = dashboard().await;
+
+        let signed_in = dashboard
+            .call("load_signed_in_user", json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(signed_in.status(), StatusCode::OK);
+        assert_eq!(
+            signed_in.json::<UserId>().await.unwrap(),
+            UserId::new(USERNAME)
+        );
+
+        let stale = dashboard
+            .call_as("load_signed_in_user", "rotated-away", json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            stale
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok()),
+            Some("Basic realm=\"dependaboard\"")
+        );
     }
 
     /// A batch target as the browser submits it.

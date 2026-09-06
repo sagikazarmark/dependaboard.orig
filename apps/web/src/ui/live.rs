@@ -1,4 +1,5 @@
-//! Live refresh: how the dashboard stays current without the user's hand.
+//! Live refresh: how the dashboard stays current without the user's hand,
+//! and how it knows when it no longer is.
 //!
 //! The read model changes behind the dashboard's back: webhooks land, the
 //! hourly sweep runs, another user merges. The dashboard learns of it by
@@ -8,6 +9,12 @@
 //! every second, and the sync glyph spins until the pull requests' own
 //! revision moves — the sweep writes every repository before it reaches a
 //! pull request, and those writes are not what the glyph is waiting for.
+//!
+//! The poll is also the dashboard's word on its line to the server. Polls
+//! that get no revision are counted, and enough in a row mean the rows on
+//! screen are no longer being kept current, which the dashboard says rather
+//! than leave a green dot over stale rows; the server refusing the
+//! credentials is told apart, since only signing in again cures that.
 
 use std::time::Duration;
 
@@ -16,8 +23,8 @@ use dioxus::logger::tracing;
 use dioxus::prelude::*;
 
 use crate::api::load_projection_revision;
-use crate::ui::dashboard_state::DashboardState;
-use crate::ui::{POLL_INTERVAL, sleep};
+use crate::ui::dashboard_state::{Connection, DashboardState};
+use crate::ui::{Fault, POLL_INTERVAL, fault, sleep};
 
 /// How often the dashboard asks whether the projection has moved while it is
 /// not waiting on anything in particular.
@@ -38,6 +45,13 @@ const REFRESH_TICKS: u32 = (REFRESH_INTERVAL.as_secs() / POLL_INTERVAL.as_secs()
 
 /// [`SYNC_FOLLOW_TIMEOUT`] in polls.
 const SYNC_FOLLOW_TICKS: u32 = (SYNC_FOLLOW_TIMEOUT.as_secs() / POLL_INTERVAL.as_secs()) as u32;
+
+/// How many polls in a row must go unanswered before the dashboard counts
+/// itself disconnected. One is a blip; this many is an outage, and the rows
+/// on screen are no longer being kept current. At the idle cadence it is
+/// reached some twenty seconds into an outage, while a sync is followed
+/// within a few.
+pub(crate) const DISCONNECT_THRESHOLD: u32 = 3;
 
 /// What the dashboard does at one tick of the poll interval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +79,8 @@ pub(crate) struct Moved {
 }
 
 /// The dashboard's refresh, decided one tick at a time: when to ask for the
-/// revision, and whether an answer means the rows have moved.
+/// revision, whether an answer means the rows have moved, and what the
+/// answers — and the polls that got none — say about the line to the server.
 ///
 /// Nothing is asked while the tab is hidden, and the first tick after it
 /// shows asks at once. While a manual sync is in flight every tick asks, for
@@ -82,6 +97,10 @@ pub(crate) struct Refresh {
     followed: u32,
     /// The revision the server last answered.
     seen: Option<ProjectionRevision>,
+    /// Polls in a row that got no revision, since the last one that did.
+    misses: u32,
+    /// Whether one of those misses was the server refusing the credentials.
+    refused: bool,
 }
 
 impl Refresh {
@@ -92,6 +111,21 @@ impl Refresh {
             owed: true,
             followed: 0,
             seen: None,
+            misses: 0,
+            refused: false,
+        }
+    }
+
+    /// The line to the server, as the polls since the last answer say. A
+    /// refusal of the credentials is definitive — the server was reached and
+    /// said no — and outranks the count; the count says the rest.
+    pub(crate) fn connection(&self) -> Connection {
+        if self.refused {
+            Connection::SignedOut
+        } else if self.misses >= DISCONNECT_THRESHOLD {
+            Connection::Disconnected
+        } else {
+            Connection::Online
         }
     }
 
@@ -128,19 +162,37 @@ impl Refresh {
     /// rows are, so it is what they show, give or take a write that lands
     /// between the two reads — which the next write, the hourly sweep's at
     /// the latest, brings in.
+    ///
+    /// An answer after a poll that got none puts the line back online and
+    /// says the rows moved whatever the revision: a read of the rows that
+    /// failed in the gap is not retried by anything else, and it is the
+    /// reload that clears the failure from the screen.
     pub(crate) fn observe(&mut self, revision: ProjectionRevision) -> Moved {
+        let restored = self.misses > 0;
+        self.misses = 0;
+        self.refused = false;
         let moved = match self.seen {
             Some(seen) => Moved {
-                projection: seen.projection != revision.projection,
+                projection: restored || seen.projection != revision.projection,
                 pull_requests: seen.pull_requests != revision.pull_requests,
             },
             None => Moved {
-                projection: false,
+                projection: restored,
                 pull_requests: false,
             },
         };
         self.seen = Some(revision);
         moved
+    }
+
+    /// A poll got no revision, and `fault` is why; what the line to the
+    /// server is now. The credentials being refused signs out at once,
+    /// whatever the count stood at; any other miss counts towards
+    /// [`DISCONNECT_THRESHOLD`].
+    pub(crate) fn miss(&mut self, fault: &Fault) -> Connection {
+        self.misses += 1;
+        self.refused |= *fault == Fault::SignedOut;
+        self.connection()
     }
 }
 
@@ -197,9 +249,13 @@ pub(crate) fn use_clock(visible: ReadSignal<bool>) -> ReadSignal<u64> {
 /// sync in flight, if any, when the pull requests' own revision has: that is
 /// the sweep reaching the pull requests, which is what the sync glyph was
 /// spinning for. The first tick is taken at once, alongside the first read
-/// of the rows, so the revision remembered is the one they were read at. An
-/// answer that does not come is noted and waited out; the next tick asks
-/// again.
+/// of the rows, so the revision remembered is the one they were read at.
+///
+/// The polls are also the dashboard's word on its line to the server: each
+/// answer dates the rows and puts the line online, each miss is counted, and
+/// the state is told when the count says the line is down or the server
+/// says the credentials are no longer good. The first answer after a miss
+/// reloads the rows, which is what clears a read that failed in the gap.
 pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bool>) {
     use_future(move || async move {
         let mut refresh = Refresh::new();
@@ -215,9 +271,11 @@ pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bo
                         if moved.projection {
                             state.reload();
                         }
+                        state.poll_answered(unix_seconds());
                     }
                     Err(error) => {
                         tracing::debug!(%error, "the projection's revision could not be read");
+                        state.poll_missed(refresh.miss(&fault(&error)));
                     }
                 },
                 Step::Reload => {
@@ -241,6 +299,23 @@ mod tests {
                 Step::Wait,
                 "tick {tick} of {ticks} (visible: {visible}, syncing: {syncing})"
             );
+        }
+    }
+
+    /// The revision the server answers with its counters at `projection`
+    /// and `pull_requests`.
+    fn at(projection: u64, pull_requests: u64) -> ProjectionRevision {
+        ProjectionRevision {
+            projection,
+            pull_requests,
+        }
+    }
+
+    /// An answer that moved nothing.
+    fn still() -> Moved {
+        Moved {
+            projection: false,
+            pull_requests: false,
         }
     }
 
@@ -309,21 +384,13 @@ mod tests {
     #[test]
     fn the_first_revision_is_remembered_and_any_other_one_says_which_rows_moved() {
         let mut refresh = Refresh::new();
-        let at = |projection, pull_requests| ProjectionRevision {
-            projection,
-            pull_requests,
-        };
-        let still = Moved {
-            projection: false,
-            pull_requests: false,
-        };
 
         assert_eq!(
             refresh.observe(at(5, 2)),
-            still,
+            still(),
             "the first answer is only remembered"
         );
-        assert_eq!(refresh.observe(at(5, 2)), still);
+        assert_eq!(refresh.observe(at(5, 2)), still());
 
         assert_eq!(
             refresh.observe(at(6, 2)),
@@ -333,7 +400,7 @@ mod tests {
             },
             "a repository row alone"
         );
-        assert_eq!(refresh.observe(at(6, 2)), still);
+        assert_eq!(refresh.observe(at(6, 2)), still());
 
         assert_eq!(
             refresh.observe(at(7, 3)),
@@ -352,5 +419,86 @@ mod tests {
             },
             "a database that was reset"
         );
+    }
+
+    /// One poll going unanswered is a blip; [`DISCONNECT_THRESHOLD`] in a row
+    /// is an outage, and the dashboard says so. An answer in between starts
+    /// the count over. The first answer after any miss says the rows moved
+    /// whatever the revision, since a read that failed in the gap is not
+    /// retried by anything else; and it puts the line back online.
+    #[test]
+    fn polls_unanswered_in_a_row_disconnect_and_the_next_answer_reconnects_and_reloads() {
+        let mut refresh = Refresh::new();
+        refresh.observe(at(5, 2));
+        assert_eq!(refresh.connection(), Connection::Online);
+
+        for miss in 1..DISCONNECT_THRESHOLD {
+            assert_eq!(
+                refresh.miss(&Fault::Unreachable),
+                Connection::Online,
+                "miss {miss} of {DISCONNECT_THRESHOLD}"
+            );
+        }
+        assert_eq!(
+            refresh.observe(at(5, 2)),
+            Moved {
+                projection: true,
+                pull_requests: false,
+            },
+            "the rows are reloaded after a miss, though the revision stands"
+        );
+        assert_eq!(refresh.connection(), Connection::Online);
+
+        for _ in 0..DISCONNECT_THRESHOLD - 1 {
+            refresh.miss(&Fault::Unreachable);
+        }
+        assert_eq!(
+            refresh.miss(&Fault::Refused("The read model is unavailable".to_owned())),
+            Connection::Disconnected,
+            "a refused read of the revision is a miss like any other"
+        );
+        assert_eq!(refresh.connection(), Connection::Disconnected);
+        assert_eq!(
+            refresh.miss(&Fault::Unreachable),
+            Connection::Disconnected,
+            "and stays so"
+        );
+
+        assert_eq!(
+            refresh.observe(at(6, 3)),
+            Moved {
+                projection: true,
+                pull_requests: true,
+            }
+        );
+        assert_eq!(refresh.connection(), Connection::Online);
+        assert_eq!(refresh.observe(at(6, 3)), still());
+    }
+
+    /// The server answering 401 is definitive — it was reached, and refused
+    /// the credentials the browser holds — so one is enough, whatever the
+    /// count stood at. An answer afterwards (the password rotated back, say)
+    /// is a recovery like any other.
+    #[test]
+    fn one_refusal_of_the_credentials_signs_out_at_once() {
+        let mut refresh = Refresh::new();
+
+        assert_eq!(refresh.miss(&Fault::SignedOut), Connection::SignedOut);
+        assert_eq!(refresh.connection(), Connection::SignedOut);
+        assert_eq!(
+            refresh.miss(&Fault::Unreachable),
+            Connection::SignedOut,
+            "a miss after a refusal does not make it an outage"
+        );
+
+        assert_eq!(
+            refresh.observe(at(1, 1)),
+            Moved {
+                projection: true,
+                pull_requests: false,
+            },
+            "the first answer is remembered, and the rows reloaded after the misses"
+        );
+        assert_eq!(refresh.connection(), Connection::Online);
     }
 }

@@ -151,14 +151,114 @@ pub(crate) async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
 
+/// What a failed server call says about the dashboard's line to the server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Fault {
+    /// The server answered 401: the credentials the browser holds are no
+    /// longer accepted, as after a password rotation. Only signing in again
+    /// cures it, which for Basic Auth is a reload of the page.
+    SignedOut,
+    /// The server ran the function and refused it, and has already reduced
+    /// the cause to a message that names the component; carries that
+    /// message.
+    Refused(String),
+    /// No answer, or an answer from something other than the server: a dead
+    /// server, a proxy's 502, a request that never left.
+    Unreachable,
+}
+
+/// The status the auth edge answers with when it refuses the credentials.
+const CREDENTIALS_REFUSED: u16 = 401;
+
+/// The status a server function's own failure comes back with: what
+/// [`ServerFnError::new`] sets, and what the server's middleware never uses.
+const SERVER_FUNCTION_FAILURE: u16 = 500;
+
+/// Reads `error` for what it says about the line to the server. The client
+/// turns every answered status into a [`ServerFnError::ServerError`] with the
+/// status as its code, the body as its message; only a server function's
+/// own failure carries a message meant for the user.
+pub(crate) fn fault(error: &ServerFnError) -> Fault {
+    match error {
+        ServerFnError::ServerError {
+            code: CREDENTIALS_REFUSED,
+            ..
+        } => Fault::SignedOut,
+        ServerFnError::ServerError {
+            code: SERVER_FUNCTION_FAILURE,
+            message,
+            ..
+        } => Fault::Refused(message.clone()),
+        _ => Fault::Unreachable,
+    }
+}
+
+/// What the user reads when the credentials the browser holds are refused.
+pub(crate) const SIGNED_OUT_MESSAGE: &str = "You are no longer signed in — reload to sign in again";
+
+/// What the user reads when the server could not be reached.
+pub(crate) const UNREACHABLE_MESSAGE: &str = "The dashboard server could not be reached";
+
 /// The text a failed server call shows the user. The server has already
 /// reduced its own failures to a message that names the component, so that
-/// message is shown as is; a round trip that never produced one gets a fixed
-/// line. The error itself goes to the log in full either way.
+/// message is shown as is; a refusal of the credentials says to sign in
+/// again, and anything else is the server not being reached. The error
+/// itself goes to the log in full either way.
 pub(crate) fn user_facing(error: &ServerFnError) -> String {
     dioxus::logger::tracing::warn!(%error, "server call failed");
-    match error {
-        ServerFnError::ServerError { message, .. } => message.clone(),
-        _ => "The dashboard server could not be reached".to_owned(),
+    match fault(error) {
+        Fault::SignedOut => SIGNED_OUT_MESSAGE.to_owned(),
+        Fault::Refused(message) => message,
+        Fault::Unreachable => UNREACHABLE_MESSAGE.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use dioxus::fullstack::RequestError;
+
+    use super::*;
+
+    /// The error the client builds from a response with status `code` and
+    /// body `message`.
+    fn answered(code: u16, message: &str) -> ServerFnError {
+        ServerFnError::ServerError {
+            message: message.to_owned(),
+            code,
+            details: None,
+        }
+    }
+
+    /// A server function's own failure arrives as a 500 carrying the message
+    /// the server chose, and that is what is shown. A 401 is the auth edge
+    /// refusing the credentials the browser holds — after a password
+    /// rotation, say — and is told apart from the server being unreachable:
+    /// what cures it is signing in again. Anything else that answered, a
+    /// proxy's 502 with a page for a body included, is the server not being
+    /// reached, as is a round trip that never got an answer.
+    #[test]
+    fn a_401_asks_the_user_to_sign_in_again_and_other_statuses_say_what_they_are() {
+        assert_eq!(
+            user_facing(&answered(500, "The read model is unavailable")),
+            "The read model is unavailable"
+        );
+        assert_eq!(
+            user_facing(&answered(401, "HTTP 401: authentication required")),
+            SIGNED_OUT_MESSAGE
+        );
+        assert!(
+            SIGNED_OUT_MESSAGE.contains("reload"),
+            "{SIGNED_OUT_MESSAGE}"
+        );
+        assert_eq!(
+            user_facing(&answered(502, "HTTP 502: <html>Bad Gateway</html>")),
+            UNREACHABLE_MESSAGE
+        );
+        assert_eq!(
+            user_facing(&ServerFnError::Request(RequestError::Request(
+                "Failed to fetch".to_owned()
+            ))),
+            UNREACHABLE_MESSAGE
+        );
     }
 }

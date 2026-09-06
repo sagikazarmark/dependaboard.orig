@@ -10,7 +10,9 @@ use dependaboard_core::{
 use dioxus::prelude::*;
 
 use crate::components::toast::ToastProvider;
-use crate::ui::dashboard_state::{DashboardState, PageStatus, Selection, SummaryStatus};
+use crate::ui::dashboard_state::{
+    Connection, DashboardState, PageStatus, Selection, SummaryStatus,
+};
 use crate::ui::pr_target;
 
 pub(crate) const GROUPED_ROW_TITLE: &str =
@@ -178,7 +180,9 @@ pub(crate) fn loaded_summary() -> DashboardSummary {
 /// toast provider and a dashboard state with `filter` in force, `page` and
 /// `summary` as the read model's answers, `selected` picked (cut short by
 /// the batch limit from `capped_from` matching rows, if given), the clock at
-/// `now`, and a manual sync in flight if `syncing`. Reloads go nowhere.
+/// `now`, a manual sync in flight if `syncing`, and the line to the server
+/// as `connection` found it with the last poll answered at `refreshed_at`.
+/// Reloads go nowhere.
 #[component]
 pub(crate) fn DashboardFixture(
     #[props(default)] filter: PrFilter,
@@ -188,6 +192,8 @@ pub(crate) fn DashboardFixture(
     #[props(default)] capped_from: Option<u64>,
     #[props(default = FIXTURE_NOW)] now: u64,
     #[props(default)] syncing: bool,
+    #[props(default = Connection::Online)] connection: Connection,
+    #[props(default)] refreshed_at: Option<u64>,
     children: Element,
 ) -> Element {
     let mut state = DashboardState::provide(
@@ -208,6 +214,12 @@ pub(crate) fn DashboardFixture(
     use_hook(move || {
         if syncing {
             state.begin_sync();
+        }
+        if let Some(answered) = refreshed_at {
+            state.poll_answered(answered);
+        }
+        if connection != Connection::Online {
+            state.poll_missed(connection);
         }
     });
     rsx! {

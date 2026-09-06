@@ -2,12 +2,14 @@
 //! bulk-action flow from confirmation through progress. The filter, cursor,
 //! and open pull request live in the URL as well, so a view can be shared and
 //! survives a refresh. The rows keep themselves current: the page follows the
-//! read model's revision and reloads when it moves.
+//! read model's revision and reloads when it moves — and says so, over the
+//! page, when the polls that follow it stop being answered.
 
 use dependaboard_core::{BatchProgress, Page, PrRecord};
+use dioxus::logger::tracing;
 use dioxus::prelude::*;
 
-use crate::api::{load_dashboard, load_summary};
+use crate::api::{load_dashboard, load_signed_in_user, load_summary};
 use crate::components::toast::{ToastOptions, use_toast};
 use crate::ui::action_bar::ActionBar;
 use crate::ui::active_batch::{ActiveBatch, BatchHost, queue_batch};
@@ -18,7 +20,7 @@ use crate::ui::live::{use_clock, use_live_refresh, use_visibility};
 use crate::ui::pr_table::PrTable;
 use crate::ui::recent_batches::RecentBatchesDrawer;
 use crate::ui::sidebar::Sidebar;
-use crate::ui::status_bar::StatusBar;
+use crate::ui::status_bar::{ConnectionBanner, StatusBar};
 use crate::ui::top_bar::TopBar;
 use crate::ui::url_state::UrlState;
 use crate::ui::url_sync::{use_url_state, use_url_sync};
@@ -68,27 +70,46 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     });
     let page = use_memo(move || PageStatus::from_resource(rows.read().as_ref()));
     let summary_status = use_memo(move || SummaryStatus::from_resource(summary.read().as_ref()));
+    // Who the server let the page in as. Asked once, since the identity does
+    // not change under an open page; a page the server has stopped letting
+    // in is told so by the polls, not by asking this again.
+    let mut signed_in = use_resource(|| async {
+        load_signed_in_user().await.inspect_err(|error| {
+            tracing::debug!(%error, "who is signed in could not be read");
+        })
+    });
     // The resources keep their last answer while the next is in flight, so a
-    // reload leaves the rows standing until the fresh ones land.
+    // reload leaves the rows standing until the fresh ones land. The name is
+    // asked again only if it was never answered: a reload is also what
+    // follows an outage, and an outage at open leaves it unanswered.
     let reload = use_callback(move |()| {
         rows.restart();
         summary.restart();
+        if signed_in.peek().as_ref().is_some_and(Result::is_err) {
+            signed_in.restart();
+        }
     });
     let mut state =
         DashboardState::provide(filter, cursor, selected, page, summary_status, now, reload);
     use_url_sync(state, detail);
     use_live_refresh(state, visible);
+    let user = signed_in
+        .read()
+        .as_ref()
+        .and_then(|answer| answer.as_ref().ok())
+        .map(ToString::to_string);
     let summary = summary_status.read();
 
     rsx! {
         TopBar { dark, aside_open, batches_open }
+        ConnectionBanner {}
 
         div { class: "workspace",
             Sidebar { open: aside_open }
             PrTable { onopen: move |row: PrRecord| detail.set(Some(row.into())) }
         }
 
-        StatusBar {}
+        StatusBar { user }
 
         ActionBar { onrequest: move |action| pending.set(Some(action)) }
 

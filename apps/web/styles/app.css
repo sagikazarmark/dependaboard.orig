@@ -277,6 +277,31 @@ code,
   min-height: 0;
 }
 
+/* Over the page while the line to the server is down: the rows below it are
+   only as fresh as the banner says. */
+.connection-banner {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--color-warning) 45%, transparent);
+  background: color-mix(in srgb, var(--color-warning) 14%, var(--color-base-200));
+  font-size: 11px;
+}
+
+.connection-banner strong {
+  color: var(--color-warning);
+}
+
+.connection-banner span {
+  color: var(--muted);
+}
+
+.connection-banner .btn {
+  margin-left: auto;
+}
+
 .sidebar {
   flex: 0 0 262px;
   width: 262px;
@@ -945,6 +970,15 @@ code,
   height: 6px;
   border-radius: 50%;
   background: var(--color-success);
+}
+
+.status-dot.offline {
+  background: var(--color-error);
+}
+
+.status-user {
+  padding-left: 7px;
+  border-left: 1px solid var(--line);
 }
 
 .action-bar {
