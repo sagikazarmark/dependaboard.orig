@@ -1088,6 +1088,32 @@ pub struct BatchRecord {
     pub targets: Vec<BatchTargetRecord>,
 }
 
+/// A bulk action the workflow is running, as the projection keeps it while it
+/// runs: what was asked, by whom, when it started, and how many pull requests it
+/// spans. Enough for the audit view to list the batch beside the finished ones
+/// and for a dashboard that lost it to follow it again; where it stands is
+/// Restate's word, read through the workflow's progress. Written as the
+/// workflow's first step and taken away by the finished record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunningBatch {
+    pub batch_id: String,
+    pub action: BulkActionKind,
+    pub requested_by: UserId,
+    /// Unix seconds when the workflow started running the batch.
+    pub started_at: u64,
+    /// How many pull requests the batch was asked to act on.
+    pub target_count: u64,
+}
+
+/// The batches the audit view lists: the ones running and the ones most
+/// recently finished, each newest first. Two lists rather than one, since a
+/// running batch has no verdicts yet and is found in Restate, not read here.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchList {
+    pub running: Vec<RunningBatch>,
+    pub finished: Vec<BatchRecord>,
+}
+
 pub fn new_batch_id() -> String {
     Uuid::now_v7().to_string()
 }

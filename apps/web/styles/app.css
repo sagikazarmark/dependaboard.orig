@@ -1366,6 +1366,21 @@ code,
   border-top: 1px solid var(--line);
 }
 
+/* What the drawer says about a batch that is not moving, or a poll that was
+   not answered: under the tally, in the note's voice, never in the rows'. */
+.progress-note {
+  margin: 0;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.progress-trouble {
+  color: var(--color-error);
+}
+
 .progress-row {
   display: grid;
   grid-template-columns: 8px 1fr;
@@ -1490,6 +1505,32 @@ code,
   flex: none;
   border-top: 1px solid var(--line-soft);
   background: var(--color-base-100);
+}
+
+/* A running batch has no verdicts to unfold; its headline is not a toggle. */
+.batch-running .batch-headline {
+  cursor: default;
+}
+
+.batch-running .batch-headline:hover {
+  background: none;
+}
+
+.batch-running .progress-footer {
+  padding: 0 18px 12px;
+  border-top: none;
+}
+
+.follow-batch-button {
+  min-height: 28px;
+  border: 1px solid var(--line);
+  color: var(--color-base-content);
+  background: color-mix(in srgb, var(--color-primary) 8%, transparent);
+  font-size: 11px;
+}
+
+.follow-batch-button:hover {
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
 }
 
 /* The toast region is always mounted; only the toasts themselves take clicks. */

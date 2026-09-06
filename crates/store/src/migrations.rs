@@ -58,6 +58,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "pull_request_retirements",
         sql: include_str!("../../../migrations/0008_pull_request_retirements.sql"),
     },
+    Migration {
+        version: 9,
+        name: "running_batches",
+        sql: include_str!("../../../migrations/0009_running_batches.sql"),
+    },
 ];
 
 const CREATE_SCHEMA_MIGRATIONS: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (

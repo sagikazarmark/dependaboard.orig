@@ -1,8 +1,12 @@
-//! The drawer that lists the batches that have run: the audit view. Restate keeps a
-//! batch's progress only for the workflow's retention; the projection keeps the finished
-//! batch for good, and this is where the dashboard shows it.
+//! The drawer that lists the batches: the audit view. Restate keeps a batch's
+//! progress only for the workflow's retention; the projection keeps the
+//! finished batch for good, and lists the running ones while they run, and this
+//! is where the dashboard shows both — so a tab that lost a batch, or never
+//! followed it, can find it and follow it.
 
-use dependaboard_core::{BatchRecord, MAX_RECENT_BATCHES, TargetProgressState};
+use dependaboard_core::{
+    BatchList, BatchRecord, MAX_RECENT_BATCHES, RunningBatch, TargetProgressState,
+};
 use dioxus::prelude::*;
 
 use crate::api::load_recent_batches;
@@ -12,19 +16,23 @@ use crate::ui::format::{pull_requests, relative_time};
 use crate::ui::progress_drawer::TargetRow;
 use crate::ui::side_panel::SidePanel;
 
-/// How many batches the drawer asks for when it opens, and how many more each
-/// **Show older** asks for.
+/// How many finished batches the drawer asks for when it opens, and how many
+/// more each **Show older** asks for.
 const BATCH_PAGE: u32 = 20;
 
 /// The batches as the dashboard has heard them from the read model.
-pub(crate) type BatchesStatus = Remote<Vec<BatchRecord>>;
+pub(crate) type BatchesStatus = Remote<BatchList>;
 
-/// The drawer. It asks for the newest [`BATCH_PAGE`] batches when it opens,
-/// each time it opens, so a batch that finishes while it is showing is there
-/// the next time; **Show older** asks for a page more, as far back as
-/// [`MAX_RECENT_BATCHES`].
+/// The drawer. It asks for every running batch and the newest [`BATCH_PAGE`]
+/// finished ones when it opens, each time it opens, so a batch that starts or
+/// finishes while it is showing is there the next time; **Show older** asks
+/// for a page more, as far back as [`MAX_RECENT_BATCHES`]. `onfollow` is asked
+/// with the id of a running batch the user wants to follow.
 #[component]
-pub(crate) fn RecentBatchesDrawer(onclose: EventHandler<()>) -> Element {
+pub(crate) fn RecentBatchesDrawer(
+    onclose: EventHandler<()>,
+    onfollow: EventHandler<String>,
+) -> Element {
     let state = use_dashboard();
     let mut limit = use_signal(|| BATCH_PAGE);
     let batches = use_resource(move || {
@@ -37,7 +45,7 @@ pub(crate) fn RecentBatchesDrawer(onclose: EventHandler<()>) -> Element {
     let may_have_older = limit() < MAX_RECENT_BATCHES
         && status
             .loaded()
-            .is_some_and(|batches| batches.len() >= limit() as usize);
+            .is_some_and(|batches| batches.finished.len() >= limit() as usize);
     rsx! {
         SidePanel {
             class: "batches-drawer",
@@ -49,14 +57,16 @@ pub(crate) fn RecentBatchesDrawer(onclose: EventHandler<()>) -> Element {
                 now: state.now(),
                 may_have_older,
                 onolder: move |_| limit.set((limit() + BATCH_PAGE).min(MAX_RECENT_BATCHES)),
+                onfollow,
             }
         }
     }
 }
 
-/// The drawer's body: the batches newest first, each folded to a headline
-/// until opened, when it lists every target with its verdict. `now` is the
-/// dashboard's clock, which the finish times are read against. While
+/// The drawer's body: the running batches first, each with an offer to follow
+/// it, then the finished ones newest first, each folded to a headline until
+/// opened, when it lists every target with its verdict. `now` is the
+/// dashboard's clock, which the times are read against. While
 /// `may_have_older`, the list ends with an offer to show older batches, which
 /// asks `onolder`.
 #[component]
@@ -65,16 +75,22 @@ pub(crate) fn RecentBatchList(
     now: u64,
     may_have_older: bool,
     onolder: EventHandler<()>,
+    onfollow: EventHandler<String>,
 ) -> Element {
     match batches {
         Remote::Loading => rsx! { p { class: "batches-note", "Loading recent batches..." } },
         Remote::Failed(error) => rsx! { p { class: "batches-note batches-error", "{error}" } },
-        Remote::Loaded(batches) if batches.is_empty() => rsx! {
-            p { class: "batches-note", "No batches have run yet." }
-        },
+        Remote::Loaded(batches) if batches.running.is_empty() && batches.finished.is_empty() => {
+            rsx! {
+                p { class: "batches-note", "No batches have run yet." }
+            }
+        }
         Remote::Loaded(batches) => rsx! {
             div { class: "batch-list",
-                for batch in batches {
+                for batch in batches.running {
+                    RunningEntry { key: "{batch.batch_id}", batch, now, onfollow }
+                }
+                for batch in batches.finished {
                     BatchEntry { key: "{batch.batch_id}", batch, now }
                 }
             }
@@ -89,6 +105,36 @@ pub(crate) fn RecentBatchList(
                 }
             }
         },
+    }
+}
+
+/// A batch still running: what was asked, by whom, since when, and over how
+/// many pull requests, with **Follow** to make it the batch the dashboard
+/// follows. Its verdicts are Restate's to give, and following it is how they
+/// show.
+#[component]
+fn RunningEntry(batch: RunningBatch, now: u64, onfollow: EventHandler<String>) -> Element {
+    let batch_id = batch.batch_id.clone();
+    rsx! {
+        div { class: "batch-entry batch-running",
+            div { class: "batch-headline",
+                div {
+                    strong { class: "batch-action", "{batch.action}" }
+                    span { class: "batch-tally", "running" }
+                }
+                small { class: "batch-meta",
+                    "{pull_requests(batch.target_count)} · by {batch.requested_by} · started {relative_time(now, batch.started_at)}"
+                }
+            }
+            div { class: "progress-footer",
+                Button {
+                    size: ButtonSize::Sm,
+                    class: "follow-batch-button",
+                    onclick: move |_| onfollow.call(batch_id.clone()),
+                    "Follow"
+                }
+            }
+        }
     }
 }
 
@@ -126,11 +172,31 @@ fn BatchEntry(batch: BatchRecord, now: u64) -> Element {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use dependaboard_core::{
-        BatchTargetRecord, BulkActionKind, RejectReason, TargetOutcome, UserId,
+        BatchTargetRecord, BulkActionKind, RejectReason, RunningBatch, TargetOutcome, UserId,
     };
 
     use super::*;
     use crate::ui::test_support::{FIXTURE_NOW, render};
+
+    /// A merge of three pull requests `carol` asked for five minutes ago,
+    /// still running.
+    fn running_batch() -> RunningBatch {
+        RunningBatch {
+            batch_id: "batch-3".to_owned(),
+            action: BulkActionKind::Merge,
+            requested_by: UserId::new("carol"),
+            started_at: FIXTURE_NOW - 5 * 60,
+            target_count: 3,
+        }
+    }
+
+    /// [`recent_batches`] as the server lists them, with nothing running.
+    fn finished() -> BatchList {
+        BatchList {
+            running: Vec::new(),
+            finished: recent_batches(),
+        }
+    }
 
     /// Two finished batches: a merge from two hours ago in which one pull request was
     /// merged and one rejected as stale, and a rebase from just now that failed.
@@ -198,10 +264,11 @@ mod tests {
         fn Fixture() -> Element {
             rsx! {
                 RecentBatchList {
-                    batches: Remote::Loaded(recent_batches()),
+                    batches: Remote::Loaded(finished()),
                     now: FIXTURE_NOW,
                     may_have_older: false,
                     onolder: move |_| {},
+                    onfollow: move |_| {},
                 }
             }
         }
@@ -263,10 +330,11 @@ mod tests {
         fn Fixture() -> Element {
             rsx! {
                 RecentBatchList {
-                    batches: Remote::Loaded(recent_batches()),
+                    batches: Remote::Loaded(finished()),
                     now: FIXTURE_NOW,
                     may_have_older: true,
                     onolder: move |_| {},
+                    onfollow: move |_| {},
                 }
             }
         }
@@ -278,15 +346,58 @@ mod tests {
 
     const OLDER_BUTTON: &str = "older-batches-button";
 
+    /// A tab that lost a batch, or never followed it, finds it here: a batch
+    /// still running is listed above the finished ones, said to be running,
+    /// with who asked for it and when, and offers to be followed. Its
+    /// verdicts are not yet its own to list; following it is how they show.
+    #[test]
+    fn a_running_batch_is_listed_first_as_running_and_offers_to_be_followed() {
+        fn Fixture() -> Element {
+            rsx! {
+                RecentBatchList {
+                    batches: Remote::Loaded(BatchList {
+                        running: vec![running_batch()],
+                        finished: recent_batches(),
+                    }),
+                    now: FIXTURE_NOW,
+                    may_have_older: false,
+                    onolder: move |_| {},
+                    onfollow: move |_| {},
+                }
+            }
+        }
+        let html = render(Fixture);
+
+        let running = html
+            .find("3 pull requests · by carol · started 5m")
+            .expect("the running batch is listed");
+        let rebase = html.find("rebase").expect("the rebase is listed");
+        assert!(running < rebase, "running first: {html}");
+        assert!(
+            html.contains(r#"<span class="batch-tally">running</span>"#),
+            "{html}"
+        );
+        assert!(html.contains(FOLLOW_BUTTON), "{html}");
+        assert!(html.contains(">Follow<"), "{html}");
+        assert_eq!(
+            html.matches(FOLLOW_BUTTON).count(),
+            1,
+            "a finished batch is not offered to follow: {html}"
+        );
+    }
+
+    const FOLLOW_BUTTON: &str = "follow-batch-button";
+
     #[test]
     fn an_empty_history_says_so_and_a_loading_one_says_it_is_loading() {
         fn Empty() -> Element {
             rsx! {
                 RecentBatchList {
-                    batches: Remote::Loaded(Vec::new()),
+                    batches: Remote::Loaded(BatchList::default()),
                     now: FIXTURE_NOW,
                     may_have_older: false,
                     onolder: move |_| {},
+                    onfollow: move |_| {},
                 }
             }
         }
@@ -301,6 +412,7 @@ mod tests {
                     now: FIXTURE_NOW,
                     may_have_older: false,
                     onolder: move |_| {},
+                    onfollow: move |_| {},
                 }
             }
         }
@@ -314,6 +426,7 @@ mod tests {
                     now: FIXTURE_NOW,
                     may_have_older: false,
                     onolder: move |_| {},
+                    onfollow: move |_| {},
                 }
             }
         }

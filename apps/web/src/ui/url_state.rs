@@ -1,10 +1,11 @@
 //! The dashboard state the URL carries: the filter in force, the page cursor,
-//! and the open pull request. A URL names a state, and a state has one URL,
-//! so a view can be shared and survives a refresh.
+//! the open pull request, and the batch being followed. A URL names a state,
+//! and a state has one URL, so a view can be shared and survives a refresh —
+//! and so does following a batch, which is what the batch is there for.
 
 use std::str::FromStr;
 
-use dependaboard_core::{PageCursor, PrFilter, PrKey};
+use dependaboard_core::{PageCursor, PrFilter, PrKey, valid_batch_id};
 
 /// The slice of the dashboard's state that lives in the query string.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -12,6 +13,9 @@ pub(crate) struct UrlState {
     pub(crate) filter: PrFilter,
     pub(crate) cursor: Option<String>,
     pub(crate) pr: Option<PrKey>,
+    /// The id of the batch the dashboard follows, so a reload follows it
+    /// again and a link to it can be shared.
+    pub(crate) batch: Option<String>,
 }
 
 // The query parameters, in the order the route lists them.
@@ -24,6 +28,7 @@ const LABEL: &str = "label";
 const DEPENDENCY: &str = "dep";
 const AFTER: &str = "after";
 const PR: &str = "pr";
+const BATCH: &str = "batch";
 
 /// The one value `view` takes; its absence is the "all open" view.
 const ATTENTION: &str = "attention";
@@ -31,8 +36,9 @@ const ATTENTION: &str = "attention";
 impl UrlState {
     /// The state a route (`/path?query`) names. A value the dashboard could
     /// not have set — an unknown parameter, a facet value that is not one of
-    /// the facet's, a cursor or pull request key that does not parse — is
-    /// dropped, so a stale or hand-edited link still opens the dashboard.
+    /// the facet's, a cursor or pull request key that does not parse, a batch
+    /// id the dashboard could not have minted — is dropped, so a stale or
+    /// hand-edited link still opens the dashboard.
     pub(crate) fn from_route(route: &str) -> Self {
         let query = route
             .split_once('#')
@@ -56,6 +62,7 @@ impl UrlState {
                     state.cursor = PageCursor::decode(value).is_ok().then(|| value.to_owned());
                 }
                 PR => state.pr = PrKey::from_str(value).ok(),
+                BATCH => state.batch = valid_batch_id(value).then(|| value.to_owned()),
                 _ => {}
             }
         }
@@ -93,6 +100,9 @@ impl UrlState {
         if let Some(pr) = &self.pr {
             query.append_pair(PR, &pr.to_string());
         }
+        if let Some(batch) = &self.batch {
+            query.append_pair(BATCH, batch);
+        }
         let query = query.finish();
         if query.is_empty() {
             "/".to_owned()
@@ -118,6 +128,18 @@ impl UrlState {
             ..self.clone()
         };
         with_previous_search == *previous
+    }
+
+    /// Whether this state shows the same view as `other`: the same filter,
+    /// page, and open pull request, whatever batch each follows. The batch a
+    /// dashboard follows rides along with the view rather than being a move
+    /// of its own: the pill is over every page, and back should not put a
+    /// running batch down.
+    pub(crate) fn same_view_as(&self, other: &Self) -> bool {
+        Self {
+            batch: other.batch.clone(),
+            ..self.clone()
+        } == *other
     }
 }
 
@@ -145,6 +167,9 @@ mod tests {
         .encode()
     }
 
+    /// A batch id as the dashboard mints them.
+    const BATCH: &str = "01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1a";
+
     fn full_state() -> UrlState {
         UrlState {
             filter: PrFilter {
@@ -158,6 +183,7 @@ mod tests {
             },
             cursor: Some(cursor()),
             pr: Some(PrKey::new(7, 9)),
+            batch: Some(BATCH.to_owned()),
         }
     }
 
@@ -181,7 +207,7 @@ mod tests {
             route,
             format!(
                 "/?view=attention&q=serde+json&repo=acme%2Fapi&repo=acme%2Fweb\
-                 &type=major&type=patch&check=failure&label=rust&dep=serde_json&after={}&pr=7%239",
+                 &type=major&type=patch&check=failure&label=rust&dep=serde_json&after={}&pr=7%239&batch={BATCH}",
                 cursor()
             )
         );
@@ -199,7 +225,7 @@ mod tests {
     #[test]
     fn values_the_dashboard_could_not_have_set_are_dropped() {
         let route = "/?view=bogus&q=+++&repo=&repo=acme%2Fapi&repo=acme%2Fapi&type=huge&type=minor\
-                     &check=flaky&label=&label=rust&dep=+&after=not-a-cursor&pr=7&utm_source=slack#top";
+                     &check=flaky&label=&label=rust&dep=+&after=not-a-cursor&pr=7&batch=42&utm_source=slack#top";
 
         let state = UrlState::from_route(route);
 
@@ -214,8 +240,48 @@ mod tests {
                 },
                 cursor: None,
                 pr: None,
+                batch: None,
             }
         );
+    }
+
+    /// The batch id is a Restate workflow key the dashboard will poll by; only
+    /// an id the dashboard could have minted, a UUIDv7, is worth asking after.
+    #[test]
+    fn only_a_batch_id_the_dashboard_could_have_minted_is_read() {
+        assert_eq!(
+            UrlState::from_route(&format!("/?batch={BATCH}")).batch,
+            Some(BATCH.to_owned())
+        );
+        // A UUIDv4: the right shape, not the right version.
+        assert_eq!(
+            UrlState::from_route("/?batch=9b2e4c6a-1d3f-4a5b-8c7d-0e1f2a3b4c5d").batch,
+            None
+        );
+        assert_eq!(UrlState::from_route("/?batch=batch-1").batch, None);
+    }
+
+    /// The batch a dashboard follows rides along with whatever else it shows,
+    /// so a state that differs in the batch alone is the same view.
+    #[test]
+    fn a_state_differing_only_in_the_batch_is_the_same_view() {
+        let without = UrlState::default();
+        let with = UrlState {
+            batch: Some(BATCH.to_owned()),
+            ..UrlState::default()
+        };
+        assert!(with.same_view_as(&without));
+        assert!(without.same_view_as(&with));
+        assert!(with.same_view_as(&with));
+
+        let with_facet = UrlState {
+            filter: PrFilter {
+                update_types: vec![UpdateType::Major],
+                ..PrFilter::default()
+            },
+            ..with.clone()
+        };
+        assert!(!with_facet.same_view_as(&without));
     }
 
     /// The `#` in a pull request key is what separates the fragment, so the

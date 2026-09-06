@@ -3,30 +3,31 @@
 //!
 //! It implements the writes and the lookups the Restate service makes, and only those:
 //! the dashboard's reads (`list_prs`, `dashboard_summary`, `projection_revision`,
-//! `recent_batches`) are `unimplemented!`, so this is not a drop-in store for a test of
-//! the web app, which reads the projection through those.
+//! `recent_batches`, `running_batches`) are `unimplemented!`, so this is not a drop-in
+//! store for a test of the web app, which reads the projection through those.
 
 use std::{collections::BTreeMap, sync::Mutex};
 
 use async_trait::async_trait;
 use dependaboard_core::{
     BatchRecord, DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord,
-    ProjectionRevision, RepoRecord, Retirement,
+    ProjectionRevision, RepoRecord, Retirement, RunningBatch,
 };
 use dependaboard_store::{PrStore, StoreError};
 
 /// Rows keyed the way the schema keys them: pull requests by `(repository_id, number)`
 /// (the `id` column is derived from that pair), repositories by id, batches by batch id,
-/// retirements by an id that only grows.
+/// running and finished apart, retirements by an id that only grows.
 ///
 /// What the schema enforces, this enforces: a pull request needs its repository's row
 /// first (libSQL rejects the foreign key; this panics, since only a test can get it wrong),
 /// deleting a repository takes its pull requests with it, a pull request reads back
 /// with its repository's `installation_id`, as the store's `JOIN` gives it, a batch
-/// recorded twice keeps its first record, and every prune queues the keys it removed
-/// for retirement under its fence. What the service never asks of the store, the
-/// dashboard listing, its summary, the revision counters, and the recent batches, is not
-/// implemented and panics if called.
+/// recorded twice keeps its first record, recording a batch stops listing it as
+/// running, and every prune queues the keys it removed for retirement under its fence.
+/// What the service never asks of the store, the dashboard listing, its summary, the
+/// revision counters, and the recent and running batches, is not implemented and panics
+/// if called.
 #[derive(Default)]
 pub(crate) struct MemoryPrStore {
     tables: Mutex<Tables>,
@@ -37,6 +38,7 @@ struct Tables {
     pull_requests: BTreeMap<(u64, u64), PrRecord>,
     repositories: BTreeMap<u64, RepoRecord>,
     batches: BTreeMap<String, BatchRecord>,
+    running_batches: BTreeMap<String, RunningBatch>,
     retirements: BTreeMap<u64, Retirement>,
     /// The last retirement id handed out; like `AUTOINCREMENT`, never reused.
     last_retirement_id: u64,
@@ -293,9 +295,9 @@ impl PrStore for MemoryPrStore {
     }
 
     async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError> {
-        self.tables
-            .lock()
-            .unwrap()
+        let mut tables = self.tables.lock().unwrap();
+        tables.running_batches.remove(&batch.batch_id);
+        tables
             .batches
             .entry(batch.batch_id.clone())
             .or_insert_with(|| batch.clone());
@@ -305,6 +307,27 @@ impl PrStore for MemoryPrStore {
     async fn recent_batches(&self, _limit: u32) -> Result<Vec<BatchRecord>, StoreError> {
         unimplemented!(
             "the Restate service never lists the recorded batches; the dashboard reads them through the web app"
+        )
+    }
+
+    async fn start_batch(&self, batch: &RunningBatch) -> Result<(), StoreError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .running_batches
+            .entry(batch.batch_id.clone())
+            .or_insert_with(|| batch.clone());
+        Ok(())
+    }
+
+    async fn unlist_batch(&self, batch_id: &str) -> Result<(), StoreError> {
+        self.tables.lock().unwrap().running_batches.remove(batch_id);
+        Ok(())
+    }
+
+    async fn running_batches(&self) -> Result<Vec<RunningBatch>, StoreError> {
+        unimplemented!(
+            "the Restate service never lists the running batches; the dashboard reads them through the web app"
         )
     }
 }

@@ -172,12 +172,14 @@ progress from the UI.
 
 ```
 run(BulkRequest { action, targets: Vec<PrTarget>, user_id })
+  ├─ ctx.run: PrStore::start_batch(kind, requester, started at, target count)   // best effort
   ├─ for each target (bounded concurrency; merges grouped per repo, see below):
   │     ctx.object_client::<PullRequest>(key).call(action)
   │       → ActionOutcome, or a TerminalError the callee gave up with
   │     write the outcome into workflow state AS IT COMPLETES
   ├─ terminal state: Completed { succeeded, rejected, failed }
   └─ ctx.run: PrStore::record_batch(kind, requester, started/completed at, per-target verdicts)
+                                     // …and stops listing the batch as running
 
 progress() -> BatchProgress    // shared handler, UI polls this
 ```
@@ -214,6 +216,35 @@ nothing later would redo this write, so giving up would lose the record for good
 dashboard's **Batches** button lists what was written, newest first; that list is the
 audit view, and it does not care how old a batch is. A merged pull request leaves
 `pull_requests`, so the targets are copied rather than referenced.
+
+**The running batch is listed in libSQL too, from its first step.** Workflow state is
+the truth about a running batch, but only a dashboard that knows the batch id can ask
+for it, and a dashboard that lost the id — the tab was closed, or it was never this
+tab's batch — is blind until the finished record lands. So the first step of `run`, once
+the start clock is journaled, lists the batch as running: kind, requester, started at,
+and how many targets, in a `running_batches` table of its own so `batches` stays
+append-only; `record_batch` takes the listing away in the transaction that writes the
+finished record. The listing is for finding the batch, not the batch itself, and it
+stands in the way of the work: its `ctx.run` step gets a retry budget of seconds, and a
+store that will not take it fails the step alone — the batch runs unlisted and the
+refusal is logged. The web edge does not write this row: a row written before a send
+that then fails is a phantom, and the projection is Restate's to write. The **Batches**
+drawer lists the running batches first, each with **Follow**, which attaches the pill
+and drawer to it through `progress`.
+
+**The dashboard follows a batch by id, and never calls it lost.** The followed batch id
+is in the URL (`batch`, beside `pr`), so a reload re-attaches through `progress`, and a
+link can be shared. It rides along with the view rather than being a history entry of
+its own — the pill is over every page — so following a batch replaces the address in
+place and back and forward keep following it. The client cannot tell a rate-limit sleep
+from a 5xx backoff, and the honest budget for one target runs to hours (a guard read and
+a mutation, each up to four thirty-minute retry budgets and three rate-limit waits of up
+to an hour), so there is no timeout the dashboard could put on "lost" that would not
+either fire inside the budget or say nothing. It keeps polling for as long as Restate
+answers; after a minute without change the drawer says on what it waits and since when.
+The follow gives up only on an id Restate has never had progress for — a stale or
+foreign link — after thirty seconds; a batch the dashboard submitted itself is waited
+for however long Restate takes to start it.
 
 **Retrying rejected targets is a new batch, refreshed first.** A rejection is the last
 word on the request *as it was sent*; most often the head moved, and the fix is to send
@@ -626,16 +657,20 @@ Bulk action       UI → server fn → Restate ingress
                        server fn resolves the rest — repository, title, link — from
                        PrStore::get_pr and refuses a target of another installation
                        POST /restate/send/BulkAction/{batch_id}/run
+                     → workflow lists the batch as running: PrStore::start_batch
                      → workflow fans out to PullRequest objects
                      → objects call GitHub API, write through to PrStore
-                     → workflow writes the finished batch: PrStore::record_batch
+                     → workflow writes the finished batch: PrStore::record_batch,
+                       which also stops listing it as running
 
 Progress          UI polls → server fn →
                        POST /restate/call/BulkAction/{batch_id}/progress
+                       the batch id is in the URL, so a reload polls on
 
-Recent batches    UI → server fn → PrStore::recent_batches(limit)
-                       the finished batches, newest first, from the projection rather
-                       than Restate, so they outlive the workflow retention
+Recent batches    UI → server fn → PrStore::running_batches() + recent_batches(limit)
+                       the running batches, then the finished ones, newest first, from
+                       the projection rather than Restate, so a finished batch outlives
+                       the workflow retention and a running one is found without its id
 
 All ingress endpoints live under `/restate/`: `/restate/call/...` waits for the handler's
 result, `/restate/send/...` returns as soon as the invocation is accepted. Use `send` for
@@ -838,11 +873,17 @@ pub trait PrStore {
     /// Forget every retirement up to and including `through`, the last one read; ids
     /// only grow, so anything queued since stays for the next drain.
     async fn acknowledge_retirements(&self, through: u64) -> Result<()>;
-    /// Keep a finished batch for audit. A batch id already recorded is left as it
-    /// was, so the workflow's recording step is safe to run again.
+    /// Keep a finished batch for audit, and stop listing it as running. A batch id
+    /// already recorded is left as it was, so the workflow's recording step is safe
+    /// to run again.
     async fn record_batch(&self, batch: &BatchRecord) -> Result<()>;
     /// The most recently finished batches, newest first, targets and verdicts included.
     async fn recent_batches(&self, limit: u32) -> Result<Vec<BatchRecord>>;
+    /// List a batch as running until it is recorded. A batch id already listed is left
+    /// as it was, for the same reason.
+    async fn start_batch(&self, batch: &RunningBatch) -> Result<()>;
+    /// Every batch started and not yet recorded, newest first.
+    async fn running_batches(&self) -> Result<Vec<RunningBatch>>;
 }
 
 pub struct PrFilter {

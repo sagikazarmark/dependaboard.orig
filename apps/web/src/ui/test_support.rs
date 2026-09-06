@@ -10,6 +10,7 @@ use dependaboard_core::{
 use dioxus::prelude::*;
 
 use crate::components::toast::ToastProvider;
+use crate::ui::batch::Followed;
 use crate::ui::dashboard_state::{
     Answers, CapabilitiesStatus, Connection, DashboardState, PageStatus, Selection, SummaryStatus,
 };
@@ -21,6 +22,11 @@ pub(crate) const GROUPED_ROW_TITLE: &str =
 /// The fixture dashboard's clock: the moment [`grouped_row`] and
 /// [`loaded_summary`] were synced, so their times read as "now".
 pub(crate) const FIXTURE_NOW: u64 = 1_700_000_000;
+
+/// Batch ids as the dashboard mints them: UUIDv7s, which is what the URL
+/// and the server accept as one.
+pub(crate) const BATCH: &str = "01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1a";
+pub(crate) const OTHER_BATCH: &str = "01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1b";
 
 pub(crate) fn grouped_row() -> PrRecord {
     PrRecord {
@@ -131,6 +137,18 @@ pub(crate) fn half_done_merge() -> BatchProgress {
         },
     );
     progress
+}
+
+/// `progress` as the dashboard follows it once Restate has reported it, at
+/// [`FIXTURE_NOW`], with the polls answered.
+pub(crate) fn followed(progress: BatchProgress) -> Followed {
+    Followed {
+        batch_id: progress.batch_id.clone(),
+        progress: Some(progress),
+        heard: true,
+        since: FIXTURE_NOW,
+        trouble: None,
+    }
 }
 
 /// The facets around [`loaded_page`]: two `acme` repositories with pull

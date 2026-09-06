@@ -273,7 +273,9 @@ mod tests {
     use dependaboard_github::ProtocolError;
 
     use super::*;
-    use crate::store::{persistent_store_retry_policy, store_retry_policy};
+    use crate::store::{
+        brief_store_retry_policy, persistent_store_retry_policy, store_retry_policy,
+    };
 
     fn is_retryable(error: &HandlerError) -> bool {
         let cause: &dyn std::error::Error = error.as_ref();
@@ -618,7 +620,8 @@ mod tests {
 
     /// A GitHub call or a projection write has a later chance — the next webhook, the
     /// next reconcile — so its retries are bounded. The one write nothing would redo, a
-    /// finished batch's record, keeps retrying until the store takes it.
+    /// finished batch's record, keeps retrying until the store takes it; the one that
+    /// stands in the way of the work, listing a batch as running, is given seconds.
     #[test]
     fn run_retry_policies_are_bounded_except_the_one_write_nothing_would_redo() {
         // The SDK exposes no accessor for the policy's bounds, so inspect its Debug form.
@@ -629,6 +632,8 @@ mod tests {
         let persistent = format!("{:?}", persistent_store_retry_policy());
         assert!(persistent.contains("max_duration: None"), "{persistent}");
         assert!(persistent.contains("max_attempts: None"), "{persistent}");
+        let brief = format!("{:?}", brief_store_retry_policy());
+        assert!(brief.contains("max_duration: Some(15s)"), "{brief}");
     }
 
     fn forbidden() -> GithubErrorResponse {

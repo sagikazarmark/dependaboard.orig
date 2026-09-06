@@ -5,16 +5,17 @@ use std::{collections::VecDeque, fmt, num::NonZeroUsize, sync::Arc, time::Durati
 
 use dependaboard_core::{
     ActionOutcome, BatchProgress, BatchRecord, BulkActionKind, BulkRequest, CommandRequest,
-    DependabotCommand, MergeRequest, PrTarget, UpdateBranchRequest, UserId, unix_seconds,
+    DependabotCommand, MergeRequest, PrTarget, RunningBatch, UpdateBranchRequest, UserId,
+    unix_seconds,
 };
 use dependaboard_store::PrStore;
 use restate_sdk::prelude::*;
 use tracing::warn;
 
 use crate::{
-    handler::{HandlerOutcome, traced, traced_read},
+    handler::{HandlerOutcome, handler_cause, traced, traced_read},
     pull_request::PullRequestClient,
-    store::{persistent_store_retry_policy, store_failure},
+    store::{brief_store_retry_policy, persistent_store_retry_policy, store_failure},
 };
 
 const BATCH_PROGRESS: &str = "progress";
@@ -74,6 +75,18 @@ trait BulkActionEffects {
     /// The wall clock, in Unix seconds, journaled under `step` so a replay reads the
     /// same moment.
     fn now(&mut self, step: &'static str) -> impl Future<Output = HandlerResult<u64>> + Send;
+    /// Lists the batch as running in the projection, so the audit view can show it
+    /// before it finishes and a dashboard that lost it can follow it again. A
+    /// convenience, not the batch's truth: the store is given a short while to take it,
+    /// and a store that does not fails this step alone.
+    fn start_batch(
+        &mut self,
+        batch: &RunningBatch,
+    ) -> impl Future<Output = HandlerResult<()>> + Send;
+    /// Stops listing the batch as running without recording it, for a workflow that
+    /// ends with no finished batch to record: cancelled, or failed past what a target's
+    /// own verdict can carry. Best effort, as the listing was.
+    fn unlist_batch(&mut self) -> impl Future<Output = HandlerResult<()>> + Send;
     /// Writes the finished batch to the projection, where it outlives the workflow's
     /// retention. Written once per batch: the store keeps the first record and Restate
     /// journals the step, so neither a retry nor a replay writes a second. Nothing would
@@ -177,6 +190,34 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
             .await?)
     }
 
+    async fn start_batch(&mut self, batch: &RunningBatch) -> HandlerResult<()> {
+        let store = self.store.clone();
+        let batch = batch.clone();
+        self.ctx
+            .run(move || async move {
+                store.start_batch(&batch).await.map_err(store_failure)?;
+                Ok(())
+            })
+            .retry_policy(brief_store_retry_policy())
+            .name("start-batch")
+            .await?;
+        Ok(())
+    }
+
+    async fn unlist_batch(&mut self) -> HandlerResult<()> {
+        let store = self.store.clone();
+        let batch_id = self.ctx.key().to_owned();
+        self.ctx
+            .run(move || async move {
+                store.unlist_batch(&batch_id).await.map_err(store_failure)?;
+                Ok(())
+            })
+            .retry_policy(brief_store_retry_policy())
+            .name("unlist-batch")
+            .await?;
+        Ok(())
+    }
+
     async fn record_batch(&mut self, record: &BatchRecord) -> HandlerResult<()> {
         let store = self.store.clone();
         let record = record.clone();
@@ -222,7 +263,14 @@ fn warn_if_record_stuck(record: &BatchRecord, now: u64, cause: &impl fmt::Displa
 /// Drives every target of the batch to a terminal state, writes the finished batch to
 /// the projection, and resolves to the final tally.
 ///
-/// Merges go out in the rounds `plan_merge_rounds` lays out. Branch updates go out
+/// The batch is first listed as running in the projection, so the audit view shows it
+/// from its first moment and a dashboard that lost it can find it; a store that will
+/// not take the listing is logged and the batch goes on without it, since the listing
+/// is for finding the batch and not the batch itself. The finished record takes the
+/// listing away; a workflow that ends without one — cancelled, or failed past what a
+/// target's own verdict can carry — takes it away itself on the way out, so nothing is
+/// listed as running for good. Merges go out in the rounds `plan_merge_rounds` lays
+/// out. Branch updates go out
 /// [`MAX_CONCURRENT`] at a time in batch order: updating one head branch moves nothing
 /// under another, so same-repository targets need no serialising. Rebases go one at a
 /// time with a pause between comments. `publish` is called with each change in progress,
@@ -242,25 +290,61 @@ async fn run_bulk_action<E: BulkActionEffects>(
     let started_at = restate.now("batch-start-clock").await?;
     let mut progress = BatchProgress::queued(restate.batch_id(), request.action, &request.targets);
     publish(&progress);
+    let running = RunningBatch {
+        batch_id: progress.batch_id.clone(),
+        action: request.action,
+        requested_by: request.user_id.clone(),
+        started_at,
+        target_count: request.targets.len() as u64,
+    };
+    if let Err(error) = restate.start_batch(&running).await {
+        warn!(
+            batch_id = %running.batch_id,
+            cause = %handler_cause(&error),
+            "the running batch could not be listed in the projection; running it unlisted"
+        );
+    }
+    let outcome = drive(restate, request, &mut progress, &mut publish, started_at).await;
+    if outcome.is_err()
+        && let Err(error) = restate.unlist_batch().await
+    {
+        warn!(
+            batch_id = %running.batch_id,
+            cause = %handler_cause(&error),
+            "the batch ended unfinished and could not be unlisted in the projection"
+        );
+    }
+    outcome.map(|()| progress)
+}
+
+/// Runs the batch's targets and records the finished batch; the body of
+/// [`run_bulk_action`] between listing the batch and, if this fails, unlisting it.
+async fn drive<E: BulkActionEffects>(
+    restate: &mut E,
+    request: &BulkRequest,
+    progress: &mut BatchProgress,
+    publish: &mut (impl FnMut(&BatchProgress) + Send),
+    started_at: u64,
+) -> HandlerResult<()> {
     match request.action {
         BulkActionKind::Merge => {
             for round in plan_merge_rounds(&request.targets, MAX_CONCURRENT) {
-                start_round(&mut progress, &round, &mut publish);
+                start_round(progress, &round, publish);
                 restate
                     .merge_round(&round, |index, outcome| {
-                        settle(&mut progress, &round[index], outcome);
-                        publish(&progress);
+                        settle(progress, &round[index], outcome);
+                        publish(progress);
                     })
                     .await?;
             }
         }
         BulkActionKind::UpdateBranch => {
             for round in request.targets.chunks(MAX_CONCURRENT.get()) {
-                start_round(&mut progress, round, &mut publish);
+                start_round(progress, round, publish);
                 restate
                     .update_branch_round(round, |index, outcome| {
-                        settle(&mut progress, &round[index], outcome);
-                        publish(&progress);
+                        settle(progress, &round[index], outcome);
+                        publish(progress);
                     })
                     .await?;
             }
@@ -268,10 +352,10 @@ async fn run_bulk_action<E: BulkActionEffects>(
         BulkActionKind::Rebase => {
             for target in &request.targets {
                 progress.start(&target.key());
-                publish(&progress);
+                publish(progress);
                 let outcome = restate.rebase(target).await;
-                settle(&mut progress, target, outcome);
-                publish(&progress);
+                settle(progress, target, outcome);
+                publish(progress);
                 if !progress.completed {
                     restate.pause().await?;
                 }
@@ -285,7 +369,7 @@ async fn run_bulk_action<E: BulkActionEffects>(
             TerminalError::new("every target was attempted, yet the batch is not complete")
         })?;
     restate.record_batch(&record).await?;
-    Ok(progress)
+    Ok(())
 }
 
 /// Marks every target of a round as running and publishes once for the round, so the
@@ -411,10 +495,13 @@ fn plan_merge_rounds(targets: &[PrTarget], max_concurrent: NonZeroUsize) -> Vec<
 mod tests {
     use std::collections::BTreeMap;
 
-    use dependaboard_core::{RejectReason, TargetOutcome, TargetProgressState, UserId};
+    use dependaboard_core::{
+        RejectReason, RunningBatch, TargetOutcome, TargetProgressState, UserId,
+    };
+    use tracing::instrument::WithSubscriber;
 
     use super::*;
-    use crate::test_support::{captured_logs, target};
+    use crate::test_support::{LogSink, captured_logs, target};
 
     /// A merge target for pull request `number` in repository `repository_id`.
     fn pull(repository_id: u64, number: u64) -> PrTarget {
@@ -486,6 +573,16 @@ mod tests {
         pauses: u32,
         /// Minutes the clock has been read for, from a fixed epoch.
         clock_readings: u64,
+        /// Every running batch listed in the projection, in order.
+        started: Vec<RunningBatch>,
+        /// What had been sent when the batch was listed as running, if it was.
+        sent_when_started: Option<Vec<u64>>,
+        /// Whether the store refuses to list the batch as running.
+        start_fails: bool,
+        /// Whether the first round ends the workflow, as a cancellation does.
+        round_fails: bool,
+        /// Every batch id whose running listing was taken away, in order.
+        unlisted: Vec<String>,
         /// Every batch record written to the projection, in order.
         recorded: Vec<BatchRecord>,
     }
@@ -540,6 +637,9 @@ mod tests {
             targets: &[PrTarget],
             landed: impl FnMut(usize, Result<ActionOutcome, TerminalError>) + Send,
         ) -> Result<(), TerminalError> {
+            if self.round_fails {
+                return Err(TerminalError::new("cancelled"));
+            }
             self.round(targets, merged(), landed);
             Ok(())
         }
@@ -566,6 +666,20 @@ mod tests {
             let reading = CLOCK_EPOCH + self.clock_readings * 60;
             self.clock_readings += 1;
             Ok(reading)
+        }
+
+        async fn start_batch(&mut self, batch: &RunningBatch) -> HandlerResult<()> {
+            if self.start_fails {
+                return Err(TerminalError::new("database is locked").into());
+            }
+            self.started.push(batch.clone());
+            self.sent_when_started = Some(self.sent.clone());
+            Ok(())
+        }
+
+        async fn unlist_batch(&mut self) -> HandlerResult<()> {
+            self.unlisted.push(self.batch_id().to_owned());
+            Ok(())
         }
 
         async fn record_batch(&mut self, record: &BatchRecord) -> HandlerResult<()> {
@@ -897,6 +1011,85 @@ mod tests {
             ],
             "every target in batch order with its own verdict"
         );
+    }
+
+    /// A dashboard that lost the batch, or never followed it, finds it in the audit
+    /// view while it runs: the workflow lists it as running before it sends the first
+    /// target, with what was asked, by whom, since when, and over how many pull
+    /// requests.
+    #[tokio::test]
+    async fn a_batch_is_listed_as_running_before_its_first_target_is_sent() {
+        let request = BulkRequest {
+            user_id: UserId::new("alice"),
+            ..request(BulkActionKind::Merge, vec![pull(7, 1), pull(8, 4)])
+        };
+        let mut restate = RecordedBulkAction::default();
+
+        run(&mut restate, &request).await;
+
+        assert_eq!(
+            restate.started,
+            vec![RunningBatch {
+                batch_id: "batch-1".to_owned(),
+                action: BulkActionKind::Merge,
+                requested_by: UserId::new("alice"),
+                started_at: CLOCK_EPOCH,
+                target_count: 2,
+            }]
+        );
+        assert_eq!(
+            restate.sent_when_started,
+            Some(Vec::new()),
+            "listed before the first target went out"
+        );
+    }
+
+    /// The running row is a convenience for the audit view, not the batch's truth; a
+    /// store that will not take it holds up no merge. The batch runs, is recorded at
+    /// the end as any other, and the store's refusal is in the service log.
+    #[tokio::test]
+    async fn a_batch_whose_running_row_cannot_be_written_still_runs_and_is_recorded() {
+        let request = request(BulkActionKind::Merge, vec![pull(7, 1)]);
+        let mut restate = RecordedBulkAction {
+            start_fails: true,
+            ..Default::default()
+        };
+
+        let logs = LogSink::default();
+        let (progress, _) = run(&mut restate, &request)
+            .with_subscriber(logs.subscriber())
+            .await;
+
+        assert!(progress.completed);
+        assert_eq!(restate.sent, vec![1]);
+        assert_eq!(restate.recorded.len(), 1, "{:?}", restate.recorded);
+        let logs = logs.contents();
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(logs.contains("batch_id=batch-1"), "{logs}");
+        assert!(
+            logs.contains("the running batch could not be listed"),
+            "{logs}"
+        );
+    }
+
+    /// A batch cancelled in Restate, or failed past what a target's own verdict can
+    /// carry, ends with no finished batch to record. It must not stay listed as
+    /// running for good: the listing is taken away on the way out, and nothing is
+    /// recorded in its place.
+    #[tokio::test]
+    async fn a_batch_that_ends_without_finishing_is_unlisted_and_not_recorded() {
+        let request = request(BulkActionKind::Merge, vec![pull(7, 1), pull(8, 4)]);
+        let mut restate = RecordedBulkAction {
+            round_fails: true,
+            ..Default::default()
+        };
+
+        let outcome = run_bulk_action(&mut restate, &request, |_| {}).await;
+
+        assert!(outcome.is_err(), "the cancellation ends the workflow");
+        assert_eq!(restate.started.len(), 1);
+        assert_eq!(restate.unlisted, vec!["batch-1"]);
+        assert!(restate.recorded.is_empty(), "{:?}", restate.recorded);
     }
 
     #[test]

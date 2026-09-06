@@ -130,6 +130,12 @@ impl Dashboard {
         forwards.into_iter().next().unwrap()
     }
 
+    /// The read model behind the server, for putting there what the Restate
+    /// service would have written.
+    pub(crate) fn store(&self) -> &LibSqlPrStore {
+        &self.store
+    }
+
     /// Puts `row` in the read model, under a repository of `installation_id`:
     /// the repository row is what says which installation a pull request
     /// belongs to.

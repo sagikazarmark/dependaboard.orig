@@ -5,14 +5,16 @@
 //! read model's revision and reloads when it moves — and says so, over the
 //! page, when the polls that follow it stop being answered.
 
-use dependaboard_core::{BatchProgress, Page, PrRecord};
+use dependaboard_core::{Page, PrRecord};
+use dioxus::core::Task;
 use dioxus::logger::tracing;
 use dioxus::prelude::*;
 
 use crate::api::{load_capabilities, load_dashboard, load_signed_in_user, load_summary};
 use crate::components::toast::{ToastOptions, use_toast};
 use crate::ui::action_bar::ActionBar;
-use crate::ui::active_batch::{ActiveBatch, BatchHost, queue_batch};
+use crate::ui::active_batch::{ActiveBatch, BatchHost, attach_batch, queue_batch};
+use crate::ui::batch::Followed;
 use crate::ui::confirm_modal::ConfirmModal;
 use crate::ui::dashboard_state::{
     Answers, CapabilitiesStatus, DashboardState, PageStatus, Selection, SummaryStatus,
@@ -47,13 +49,15 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
         filter: initial_filter,
         cursor: initial_cursor,
         pr: initial_pr,
+        ..
     } = use_url_state();
     let filter = use_signal(|| initial_filter);
     let cursor = use_signal(|| initial_cursor);
     let selected = use_signal(Selection::default);
     let mut detail = use_signal(|| initial_pr.map(OpenPr::Loading));
     let mut pending = use_signal(|| None::<PendingAction>);
-    let active_batch = use_signal(|| None::<BatchProgress>);
+    let followed = use_signal(|| None::<Followed>);
+    let follower = use_signal(|| None::<Task>);
     let progress_open = use_signal(|| false);
     let visible = use_visibility();
     let now = use_clock(visible);
@@ -116,7 +120,17 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
         now,
         reload,
     );
-    use_url_sync(state, detail);
+    let host = BatchHost {
+        followed,
+        follower,
+        open: progress_open,
+        toast,
+        state,
+    };
+    // The batch the URL names is followed by id: after a reload, this is how
+    // the drawer reopens on the batch the page was following.
+    let onbatch = use_callback(move |batch_id: String| attach_batch(batch_id, host));
+    use_url_sync(state, detail, followed, onbatch);
     use_live_refresh(state, visible);
     let user = signed_in
         .read()
@@ -139,7 +153,15 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
         ActionBar { onrequest: move |action| pending.set(Some(action)) }
 
         if batches_open() {
-            RecentBatchesDrawer { onclose: move |_| batches_open.set(false) }
+            RecentBatchesDrawer {
+                onclose: move |_| batches_open.set(false),
+                // Following a batch from the list opens the progress drawer
+                // on it, which takes the list's place over the page.
+                onfollow: move |batch_id| {
+                    batches_open.set(false);
+                    attach_batch(batch_id, host);
+                },
+            }
         }
 
         OpenDetail {
@@ -161,7 +183,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
             },
         }
 
-        ActiveBatch { progress: active_batch, open: progress_open }
+        ActiveBatch { followed, follower, open: progress_open }
 
         ConfirmModal {
             pending: pending(),
@@ -179,15 +201,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
                 // so one pull request merged from its drawer does not drop
                 // the twenty picked for the next batch.
                 state.deselect(&action.rows);
-                queue_batch(
-                    action,
-                    BatchHost {
-                        progress: active_batch,
-                        open: progress_open,
-                        toast,
-                        state,
-                    },
-                );
+                queue_batch(action, host);
             },
         }
     }

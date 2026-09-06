@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use dependaboard_core::{
     BatchRecord, BatchTargetRecord, CursorError, DashboardPage, DashboardSummary, FacetCounts,
     LabelFacet, Mergeable, Page, PageCursor, PrFilter, PrKey, PrRecord, ProjectionRevision,
-    RepoFacet, RepoRecord, Retirement, UserId, unix_seconds,
+    RepoFacet, RepoRecord, Retirement, RunningBatch, UserId, unix_seconds,
 };
 use libsql::{Builder, Row, Value};
 use secrecy::{ExposeSecret, SecretString};
@@ -165,14 +165,25 @@ pub trait PrStore: Send + Sync {
     /// anything queued since that read stays for the next drain; acknowledging
     /// again is a no-op.
     async fn acknowledge_retirements(&self, through: u64) -> Result<(), StoreError>;
-    /// Keeps a finished bulk action for the audit view, targets and all. A
-    /// batch already recorded is left as it was: Restate may run the recording
-    /// step again when the first attempt's result was lost, and the first word
-    /// is the one that stands.
+    /// Keeps a finished bulk action for the audit view, targets and all, and
+    /// stops listing it as running. A batch already recorded is left as it
+    /// was: Restate may run the recording step again when the first attempt's
+    /// result was lost, and the first word is the one that stands.
     async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError>;
     /// The `limit` most recently finished batches, newest first, each with
     /// every target's verdict in batch order.
     async fn recent_batches(&self, limit: u32) -> Result<Vec<BatchRecord>, StoreError>;
+    /// Lists a bulk action as running until [`PrStore::record_batch`] keeps
+    /// it as finished, or [`PrStore::unlist_batch`] gives it up. A batch
+    /// already listed is left as it was, for the same reason a recorded one
+    /// is.
+    async fn start_batch(&self, batch: &RunningBatch) -> Result<(), StoreError>;
+    /// Stops listing a bulk action as running without recording it: the
+    /// workflow ended without a finished batch to keep, as a cancelled one
+    /// does. A batch not listed is left as it is.
+    async fn unlist_batch(&self, batch_id: &str) -> Result<(), StoreError>;
+    /// Every batch started and not yet recorded or given up, newest first.
+    async fn running_batches(&self) -> Result<Vec<RunningBatch>, StoreError>;
 }
 
 #[async_trait]
@@ -457,6 +468,13 @@ impl PrStore for LibSqlPrStore {
     async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError> {
         let connection = self.connection().await;
         let transaction = connection.transaction().await?;
+        // Whether or not this is the record that stands, the batch has run.
+        transaction
+            .execute(
+                "DELETE FROM running_batches WHERE batch_id = ?1",
+                vec![Value::Text(batch.batch_id.clone())],
+            )
+            .await?;
         let inserted = transaction
             .execute(
                 r#"INSERT INTO batches (
@@ -477,7 +495,7 @@ impl PrStore for LibSqlPrStore {
             )
             .await?;
         if inserted == 0 {
-            transaction.rollback().await?;
+            transaction.commit().await?;
             return Ok(());
         }
         for (position, target) in batch.targets.iter().enumerate() {
@@ -549,6 +567,61 @@ impl PrStore for LibSqlPrStore {
         }
         for batch in &mut batches {
             batch.targets = by_batch.remove(&batch.batch_id).unwrap_or_default();
+        }
+        Ok(batches)
+    }
+
+    async fn start_batch(&self, batch: &RunningBatch) -> Result<(), StoreError> {
+        self.connection()
+            .await
+            .execute(
+                r#"INSERT INTO running_batches (
+                    batch_id, action, requested_by, started_at, target_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                ON CONFLICT(batch_id) DO NOTHING"#,
+                vec![
+                    Value::Text(batch.batch_id.clone()),
+                    Value::Text(batch.action.to_string()),
+                    Value::Text(batch.requested_by.to_string()),
+                    integer(batch.started_at)?,
+                    integer(batch.target_count)?,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn unlist_batch(&self, batch_id: &str) -> Result<(), StoreError> {
+        self.connection()
+            .await
+            .execute(
+                "DELETE FROM running_batches WHERE batch_id = ?1",
+                vec![Value::Text(batch_id.to_owned())],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn running_batches(&self) -> Result<Vec<RunningBatch>, StoreError> {
+        let mut rows = self
+            .connection()
+            .await
+            .query(
+                r#"SELECT batch_id, action, requested_by, started_at, target_count
+                   FROM running_batches
+                   ORDER BY started_at DESC, batch_id DESC"#,
+                (),
+            )
+            .await?;
+        let mut batches = Vec::new();
+        while let Some(row) = rows.next().await? {
+            batches.push(RunningBatch {
+                batch_id: row.get(0)?,
+                action: stored_enum(row.get(1)?)?,
+                requested_by: UserId::new(row.get::<String>(2)?),
+                started_at: unsigned(row.get::<i64>(3)?)?,
+                target_count: unsigned(row.get::<i64>(4)?)?,
+            });
         }
         Ok(batches)
     }
@@ -1077,7 +1150,7 @@ fn retryable_sqlite_code(code: i32) -> bool {
 mod tests {
     use dependaboard_core::{
         BatchRecord, BatchTargetRecord, BulkActionKind, CheckStatus, DependencyUpdate, MergeMethod,
-        RejectReason, TargetOutcome, UpdateType, UserId,
+        RejectReason, RunningBatch, TargetOutcome, UpdateType, UserId,
     };
     use tempfile::TempDir;
 
@@ -2451,6 +2524,99 @@ mod tests {
         store.record_batch(&again).await.unwrap();
 
         assert_eq!(store.recent_batches(10).await.unwrap(), vec![first]);
+    }
+
+    /// A merge of two pull requests `alice` asked for, as the workflow writes it
+    /// when it starts running the batch.
+    fn running(batch_id: &str, started_at: u64) -> RunningBatch {
+        RunningBatch {
+            batch_id: batch_id.to_owned(),
+            action: BulkActionKind::Merge,
+            requested_by: UserId::new("alice"),
+            started_at,
+            target_count: 2,
+        }
+    }
+
+    /// The workflow writes a batch as running when it starts, so the audit
+    /// view can list a batch that is still going.
+    #[tokio::test]
+    async fn started_batches_are_listed_as_running_newest_first() {
+        let (_directory, store) = test_store().await;
+        let older = running("batch-older", 1_000);
+        let newer = RunningBatch {
+            action: BulkActionKind::Rebase,
+            requested_by: UserId::new("bob"),
+            target_count: 1,
+            ..running("batch-newer", 2_000)
+        };
+
+        store.start_batch(&older).await.unwrap();
+        store.start_batch(&newer).await.unwrap();
+
+        assert_eq!(
+            store.running_batches().await.unwrap(),
+            vec![newer, older],
+            "every column comes back, newest first"
+        );
+    }
+
+    /// The finished record takes the running listing away, so a batch is
+    /// listed as running or as finished, never both.
+    #[tokio::test]
+    async fn recording_a_batch_stops_listing_it_as_running() {
+        let (_directory, store) = test_store().await;
+        let still_running = running("batch-newer", 2_000);
+        store
+            .start_batch(&running("batch-older", 1_000))
+            .await
+            .unwrap();
+        store.start_batch(&still_running).await.unwrap();
+
+        store
+            .record_batch(&batch("batch-older", 3_000))
+            .await
+            .unwrap();
+
+        assert_eq!(store.running_batches().await.unwrap(), vec![still_running]);
+        assert_eq!(
+            store.recent_batches(10).await.unwrap(),
+            vec![batch("batch-older", 3_000)]
+        );
+    }
+
+    /// A workflow that ends without a finished batch — cancelled, or failed
+    /// past what a target's own verdict can carry — has nothing to record,
+    /// and must not stay listed as running for good.
+    #[tokio::test]
+    async fn unlisting_a_batch_takes_it_out_of_the_running_ones_and_records_nothing() {
+        let (_directory, store) = test_store().await;
+        store.start_batch(&running("batch-1", 1_000)).await.unwrap();
+
+        store.unlist_batch("batch-1").await.unwrap();
+        store.unlist_batch("never-listed").await.unwrap();
+
+        assert_eq!(store.running_batches().await.unwrap(), Vec::new());
+        assert_eq!(store.recent_batches(10).await.unwrap(), Vec::new());
+    }
+
+    /// Restate may run the starting step again when the first attempt's result
+    /// was lost; the batch is still one running batch.
+    #[tokio::test]
+    async fn starting_a_batch_again_leaves_it_listed_once() {
+        let (_directory, store) = test_store().await;
+        let first = running("batch-1", 1_000);
+        store.start_batch(&first).await.unwrap();
+
+        store
+            .start_batch(&RunningBatch {
+                started_at: 1_001,
+                ..first.clone()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(store.running_batches().await.unwrap(), vec![first]);
     }
 
     /// The record is the audit trail, so it outlives what it is about: the pull

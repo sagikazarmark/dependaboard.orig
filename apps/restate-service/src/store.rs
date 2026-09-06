@@ -32,6 +32,18 @@ pub(crate) fn persistent_store_retry_policy() -> RunRetryPolicy {
         .max_delay(Duration::from_secs(5))
 }
 
+/// The same backoff cut short, for a projection write that is a convenience and stands
+/// in the way of the work: listing a batch as running is how the audit view shows it
+/// before it finishes, and a store away for longer than this should not hold up a
+/// hundred merges. The caller carries on without the write once the budget is spent.
+pub(crate) fn brief_store_retry_policy() -> RunRetryPolicy {
+    RunRetryPolicy::new()
+        .initial_delay(Duration::from_millis(100))
+        .exponentiation_factor(2.0)
+        .max_delay(Duration::from_secs(5))
+        .max_duration(Duration::from_secs(15))
+}
+
 pub(crate) fn store_failure(error: StoreError) -> HandlerError {
     match error.class() {
         StoreErrorClass::Retryable => RetryableServiceError::Store(error.to_string()).into(),

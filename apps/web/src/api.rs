@@ -3,8 +3,8 @@
 //! the store and Restate through [`crate::server::state::ServerState`].
 
 use dependaboard_core::{
-    BatchProgress, BatchRecord, BulkActionKind, Capabilities, DashboardPage, DashboardSummary,
-    Page, PrFilter, PrRecord, PrState, ProjectionRevision, SubmittedTarget, UserId,
+    BatchList, BatchProgress, BulkActionKind, Capabilities, DashboardPage, DashboardSummary, Page,
+    PrFilter, PrRecord, PrState, ProjectionRevision, SubmittedTarget, UserId,
 };
 use dioxus::prelude::*;
 
@@ -160,18 +160,22 @@ pub(crate) async fn load_batch_progress(
         .map_err(restate_unavailable)
 }
 
-/// The `limit` most recently finished batches, newest first, as the projection
-/// keeps them: what was asked, by whom, when, and how each target went. Read
-/// from the store, not Restate, so a batch is still here after the workflow's
-/// retention has cleared its progress. `limit` is held to
+/// The batches the audit view lists: every batch running, and the `limit`
+/// most recently finished, newest first, as the projection keeps them: what
+/// was asked, by whom, when, and — once finished — how each target went. Read
+/// from the store, not Restate, so a finished batch is still here after the
+/// workflow's retention has cleared its progress, and a running one is found
+/// without knowing its id. `limit` is held to
 /// [`MAX_RECENT_BATCHES`](dependaboard_core::MAX_RECENT_BATCHES).
 #[server(state: Extension<ServerState>)]
-pub(crate) async fn load_recent_batches(limit: u32) -> Result<Vec<BatchRecord>, ServerFnError> {
-    state
+pub(crate) async fn load_recent_batches(limit: u32) -> Result<BatchList, ServerFnError> {
+    let running = state.store.running_batches().await.map_err(store_failure)?;
+    let finished = state
         .store
         .recent_batches(limit.clamp(1, dependaboard_core::MAX_RECENT_BATCHES))
         .await
-        .map_err(store_failure)
+        .map_err(store_failure)?;
+    Ok(BatchList { running, finished })
 }
 
 #[server(state: Extension<ServerState>)]
@@ -282,7 +286,9 @@ fn restate_unavailable(error: String) -> ServerFnError {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use dependaboard_core::CursorError;
+    use dependaboard_core::{
+        BatchRecord, BatchTargetRecord, CursorError, RunningBatch, TargetOutcome,
+    };
     use reqwest::StatusCode;
     use serde_json::json;
 
@@ -290,7 +296,7 @@ mod tests {
     use crate::server::test_support::{
         Dashboard, INSTALLATION_ID, USERNAME, dashboard, error_message,
     };
-    use crate::ui::test_support::{GROUPED_ROW_TITLE, grouped_row, serde_row};
+    use crate::ui::test_support::{BATCH, GROUPED_ROW_TITLE, OTHER_BATCH, grouped_row, serde_row};
 
     #[test]
     fn infrastructure_failures_reach_the_browser_without_their_detail() {
@@ -319,6 +325,59 @@ mod tests {
         };
 
         assert_eq!(message, "invalid page cursor");
+    }
+
+    /// The audit view lists what is running beside what has run: a batch the
+    /// workflow has listed as running comes back with the finished ones, so a
+    /// tab that lost a batch, or never followed it, can find it there.
+    #[tokio::test]
+    async fn recent_batches_list_the_running_ones_beside_the_finished_ones() {
+        let dashboard = dashboard().await;
+        let running = RunningBatch {
+            batch_id: OTHER_BATCH.to_owned(),
+            action: BulkActionKind::Merge,
+            requested_by: UserId::new(USERNAME),
+            started_at: 2_000,
+            target_count: 3,
+        };
+        let finished = BatchRecord {
+            batch_id: BATCH.to_owned(),
+            action: BulkActionKind::Rebase,
+            requested_by: UserId::new(USERNAME),
+            started_at: 1_000,
+            completed_at: 1_030,
+            succeeded: 1,
+            rejected: 0,
+            failed: 0,
+            targets: vec![BatchTargetRecord {
+                repository_id: 7,
+                owner: "acme".to_owned(),
+                repo: "api".to_owned(),
+                number: 9,
+                title: GROUPED_ROW_TITLE.to_owned(),
+                html_url: "https://github.example/acme/api/pull/9".to_owned(),
+                outcome: TargetOutcome::Succeeded {
+                    detail: "@dependabot rebase posted".to_owned(),
+                },
+            }],
+        };
+        dashboard.store().start_batch(&running).await.unwrap();
+        dashboard.store().record_batch(&finished).await.unwrap();
+
+        let response = dashboard
+            .call("load_recent_batches", json!({ "limit": 20 }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<BatchList>().await.unwrap(),
+            BatchList {
+                running: vec![running],
+                finished: vec![finished],
+            }
+        );
     }
 
     /// The body of the one request Restate was sent, which went to `path`.

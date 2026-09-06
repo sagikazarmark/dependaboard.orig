@@ -119,7 +119,7 @@ fn log_handler_failure(handler: &'static str, key: &str, error: &HandlerError, e
 
 /// `HandlerError` only renders through `AsRef<dyn Error>`; its message already says whether
 /// Restate will treat the failure as terminal or retry it.
-fn handler_cause(error: &HandlerError) -> &dyn std::error::Error {
+pub(crate) fn handler_cause(error: &HandlerError) -> &dyn std::error::Error {
     error.as_ref()
 }
 
