@@ -31,6 +31,9 @@ octoevents.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
+# Already in the server build through octoevents and rustls; compares the
+# dashboard's credentials in constant time.
+subtle.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

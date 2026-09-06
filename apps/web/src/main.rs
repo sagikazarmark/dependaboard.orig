@@ -16,13 +16,9 @@ mod ui;
 #[cfg(feature = "server")]
 use {
     crate::server::{
-        auth::require_dashboard_auth,
-        config::Config,
-        restate::RestateIngress,
-        state::ServerState,
-        webhook::{WebhookState, webhook_router},
+        config::Config, restate::RestateIngress, router::router, state::ServerState,
+        webhook::WebhookState,
     },
-    axum::{Extension, middleware},
     dependaboard_store::{LibSqlPrStore, StoreConfig},
     dioxus::server::{DioxusRouterExt, ServeConfig},
 };
@@ -48,15 +44,9 @@ async fn main() {
         store,
         installation_id: config.installation_id,
     };
-    let dashboard = axum::Router::new()
-        .serve_dioxus_application(ServeConfig::new(), ui::App)
-        .layer(Extension(state))
-        .layer(middleware::from_fn_with_state(
-            config.credentials,
-            require_dashboard_auth,
-        ));
-    let webhooks = webhook_router(WebhookState::new(&config.webhook_secret, ingress));
-    let router = webhooks.merge(dashboard);
+    let app = axum::Router::new().serve_dioxus_application(ServeConfig::new(), ui::App);
+    let webhooks = WebhookState::new(&config.webhook_secret, ingress);
+    let router = router(app, config.credentials, state, webhooks);
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .expect("web listener should bind");

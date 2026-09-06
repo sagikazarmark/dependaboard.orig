@@ -222,13 +222,12 @@ struct CheckPullRequest {
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
 
     use axum::http::header;
     use serde_json::Value;
 
     use super::*;
-    use crate::server::test_support::{ingress_at, serve};
+    use crate::server::test_support::{fake_restate_ingress, serve};
 
     #[test]
     fn webhook_deliveries_are_authenticated_before_they_are_routed() {
@@ -348,41 +347,6 @@ mod tests {
         // Restate should never hear about it.
         assert!(response.status().is_success(), "{}", response.status());
         assert!(forwarded.lock().unwrap().is_empty());
-    }
-
-    /// What the fake Restate ingress saw for one `/restate/send` request.
-    struct ForwardedSend {
-        path: String,
-        idempotency_key: Option<String>,
-        body: Bytes,
-    }
-
-    /// Serves a stand-in for the Restate ingress that accepts every send and
-    /// records what it was asked to enqueue.
-    async fn fake_restate_ingress() -> (RestateIngress, Arc<Mutex<Vec<ForwardedSend>>>) {
-        let forwarded = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Arc::clone(&forwarded);
-        let router = axum::Router::new().fallback(
-            move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
-                let recorder = Arc::clone(&recorder);
-                async move {
-                    recorder.lock().unwrap().push(ForwardedSend {
-                        path: uri.path().to_owned(),
-                        idempotency_key: headers
-                            .get("idempotency-key")
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_owned),
-                        body,
-                    });
-                    axum::Json(serde_json::json!({
-                        "invocationId": "inv_1aiqX0vFEFNH1Umgre58JiCLgHfTtztYK5",
-                        "status": "Accepted"
-                    }))
-                }
-            },
-        );
-        let address = serve(router).await;
-        (ingress_at(address), forwarded)
     }
 
     /// Posts a delivery the way GitHub does: signed, typed, and identified.

@@ -279,7 +279,7 @@ Open <http://127.0.0.1:8081> and sign in with `DASHBOARD_USERNAME` and `DASHBOAR
 
 The startup scheduler performs the first installation reconciliation and creates `data/dependaboard.db`. The dashboard may take a few seconds to populate. If the selected repositories have no open Dependabot pull requests, an empty dashboard is expected.
 
-The public tunnel now forwards GitHub requests to the same web server. The dashboard and generated server functions require Basic Auth; `/api/webhooks/github` is outside that layer and instead requires GitHub's HMAC signature.
+The public tunnel now forwards GitHub requests to the same web server. The dashboard and generated server functions require Basic Auth, and a server function that changes state is refused when the browser says the request came from another site (`Sec-Fetch-Site`, or `Origin` against `Host` where the browser sends no fetch metadata; a reverse proxy in front of the server must pass the browser's `Host` through for that fallback to hold); `/api/webhooks/github` is outside that layer and instead requires GitHub's HMAC signature.
 
 For live CSS changes, run `npm run css:watch` in another terminal.
 
@@ -461,7 +461,7 @@ Never edit a migration that has shipped; add a new one instead. `0001_initial.sq
 | Variable | Used by | Purpose |
 |---|---|---|
 | `GITHUB_APP_ID` | Restate service | Numeric GitHub App ID |
-| `GITHUB_INSTALLATION_ID` | Both | Installation to reconcile; required at startup, and the web app refuses a per-PR sync for any other installation |
+| `GITHUB_INSTALLATION_ID` | Both | Installation to reconcile; required at startup, and the web app refuses a per-PR sync or a batch target for any other installation |
 | `GITHUB_PRIVATE_KEY` / `GITHUB_PRIVATE_KEY_PATH` | Restate service | RS256 App private key value or absolute PEM path |
 | `GITHUB_USER_PAT` | Restate service | User identity for `@dependabot rebase` comments |
 | `GITHUB_MERGE_METHOD` | Restate service | Preferred merge method: `merge`, `squash` (default), or `rebase`; a repository that disallows it is merged with the first allowed of squash, merge, rebase |

@@ -676,6 +676,35 @@ impl PrTarget {
     }
 }
 
+/// A target as the browser submits it: the pull request, and the head the
+/// user saw when they decided. That is all the browser gets a say in. The
+/// rest of a [`PrTarget`] — whose repository it is, what it is called, where
+/// it links — the web API fills in from the projection, so a batch and the
+/// record it leaves for audit carry the dashboard's word on the target, not
+/// the client's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmittedTarget {
+    pub repository_id: u64,
+    pub number: u64,
+    pub expected_sha: String,
+}
+
+impl SubmittedTarget {
+    pub fn key(&self) -> PrKey {
+        PrKey::new(self.repository_id, self.number)
+    }
+}
+
+impl From<&PrTarget> for SubmittedTarget {
+    fn from(target: &PrTarget) -> Self {
+        Self {
+            repository_id: target.repository_id,
+            number: target.number,
+            expected_sha: target.expected_sha.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BulkRequest {
     pub action: BulkActionKind,
@@ -688,18 +717,29 @@ impl BulkRequest {
     /// asking Restate, and the workflow checks it again on its way in, so a batch that
     /// reaches Restate by another route is held to the same rules.
     pub fn validate(&self, batch_id: &str) -> Result<(), InvalidBatch> {
-        if !valid_batch_id(batch_id) {
-            return Err(InvalidBatch::BatchId);
-        }
-        if self.targets.is_empty() || self.targets.len() > MAX_BATCH_TARGETS {
-            return Err(InvalidBatch::TargetCount);
-        }
-        let mut keys = BTreeSet::new();
-        if self.targets.iter().any(|target| !keys.insert(target.key())) {
-            return Err(InvalidBatch::DuplicateTargets);
-        }
-        Ok(())
+        validate_batch(batch_id, self.targets.iter().map(PrTarget::key))
     }
+}
+
+/// Whether pull requests `keys` may run as batch `batch_id`: the id is a UUIDv7, the
+/// count is within bounds, and no pull request is named twice. Takes the keys alone so
+/// the web API can hold a submission to the rules before it resolves a single target.
+pub fn validate_batch(
+    batch_id: &str,
+    keys: impl IntoIterator<Item = PrKey>,
+) -> Result<(), InvalidBatch> {
+    if !valid_batch_id(batch_id) {
+        return Err(InvalidBatch::BatchId);
+    }
+    let keys: Vec<PrKey> = keys.into_iter().collect();
+    if keys.is_empty() || keys.len() > MAX_BATCH_TARGETS {
+        return Err(InvalidBatch::TargetCount);
+    }
+    let mut seen = BTreeSet::new();
+    if keys.iter().any(|key| !seen.insert(key)) {
+        return Err(InvalidBatch::DuplicateTargets);
+    }
+    Ok(())
 }
 
 /// Why a batch request cannot run. Each message is meant for the user who submitted it.

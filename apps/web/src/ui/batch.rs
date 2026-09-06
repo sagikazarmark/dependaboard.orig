@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use dependaboard_core::{BatchProgress, BulkActionKind, PrTarget};
+use dependaboard_core::{BatchProgress, BulkActionKind, PrTarget, SubmittedTarget};
 
 use crate::api::{load_batch_progress, submit_batch};
 use crate::ui::{POLL_INTERVAL, sleep, user_facing};
@@ -30,7 +30,10 @@ pub(crate) trait BatchGateway {
     async fn tick(&mut self);
 }
 
-/// One batch, driven through the server functions.
+/// One batch, driven through the server functions. The targets are kept in
+/// full so the drawer can show them before the first progress arrives; the
+/// server is sent only what it takes the browser's word on, the key and the
+/// head the user saw.
 pub(crate) struct ServerBatch {
     pub(crate) batch_id: String,
     pub(crate) action: BulkActionKind,
@@ -39,7 +42,8 @@ pub(crate) struct ServerBatch {
 
 impl BatchGateway for ServerBatch {
     async fn submit(&mut self) -> Result<(), String> {
-        submit_batch(self.batch_id.clone(), self.action, self.targets.clone())
+        let targets = self.targets.iter().map(SubmittedTarget::from).collect();
+        submit_batch(self.batch_id.clone(), self.action, targets)
             .await
             .map_err(|error| user_facing(&error))
     }

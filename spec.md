@@ -582,6 +582,9 @@ matching               the selection is resolved server side, newest update firs
                        rows so the UI can say when the filter matched more than it took
 
 Bulk action       UI → server fn → Restate ingress
+                       the UI names each target by key and the head SHA it saw; the
+                       server fn resolves the rest — repository, title, link — from
+                       PrStore::get_pr and refuses a target of another installation
                        POST /restate/send/BulkAction/{batch_id}/run
                      → workflow fans out to PullRequest objects
                      → objects call GitHub API, write through to PrStore

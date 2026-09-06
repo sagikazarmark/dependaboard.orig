@@ -9,8 +9,8 @@ use secrecy::SecretString;
 pub(crate) struct Config {
     pub(crate) credentials: Credentials,
     pub(crate) webhook_secret: SecretString,
-    /// The installation the dashboard is bound to; a per-PR sync is refused
-    /// for any other.
+    /// The installation the dashboard is bound to; a per-PR sync or a batch
+    /// target from any other is refused.
     pub(crate) installation_id: u64,
     pub(crate) restate: RestateConfig,
 }
