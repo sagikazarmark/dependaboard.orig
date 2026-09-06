@@ -11,18 +11,20 @@ use std::{collections::BTreeMap, sync::Mutex};
 use async_trait::async_trait;
 use dependaboard_core::{
     BatchRecord, DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord,
-    ProjectionRevision, RepoRecord,
+    ProjectionRevision, RepoRecord, Retirement,
 };
 use dependaboard_store::{PrStore, StoreError};
 
 /// Rows keyed the way the schema keys them: pull requests by `(repository_id, number)`
-/// (the `id` column is derived from that pair), repositories by id, batches by batch id.
+/// (the `id` column is derived from that pair), repositories by id, batches by batch id,
+/// retirements by an id that only grows.
 ///
 /// What the schema enforces, this enforces: a pull request needs its repository's row
 /// first (libSQL rejects the foreign key; this panics, since only a test can get it wrong),
 /// deleting a repository takes its pull requests with it, a pull request reads back
-/// with its repository's `installation_id`, as the store's `JOIN` gives it, and a batch
-/// recorded twice keeps its first record. What the service never asks of the store, the
+/// with its repository's `installation_id`, as the store's `JOIN` gives it, a batch
+/// recorded twice keeps its first record, and every prune queues the keys it removed
+/// for retirement under its fence. What the service never asks of the store, the
 /// dashboard listing, its summary, the revision counters, and the recent batches, is not
 /// implemented and panics if called.
 #[derive(Default)]
@@ -35,6 +37,9 @@ struct Tables {
     pull_requests: BTreeMap<(u64, u64), PrRecord>,
     repositories: BTreeMap<u64, RepoRecord>,
     batches: BTreeMap<String, BatchRecord>,
+    retirements: BTreeMap<u64, Retirement>,
+    /// The last retirement id handed out; like `AUTOINCREMENT`, never reused.
+    last_retirement_id: u64,
 }
 
 impl Tables {
@@ -48,8 +53,9 @@ impl Tables {
         }
     }
 
-    /// Drops the pull requests of `repository_ids`; resolves to their keys in key order.
-    fn cascade(&mut self, repository_ids: &[u64]) -> Vec<PrKey> {
+    /// Drops the pull requests of `repository_ids` and queues them for retirement under
+    /// `synced_before`; resolves to their keys in key order.
+    fn cascade(&mut self, repository_ids: &[u64], synced_before: Option<u64>) -> Vec<PrKey> {
         let purged = self
             .pull_requests
             .keys()
@@ -59,10 +65,28 @@ impl Tables {
         for key in &purged {
             self.pull_requests.remove(key);
         }
-        purged
+        let purged = purged
             .into_iter()
             .map(|(repository_id, number)| PrKey::new(repository_id, number))
-            .collect()
+            .collect::<Vec<_>>();
+        self.queue_retirements(&purged, synced_before);
+        purged
+    }
+
+    /// Queues `keys` for retirement under `synced_before`, as the store does in the
+    /// transaction that deleted them.
+    fn queue_retirements(&mut self, keys: &[PrKey], synced_before: Option<u64>) {
+        for key in keys {
+            self.last_retirement_id += 1;
+            self.retirements.insert(
+                self.last_retirement_id,
+                Retirement {
+                    id: self.last_retirement_id,
+                    key: key.clone(),
+                    synced_before,
+                },
+            );
+        }
     }
 
     /// Drops the installation's stale repositories and their pull requests, as the
@@ -86,7 +110,7 @@ impl Tables {
         for repository_id in &stale {
             self.repositories.remove(repository_id);
         }
-        self.cascade(&stale)
+        self.cascade(&stale, Some(synced_before))
     }
 }
 
@@ -144,10 +168,12 @@ impl PrStore for MemoryPrStore {
         for key in &stale {
             tables.pull_requests.remove(key);
         }
-        Ok(stale
+        let stale = stale
             .into_iter()
             .map(|(repository_id, number)| PrKey::new(repository_id, number))
-            .collect())
+            .collect::<Vec<_>>();
+        tables.queue_retirements(&stale, Some(synced_before));
+        Ok(stale)
     }
 
     async fn list_prs(&self, _filter: &PrFilter, _page: Page) -> Result<DashboardPage, StoreError> {
@@ -239,11 +265,31 @@ impl PrStore for MemoryPrStore {
             .filter(|repository| repository.installation_id == installation_id)
             .map(|repository| repository.repository_id)
             .collect::<Vec<_>>();
-        let purged = tables.cascade(&repositories);
+        let purged = tables.cascade(&repositories, None);
         for repository_id in &repositories {
             tables.repositories.remove(repository_id);
         }
         Ok(purged)
+    }
+
+    async fn pending_retirements(&self) -> Result<Vec<Retirement>, StoreError> {
+        Ok(self
+            .tables
+            .lock()
+            .unwrap()
+            .retirements
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn acknowledge_retirements(&self, through: u64) -> Result<(), StoreError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .retirements
+            .retain(|id, _| *id > through);
+        Ok(())
     }
 
     async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError> {
@@ -385,5 +431,46 @@ mod tests {
             "the repository that stayed carries the fresh listing"
         );
         assert!(store.get_pr(&PrKey::new(8, 1)).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn every_prune_queues_what_it_removed_with_its_fence_until_acknowledged() {
+        let store = MemoryPrStore::default();
+        store.upsert_repo(&repository()).await.unwrap();
+        store
+            .upsert_repo(&RepoRecord {
+                repository_id: 8,
+                ..repository()
+            })
+            .await
+            .unwrap();
+        store.upsert_pr(&pull(7, 1, 0)).await.unwrap();
+        store.upsert_pr(&pull(7, 2, 0)).await.unwrap();
+        store.upsert_pr(&pull(8, 1, 0)).await.unwrap();
+
+        store.retain_prs(7, &[2], 500).await.unwrap();
+        let read = store.pending_retirements().await.unwrap();
+        store.purge_installation(1).await.unwrap();
+
+        assert_eq!(
+            read.iter()
+                .map(|retirement| (retirement.key.clone(), retirement.synced_before))
+                .collect::<Vec<_>>(),
+            vec![(PrKey::new(7, 1), Some(500))]
+        );
+        store
+            .acknowledge_retirements(read.last().unwrap().id)
+            .await
+            .unwrap();
+        let pending = store.pending_retirements().await.unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|retirement| (retirement.key.clone(), retirement.synced_before))
+                .collect::<Vec<_>>(),
+            vec![(PrKey::new(7, 2), None), (PrKey::new(8, 1), None)],
+            "the purge's unfenced retirements were queued after the read and survive its acknowledgement"
+        );
+        assert!(pending.iter().all(|retirement| retirement.id > read[0].id));
     }
 }

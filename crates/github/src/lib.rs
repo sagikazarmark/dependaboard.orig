@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, fs, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use dependaboard_core::{
@@ -24,6 +29,8 @@ mod graphql;
 
 const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "dependaboard/0.1";
+/// GitHub's largest page for the listings paged here.
+const LISTING_PAGE_SIZE: usize = 100;
 
 #[derive(Clone)]
 pub struct GithubConfig {
@@ -500,7 +507,7 @@ impl GithubClient {
                 self.installation_request(
                     self.config.installation_id,
                     Method::GET,
-                    &format!("{path}?per_page=100&page={page}"),
+                    &format!("{path}?per_page={LISTING_PAGE_SIZE}&page={page}"),
                     None,
                 )
                 .await?,
@@ -512,7 +519,7 @@ impl GithubClient {
             {
                 return Ok(Some(comment.id));
             }
-            if comments.len() < 100 {
+            if comments.len() < LISTING_PAGE_SIZE {
                 return Ok(None);
             }
             page += 1;
@@ -742,16 +749,30 @@ impl GithubApi for GithubClient {
     async fn list_installation_repositories(&self) -> Result<Vec<RepoRecord>, GithubError> {
         let mut page = 1;
         let mut repositories = Vec::new();
+        let mut total_count = None;
         let synced_at = unix_seconds();
-        loop {
+        let total = loop {
             let response: InstallationRepositories = self
                 .installation_json(
                     self.config.installation_id,
                     Method::GET,
-                    &format!("/installation/repositories?per_page=100&page={page}"),
+                    &format!("/installation/repositories?per_page={LISTING_PAGE_SIZE}&page={page}"),
                     None,
                 )
                 .await?;
+            // Every page reports the installation's total as of that page. One that
+            // disagrees with the first means a repository joined or left in between, and
+            // offset pagination cannot say which item the boundary shift dropped.
+            let total = *total_count.get_or_insert(response.total_count);
+            if response.total_count != total {
+                return Err(GithubError::Shifted {
+                    listing: "installation repositories",
+                    detail: format!(
+                        "the total moved from {total} to {} between pages",
+                        response.total_count
+                    ),
+                });
+            }
             let count = response.repositories.len();
             repositories.extend(response.repositories.into_iter().map(|repo| {
                 RepoRecord {
@@ -765,10 +786,23 @@ impl GithubApi for GithubClient {
                     synced_at,
                 }
             }));
-            if count < 100 {
-                break;
+            if count < LISTING_PAGE_SIZE || repositories.len() >= total {
+                break total;
             }
             page += 1;
+        };
+        // A boundary that shifted without moving the total shows as a repository listed
+        // twice where another was never listed: the distinct ids fall short of the total.
+        let mut seen = HashSet::new();
+        repositories.retain(|repository| seen.insert(repository.repository_id));
+        if repositories.len() != total {
+            return Err(GithubError::Shifted {
+                listing: "installation repositories",
+                detail: format!(
+                    "{} distinct repositories were listed against a total of {total}",
+                    repositories.len()
+                ),
+            });
         }
         Ok(repositories)
     }
@@ -786,7 +820,9 @@ impl GithubApi for GithubClient {
                 .installation_json(
                     self.config.installation_id,
                     Method::GET,
-                    &format!("/repos/{owner}/{repo}/pulls?state=open&per_page=100&page={page}"),
+                    &format!(
+                        "/repos/{owner}/{repo}/pulls?state=open&per_page={LISTING_PAGE_SIZE}&page={page}"
+                    ),
                     None,
                 )
                 .await?;
@@ -804,7 +840,7 @@ impl GithubApi for GithubClient {
                         completion_id: None,
                     }),
             );
-            if count < 100 {
+            if count < LISTING_PAGE_SIZE {
                 break;
             }
             page += 1;
@@ -1066,6 +1102,15 @@ pub enum GithubError {
     Config(String),
     #[error("pull request head changed from {expected} to {actual}")]
     StaleSha { expected: String, actual: String },
+    /// A paged listing moved under its own pages: the total GitHub reports changed
+    /// between them, or the pages did not add up to it. Offset pagination cannot say
+    /// which item a boundary shift dropped, so the set fetched must not be treated as
+    /// authoritative. Safe to retry: a fresh listing starts over from the first page.
+    #[error("GitHub {listing} listing shifted while it was being paged: {detail}")]
+    Shifted {
+        listing: &'static str,
+        detail: String,
+    },
 }
 
 /// Why a successful GitHub answer could not be read.
@@ -1117,8 +1162,12 @@ struct GithubPull {
     merged: bool,
 }
 
+/// One page of `GET /installation/repositories`: the page's repositories beside how many
+/// the installation has in all, which is what lets a listing notice it moved under its
+/// own pages.
 #[derive(Debug, Deserialize)]
 struct InstallationRepositories {
+    total_count: usize,
     repositories: Vec<GithubRepository>,
 }
 

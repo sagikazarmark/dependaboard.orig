@@ -384,7 +384,7 @@ The Compose file fixes `RESTATE_NODE_NAME=dependaboard` so the current project's
 - `apps/restate-service`: Restate virtual objects and workflows. GitHub and libSQL side effects are journaled with `ctx.run`.
 - `crates/core`: shared domain contracts, dependency parsing, check rollups, and GitHub error classification. Dependabot metadata parsing is behind the opt-in `dependabot-metadata` feature so the browser bundle's dependency graph stays free of `regex`, `semver`, and `serde_norway`; only `crates/github` enables it.
 - `crates/github`: GitHub App JWT/token handling, canonical PR reads, merge calls, and idempotent user-authored Dependabot commands. A pull request snapshot is one GraphQL query (it was five or more REST requests: pull request, head commit, paginated check runs, paginated check suites, combined status); only a commit with more than a hundred check contexts or suites costs a further request per extra page. Mutations and installation listing stay on REST.
-- `crates/store`: local or remote libSQL projection behind `PrStore`: the pull requests and repositories the dashboard queries, and the finished batches it lists for audit.
+- `crates/store`: local or remote libSQL projection behind `PrStore`: the pull requests and repositories the dashboard queries, the finished batches it lists for audit, and the retirement outbox — the pull requests a reconciliation prune has removed whose Restate objects have not yet been told, written in the prune's own transaction so a step whose result Restate lost is still made good by the next drain.
 
 Restate owns in-flight truth and retries. libSQL is the cross-PR query model used by the dashboard. The browser never calls Restate directly.
 

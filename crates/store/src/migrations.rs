@@ -53,6 +53,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "pull_request_revision",
         sql: include_str!("../../../migrations/0007_pull_request_revision.sql"),
     },
+    Migration {
+        version: 8,
+        name: "pull_request_retirements",
+        sql: include_str!("../../../migrations/0008_pull_request_retirements.sql"),
+    },
 ];
 
 const CREATE_SCHEMA_MIGRATIONS: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (

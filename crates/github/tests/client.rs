@@ -82,7 +82,7 @@ fn repositories_endpoint(token: &str) -> MockBuilder {
 }
 
 fn no_repositories() -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_json(json!({ "repositories": [] }))
+    ResponseTemplate::new(200).set_body_json(json!({ "total_count": 0, "repositories": [] }))
 }
 
 fn rfc3339_in(seconds: i64) -> String {
@@ -237,6 +237,35 @@ fn repository(id: u64) -> Value {
     json!({ "id": id, "name": format!("repo-{id}"), "owner": { "login": OWNER } })
 }
 
+/// One page of `GET /installation/repositories`, as GitHub shapes it: the page's
+/// repositories beside the installation's total.
+fn repositories_page(total_count: usize, repositories: Vec<Value>) -> ResponseTemplate {
+    ResponseTemplate::new(200).set_body_json(json!({
+        "total_count": total_count,
+        "repositories": repositories,
+    }))
+}
+
+/// Mounts page `page` of the repository listing, expected to be fetched exactly once.
+async fn mount_repositories_page(
+    server: &MockServer,
+    page: usize,
+    total_count: usize,
+    ids: impl IntoIterator<Item = u64>,
+) {
+    Mock::given(method("GET"))
+        .and(path("/installation/repositories"))
+        .and(query_param("per_page", "100"))
+        .and(query_param("page", page.to_string()))
+        .respond_with(repositories_page(
+            total_count,
+            ids.into_iter().map(repository).collect(),
+        ))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
 fn pull_list_item(number: u64, login: &str) -> Value {
     json!({ "number": number, "user": { "login": login } })
 }
@@ -245,19 +274,8 @@ fn pull_list_item(number: u64, login: &str) -> Value {
 async fn repository_listing_stops_after_the_first_short_page() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    let pages = [(1..=100).collect::<Vec<u64>>(), (101..=103).collect()];
-    for (index, ids) in pages.iter().enumerate() {
-        Mock::given(method("GET"))
-            .and(path("/installation/repositories"))
-            .and(query_param("per_page", "100"))
-            .and(query_param("page", (index + 1).to_string()))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "repositories": ids.iter().map(|id| repository(*id)).collect::<Vec<_>>()
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-    }
+    mount_repositories_page(&server, 1, 103, 1..=100).await;
+    mount_repositories_page(&server, 2, 103, 101..=103).await;
 
     let repositories = client(&server)
         .list_installation_repositories()
@@ -274,6 +292,71 @@ async fn repository_listing_stops_after_the_first_short_page() {
         request_count(&server, "GET", "/installation/repositories").await,
         2,
         "no request is made for a third page"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn repository_listing_fails_retryably_when_a_repository_leaves_between_pages() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    // Repository 50 is removed from the installation after the first page is served, so
+    // the second page starts one position early: 101 is never listed, and the total
+    // GitHub reports has moved. Offset pagination cannot say which one went.
+    mount_repositories_page(&server, 1, 150, 1..=100).await;
+    mount_repositories_page(&server, 2, 149, 102..=150).await;
+
+    let error = client(&server)
+        .list_installation_repositories()
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, GithubError::Shifted { .. }),
+        "a listing that moved under its pages is not an authoritative set: {error:?}"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn repository_listing_fails_retryably_when_the_pages_do_not_add_up_to_the_total() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    // One repository leaves the tail and another joins the head between the pages: the
+    // total stands, but the page boundary shifted and repository 100 is listed twice while
+    // the newcomer, sorted before it, is never seen.
+    mount_repositories_page(&server, 1, 101, 1..=100).await;
+    mount_repositories_page(&server, 2, 101, [100]).await;
+
+    let error = client(&server)
+        .list_installation_repositories()
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, GithubError::Shifted { .. }),
+        "a duplicate at the boundary means something else was dropped: {error:?}"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn repository_listing_stops_once_the_total_is_reached() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    mount_repositories_page(&server, 1, 200, 1..=100).await;
+    mount_repositories_page(&server, 2, 200, 101..=200).await;
+
+    let repositories = client(&server)
+        .list_installation_repositories()
+        .await
+        .unwrap();
+
+    assert_eq!(repositories.len(), 200);
+    assert_eq!(
+        request_count(&server, "GET", "/installation/repositories").await,
+        2,
+        "the total says there is no third page to ask for"
     );
     server.verify().await;
 }
@@ -385,8 +468,9 @@ async fn repository_listing_resolves_a_method_only_where_the_preferred_one_is_di
     mount_token(&server).await;
     // The client is configured to prefer squash.
     repositories_endpoint(TOKEN)
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "repositories": [
+        .respond_with(repositories_page(
+            6,
+            vec![
                 // Squash allowed: the preference stands, no override recorded.
                 repository_allowing(1, Some(true), Some(false), Some(false)),
                 // Squash disallowed: the first allowed of squash, merge, rebase.
@@ -397,8 +481,8 @@ async fn repository_listing_resolves_a_method_only_where_the_preferred_one_is_di
                 repository_allowing(5, Some(false), None, Some(false)),
                 // Nothing allowed: nothing to resolve to; GitHub gets the preference.
                 repository_allowing(6, Some(false), Some(false), Some(false)),
-            ]
-        })))
+            ],
+        ))
         .mount(&server)
         .await;
 
@@ -428,12 +512,13 @@ async fn repository_listing_honours_a_non_default_preference() {
     let server = MockServer::start().await;
     mount_token(&server).await;
     repositories_endpoint(TOKEN)
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "repositories": [
+        .respond_with(repositories_page(
+            2,
+            vec![
                 repository_allowing(1, Some(true), Some(true), Some(false)),
                 repository_allowing(2, Some(true), Some(true), Some(true)),
-            ]
-        })))
+            ],
+        ))
         .mount(&server)
         .await;
     let config = GithubConfig {

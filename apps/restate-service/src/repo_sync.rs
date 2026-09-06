@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use dependaboard_core::{Operation, PrKey, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds};
+use dependaboard_core::{Operation, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds};
 use dependaboard_store::PrStore;
 use restate_sdk::prelude::*;
 use tracing::warn;
@@ -11,7 +11,8 @@ use tracing::warn;
 use crate::{
     github::{GithubApiHandle, RestateGithubStep, read_result, run_github_step},
     handler::traced,
-    pull_request::{ClosedRequest, PullRequestClient, close_pull_request, request_key, short_sha},
+    pull_request::{PullRequestClient, request_key, short_sha},
+    retirement::{RestateRetirements, RetirementEffects, retire_pending},
     store::{store_failure, store_retry_policy},
 };
 
@@ -28,15 +29,13 @@ trait RepoReconcileEffects {
         &mut self,
         request: &SyncRequest,
     ) -> impl Future<Output = Result<(), TerminalError>> + Send;
-    /// Prunes the projection down to `live`; resolves to the keys it removed.
+    /// Prunes the projection down to `live`. The keys it removes are queued for
+    /// retirement by the store, fenced by the sweep's start; the drain that follows tells
+    /// them, so nothing here depends on what this step returns.
     fn retain_pull_requests(
         &mut self,
         live: &[u64],
-    ) -> impl Future<Output = HandlerResult<Vec<PrKey>>> + Send;
-    /// Retires the pull request's durable state, so its object stops serving a snapshot
-    /// the projection no longer has. Fenced by the sweep's start: a pull request synced
-    /// since then was reopened behind the sweep's back and keeps its state.
-    fn close_pull_request(&mut self, key: &PrKey);
+    ) -> impl Future<Output = HandlerResult<()>> + Send;
 }
 
 struct RestateReconcileEffects<'a, 'ctx> {
@@ -85,46 +84,38 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
             .await
     }
 
-    async fn retain_pull_requests(&mut self, live: &[u64]) -> HandlerResult<Vec<PrKey>> {
+    async fn retain_pull_requests(&mut self, live: &[u64]) -> HandlerResult<()> {
         let store = self.store.clone();
         let repository_id = self.repository_id();
         let reconcile_start = self.reconcile_start;
         let live = live.to_vec();
-        let pruned = self
-            .ctx
+        self.ctx
             .run(move || async move {
-                Ok(Json::from(
-                    store
-                        .retain_prs(repository_id, &live, reconcile_start)
-                        .await
-                        .map_err(store_failure)?,
-                ))
+                store
+                    .retain_prs(repository_id, &live, reconcile_start)
+                    .await
+                    .map_err(store_failure)?;
+                Ok(())
             })
             .retry_policy(store_retry_policy())
             .name("retain-live-pull-requests")
             .await?;
-        Ok(pruned.into_inner())
-    }
-
-    fn close_pull_request(&mut self, key: &PrKey) {
-        close_pull_request(
-            self.ctx,
-            key,
-            ClosedRequest {
-                synced_before: Some(self.reconcile_start),
-            },
-        );
+        Ok(())
     }
 }
 
 /// Sweeps every listed pull request, prunes the projection down to the listing, then
-/// retires the durable state of every pull request that pruning removed.
+/// retires the durable state of every pull request the outbox holds — those pruning
+/// removed just now, and any an earlier prune removed without getting to tell.
 ///
 /// A pull request that fails terminally is logged and remembered rather than propagated,
 /// so one unsyncable pull request can neither starve the rest of the repository nor skip
 /// stale-row cleanup. Retention still requires a complete listing: if listing fails, the
 /// live set is unknown and nothing is deleted. Resolves to how many pull requests synced.
-async fn run_repo_reconcile<E: RepoReconcileEffects>(restate: &mut E) -> HandlerResult<usize> {
+async fn run_repo_reconcile<E: RepoReconcileEffects, R: RetirementEffects>(
+    restate: &mut E,
+    retirements: &mut R,
+) -> HandlerResult<usize> {
     let pulls = restate.list_pull_requests().await?;
     let mut failed = Vec::new();
     for request in &pulls {
@@ -143,10 +134,8 @@ async fn run_repo_reconcile<E: RepoReconcileEffects>(restate: &mut E) -> Handler
         .iter()
         .map(|request| request.number)
         .collect::<Vec<_>>();
-    let pruned = restate.retain_pull_requests(&live).await?;
-    for key in &pruned {
-        restate.close_pull_request(key);
-    }
+    restate.retain_pull_requests(&live).await?;
+    retire_pending(retirements).await?;
     if failed.is_empty() {
         return Ok(pulls.len());
     }
@@ -191,7 +180,11 @@ impl RepoSync {
                 repository,
                 reconcile_start,
             };
-            let pull_requests = run_repo_reconcile(&mut restate).await?;
+            let mut retirements = RestateRetirements {
+                ctx: &ctx,
+                store: &self.store,
+            };
+            let pull_requests = run_repo_reconcile(&mut restate, &mut retirements).await?;
             Ok(format!("synced {pull_requests} pull requests"))
         })
         .await
@@ -255,7 +248,10 @@ impl RepoSync {
 mod tests {
     use std::collections::BTreeMap;
 
+    use dependaboard_core::PrKey;
+
     use super::*;
+    use crate::{pull_request::ClosedRequest, test_support::RecordedRetirements};
 
     fn dependabot_pull(number: u64) -> SyncRequest {
         SyncRequest {
@@ -275,11 +271,8 @@ mod tests {
         pulls: Vec<SyncRequest>,
         listing_failure: Option<HandlerError>,
         sync_failures: BTreeMap<u64, TerminalError>,
-        /// What the projection reports pruning when retention runs.
-        pruned: Vec<PrKey>,
         synced: Vec<u64>,
         retained: Option<Vec<u64>>,
-        closed: Vec<PrKey>,
     }
 
     impl RepoReconcileEffects for RecordedRepoSync {
@@ -302,32 +295,48 @@ mod tests {
             }
         }
 
-        async fn retain_pull_requests(&mut self, live: &[u64]) -> HandlerResult<Vec<PrKey>> {
+        async fn retain_pull_requests(&mut self, live: &[u64]) -> HandlerResult<()> {
             self.retained = Some(live.to_vec());
-            Ok(self.pruned.clone())
-        }
-
-        fn close_pull_request(&mut self, key: &PrKey) {
-            self.closed.push(key.clone());
+            Ok(())
         }
     }
 
     #[tokio::test]
-    async fn every_pruned_pull_request_has_its_durable_state_closed() {
+    async fn every_pruned_pull_request_has_its_durable_state_closed_under_the_sweeps_fence() {
         let mut restate = RecordedRepoSync {
             pulls: vec![dependabot_pull(12)],
-            pruned: vec![PrKey::new(7, 3), PrKey::new(7, 9)],
             ..Default::default()
         };
+        // What the projection queued when it pruned 3 and 9, whether by this run of the
+        // retain or by an earlier attempt whose result never reached the journal.
+        let mut retirements =
+            RecordedRetirements::queued(&[PrKey::new(7, 3), PrKey::new(7, 9)], Some(900));
 
-        run_repo_reconcile(&mut restate).await.unwrap();
+        run_repo_reconcile(&mut restate, &mut retirements)
+            .await
+            .unwrap();
 
         assert_eq!(restate.retained, Some(vec![12]));
         assert_eq!(
-            restate.closed,
-            vec![PrKey::new(7, 3), PrKey::new(7, 9)],
-            "a row pruned from the projection must not keep a snapshot in its object"
+            retirements.closed,
+            vec![
+                (
+                    PrKey::new(7, 3),
+                    ClosedRequest {
+                        synced_before: Some(900)
+                    }
+                ),
+                (
+                    PrKey::new(7, 9),
+                    ClosedRequest {
+                        synced_before: Some(900)
+                    }
+                ),
+            ],
+            "a row pruned from the projection must not keep a snapshot in its object, \
+             unless it was re-synced since the sweep began"
         );
+        assert_eq!(retirements.acknowledged, vec![2]);
     }
 
     #[tokio::test]
@@ -342,11 +351,11 @@ mod tests {
                 19,
                 TerminalError::new("GitHub read failed with HTTP 404: Not Found"),
             )]),
-            pruned: vec![PrKey::new(7, 5)],
             ..Default::default()
         };
+        let mut retirements = RecordedRetirements::queued(&[PrKey::new(7, 5)], Some(900));
 
-        let outcome = run_repo_reconcile(&mut restate).await;
+        let outcome = run_repo_reconcile(&mut restate, &mut retirements).await;
 
         assert_eq!(restate.synced, vec![12, 19, 23]);
         assert_eq!(
@@ -355,7 +364,7 @@ mod tests {
             "the failed pull request is still open on GitHub, so its row must survive"
         );
         assert_eq!(
-            restate.closed,
+            retirements.closed_keys(),
             vec![PrKey::new(7, 5)],
             "the pruned pull request's durable state is retired despite the failed sync"
         );
@@ -369,11 +378,11 @@ mod tests {
             listing_failure: Some(
                 TerminalError::new("GitHub read failed with HTTP 401: Bad credentials").into(),
             ),
-            pruned: vec![PrKey::new(7, 3)],
             ..Default::default()
         };
+        let mut retirements = RecordedRetirements::queued(&[PrKey::new(7, 3)], Some(900));
 
-        let outcome = run_repo_reconcile(&mut restate).await;
+        let outcome = run_repo_reconcile(&mut restate, &mut retirements).await;
 
         assert!(outcome.is_err());
         assert!(restate.synced.is_empty());
@@ -382,7 +391,7 @@ mod tests {
             "an unknown live set must not delete anything"
         );
         assert!(
-            restate.closed.is_empty(),
+            retirements.closed.is_empty(),
             "nothing was pruned, so no durable state may be retired"
         );
     }
@@ -408,7 +417,9 @@ mod tests {
             ..Default::default()
         };
 
-        let error = run_repo_reconcile(&mut restate).await.unwrap_err();
+        let error = run_repo_reconcile(&mut restate, &mut RecordedRetirements::default())
+            .await
+            .unwrap_err();
 
         let cause: &dyn std::error::Error = error.as_ref();
         assert_eq!(
@@ -424,7 +435,9 @@ mod tests {
             ..Default::default()
         };
 
-        let synced = run_repo_reconcile(&mut restate).await.unwrap();
+        let synced = run_repo_reconcile(&mut restate, &mut RecordedRetirements::default())
+            .await
+            .unwrap();
 
         assert_eq!(synced, 2);
         assert_eq!(restate.synced, vec![12, 19]);
@@ -435,7 +448,9 @@ mod tests {
     async fn an_empty_listing_still_prunes_the_projection() {
         let mut restate = RecordedRepoSync::default();
 
-        run_repo_reconcile(&mut restate).await.unwrap();
+        run_repo_reconcile(&mut restate, &mut RecordedRetirements::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             restate.retained,

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use dependaboard_core::{
     BatchRecord, BatchTargetRecord, CursorError, DashboardPage, DashboardSummary, FacetCounts,
     LabelFacet, Mergeable, Page, PageCursor, PrFilter, PrKey, PrRecord, ProjectionRevision,
-    RepoFacet, RepoRecord, UserId, unix_seconds,
+    RepoFacet, RepoRecord, Retirement, UserId, unix_seconds,
 };
 use libsql::{Builder, Row, Value};
 use secrecy::{ExposeSecret, SecretString};
@@ -102,9 +102,11 @@ pub trait PrStore: Send + Sync {
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError>;
     async fn delete_pr(&self, key: &PrKey) -> Result<(), StoreError>;
     /// Reconciliation: drops this repository's rows that are not in `live` and
-    /// were synced before the listing started, and reports which ones went so
-    /// the caller can retire their durable state too. The `synced_before`
-    /// guard keeps rows written by concurrent webhook syncs alive.
+    /// were synced before the listing started, and reports which ones went.
+    /// The `synced_before` guard keeps rows written by concurrent webhook
+    /// syncs alive. The same keys are queued for retirement (see
+    /// [`PrStore::pending_retirements`]) in the delete's own transaction, so
+    /// the caller need not trust this call's return value to reach it.
     async fn retain_prs(
         &self,
         repository_id: u64,
@@ -131,7 +133,8 @@ pub trait PrStore: Send + Sync {
     /// Installation reconciliation, in one transaction: upserts every repository in
     /// `repos`, then drops the installation's other repositories that were synced
     /// before the listing started, pull requests and all. Reports the pull requests
-    /// that went with them so the caller can retire their durable state too.
+    /// that went with them; the same keys are queued for retirement under
+    /// `synced_before` as their fence.
     async fn replace_installation_repos(
         &self,
         installation_id: u64,
@@ -140,8 +143,8 @@ pub trait PrStore: Send + Sync {
     ) -> Result<Vec<PrKey>, StoreError>;
     /// Drops the installation's repositories that are not in `live` and were synced
     /// before the listing started, pull requests and all, and reports which pull
-    /// requests went so the caller can retire their durable state too. The
-    /// `synced_before` guard keeps repositories added by concurrent syncs alive.
+    /// requests went; the same keys are queued for retirement under `synced_before`
+    /// as their fence. The guard keeps repositories added by concurrent syncs alive.
     async fn retain_repos(
         &self,
         installation_id: u64,
@@ -149,9 +152,19 @@ pub trait PrStore: Send + Sync {
         synced_before: u64,
     ) -> Result<Vec<PrKey>, StoreError>;
     /// Drops the installation's repositories and their pull requests, and
-    /// reports which pull requests went so the caller can retire their durable
-    /// state too.
+    /// reports which pull requests went; the same keys are queued for
+    /// retirement with no fence, since the App has lost the installation and
+    /// nothing can reopen them.
     async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>, StoreError>;
+    /// Every pull request a prune has removed and not yet acknowledged, oldest
+    /// first. Reading is a step of its own in the sweep, so a prune whose
+    /// result was lost is made good the next time anything drains.
+    async fn pending_retirements(&self) -> Result<Vec<Retirement>, StoreError>;
+    /// Forgets every retirement up to and including `through`, which a
+    /// [`PrStore::pending_retirements`] read returned last. Ids only grow, so
+    /// anything queued since that read stays for the next drain; acknowledging
+    /// again is a no-op.
+    async fn acknowledge_retirements(&self, through: u64) -> Result<(), StoreError>;
     /// Keeps a finished bulk action for the audit view, targets and all. A
     /// batch already recorded is left as it was: Restate may run the recording
     /// step again when the first attempt's result was lost, and the first word
@@ -251,7 +264,10 @@ impl PrStore for LibSqlPrStore {
         synced_before: u64,
     ) -> Result<Vec<PrKey>, StoreError> {
         let connection = self.connection().await;
-        retain_prs_on(&connection, repository_id, live, synced_before).await
+        let transaction = connection.transaction().await?;
+        let pruned = retain_prs_on(&transaction, repository_id, live, synced_before).await?;
+        transaction.commit().await?;
+        Ok(pruned)
     }
 
     async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage, StoreError> {
@@ -400,10 +416,42 @@ impl PrStore for LibSqlPrStore {
             &transaction,
             "installation_id = ?1",
             vec![integer(installation_id)?],
+            None,
         )
         .await?;
         transaction.commit().await?;
         Ok(purged)
+    }
+
+    async fn pending_retirements(&self) -> Result<Vec<Retirement>, StoreError> {
+        let connection = self.connection().await;
+        let mut rows = connection
+            .query(
+                "SELECT id, repository_id, number, synced_before
+                 FROM pull_request_retirements ORDER BY id",
+                (),
+            )
+            .await?;
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next().await? {
+            pending.push(Retirement {
+                id: unsigned(row.get::<i64>(0)?)?,
+                key: PrKey::new(unsigned(row.get::<i64>(1)?)?, unsigned(row.get::<i64>(2)?)?),
+                synced_before: row.get::<Option<i64>>(3)?.map(unsigned).transpose()?,
+            });
+        }
+        Ok(pending)
+    }
+
+    async fn acknowledge_retirements(&self, through: u64) -> Result<(), StoreError> {
+        self.connection()
+            .await
+            .execute(
+                "DELETE FROM pull_request_retirements WHERE id <= ?1",
+                vec![integer(through)?],
+            )
+            .await?;
+        Ok(())
     }
 
     async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError> {
@@ -807,6 +855,9 @@ async fn upsert_repo_on(
     Ok(())
 }
 
+/// Prunes one repository's pull requests down to `live`, reporting the keys it removed
+/// and queueing them for retirement under `synced_before`. Two statements, so run it
+/// inside a transaction: the queue must land with the delete or not at all.
 async fn retain_prs_on(
     connection: &libsql::Connection,
     repository_id: u64,
@@ -835,7 +886,36 @@ async fn retain_prs_on(
             params,
         )
         .await?;
-    deleted_pr_keys(rows).await
+    let pruned = deleted_pr_keys(rows).await?;
+    queue_retirements(connection, &pruned, Some(synced_before)).await?;
+    Ok(pruned)
+}
+
+/// Queues `keys` in the retirement outbox under `synced_before` as their fence, one
+/// row each, in key order. Run it in the transaction that deleted them.
+async fn queue_retirements(
+    connection: &libsql::Connection,
+    keys: &[PrKey],
+    synced_before: Option<u64>,
+) -> Result<(), StoreError> {
+    let fence = match synced_before {
+        Some(synced_before) => integer(synced_before)?,
+        None => Value::Null,
+    };
+    for key in keys {
+        connection
+            .execute(
+                "INSERT INTO pull_request_retirements (repository_id, number, synced_before)
+                 VALUES (?1, ?2, ?3)",
+                vec![
+                    integer(key.repository_id)?,
+                    integer(key.number)?,
+                    fence.clone(),
+                ],
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 /// Collects a `DELETE ... RETURNING repository_id, number` over `pull_requests`
@@ -855,8 +935,9 @@ async fn deleted_pr_keys(mut rows: libsql::Rows) -> Result<Vec<PrKey>, StoreErro
 }
 
 /// Drops the installation's repositories that are not in `live` and were synced before
-/// `synced_before`, and reports the pull requests that went with them. Run it inside a
-/// transaction; see `delete_repositories_where`.
+/// `synced_before`, and reports the pull requests that went with them, queued for
+/// retirement under that fence. Run it inside a transaction; see
+/// `delete_repositories_where`.
 async fn retain_repos_on(
     connection: &libsql::Connection,
     installation_id: u64,
@@ -881,19 +962,22 @@ async fn retain_repos_on(
         connection,
         &format!("installation_id = ?1 AND synced_at < ?2{live_clause}"),
         params,
+        Some(synced_before),
     )
     .await
 }
 
 /// Drops the repositories `predicate` selects (a `WHERE` clause over `repositories`,
-/// bound to `params`) and reports the pull requests that went with them, in key order.
-/// Two statements over one predicate, so run it inside a transaction: the repository
-/// delete would cascade anyway; deleting the pull requests first is what lets
-/// `RETURNING` report them.
+/// bound to `params`) and reports the pull requests that went with them, in key order,
+/// queued for retirement under `synced_before` as their fence. Three statements over
+/// one predicate, so run it inside a transaction: the repository delete would cascade
+/// anyway; deleting the pull requests first is what lets `RETURNING` report them, and
+/// the queue must land with the delete or not at all.
 async fn delete_repositories_where(
     connection: &libsql::Connection,
     predicate: &str,
     params: Vec<Value>,
+    synced_before: Option<u64>,
 ) -> Result<Vec<PrKey>, StoreError> {
     let rows = connection
         .query(
@@ -912,6 +996,7 @@ async fn delete_repositories_where(
             params,
         )
         .await?;
+    queue_retirements(connection, &cascaded, synced_before).await?;
     Ok(cascaded)
 }
 
@@ -2040,6 +2125,120 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3],
             "only the other installation's repository survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prune_whose_result_is_lost_still_leaves_its_retirements_pending() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 4, 10)).await.unwrap();
+
+        let pruned = store.retain_prs(1, &[], 20).await.unwrap();
+        // Restate lost the step's result and runs it again: nothing is left to delete.
+        let replayed = store.retain_prs(1, &[], 20).await.unwrap();
+
+        assert_eq!(pruned, vec![PrKey::new(1, 1), PrKey::new(1, 4)]);
+        assert_eq!(replayed, Vec::<PrKey>::new());
+        let pending = store.pending_retirements().await.unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|retirement| (retirement.key.clone(), retirement.synced_before))
+                .collect::<Vec<_>>(),
+            vec![(PrKey::new(1, 1), Some(20)), (PrKey::new(1, 4), Some(20))],
+            "the keys the delete removed are queued with the fence the prune ran under"
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledging_retirements_keeps_the_ones_queued_since_the_read() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 2, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 3, 10)).await.unwrap();
+        store.retain_prs(1, &[3], 20).await.unwrap();
+        let read = store.pending_retirements().await.unwrap();
+        // Another handler prunes between the read and its acknowledgement.
+        store.retain_prs(1, &[], 30).await.unwrap();
+
+        store
+            .acknowledge_retirements(read.last().unwrap().id)
+            .await
+            .unwrap();
+        // Restate runs the acknowledgement again: nothing else goes.
+        store
+            .acknowledge_retirements(read.last().unwrap().id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read.iter()
+                .map(|retirement| retirement.key.clone())
+                .collect::<Vec<_>>(),
+            vec![PrKey::new(1, 1), PrKey::new(1, 2)]
+        );
+        let pending = store.pending_retirements().await.unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|retirement| (retirement.key.clone(), retirement.synced_before))
+                .collect::<Vec<_>>(),
+            vec![(PrKey::new(1, 3), Some(30))],
+            "what was queued after the read waits for the next drain"
+        );
+        assert!(
+            pending[0].id > read.last().unwrap().id,
+            "ids only grow, which is what makes acknowledging through the last read safe"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repository_that_left_queues_its_pull_requests_under_the_sweeps_fence() {
+        let (_directory, store) = test_store().await;
+        store
+            .replace_installation_repos(9, &[repo(1, 10), repo(2, 10)], 20)
+            .await
+            .unwrap();
+        store.upsert_pr(&pr(1, 4, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+        store.upsert_pr(&pr(2, 1, 10)).await.unwrap();
+
+        store
+            .replace_installation_repos(9, &[repo(2, 30)], 25)
+            .await
+            .unwrap();
+
+        let pending = store.pending_retirements().await.unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|retirement| (retirement.key.clone(), retirement.synced_before))
+                .collect::<Vec<_>>(),
+            vec![(PrKey::new(1, 1), Some(25)), (PrKey::new(1, 4), Some(25))],
+            "the closes for a repository that left carry the instant the listing started"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_purge_queues_its_pull_requests_unfenced() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 5, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 8, 40)).await.unwrap();
+
+        store.purge_installation(9).await.unwrap();
+
+        let pending = store.pending_retirements().await.unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .map(|retirement| (retirement.key.clone(), retirement.synced_before))
+                .collect::<Vec<_>>(),
+            vec![(PrKey::new(1, 5), None), (PrKey::new(1, 8), None)],
+            "the App has lost the installation, so nothing can reopen these"
         );
     }
 

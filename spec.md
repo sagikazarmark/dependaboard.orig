@@ -96,7 +96,7 @@ refresh. It also makes the webhook Worker trivially boring, which is the point.
 | Handler | Kind | Behaviour |
 |---|---|---|
 | `sync(SyncRequest)` | exclusive | Debounce, then fetch canonical state from GitHub, update state, write through to `PrStore`. Idempotent. |
-| `closed(synced_before?)` | exclusive | PR merged or closed: clear the object's state keys, `delete_pr()` from the read model. A sweep passes the instant its listing started; the object stands down if it has synced since (reopened behind the sweep). Webhooks pass nothing: unconditional. |
+| `closed(synced_before?)` | exclusive | PR merged or closed: clear the object's state keys, `delete_pr()` from the read model. A sweep's drain passes the fence the prune recorded — the instant its listing started; the object stands down if it has synced since (reopened behind the sweep). Webhooks and purges pass nothing: unconditional. |
 | `merge(MergeRequest)` | exclusive | Guard `expected_sha == snapshot.sha`; `PUT /pulls/{n}/merge` with an explicit `merge_method`; on success `delete_pr()`. |
 | `command(DependabotCommand)` | exclusive | Post `@dependabot <cmd>` + attribution footer. **User token required** — see §6. Fire-and-forget. |
 | `update_branch()` | exclusive | `PUT /pulls/{n}/update-branch` with `expected_head_sha`. App-identity alternative to rebase; on success, one-way self-send of `sync` so the row catches up before the webhook does. |
@@ -331,7 +331,11 @@ can't collide on a base branch.
 `ctx.run` journals the result *after* the closure runs. If the process dies in that
 window, the replay re-executes the closure — the Rust SDK is explicit that the closure
 may run more attempts than the journal records. So every GitHub mutation needs to be
-safe to perform twice.
+safe to perform twice — and nothing may depend on a step's *return value* having been
+seen, when the step's effect has happened either way. The store's prunes are the case in
+point: a re-run `DELETE ... RETURNING` returns nothing, so the keys it removed are queued
+in the same transaction instead (§2 `RepoSync`, "the prune's step result is not what
+drives the closes").
 
 - **Comments:** put a deterministic marker in the body — the hidden HTML comment you
   already wanted for provenance, containing the batch id. Before posting, list recent
@@ -476,16 +480,29 @@ exists will fail the insert. Sequence `sync_now` explicitly:
 
 ```
 capture reconcile_start
-enumerate ALL repos (complete, successful pagination)
+enumerate ALL repos (complete, successful pagination; see below)
   → in one transaction: upsert every live RepoRecord
                         + retain_repos(live_ids, synced_before: reconcile_start)
-                          → returns the PR keys the cascade removed
-  → send PullRequest.closed to each of those
+                          → queues the PR keys the cascade removed for retirement,
+                            fenced by reconcile_start
+  → drain the retirement outbox: send PullRequest.closed(fence) to each, acknowledge
   → then fan out RepoSync.reconcile for the live set
 ```
 
 Doing the upsert first also means renames and metadata changes land before PR
 reconciliation reads them.
+
+**Enumeration must notice when it moved under its own pages.** `GET
+/installation/repositories` is offset-paged, and an installation with more than a page of
+repositories can change between two page fetches: a repository removed before the page
+boundary shifts the next page one position early, and the repository that was at the
+boundary is never listed — for that sweep it is "gone", its rows are cascaded, and its
+pull requests' objects retired. Every page carries `total_count`, so the client compares
+it across pages, de-duplicates by id, and refuses the listing when the total moved or the
+distinct ids do not add up to it; inside the sweep that is a retryable failure, and Restate
+lists again from page one under the step's backoff. Residual, accepted: a removal and an
+addition landing between the same two pages leave the total unchanged and can still hide
+one repository; only a cursor-paged listing could rule that out.
 
 One race survives the ordering: a `pull_request.opened` webhook for a freshly added repo
 can reach `upsert_pr` before `sync_now`'s transaction has inserted the parent row. This
@@ -500,9 +517,11 @@ survive forever, invisible to every reconcile. `RepoSync` can't fix this; it onl
 sees repos it was told about. `InstallationSync` has to diff the live repo set and
 cascade-delete the rest. Same completeness and timestamp rules as below: only after a
 fully successful enumeration, and only rows synced before the enumeration started. And
-the same object-state rule as `RepoSync.reconcile` below: `retain_repos` reports the PR
-keys the cascade removed, and `sync_now` sends `PullRequest.closed` to each, so no
-object keeps serving a snapshot for a repository the App no longer sees.
+the same object-state rule as `RepoSync.reconcile` below: `retain_repos` queues the PR
+keys the cascade removed, and `sync_now` drains the queue and sends `PullRequest.closed`
+to each, fenced by `reconcile_start`, so no object keeps serving a snapshot for a
+repository the App no longer sees — and one re-synced since the sweep began, because
+the repository was re-added behind its back, keeps its state.
 
 **Installation lifecycle is not all one event.** Mapping every `installation.*` action to
 "go enumerate GitHub" is wrong, because for half of them the App has just lost the access
@@ -513,7 +532,7 @@ budget and then park.
 | Action | Handler | Why |
 |---|---|---|
 | `created`, `unsuspend`, `installation_repositories.*` | `sync_now()` | access exists; enumerate |
-| `deleted` | `purge()` | delete this installation's repos + cascade, then send `PullRequest.closed` to every PR that went with them; no API call |
+| `deleted` | `purge()` | delete this installation's repos + cascade, then drain the retirement outbox and send `PullRequest.closed` to every PR that went with them; no API call |
 | `suspend` | `pause()` | clear `scheduler_started`, stop ticking; don't call GitHub |
 
 `resume` after a suspension goes through `start()` again. These events are delivered to
@@ -528,18 +547,39 @@ be subscribed to.
   rather than additive-only.
 - **A pruned row takes its object's state with it.** Deleting the row is only half the
   cleanup: the `PullRequest` object still holds the snapshot, and `status()` keeps
-  serving it to the detail drawer indefinitely. `retain_prs` reports the keys it
-  actually deleted; `reconcile` sends `PullRequest.closed` to each. Fan out from what
-  was *deleted*, not from what was *absent from the listing*: a PR reopened mid-sweep and
-  re-synced by its own webhook survives the `synced_at` guard below and must not be
-  closed. That guard covers a webhook that lands *before* the delete; one that lands
-  between the delete and the `closed` invocation would still be wiped, so the sweep's
-  `closed` carries `reconcile_start` and the object stands down when its
-  `last_synced_at >= reconcile_start` — the same boundary, applied on the object side.
-  `purge()` does the same over everything the installation delete removed, unfenced:
-  the App has lost the installation, so nothing can reopen those. So does `sync_now`
-  over everything `retain_repos` cascaded when a repository left the installation,
-  also unfenced: the App receives no webhooks for a repository it no longer sees.
+  serving it to the detail drawer indefinitely. `retain_prs` queues the keys it
+  actually deleted; `reconcile` drains the queue and sends `PullRequest.closed` to each.
+  Fan out from what was *deleted*, not from what was *absent from the listing*: a PR
+  reopened mid-sweep and re-synced by its own webhook survives the `synced_at` guard
+  below and must not be closed. That guard covers a webhook that lands *before* the
+  delete; one that lands between the delete and the `closed` invocation would still be
+  wiped, so the sweep's `closed` carries `reconcile_start` and the object stands down
+  when its `last_synced_at >= reconcile_start` — the same boundary, applied on the
+  object side. `sync_now` does the same over everything `retain_repos` cascaded when a
+  repository left the installation, under the same fence: the App receives no webhooks
+  for a repository it no longer sees, but the repository can be re-added and its pull
+  requests re-synced before the close lands, and a listing that dropped it by mistake
+  (the pagination shift above) must not cost them their history. `purge()` alone is
+  unfenced: the App has lost the installation, so nothing can reopen those.
+- **The prune's step result is not what drives the closes.** `ctx.run` is at-least-once
+  (§"GitHub mutations are at-least-once"): the `DELETE ... RETURNING` can commit and the
+  process die before the journal takes the returned keys, and the re-run then finds
+  nothing left to delete. Driving `closed` from that return value would leave the
+  objects that just lost their rows serving a snapshot nobody else has, indefinitely. So
+  every prune — `retain_prs`, `retain_repos`, `purge_installation` — writes the keys it
+  removed to `pull_request_retirements`, in the delete's own transaction, with the fence
+  it ran under (`NULL` for a purge). The handler then drains the outbox in steps that are
+  each safe to run again: read what is pending, send `closed` to each with the fence its
+  row carries, acknowledge through the last id read. A re-run read sees the same rows; a
+  duplicate `closed` is idempotent, and a fenced one is refused exactly where it should
+  be; a re-run acknowledgement is a no-op. Ids are `AUTOINCREMENT`, so acknowledging
+  `id <= last` covers exactly what was read and anything queued in between waits for the
+  next drain. The fence is stored, not recomputed at drain time: a row pruned by a sweep
+  that started at T1 and drained by one at T2 must carry T1, since a PR reopened and
+  re-synced between the two has `last_synced_at >= T1` and keeps its state, where T2
+  would retire it. Any drain drains everything pending — a `RepoSync` may tell an
+  object another repository's sweep pruned — which is what makes a lost drain harmless:
+  the next handler to prune anything finishes it.
 - **`retain_prs` runs only after every page has been fetched successfully.** A listing
   that fails on page 3 of 5 must abort the whole reconcile, not treat two pages as the
   authoritative live set — otherwise a transient API error silently deletes most of a
@@ -777,17 +817,27 @@ pub trait PrStore {
     /// Reconciliation: drop rows for this repo not in `live` AND synced before the
     /// listing started. The `synced_before` guard keeps rows written by concurrent
     /// webhook syncs alive — without it, a PR opened mid-reconcile gets deleted.
-    /// Returns the keys it deleted so the caller can retire their object state too.
+    /// Returns the keys it deleted, and queues the same keys for retirement under
+    /// `synced_before` in the delete's own transaction, so the caller need not trust
+    /// this call's return value to reach them.
     async fn retain_prs(&self, repository_id: u64, live: &[u64], synced_before: u64) -> Result<Vec<PrKey>>;
     async fn list_prs(&self, f: &PrFilter, page: Page) -> Result<Vec<PrRecord>>;
     async fn upsert_repo(&self, repo: &RepoRecord) -> Result<()>;
     /// Drop repos (and cascade their PRs) no longer in the installation.
     /// Same `synced_before` guard as retain_prs, for the same race. Returns the
-    /// cascaded PR keys so `sync_now` can retire their object state too.
+    /// cascaded PR keys, queued for retirement under `synced_before`.
     async fn retain_repos(&self, installation_id: u64, live: &[u64], synced_before: u64) -> Result<Vec<PrKey>>;
-    /// Drop every repo of a deleted installation and its PRs; returns the PR keys so
-    /// `purge()` can retire their object state.
+    /// What `sync_now` calls: upsert every listed repo, then retain_repos over their
+    /// ids, in one transaction, so a new repo's row is in place before its PRs arrive.
+    async fn replace_installation_repos(&self, installation_id: u64, repos: &[RepoRecord], synced_before: u64) -> Result<Vec<PrKey>>;
+    /// Drop every repo of a deleted installation and its PRs; returns the PR keys,
+    /// queued for retirement with no fence: nothing can reopen them.
     async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>>;
+    /// Every pull request a prune removed and no drain has acknowledged, oldest first.
+    async fn pending_retirements(&self) -> Result<Vec<Retirement>>;
+    /// Forget every retirement up to and including `through`, the last one read; ids
+    /// only grow, so anything queued since stays for the next drain.
+    async fn acknowledge_retirements(&self, through: u64) -> Result<()>;
     /// Keep a finished batch for audit. A batch id already recorded is left as it
     /// was, so the workflow's recording step is safe to run again.
     async fn record_batch(&self, batch: &BatchRecord) -> Result<()>;
@@ -888,6 +938,17 @@ CREATE TABLE batch_targets (
   outcome       TEXT NOT NULL,     -- JSON: succeeded { detail } | rejected { reason } | failed { detail }
   PRIMARY KEY (batch_id, position)
 );
+
+-- The retirement outbox (§2 RepoSync): the pull requests a prune removed whose
+-- objects have not yet been told. Written in the prune's transaction, drained by
+-- the sweep afterwards. AUTOINCREMENT keeps ids monotonic across deletes, so a
+-- drain acknowledges with `id <= last read` and anything queued since stays.
+CREATE TABLE pull_request_retirements (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  repository_id INTEGER NOT NULL,
+  number        INTEGER NOT NULL,
+  synced_before INTEGER            -- the prune's fence; NULL for a purge's unconditional close
+);
 ```
 
 **Grouped updates need the list, not just the scalars.** The `updated-dependencies` block
@@ -903,8 +964,10 @@ group (it probably should).
 in one statement — which is what makes the §2 installation-level reconciliation actually
 enforceable rather than aspirational. The cascade is silent, though: a `DELETE FROM
 repositories` cannot `RETURNING` the PR rows it takes with it. To report them, delete the
-stale repositories' PRs first with `RETURNING`, then the repositories, both inside the
-sync's transaction — the same shape `purge_installation` uses.
+stale repositories' PRs first with `RETURNING`, then the repositories, then queue the keys
+in `pull_request_retirements`, all inside the sync's transaction — the same shape
+`purge_installation` uses. `retain_prs` is one `DELETE ... RETURNING` plus the same queue
+insert, and opens a transaction for the pair.
 
 **Keep `synced_at` separate from `updated_at`.** They answer different questions: one is
 "when did this PR last change on GitHub", the other is "how much do I trust this row".

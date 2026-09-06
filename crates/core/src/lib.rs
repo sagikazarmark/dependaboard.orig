@@ -89,6 +89,24 @@ impl fmt::Display for PrKey {
     }
 }
 
+/// A pull request a prune has removed from the read model whose object has not yet
+/// been told: one row of the store's retirement outbox.
+///
+/// The prune writes it in the same transaction as the delete, so the keys survive a
+/// step whose result Restate lost; the sweep drains them afterwards and sends each
+/// its `closed`. `synced_before` is the fence the prune ran under — the instant the
+/// sweep's listing started, or `None` for a purge, whose close is unconditional. It
+/// is recorded, not recomputed when drained: an object synced since that instant was
+/// reopened behind the sweep and keeps its state, however late the close arrives.
+/// `id` grows with every row queued, so acknowledging up to one acknowledges exactly
+/// what was read before it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Retirement {
+    pub id: u64,
+    pub key: PrKey,
+    pub synced_before: Option<u64>,
+}
+
 #[derive(Debug, Error)]
 #[error("invalid pull request key: {0}")]
 pub struct ParsePrKeyError(String);

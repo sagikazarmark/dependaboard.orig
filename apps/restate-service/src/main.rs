@@ -9,6 +9,7 @@ mod ingress;
 mod installation_sync;
 mod pull_request;
 mod repo_sync;
+mod retirement;
 mod store;
 #[cfg(test)]
 mod test_support;

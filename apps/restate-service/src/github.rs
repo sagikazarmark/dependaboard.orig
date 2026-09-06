@@ -110,7 +110,11 @@ where
                 actual,
             })));
         }
-        Err(error @ (GithubError::Transport(_) | GithubError::Ambiguous { .. })) => {
+        Err(
+            error @ (GithubError::Transport(_)
+            | GithubError::Ambiguous { .. }
+            | GithubError::Shifted { .. }),
+        ) => {
             return Err(RetryableServiceError::Github(error.to_string()).into());
         }
         Err(error @ (GithubError::Protocol(_) | GithubError::Config(_))) => {
@@ -358,6 +362,21 @@ mod tests {
             Operation::Merge,
         );
         assert!(is_retryable(&error), "{error:?}");
+    }
+
+    #[test]
+    fn a_listing_that_shifted_under_its_pages_fails_the_attempt_so_it_is_listed_again() {
+        let error = journal_failure(
+            GithubError::Shifted {
+                listing: "installation repositories",
+                detail: "the total moved from 150 to 149 between pages".to_owned(),
+            },
+            Operation::Read,
+        );
+        assert!(
+            is_retryable(&error),
+            "a partial set must never become the authoritative one: {error:?}"
+        );
     }
 
     #[test]

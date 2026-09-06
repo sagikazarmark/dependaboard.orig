@@ -480,10 +480,10 @@ pub(crate) fn request_key(request: &SyncRequest) -> PrKey {
 }
 
 /// Tells the pull request's object it is no longer open, one-way, from any Restate context.
-/// A sweep passes the instant its listing started as `request.synced_before`; a webhook
-/// passes the default. The projection row is usually already gone by the time this is
-/// sent; `closed` tolerates that and retires the durable state regardless, so the object
-/// stops serving a snapshot nobody else has.
+/// A sweep's drain passes the fence the prune recorded — the instant its listing started —
+/// as `request.synced_before`; a webhook passes the default. The projection row is usually
+/// already gone by the time this is sent; `closed` tolerates that and retires the durable
+/// state regardless, so the object stops serving a snapshot nobody else has.
 pub(crate) fn close_pull_request<'ctx>(
     ctx: &impl ContextClient<'ctx>,
     key: &PrKey,
