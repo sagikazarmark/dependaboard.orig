@@ -1208,8 +1208,10 @@ code,
   line-height: 1.5;
 }
 
-/* The drawer's word that its pull request has left the read model. */
-.drawer-gone {
+/* The drawer's word that its pull request has left the read model, and its
+   word on why an action is withheld. */
+.drawer-gone,
+.drawer-note {
   margin: 10px 0 0;
   padding: 8px 10px;
   border-left: 2px solid var(--color-warning);

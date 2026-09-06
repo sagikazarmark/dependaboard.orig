@@ -101,7 +101,9 @@ mod tests {
     use dioxus::history::{History, MemoryHistory};
 
     use super::*;
-    use crate::ui::dashboard_state::{PageStatus, Selection, SummaryStatus};
+    use crate::ui::dashboard_state::{
+        Answers, CapabilitiesStatus, PageStatus, Selection, SummaryStatus,
+    };
     use crate::ui::test_support::{FIXTURE_NOW, grouped_row, loaded_page, loaded_summary};
 
     /// A browser history: in memory, and firing `popstate` — the callback
@@ -174,8 +176,11 @@ mod tests {
             use_signal(|| filter),
             use_signal(|| cursor),
             use_signal(Selection::default),
-            use_signal(|| PageStatus::Loaded(loaded_page())),
-            use_signal(|| SummaryStatus::Loaded(loaded_summary())),
+            Answers {
+                page: use_signal(|| PageStatus::Loaded(loaded_page())).into(),
+                summary: use_signal(|| SummaryStatus::Loaded(loaded_summary())).into(),
+                capabilities: use_signal(|| CapabilitiesStatus::Loading).into(),
+            },
             use_signal(|| FIXTURE_NOW),
             use_callback(|_| {}),
         );

@@ -9,12 +9,14 @@ use dependaboard_core::{BatchProgress, Page, PrRecord};
 use dioxus::logger::tracing;
 use dioxus::prelude::*;
 
-use crate::api::{load_dashboard, load_signed_in_user, load_summary};
+use crate::api::{load_capabilities, load_dashboard, load_signed_in_user, load_summary};
 use crate::components::toast::{ToastOptions, use_toast};
 use crate::ui::action_bar::ActionBar;
 use crate::ui::active_batch::{ActiveBatch, BatchHost, queue_batch};
 use crate::ui::confirm_modal::ConfirmModal;
-use crate::ui::dashboard_state::{DashboardState, PageStatus, Selection, SummaryStatus};
+use crate::ui::dashboard_state::{
+    Answers, CapabilitiesStatus, DashboardState, PageStatus, Selection, SummaryStatus,
+};
 use crate::ui::detail_drawer::{OpenDetail, OpenPr};
 use crate::ui::live::{use_clock, use_live_refresh, use_visibility};
 use crate::ui::pr_table::PrTable;
@@ -78,19 +80,42 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
             tracing::debug!(%error, "who is signed in could not be read");
         })
     });
+    // What the service can do. Asked once too: it is settled when the service
+    // starts, and a running service does not change its mind.
+    let mut capabilities = use_resource(|| async {
+        load_capabilities().await.inspect_err(|error| {
+            tracing::debug!(%error, "what the service can do could not be read");
+        })
+    });
+    let capabilities_status =
+        use_memo(move || CapabilitiesStatus::from_resource(capabilities.read().as_ref()));
     // The resources keep their last answer while the next is in flight, so a
-    // reload leaves the rows standing until the fresh ones land. The name is
-    // asked again only if it was never answered: a reload is also what
-    // follows an outage, and an outage at open leaves it unanswered.
+    // reload leaves the rows standing until the fresh ones land. The name and
+    // the capabilities are asked again only if they were never answered: a
+    // reload is also what follows an outage, and an outage at open leaves
+    // them unanswered.
     let reload = use_callback(move |()| {
         rows.restart();
         summary.restart();
         if signed_in.peek().as_ref().is_some_and(Result::is_err) {
             signed_in.restart();
         }
+        if capabilities.peek().as_ref().is_some_and(Result::is_err) {
+            capabilities.restart();
+        }
     });
-    let mut state =
-        DashboardState::provide(filter, cursor, selected, page, summary_status, now, reload);
+    let mut state = DashboardState::provide(
+        filter,
+        cursor,
+        selected,
+        Answers {
+            page: page.into(),
+            summary: summary_status.into(),
+            capabilities: capabilities_status.into(),
+        },
+        now,
+        reload,
+    );
     use_url_sync(state, detail);
     use_live_refresh(state, visible);
     let user = signed_in

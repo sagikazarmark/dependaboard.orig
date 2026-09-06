@@ -3,8 +3,8 @@
 //! the store and Restate through [`crate::server::state::ServerState`].
 
 use dependaboard_core::{
-    BatchProgress, BatchRecord, BulkActionKind, DashboardPage, DashboardSummary, Page, PrFilter,
-    PrRecord, PrState, ProjectionRevision, SubmittedTarget, UserId,
+    BatchProgress, BatchRecord, BulkActionKind, Capabilities, DashboardPage, DashboardSummary,
+    Page, PrFilter, PrRecord, PrState, ProjectionRevision, SubmittedTarget, UserId,
 };
 use dioxus::prelude::*;
 
@@ -84,6 +84,19 @@ pub(crate) async fn load_projection_revision() -> Result<ProjectionRevision, Ser
 #[server(user: Extension<UserId>)]
 pub(crate) async fn load_signed_in_user() -> Result<UserId, ServerFnError> {
     Ok(user.0)
+}
+
+/// What the Restate service can do, as it resolved at startup: which actions
+/// the dashboard should offer. Asked of the service rather than read from
+/// this process's environment, since the service is the one that holds the
+/// credentials the answer turns on.
+#[server(state: Extension<ServerState>)]
+pub(crate) async fn load_capabilities() -> Result<Capabilities, ServerFnError> {
+    state
+        .ingress
+        .call("DashboardIngress/capabilities")
+        .await
+        .map_err(restate_unavailable)
 }
 
 /// Asks Restate to run the batch. The batch id is the workflow key, which lets

@@ -38,7 +38,10 @@ pub struct GithubConfig {
     pub app_id: u64,
     pub installation_id: u64,
     pub private_key: SecretString,
-    pub user_pat: SecretString,
+    /// The user identity `@dependabot` commands are posted under. Merge and update
+    /// branch run as the App, so a merge-only deployment leaves it unset and the
+    /// client refuses to post commands.
+    pub user_pat: Option<SecretString>,
     pub dashboard_user: UserId,
     pub merge_method: MergeMethod,
 }
@@ -86,9 +89,9 @@ impl GithubConfig {
             app_id: parse_u64_var(&var, "GITHUB_APP_ID")?,
             installation_id: parse_u64_var(&var, "GITHUB_INSTALLATION_ID")?,
             private_key: SecretString::from(private_key),
-            user_pat: SecretString::from(var("GITHUB_USER_PAT").ok_or_else(|| {
-                GithubError::Config("set GITHUB_USER_PAT for Dependabot rebase commands".to_owned())
-            })?),
+            user_pat: var("GITHUB_USER_PAT")
+                .filter(|value| !value.trim().is_empty())
+                .map(SecretString::from),
             dashboard_user: UserId::new(dashboard_user),
             merge_method,
         })
@@ -109,22 +112,34 @@ pub trait TokenProvider: Send + Sync {
     async fn user_token(&self, user: &UserId) -> Result<SecretString, GithubError>;
 }
 
+/// The one user identity a deployment configures, with its PAT if the operator minted
+/// one. Without a PAT there is no token for anyone, and every command is refused with
+/// the variable to set.
 struct StaticTokenProvider {
     user: UserId,
-    token: SecretString,
+    token: Option<SecretString>,
 }
 
 #[async_trait]
 impl TokenProvider for StaticTokenProvider {
     async fn user_token(&self, user: &UserId) -> Result<SecretString, GithubError> {
+        let token = self.token.clone().ok_or_else(no_user_token)?;
         if user == &self.user {
-            Ok(self.token.clone())
+            Ok(token)
         } else {
             Err(GithubError::Config(format!(
                 "no GitHub user token is configured for {user}"
             )))
         }
     }
+}
+
+/// The refusal a command meets when the deployment has no user identity at all.
+fn no_user_token() -> GithubError {
+    GithubError::Config(
+        "no GitHub user token is configured; set GITHUB_USER_PAT to post @dependabot commands"
+            .to_owned(),
+    )
 }
 
 fn parse_u64_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Result<u64, GithubError> {
@@ -143,6 +158,9 @@ pub struct GithubClient {
     http: reqwest::Client,
     tokens: Arc<Mutex<HashMap<u64, CachedToken>>>,
     user_tokens: Arc<dyn TokenProvider>,
+    /// Whether `user_tokens` can answer for anyone: false for a deployment without a
+    /// PAT, where every command is refused before GitHub is asked anything.
+    user_commands: bool,
 }
 
 #[derive(Clone)]
@@ -152,17 +170,30 @@ struct CachedToken {
 }
 
 impl GithubClient {
+    /// A client for the configured deployment: the dashboard user's PAT is the one user
+    /// token, and without one commands are refused.
     pub fn new(config: GithubConfig) -> Result<Self, GithubError> {
+        let user_commands = config.user_pat.is_some();
         let user_tokens = Arc::new(StaticTokenProvider {
             user: config.dashboard_user.clone(),
             token: config.user_pat.clone(),
         });
-        Self::with_token_provider(config, user_tokens)
+        Self::build(config, user_tokens, user_commands)
     }
 
+    /// A client whose user tokens come from `user_tokens`, which is taken to have a
+    /// token for the users it serves: commands are offered.
     pub fn with_token_provider(
         config: GithubConfig,
         user_tokens: Arc<dyn TokenProvider>,
+    ) -> Result<Self, GithubError> {
+        Self::build(config, user_tokens, true)
+    }
+
+    fn build(
+        config: GithubConfig,
+        user_tokens: Arc<dyn TokenProvider>,
+        user_commands: bool,
     ) -> Result<Self, GithubError> {
         let app_key = EncodingKey::from_rsa_pem(config.private_key.expose_secret().as_bytes())
             .map_err(|error| GithubError::Config(format!("invalid GitHub private key: {error}")))?;
@@ -178,6 +209,7 @@ impl GithubClient {
             http,
             tokens: Arc::new(Mutex::new(HashMap::new())),
             user_tokens,
+            user_commands,
         })
     }
 
@@ -653,6 +685,10 @@ impl<T> MutationOutcome<T> {
 #[async_trait]
 pub trait GithubApi: Send + Sync {
     fn installation_id(&self) -> u64;
+    /// Whether a user identity is configured to post `@dependabot` commands under.
+    /// Merge and update branch run as the App and need no such identity; a
+    /// deployment without one has [`Self::post_command`] refuse every request.
+    fn can_post_commands(&self) -> bool;
     async fn fetch_snapshot(&self, request: &SyncRequest) -> Result<Option<PrRecord>, GithubError>;
     async fn list_installation_repositories(&self) -> Result<Vec<RepoRecord>, GithubError>;
     async fn list_dependabot_prs(
@@ -677,6 +713,10 @@ pub trait GithubApi: Send + Sync {
 impl GithubApi for GithubClient {
     fn installation_id(&self) -> u64 {
         self.installation_id()
+    }
+
+    fn can_post_commands(&self) -> bool {
+        self.user_commands
     }
 
     /// One GraphQL request in the common case, where the REST reads it replaced cost at
@@ -904,7 +944,12 @@ impl GithubApi for GithubClient {
         })
     }
 
+    /// Refused outright without a user identity: the verify read would only be wasted
+    /// on a comment that can never be posted.
     async fn post_command(&self, request: &CommandRequest) -> Result<String, GithubError> {
+        if !self.user_commands {
+            return Err(no_user_token());
+        }
         let target = &request.target;
         let marker = format!("<!-- dependaboard-batch:{} -->", request.batch_id);
         let path = format!(
@@ -1299,6 +1344,27 @@ mod tests {
         assert_eq!(custom.dashboard_user, UserId::new("octocat"));
     }
 
+    /// Only `@dependabot` commands need the user PAT; merge and update branch run as
+    /// the App. A merge-only operator runs without one, and a placeholder left blank
+    /// counts as none.
+    #[test]
+    fn the_user_pat_is_optional() {
+        let with_pat = GithubConfig::from_lookup(lookup(&required_env(APP_KEY))).unwrap();
+        assert_eq!(
+            with_pat.user_pat.as_ref().map(ExposeSecret::expose_secret),
+            Some("ghp_pat")
+        );
+
+        let mut vars = required_env(APP_KEY);
+        vars.retain(|(name, _)| *name != "GITHUB_USER_PAT");
+        let without = GithubConfig::from_lookup(lookup(&vars)).unwrap();
+        assert!(without.user_pat.is_none());
+
+        vars.push(("GITHUB_USER_PAT", ""));
+        let blank = GithubConfig::from_lookup(lookup(&vars)).unwrap();
+        assert!(blank.user_pat.is_none(), "a blank value is no PAT");
+    }
+
     #[test]
     fn config_rejects_missing_or_malformed_settings() {
         let missing_key = GithubConfig::from_lookup(lookup(&[("GITHUB_APP_ID", "1")]));
@@ -1348,7 +1414,7 @@ mod tests {
     async fn static_token_provider_is_scoped_to_the_configured_user() {
         let provider = StaticTokenProvider {
             user: UserId::new("dependaboard"),
-            token: SecretString::from("secret"),
+            token: Some(SecretString::from("secret")),
         };
         assert!(
             provider

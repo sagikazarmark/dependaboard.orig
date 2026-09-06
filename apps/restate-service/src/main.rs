@@ -16,6 +16,7 @@ mod test_support;
 
 use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
+use dependaboard_core::Capabilities;
 use dependaboard_github::{GithubClient, GithubConfig};
 use dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig};
 use restate_sdk::{filter::ReplayAwareFilter, prelude::*};
@@ -59,12 +60,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DEFAULT_RECONCILE_SECONDS,
     ));
     let installation_id = github.installation_id();
+    let capabilities = Capabilities {
+        rebase_enabled: github.can_post_commands(),
+    };
     info!(
         installation_id,
         debounce_seconds = debounce.as_secs(),
         reconcile_interval_seconds = interval.as_secs(),
         "resolved service settings"
     );
+    announce_capabilities(capabilities);
 
     let pull_request = PullRequest {
         github: github.clone(),
@@ -84,7 +89,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .bind(pull_request)
         .bind(BulkAction { store })
         .bind(WebhookIngress { installation_id })
-        .bind(DashboardIngress { installation_id })
+        .bind(DashboardIngress {
+            installation_id,
+            capabilities,
+        })
         .bind(SchedulerIngress { installation_id })
         .bind(installation_sync)
         .bind(repo_sync)
@@ -194,6 +202,21 @@ fn scheduler_start_request(
     request
 }
 
+/// Says at startup which optional actions are on, and what turns the others on. A
+/// merge-only operator who left `GITHUB_USER_PAT` out on purpose sees that confirmed; one
+/// who forgot it learns here rather than from a rejected batch. Neither is a mistake, so
+/// neither is a warning.
+fn announce_capabilities(capabilities: Capabilities) {
+    if capabilities.rebase_enabled {
+        info!("rebase enabled: @dependabot commands are posted as the configured user");
+    } else {
+        info!(
+            "rebase disabled: GITHUB_USER_PAT is not set, so @dependabot commands are rejected; \
+             merge and update branch run as the App"
+        );
+    }
+}
+
 /// Reads a whole-seconds setting from the environment.
 fn env_seconds(name: &str, default: u64) -> u64 {
     let raw = match env::var(name) {
@@ -284,5 +307,27 @@ mod tests {
 
         assert_eq!(resolved, vec![900, 3600, 3600]);
         assert!(logs.is_empty(), "{logs}");
+    }
+
+    /// A deployment without a user PAT starts, and says at startup that rebase is off and
+    /// what turns it on, so the operator learns it here rather than from a rejected batch.
+    #[test]
+    fn startup_says_rebase_is_disabled_and_names_the_variable_that_enables_it() {
+        let without_pat = captured_logs(|| {
+            announce_capabilities(Capabilities {
+                rebase_enabled: false,
+            });
+        });
+        assert!(without_pat.contains("rebase"), "{without_pat}");
+        assert!(without_pat.contains("disabled"), "{without_pat}");
+        assert!(without_pat.contains("GITHUB_USER_PAT"), "{without_pat}");
+
+        let with_pat = captured_logs(|| {
+            announce_capabilities(Capabilities {
+                rebase_enabled: true,
+            });
+        });
+        assert!(with_pat.contains("rebase"), "{with_pat}");
+        assert!(!with_pat.contains("disabled"), "{with_pat}");
     }
 }

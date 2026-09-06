@@ -149,6 +149,7 @@ pub(crate) fn OpenDetail(
                 key: "{row.id}",
                 row: row.clone(),
                 gone: matches!(&*open, Some(OpenPr::Gone(_))),
+                rebase_withheld: state.rebase_withheld(),
                 now,
                 onclose: move |_| detail.set(None),
                 onaction,
@@ -195,10 +196,13 @@ fn follow(open: &OpenPr, page: &DashboardPage) -> Followed {
 /// last the dashboard saw of it, but says so and withholds every action. The
 /// bulk actions would be rejected against a head that is gone, and a sync
 /// starts from the row in the read model, which is no longer there.
+/// `rebase_withheld` is why a rebase alone is not on offer, if the service
+/// has said it is not; the rest of the actions run as the App and stand.
 #[component]
 pub(crate) fn DetailDrawer(
     row: PrRecord,
     #[props(default)] gone: bool,
+    #[props(default)] rebase_withheld: Option<&'static str>,
     now: u64,
     onclose: EventHandler<()>,
     onaction: EventHandler<PendingAction>,
@@ -257,7 +261,7 @@ pub(crate) fn DetailDrawer(
                     Button {
                         size: ButtonSize::Sm,
                         class: "rebase-button",
-                        disabled: gone,
+                        disabled: gone || rebase_withheld.is_some(),
                         onclick: move |_| request(BulkActionKind::Rebase),
                         "Rebase"
                     }
@@ -323,6 +327,9 @@ pub(crate) fn DetailDrawer(
                             "Sync"
                         }
                     }
+                }
+                if let Some(reason) = rebase_withheld {
+                    p { class: "drawer-note", "{reason}" }
                 }
                 dl { class: "detail-list",
                     dt { "Head SHA" } dd { code { "{row.head_sha}" } }
@@ -425,11 +432,14 @@ fn DurableState(status: DurableStatus, now: u64) -> Element {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use dependaboard_core::{DashboardPage, Mergeable, PrFilter};
+    use dependaboard_core::{Capabilities, DashboardPage, Mergeable, PrFilter};
     use dioxus::core::{ElementId, Mutation, consume_context_from_scope};
 
     use super::*;
-    use crate::ui::dashboard_state::{DashboardState, PageStatus, Selection, SummaryStatus};
+    use crate::ui::dashboard_state::{
+        Answers, CapabilitiesStatus, DashboardState, PageStatus, REBASE_UNAVAILABLE, Selection,
+        SummaryStatus,
+    };
     use crate::ui::test_support::{
         DashboardFixture, FIXTURE_NOW, grouped_row, loaded_page, off_page_row, render, serde_row,
     };
@@ -553,8 +563,11 @@ mod tests {
             use_signal(PrFilter::default),
             use_signal(|| None),
             use_signal(Selection::default),
-            page,
-            use_signal(|| SummaryStatus::Loading),
+            Answers {
+                page: page.into(),
+                summary: use_signal(|| SummaryStatus::Loading).into(),
+                capabilities: use_signal(|| CapabilitiesStatus::Loading).into(),
+            },
             use_signal(|| FIXTURE_NOW),
             use_callback(|_| {}),
         );
@@ -700,6 +713,44 @@ mod tests {
             4,
             "rebase, update branch, merge, and sync are withheld: {html}"
         );
+    }
+
+    /// Once the service has said it has no user token to post `@dependabot
+    /// rebase` with, the drawer withholds that one action with the reason,
+    /// and offers the rest: update branch and merge run as the App, and a
+    /// sync needs no identity at all. Until it has said so, the rebase is on
+    /// offer like the rest, and the service guards the command itself.
+    #[test]
+    fn a_rebase_is_withheld_with_its_reason_once_the_service_says_it_is_off() {
+        #[component]
+        fn Fixture(capabilities: CapabilitiesStatus) -> Element {
+            let detail = use_signal(|| Some(OpenPr::from(grouped_row())));
+            rsx! {
+                DashboardFixture { page: PageStatus::Loaded(loaded_page()), capabilities,
+                    OpenDetail { detail, now: FIXTURE_NOW, onaction: move |_| {}, onsync: move |_| {} }
+                }
+            }
+        }
+        let render = |capabilities: CapabilitiesStatus| {
+            let mut dom = VirtualDom::new_with_props(Fixture, FixtureProps { capabilities });
+            dom.rebuild_in_place();
+            dioxus::ssr::render(&dom)
+        };
+
+        let off = render(CapabilitiesStatus::Loaded(Capabilities {
+            rebase_enabled: false,
+        }));
+        assert!(off.contains(REBASE_UNAVAILABLE), "{off}");
+        assert!(off.contains(r#"rebase-button" disabled=true"#), "{off}");
+        assert_eq!(
+            off.matches("disabled").count(),
+            1,
+            "the rebase alone is withheld: {off}"
+        );
+
+        let unknown = render(CapabilitiesStatus::Loading);
+        assert!(!unknown.contains("disabled"), "{unknown}");
+        assert!(!unknown.contains(REBASE_UNAVAILABLE), "{unknown}");
     }
 
     fn render_durable_state(status: DurableStatus) -> String {

@@ -1,21 +1,47 @@
 //! The `DashboardIngress` service: the manual refreshes the dashboard asks for, addressed by
-//! name rather than disguised as GitHub deliveries.
+//! name rather than disguised as GitHub deliveries, and the word on what this deployment
+//! can do.
 
-use dependaboard_core::{ManualSyncRequest, SyncRequest};
+use dependaboard_core::{Capabilities, ManualSyncRequest, SyncRequest};
 use restate_sdk::prelude::*;
 
 use crate::{
-    handler::traced,
+    handler::{HandlerOutcome, traced, traced_read},
     installation_sync::InstallationSyncClient,
     pull_request::{PullRequestClient, request_key},
 };
 
 pub(crate) struct DashboardIngress {
     pub(crate) installation_id: u64,
+    /// What the service resolved at startup that decides which actions the dashboard
+    /// offers; fixed for the life of the process.
+    pub(crate) capabilities: Capabilities,
+}
+
+impl HandlerOutcome for Json<Capabilities> {
+    fn outcome(&self) -> String {
+        if self.0.rebase_enabled {
+            "rebase enabled".to_owned()
+        } else {
+            "rebase disabled".to_owned()
+        }
+    }
 }
 
 #[restate_sdk::service]
 impl DashboardIngress {
+    /// What this deployment can do, so the dashboard offers only the actions the service
+    /// would not refuse. Answered from the settings resolved at startup: no side effect,
+    /// nothing to journal, and asked once per page, so it completes quietly.
+    #[handler]
+    async fn capabilities(&self, _ctx: Context<'_>) -> HandlerResult<Json<Capabilities>> {
+        let installation_id = self.installation_id.to_string();
+        traced_read("DashboardIngress/capabilities", &installation_id, async {
+            Ok(Json::from(self.capabilities))
+        })
+        .await
+    }
+
     /// Reconciles the whole installation now, without waiting for the scheduler's next sweep.
     #[handler]
     async fn sync_installation(&self, ctx: Context<'_>) -> HandlerResult<()> {
@@ -77,7 +103,7 @@ mod tests {
         let discovery = <DashboardIngress as Discoverable>::discover();
         assert_ne!(discovery.ingress_private, Some(true));
 
-        for handler_name in ["sync_installation", "sync_pull_request"] {
+        for handler_name in ["sync_installation", "sync_pull_request", "capabilities"] {
             let handler = discovery
                 .handlers
                 .iter()

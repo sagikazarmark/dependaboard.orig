@@ -217,11 +217,16 @@ mod tests {
     }
 
     /// A rejection over the configuration — the identity GitHub refused, the
-    /// merge method the repository disallows — meets the same answer on the
-    /// next attempt; a batch with only those has nothing a retry can cure.
+    /// merge method the repository disallows, the user token the deployment
+    /// lacks — meets the same answer on the next attempt; a batch with only
+    /// those has nothing a retry can cure.
     #[test]
     fn a_batch_whose_only_rejections_are_over_the_configuration_offers_no_retry() {
-        for reason in [RejectReason::Forbidden, RejectReason::MergeMethodDisallowed] {
+        for reason in [
+            RejectReason::Forbidden,
+            RejectReason::MergeMethodDisallowed,
+            RejectReason::NoUserToken,
+        ] {
             let html = render_drawer(finished_with_rejection(reason.clone()), false);
 
             assert!(!html.contains(RETRY_BUTTON), "{reason:?}: {html}");

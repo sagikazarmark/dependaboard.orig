@@ -4,8 +4,9 @@
 //! row read back, and the new batch carries the head SHAs the dashboard now
 //! shows rather than the ones the batch was rejected over. Only rejections a
 //! fresh attempt can cure are sent again: one over the configuration — the
-//! identity GitHub refuses, the merge method the repository disallows — would
-//! be rejected the same way whatever the head, and is left out with that said.
+//! identity GitHub refuses, the merge method the repository disallows, the
+//! user token the deployment has none of — would be rejected the same way
+//! whatever the head, and is left out with that said.
 
 use dependaboard_core::{BatchProgress, PrRecord, PrTarget, RejectReason};
 use futures_util::future::join_all;
@@ -103,15 +104,17 @@ pub(crate) enum LeftOutReason {
 /// Whether a fresh attempt can cure `reason`. A head that moved is cured by
 /// sending the head the dashboard shows now; GitHub judges mergeability anew
 /// on every attempt, so a base that has since moved or checks that have since
-/// finished can cure that too. The identity GitHub refuses and the merge
-/// method the repository disallows are the same whatever the head, and a
-/// pull request rejected as not found is closed or merged with its row gone.
+/// finished can cure that too. The identity GitHub refuses, the merge
+/// method the repository disallows, and the user token the deployment lacks
+/// are the same whatever the head, and a pull request rejected as not found
+/// is closed or merged with its row gone.
 fn worth_retrying(reason: &RejectReason) -> bool {
     match reason {
         RejectReason::StaleSha { .. } | RejectReason::NotMergeable => true,
-        RejectReason::Forbidden | RejectReason::MergeMethodDisallowed | RejectReason::NotFound => {
-            false
-        }
+        RejectReason::Forbidden
+        | RejectReason::MergeMethodDisallowed
+        | RejectReason::NotFound
+        | RejectReason::NoUserToken => false,
     }
 }
 
@@ -425,6 +428,37 @@ mod tests {
             RejectReason::MergeMethodDisallowed
         )));
         assert!(!can_retry(&finished_with(RejectReason::NotFound)));
+        assert!(
+            !can_retry(&finished_with(RejectReason::NoUserToken)),
+            "a rebase without a user token is refused the same way every time"
+        );
+    }
+
+    /// A rebase asked of a deployment without a user token is a rejection
+    /// over the configuration: the notice says so in words that name what
+    /// is missing, and the target is not refreshed.
+    #[tokio::test]
+    async fn a_rebase_rejected_for_want_of_a_user_token_is_left_out_saying_so() {
+        let targets = [pr_target(&serde_row())];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Rebase, &targets);
+        progress.record(
+            &targets[0].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::NoUserToken,
+            },
+        );
+        let gateway = Scripted::new([]);
+
+        let refreshed = refresh_rejected(&gateway, &progress).await;
+
+        assert_eq!(refreshed.rows, vec![]);
+        assert_eq!(
+            refreshed.notice().as_deref(),
+            Some(
+                "Left out of the retry: acme/web#12 would be rejected again (no GitHub user \
+                 token is configured for @dependabot commands)."
+            )
+        );
     }
 
     /// A refresh that fails is not a reason to send that target out with the

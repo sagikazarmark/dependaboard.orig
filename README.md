@@ -193,9 +193,9 @@ updates:
 
 Commit that file and use the repository's **Insights > Dependency graph > Dependabot** page to trigger or inspect updates. GitHub creates a pull request only when an eligible dependency update exists.
 
-### 7. Create the user PAT
+### 7. Create the user PAT (optional)
 
-GitHub ignores `@dependabot rebase` commands authored by a GitHub App, so rebases require a real user's fine-grained personal access token.
+GitHub ignores `@dependabot rebase` commands authored by a GitHub App, so rebases require a real user's fine-grained personal access token. Merge and update branch run under the App's identity and need no token: a merge-only deployment can skip this step. The Restate service then starts with `rebase disabled` in its log, the dashboard withholds **Request rebase** and says why, and a rebase that reaches the service anyway is rejected per pull request rather than attempted.
 
 Open **Settings > Developer settings > Personal access tokens > Fine-grained tokens > Generate new token** and configure:
 
@@ -206,7 +206,7 @@ Open **Settings > Developer settings > Personal access tokens > Fine-grained tok
 
 The token's user must have write access to those repositories. An organization may require administrator approval or SSO authorization before the token can access its repositories. Use that user's GitHub login as `DASHBOARD_USERNAME`; the application scopes the environment PAT to that authenticated dashboard identity.
 
-Record the token once as `GITHUB_USER_PAT`. It remains in process memory and is never placed in Restate inputs or state.
+Record the token once as `GITHUB_USER_PAT`. It remains in process memory and is never placed in Restate inputs or state. Leave the variable unset or empty to run without one.
 
 ### 8. Configure the environment
 
@@ -218,7 +218,7 @@ cp .env.web.example .env.web
 chmod 600 .env.restate .env.web
 ```
 
-Edit both files. Set the same installation ID, dashboard username, libSQL URL, and Restate ingress URL in each. Put GitHub App credentials and the user PAT only in `.env.restate`; put the webhook secret and dashboard password only in `.env.web`. This prevents the Dioxus process from inheriting the PAT or App private key.
+Edit both files. Set the same installation ID, dashboard username, libSQL URL, and Restate ingress URL in each. Put GitHub App credentials and the user PAT (if any) only in `.env.restate`; put the webhook secret and dashboard password only in `.env.web`. This prevents the Dioxus process from inheriting the PAT or App private key.
 
 Insert the webhook secret retained in step 5 into `.env.web`. Generate a separate dashboard password and insert it there too:
 
@@ -370,6 +370,10 @@ Confirm the repository allows at least one of squash, merge, and rebase, require
 
 Confirm the fine-grained PAT has Pull requests read/write access, its user can write to the repository, and `DASHBOARD_USERNAME` is that user's GitHub login.
 
+**Request rebase is disabled**
+
+The Restate service has no `GITHUB_USER_PAT`, and says so at startup with `rebase disabled`. The dashboard asks the service what it can do when the page opens (`DashboardIngress/capabilities`) and withholds **Request rebase** with the reason; a rebase submitted regardless is rejected per pull request with "no GitHub user token is configured for @dependabot commands", and **Retry rejected** leaves those targets out. Set the PAT as in step 7 and restart the service; **Update branch** is the App-identity alternative meanwhile.
+
 **Update branch is rejected**
 
 Update branch merges the base into the pull request's head branch under the App's identity, so it needs the same Contents write access as merge and a head branch the App may push to; a stale head SHA or a pull request GitHub reports as not mergeable is rejected rather than retried on its own — the batch drawer's **Retry rejected** sends the rejected ones again with their current heads. Note that Dependabot stops rebasing a pull request once another commit lands on it, so prefer **Request rebase** when a PAT is configured.
@@ -419,7 +423,7 @@ Every Restate handler is reachable through the ingress unless marked private, an
 | Public (ingress-reachable) | Private (Restate-internal only) |
 |---|---|
 | `WebhookIngress.dispatch` — verified GitHub deliveries, forwarded by the web edge | `PullRequest.sync`, `.closed`, `.merge`, `.command`, `.update_branch` |
-| `DashboardIngress.sync_installation`, `.sync_pull_request` — the dashboard's **Sync** buttons | `InstallationSync.*` |
+| `DashboardIngress.sync_installation`, `.sync_pull_request` — the dashboard's **Sync** buttons; `.capabilities` — what the service can do, read once per page | `InstallationSync.*` |
 | `BulkAction.run`, `.progress` — batch merges, rebases, and branch updates | `RepoSync.*` |
 | `PullRequest.status` — the read the detail drawer polls | |
 | `SchedulerIngress.start` — arms the reconcile chain at startup | |
@@ -465,7 +469,7 @@ Never edit a migration that has shipped; add a new one instead. `0001_initial.sq
 | `GITHUB_APP_ID` | Restate service | Numeric GitHub App ID |
 | `GITHUB_INSTALLATION_ID` | Both | Installation to reconcile; required at startup, and the web app refuses a per-PR sync or a batch target for any other installation |
 | `GITHUB_PRIVATE_KEY` / `GITHUB_PRIVATE_KEY_PATH` | Restate service | RS256 App private key value or absolute PEM path |
-| `GITHUB_USER_PAT` | Restate service | User identity for `@dependabot rebase` comments |
+| `GITHUB_USER_PAT` | Restate service | Optional user identity for `@dependabot rebase` comments; unset or empty disables **Request rebase**, logged at startup, while merge and update branch run as the App |
 | `GITHUB_MERGE_METHOD` | Restate service | Preferred merge method: `merge`, `squash` (default), or `rebase`; a repository that disallows it is merged with the first allowed of squash, merge, rebase |
 | `GITHUB_WEBHOOK_SECRET` | Web app | HMAC-SHA256 webhook verification; required at startup |
 | `GITHUB_API_URL` | Restate service | GitHub REST API root, default `https://api.github.com`. The GraphQL endpoint is derived from it: `/graphql` under that root, or `/api/graphql` when the root is GitHub Enterprise's `/api/v3` |
@@ -478,7 +482,7 @@ Never edit a migration that has shipped; add a new one instead. `0001_initial.sq
 | `RESTATE_SERVICE_ADDRESS` | Restate service | SDK endpoint bind address; quickstart uses loopback or Docker's host gateway |
 | `SYNC_DEBOUNCE_SECONDS` | Restate service | Leading/trailing per-PR webhook debounce, default 20; an unparsable value is warned about at startup and the default used |
 | `RECONCILE_INTERVAL_SECONDS` | Restate service | Installation sweep interval, default 3600; an unparsable value is warned about at startup and the default used |
-| `RUST_LOG` | Both | Rust tracing filter; the Restate service logs one line per handler invocation at `info` (`debug` for the polled `status`/`progress` reads) |
+| `RUST_LOG` | Both | Rust tracing filter; the Restate service logs one line per handler invocation at `info` (`debug` for the polled `status`/`progress` reads and the once-per-page `capabilities` read) |
 
 For production, point both binaries at the same remote libSQL database, expose only the web application publicly, deploy the Restate endpoint where Restate can reach it, and use authenticated Restate Cloud ingress.
 
@@ -508,10 +512,11 @@ Automated tests do not possess GitHub credentials. Before relying on a deploymen
 5. Close a Dependabot pull request while the Restate service is down, bring it back, wait for the next `RepoSync/reconcile`, and confirm the row is gone, `PullRequest/status` returns no state, and the detail drawer reports the pull request as no longer open.
 6. Queue a merge and confirm GitHub records the App installation as actor and uses `GITHUB_MERGE_METHOD`. In a repository that disallows that method, confirm the dialog names the repository with the method it will use, and that the merge succeeds with it.
 7. Queue a rebase and confirm the PAT user authors one marked, attributed `@dependabot rebase` comment.
-8. Queue a branch update and confirm GitHub records the App installation as the author of the merge commit on the head branch, and that the row's head SHA and checks refresh without a manual sync.
-9. Restart the Restate service during an in-flight batch and confirm target progress resumes.
-10. Once a batch has finished, open **Batches** and confirm it is listed with its counts, requester, and a working link per target; confirm it is still listed after `BulkAction/progress` for its id has stopped returning state.
-11. Inspect Restate inputs, journals, and object state and confirm the PAT value is absent.
+8. Start the Restate service without `GITHUB_USER_PAT` and confirm it logs `rebase disabled`, that **Request rebase** is disabled with its reason in the action bar and the drawer while **Update branch** and **Merge** are not, and that a `BulkAction/run` rebase sent to the ingress directly settles every target as rejected without a comment appearing on GitHub.
+9. Queue a branch update and confirm GitHub records the App installation as the author of the merge commit on the head branch, and that the row's head SHA and checks refresh without a manual sync.
+10. Restart the Restate service during an in-flight batch and confirm target progress resumes.
+11. Once a batch has finished, open **Batches** and confirm it is listed with its counts, requester, and a working link per target; confirm it is still listed after `BulkAction/progress` for its id has stopped returning state.
+12. Inspect Restate inputs, journals, and object state and confirm the PAT value is absent.
 
 ## License
 

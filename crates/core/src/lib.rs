@@ -813,11 +813,18 @@ pub enum ActionOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RejectReason {
-    StaleSha { expected: String, actual: String },
+    StaleSha {
+        expected: String,
+        actual: String,
+    },
     NotMergeable,
     MergeMethodDisallowed,
     Forbidden,
     NotFound,
+    /// The deployment has no user identity to post `@dependabot` commands under: a
+    /// rebase is refused before GitHub is asked anything. Merge and update branch
+    /// run as the App and are unaffected.
+    NoUserToken,
 }
 
 impl fmt::Display for RejectReason {
@@ -839,6 +846,9 @@ impl fmt::Display for RejectReason {
                 f.write_str("the configured identity is not allowed to perform this action")
             }
             Self::NotFound => f.write_str("the pull request was closed or no longer exists"),
+            Self::NoUserToken => {
+                f.write_str("no GitHub user token is configured for @dependabot commands")
+            }
         }
     }
 }
@@ -1109,6 +1119,19 @@ pub struct ManualSyncRequest {
     pub number: u64,
     /// The id the dashboard polls `PullRequest.status` for, in `completed_sync_ids`.
     pub completion_id: String,
+}
+
+/// What this deployment can do, as `DashboardIngress.capabilities` answers the dashboard:
+/// the settings the Restate service resolved at startup that decide which actions are on
+/// offer. The service is the one process that holds the credentials, so it is the one
+/// that can say.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// Whether a user identity is configured to post `@dependabot rebase` under. Without
+    /// one the service rejects every rebase as [`RejectReason::NoUserToken`] and the
+    /// dashboard withholds **Request rebase**; merge and update branch run as the App
+    /// and are always on offer.
+    pub rebase_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

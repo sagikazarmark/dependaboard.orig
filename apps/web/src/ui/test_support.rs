@@ -11,7 +11,7 @@ use dioxus::prelude::*;
 
 use crate::components::toast::ToastProvider;
 use crate::ui::dashboard_state::{
-    Connection, DashboardState, PageStatus, Selection, SummaryStatus,
+    Answers, CapabilitiesStatus, Connection, DashboardState, PageStatus, Selection, SummaryStatus,
 };
 use crate::ui::pr_target;
 
@@ -177,17 +177,18 @@ pub(crate) fn loaded_summary() -> DashboardSummary {
 }
 
 /// Mounts `children` where the dashboard's components expect to be: under a
-/// toast provider and a dashboard state with `filter` in force, `page` and
-/// `summary` as the read model's answers, `selected` picked (cut short by
-/// the batch limit from `capped_from` matching rows, if given), the clock at
-/// `now`, a manual sync in flight if `syncing`, and the line to the server
-/// as `connection` found it with the last poll answered at `refreshed_at`.
-/// Reloads go nowhere.
+/// toast provider and a dashboard state with `filter` in force, `page`,
+/// `summary`, and `capabilities` as the server's answers, `selected` picked
+/// (cut short by the batch limit from `capped_from` matching rows, if given),
+/// the clock at `now`, a manual sync in flight if `syncing`, and the line to
+/// the server as `connection` found it with the last poll answered at
+/// `refreshed_at`. Reloads go nowhere.
 #[component]
 pub(crate) fn DashboardFixture(
     #[props(default)] filter: PrFilter,
     #[props(default = PageStatus::Loading)] page: PageStatus,
     #[props(default = SummaryStatus::Loading)] summary: SummaryStatus,
+    #[props(default = CapabilitiesStatus::Loading)] capabilities: CapabilitiesStatus,
     #[props(default)] selected: Vec<PrRecord>,
     #[props(default)] capped_from: Option<u64>,
     #[props(default = FIXTURE_NOW)] now: u64,
@@ -206,8 +207,11 @@ pub(crate) fn DashboardFixture(
                 None => selection,
             }
         }),
-        use_signal(|| page),
-        use_signal(|| summary),
+        Answers {
+            page: use_signal(|| page).into(),
+            summary: use_signal(|| summary).into(),
+            capabilities: use_signal(|| capabilities).into(),
+        },
         use_signal(|| now),
         use_callback(|_| {}),
     );

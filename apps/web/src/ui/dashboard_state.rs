@@ -1,5 +1,6 @@
 //! The state the dashboard's components share: the filter in force, the page
-//! cursor, the selection, and the read model's answers.
+//! cursor, the selection, the read model's answers, and what the service says
+//! it can do.
 //!
 //! The filter, cursor, and selection are only changed through the methods
 //! here, so that a filter change always restarts paging and drops the
@@ -9,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use dependaboard_core::{DashboardPage, DashboardSummary, PrFilter, PrRecord};
+use dependaboard_core::{Capabilities, DashboardPage, DashboardSummary, PrFilter, PrRecord};
 use dioxus::prelude::*;
 
 use crate::ui::{repository_count, user_facing};
@@ -58,6 +59,24 @@ pub(crate) type PageStatus = Remote<DashboardPage>;
 /// The facets and freshness for the filter in force. Asked for once per
 /// filter: moving to the next page does not ask again.
 pub(crate) type SummaryStatus = Remote<DashboardSummary>;
+
+/// What the Restate service can do, as it said at startup. Asked once per
+/// page: it does not change under a running service.
+pub(crate) type CapabilitiesStatus = Remote<Capabilities>;
+
+/// Why a rebase is not on offer, once the service has said it is not: the
+/// deployment has no user PAT to post `@dependabot` commands with.
+pub(crate) const REBASE_UNAVAILABLE: &str =
+    "rebase is unavailable: no GitHub user token is configured";
+
+/// The server's answers the state carries, as the component that asked holds
+/// them: the rows for the filter and cursor in force, the facets for the
+/// filter, and what the service can do.
+pub(crate) struct Answers {
+    pub(crate) page: ReadSignal<PageStatus>,
+    pub(crate) summary: ReadSignal<SummaryStatus>,
+    pub(crate) capabilities: ReadSignal<CapabilitiesStatus>,
+}
 
 /// The dashboard's line to the read model, as the live refresh's polls find
 /// it.
@@ -120,6 +139,8 @@ pub(crate) struct DashboardState {
     pub(crate) page: ReadSignal<PageStatus>,
     /// The read model's facets and freshness for the filter in force.
     pub(crate) summary: ReadSignal<SummaryStatus>,
+    /// What the service can do, as it said when asked.
+    capabilities: ReadSignal<CapabilitiesStatus>,
     /// The dashboard's clock, in Unix seconds. It ticks on its own, so the
     /// relative times a component prints against it move without anything
     /// else happening.
@@ -137,17 +158,16 @@ pub(crate) struct DashboardState {
 }
 
 impl DashboardState {
-    /// Provides the state to the calling component's subtree. `page`,
-    /// `summary`, and `now` are boxed once, here, since every conversion to a
-    /// [`ReadSignal`] takes a slot in the scope for as long as the scope
+    /// Provides the state to the calling component's subtree. `now` is boxed
+    /// once, here, as `answers` were by the caller, since every conversion to
+    /// a [`ReadSignal`] takes a slot in the scope for as long as the scope
     /// lives. No manual sync is in flight to begin with, and the line to the
     /// server counts as online until a poll finds otherwise.
     pub(crate) fn provide(
         filter: Signal<PrFilter>,
         cursor: Signal<Option<String>>,
         selected: Signal<Selection>,
-        page: impl Into<ReadSignal<PageStatus>>,
-        summary: impl Into<ReadSignal<SummaryStatus>>,
+        answers: Answers,
         now: impl Into<ReadSignal<u64>>,
         reload: Callback<()>,
     ) -> Self {
@@ -158,14 +178,29 @@ impl DashboardState {
             filter,
             cursor,
             selected,
-            page: page.into(),
-            summary: summary.into(),
+            page: answers.page,
+            summary: answers.summary,
+            capabilities: answers.capabilities,
             now: now.into(),
             syncing,
             connection,
             refreshed_at,
             reload,
         })
+    }
+
+    /// Why a rebase is not on offer, if the service has said it is not; `None`
+    /// while it is, or while it has not said either way — the answer still in
+    /// flight, or not had — since the service guards the command itself, and
+    /// withholding on a guess would take an action away that may well work.
+    /// Reading it in a component subscribes the component to the answer.
+    pub(crate) fn rebase_withheld(&self) -> Option<&'static str> {
+        match &*self.capabilities.read() {
+            Remote::Loaded(capabilities) if !capabilities.rebase_enabled => {
+                Some(REBASE_UNAVAILABLE)
+            }
+            _ => None,
+        }
     }
 
     /// The filter in force. Reading it in a component subscribes the
@@ -492,8 +527,11 @@ mod tests {
             use_signal(PrFilter::default),
             use_signal(|| Some("page-2".to_owned())),
             use_signal(|| Selection::of([grouped_row()])),
-            use_signal(|| PageStatus::Loaded(loaded_page())),
-            use_signal(|| SummaryStatus::Loaded(loaded_summary())),
+            Answers {
+                page: use_signal(|| PageStatus::Loaded(loaded_page())).into(),
+                summary: use_signal(|| SummaryStatus::Loaded(loaded_summary())).into(),
+                capabilities: use_signal(|| CapabilitiesStatus::Loading).into(),
+            },
             use_signal(|| FIXTURE_NOW),
             use_callback(move |()| {
                 let mut reloads = reloads;

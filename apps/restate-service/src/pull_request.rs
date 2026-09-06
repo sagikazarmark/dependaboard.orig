@@ -323,7 +323,11 @@ impl PullRequest {
                 .await?
                 .map(Json::into_inner)
                 .unwrap_or_default();
-            if let Err(reason) = guard_target(state.snapshot.as_ref(), &request.target) {
+            if let Err(reason) = guard_command(
+                self.github.can_post_commands(),
+                state.snapshot.as_ref(),
+                &request.target,
+            ) {
                 return Ok(Json::from(rejected(reason)));
             }
 
@@ -526,6 +530,22 @@ fn target_matches_snapshot(target: &PrTarget, snapshot: &PrRecord) -> bool {
         && target.number == snapshot.number
 }
 
+/// [`guard_target`] for a `@dependabot` command, which also needs a user identity to
+/// be posted under. A deployment without one — no `GITHUB_USER_PAT` — has every
+/// command rejected before its target is judged: the want of a token is the
+/// deployment's condition, not the pull request's, and the reason the operator can
+/// act on. Nothing is sent to GitHub either way.
+fn guard_command(
+    can_post_commands: bool,
+    snapshot: Option<&PrRecord>,
+    target: &PrTarget,
+) -> Result<(), RejectReason> {
+    if !can_post_commands {
+        return Err(RejectReason::NoUserToken);
+    }
+    guard_target(snapshot, target)
+}
+
 pub(crate) fn short_sha(value: &str) -> &str {
     value.get(..7).unwrap_or(value)
 }
@@ -588,6 +608,40 @@ mod tests {
 
         assert_eq!(
             guard_target(Some(&snapshot()), &before_a_push),
+            Err(RejectReason::StaleSha {
+                expected: "def456".to_owned(),
+                actual: "abc123".to_owned(),
+            })
+        );
+    }
+
+    /// A deployment without a user PAT cannot post `@dependabot` commands. A command is
+    /// rejected for that first, whatever the target: the want of a token is the
+    /// deployment's condition, not the pull request's, and it is the reason the
+    /// operator can act on. With a token, the target guard has its say as usual.
+    #[test]
+    fn a_command_is_rejected_for_want_of_a_user_token_before_its_target_is_judged() {
+        let mut before_a_push = target();
+        before_a_push.expected_sha = "def456".to_owned();
+
+        assert_eq!(
+            guard_command(false, Some(&snapshot()), &target()),
+            Err(RejectReason::NoUserToken)
+        );
+        assert_eq!(
+            guard_command(false, Some(&snapshot()), &before_a_push),
+            Err(RejectReason::NoUserToken),
+            "the missing token outranks a stale head"
+        );
+        assert_eq!(
+            guard_command(false, None, &target()),
+            Err(RejectReason::NoUserToken),
+            "and a pull request the object holds no snapshot for"
+        );
+
+        assert_eq!(guard_command(true, Some(&snapshot()), &target()), Ok(()));
+        assert_eq!(
+            guard_command(true, Some(&snapshot()), &before_a_push),
             Err(RejectReason::StaleSha {
                 expected: "def456".to_owned(),
                 actual: "abc123".to_owned(),

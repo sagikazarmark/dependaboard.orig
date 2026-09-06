@@ -40,7 +40,7 @@ fn config(server: &MockServer) -> GithubConfig {
         app_id: APP_ID,
         installation_id: INSTALLATION_ID,
         private_key: SecretString::from(APP_KEY),
-        user_pat: SecretString::from(USER_PAT),
+        user_pat: Some(SecretString::from(USER_PAT)),
         dashboard_user: UserId::new(DASHBOARD_USER),
         merge_method: MergeMethod::Squash,
     }
@@ -1381,6 +1381,36 @@ async fn command_confirms_success_after_an_unparsable_response() {
     assert_eq!(
         detail,
         "command accepted as comment #777 (confirmed after an ambiguous response)"
+    );
+    server.verify().await;
+}
+
+/// A merge-only deployment mints no PAT. The client says so up front, so the service can
+/// reject a rebase rather than attempt it, and a command that slips through is refused
+/// with the variable to set before GitHub is asked anything: not even the verify read.
+#[tokio::test]
+async fn without_a_user_pat_the_client_cannot_post_commands_and_refuses_them_untouched() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ok_json(json!({})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let config = GithubConfig {
+        user_pat: None,
+        ..config(&server)
+    };
+    let merge_only = GithubClient::new(config).expect("a PAT is not needed to build a client");
+
+    assert!(client(&server).can_post_commands());
+    assert!(!merge_only.can_post_commands());
+    let error = merge_only
+        .post_command(&command_request())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, GithubError::Config(message) if message.contains("GITHUB_USER_PAT")),
+        "expected a config error naming the variable to set, got {error:?}"
     );
     server.verify().await;
 }

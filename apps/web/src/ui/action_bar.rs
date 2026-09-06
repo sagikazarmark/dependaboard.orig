@@ -13,6 +13,8 @@ use crate::ui::format::repositories;
 /// that moment. A selection larger than one batch takes has its actions
 /// withheld until it is trimmed: rows picked one by one on later pages can
 /// push a selection past the limit, and the server would refuse the batch.
+/// A rebase is withheld on its own, with the reason, once the service has
+/// said it has no user token to post one with.
 #[component]
 pub(crate) fn ActionBar(onrequest: EventHandler<PendingAction>) -> Element {
     let mut state = use_dashboard();
@@ -33,6 +35,7 @@ pub(crate) fn ActionBar(onrequest: EventHandler<PendingAction>) -> Element {
             )
         })
     };
+    let rebase_withheld = state.rebase_withheld();
     let request = move |action: BulkActionKind| {
         onrequest.call(PendingAction {
             action,
@@ -47,11 +50,14 @@ pub(crate) fn ActionBar(onrequest: EventHandler<PendingAction>) -> Element {
             if let Some(note) = note {
                 span { class: "action-note", "{note}" }
             }
+            if let Some(reason) = rebase_withheld {
+                span { class: "action-note", "{reason}" }
+            }
             span { class: "action-divider" }
             Button {
                 size: ButtonSize::Sm,
                 class: "rebase-button",
-                disabled: over_limit > 0,
+                disabled: over_limit > 0 || rebase_withheld.is_some(),
                 onclick: move |_| request(BulkActionKind::Rebase),
                 "Request rebase"
             }
@@ -75,10 +81,10 @@ pub(crate) fn ActionBar(onrequest: EventHandler<PendingAction>) -> Element {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use dependaboard_core::PrRecord;
+    use dependaboard_core::{Capabilities, PrRecord};
 
     use super::*;
-    use crate::ui::dashboard_state::PageStatus;
+    use crate::ui::dashboard_state::{CapabilitiesStatus, PageStatus, REBASE_UNAVAILABLE};
     use crate::ui::test_support::{
         DashboardFixture, grouped_row, loaded_page, off_page_row, render, serde_row,
     };
@@ -190,5 +196,56 @@ mod tests {
             3,
             "every action is withheld: {html}"
         );
+    }
+
+    /// A deployment without a user PAT cannot post `@dependabot rebase`; the
+    /// service says so, and the bar withholds that one action with the reason,
+    /// leaving merge and update branch, which run as the App, on offer. Until
+    /// the service has said either way — the answer still in flight, or not
+    /// had — nothing is withheld: the service guards the command itself.
+    #[test]
+    fn a_rebase_is_withheld_with_its_reason_only_once_the_service_says_it_is_off() {
+        #[component]
+        fn Fixture(capabilities: CapabilitiesStatus) -> Element {
+            rsx! {
+                DashboardFixture {
+                    page: PageStatus::Loaded(loaded_page()),
+                    selected: vec![grouped_row(), serde_row()],
+                    capabilities,
+                    ActionBar { onrequest: move |_| {} }
+                }
+            }
+        }
+        let render = |capabilities: CapabilitiesStatus| {
+            let mut dom = VirtualDom::new_with_props(Fixture, FixtureProps { capabilities });
+            dom.rebuild_in_place();
+            dioxus::ssr::render(&dom)
+        };
+
+        let off = render(CapabilitiesStatus::Loaded(Capabilities {
+            rebase_enabled: false,
+        }));
+        assert!(off.contains(REBASE_UNAVAILABLE), "{off}");
+        assert_eq!(
+            off.matches("disabled").count(),
+            1,
+            "the rebase alone is withheld: {off}"
+        );
+        assert!(off.contains(r#"rebase-button" disabled=true"#), "{off}");
+
+        let on = render(CapabilitiesStatus::Loaded(Capabilities {
+            rebase_enabled: true,
+        }));
+        assert!(!on.contains("disabled"), "{on}");
+        assert!(!on.contains(REBASE_UNAVAILABLE), "{on}");
+
+        for unknown in [
+            CapabilitiesStatus::Loading,
+            CapabilitiesStatus::Failed("Restate is unavailable".to_owned()),
+        ] {
+            let html = render(unknown);
+            assert!(!html.contains("disabled"), "{html}");
+            assert!(!html.contains(REBASE_UNAVAILABLE), "{html}");
+        }
     }
 }
