@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time:
 use async_trait::async_trait;
 use dependaboard_core::{
     BatchRecord, BatchTargetRecord, CursorError, DashboardPage, DashboardSummary, FacetCounts,
-    LabelFacet, Mergeable, Page, PageCursor, PrFilter, PrKey, PrRecord, RepoFacet, RepoRecord,
-    UserId, unix_seconds,
+    LabelFacet, Mergeable, Page, PageCursor, PrFilter, PrKey, PrRecord, ProjectionRevision,
+    RepoFacet, RepoRecord, UserId, unix_seconds,
 };
 use libsql::{Builder, Row, Value};
 use secrecy::{ExposeSecret, SecretString};
@@ -119,10 +119,11 @@ pub trait PrStore: Send + Sync {
     /// does not depend on paging, so a caller moving to the next page need not
     /// ask again.
     async fn dashboard_summary(&self, filter: &PrFilter) -> Result<DashboardSummary, StoreError>;
-    /// A counter that moves whenever a row of the read model changes, however
-    /// it changes. Cheap to read, so a dashboard can ask often and reload
-    /// only when the answer differs from the one it last saw.
-    async fn projection_revision(&self) -> Result<u64, StoreError>;
+    /// Two counters, one that moves whenever a row of the read model changes,
+    /// however it changes, and one that moves only when a pull request row
+    /// does. Cheap to read, so a dashboard can ask often and act only when
+    /// an answer differs from the one it last saw.
+    async fn projection_revision(&self) -> Result<ProjectionRevision, StoreError>;
     async fn prs_for_sha(&self, repository_id: u64, sha: &str)
     -> Result<Vec<PrRecord>, StoreError>;
     async fn upsert_repo(&self, repo: &RepoRecord) -> Result<(), StoreError>;
@@ -311,14 +312,18 @@ impl PrStore for LibSqlPrStore {
         })
     }
 
-    async fn projection_revision(&self) -> Result<u64, StoreError> {
+    async fn projection_revision(&self) -> Result<ProjectionRevision, StoreError> {
         let connection = self.connection().await;
-        scalar_u64(
+        let row = single_row(
             &connection,
-            "SELECT revision FROM projection_revision WHERE id = 1",
+            "SELECT revision, pull_requests FROM projection_revision WHERE id = 1",
             Vec::new(),
         )
-        .await
+        .await?;
+        Ok(ProjectionRevision {
+            projection: unsigned(row.get::<i64>(0)?)?,
+            pull_requests: unsigned(row.get::<i64>(1)?)?,
+        })
     }
 
     async fn prs_for_sha(
@@ -745,13 +750,23 @@ async fn grouped_counts(
     Ok(counts)
 }
 
+/// The one row a query is bound to produce — an aggregate's, or the
+/// single-row table's — which not coming back is [`StoreError::MissingScalar`].
+async fn single_row(
+    connection: &libsql::Connection,
+    sql: &str,
+    params: Vec<Value>,
+) -> Result<Row, StoreError> {
+    let mut rows = connection.query(sql, params).await?;
+    rows.next().await?.ok_or(StoreError::MissingScalar)
+}
+
 async fn scalar_u64(
     connection: &libsql::Connection,
     sql: &str,
     params: Vec<Value>,
 ) -> Result<u64, StoreError> {
-    let mut rows = connection.query(sql, params).await?;
-    let row = rows.next().await?.ok_or(StoreError::MissingScalar)?;
+    let row = single_row(connection, sql, params).await?;
     unsigned(row.get::<i64>(0)?)
 }
 
@@ -760,8 +775,7 @@ async fn scalar_optional_u64(
     sql: &str,
     params: Vec<Value>,
 ) -> Result<Option<u64>, StoreError> {
-    let mut rows = connection.query(sql, params).await?;
-    let row = rows.next().await?.ok_or(StoreError::MissingScalar)?;
+    let row = single_row(connection, sql, params).await?;
     row.get::<Option<i64>>(0)?.map(unsigned).transpose()
 }
 
@@ -1663,27 +1677,54 @@ mod tests {
     }
 
     /// The dashboard polls the revision to learn whether anything it shows
-    /// has changed, so every write that changes a row moves it — the rows a
-    /// repository delete takes with it included — and reads and writes that
-    /// change nothing leave it where it is.
+    /// has changed, so every write that changes a row moves the projection's
+    /// counter — the rows a repository delete takes with it included — and
+    /// reads and writes that change nothing leave it where it is. The pull
+    /// requests' counter follows their rows alone: a sweep writes every
+    /// repository before it reaches a single pull request, and the dashboard
+    /// must not take those writes for the pull requests having refreshed.
     #[tokio::test]
-    async fn the_projection_revision_advances_on_every_row_change_and_only_then() {
+    async fn the_projection_revision_follows_every_row_and_the_pull_requests_one_only_theirs() {
         /// The revision as the dashboard follows it: what it last saw.
         struct Follower<'a> {
             store: &'a LibSqlPrStore,
-            seen: u64,
+            seen: ProjectionRevision,
         }
 
         impl Follower<'_> {
-            async fn advanced(&mut self, what: &str) {
+            /// A pull request row changed: both counters moved.
+            async fn pull_requests_advanced(&mut self, what: &str) {
                 let now = self.store.projection_revision().await.unwrap();
-                assert!(now > self.seen, "{what} should advance the revision");
+                assert!(
+                    now.projection > self.seen.projection,
+                    "{what} should advance the projection's revision"
+                );
+                assert!(
+                    now.pull_requests > self.seen.pull_requests,
+                    "{what} should advance the pull requests' revision"
+                );
                 self.seen = now;
             }
 
+            /// Only repository rows changed: the projection's counter moved
+            /// alone.
+            async fn repositories_advanced(&mut self, what: &str) {
+                let now = self.store.projection_revision().await.unwrap();
+                assert!(
+                    now.projection > self.seen.projection,
+                    "{what} should advance the projection's revision"
+                );
+                assert_eq!(
+                    now.pull_requests, self.seen.pull_requests,
+                    "{what} should not advance the pull requests' revision"
+                );
+                self.seen = now;
+            }
+
+            /// No row changed: neither counter moved.
             async fn unchanged(&self, what: &str) {
                 let now = self.store.projection_revision().await.unwrap();
-                assert_eq!(now, self.seen, "{what} should not advance the revision");
+                assert_eq!(now, self.seen, "{what} should not advance either revision");
             }
         }
 
@@ -1694,11 +1735,19 @@ mod tests {
         };
 
         store.upsert_repo(&repo(1, 10)).await.unwrap();
-        follower.advanced("adding a repository").await;
+        follower.repositories_advanced("adding a repository").await;
+        store.upsert_repo(&repo(1, 20)).await.unwrap();
+        follower
+            .repositories_advanced("syncing a repository again")
+            .await;
         store.upsert_pr(&pr(1, 1, 100)).await.unwrap();
-        follower.advanced("adding a pull request").await;
+        follower
+            .pull_requests_advanced("adding a pull request")
+            .await;
         store.upsert_pr(&pr(1, 1, 200)).await.unwrap();
-        follower.advanced("syncing a pull request again").await;
+        follower
+            .pull_requests_advanced("syncing a pull request again")
+            .await;
 
         store
             .list_prs(&PrFilter::default(), Page::default())
@@ -1713,38 +1762,57 @@ mod tests {
             .await;
 
         store.delete_pr(&PrKey::new(1, 1)).await.unwrap();
-        follower.advanced("deleting a pull request").await;
+        follower
+            .pull_requests_advanced("deleting a pull request")
+            .await;
         store.upsert_pr(&pr(1, 2, 100)).await.unwrap();
         store.upsert_pr(&pr(1, 3, 100)).await.unwrap();
-        follower.advanced("adding pull requests").await;
+        follower
+            .pull_requests_advanced("adding pull requests")
+            .await;
         store.retain_prs(1, &[2], 1_000).await.unwrap();
         follower
-            .advanced("a reconciliation that prunes a row")
+            .pull_requests_advanced("a reconciliation that prunes a row")
             .await;
 
         store.upsert_repo(&repo(2, 10)).await.unwrap();
+        follower
+            .repositories_advanced("adding a second repository")
+            .await;
         store.upsert_pr(&pr(2, 1, 100)).await.unwrap();
         follower
-            .advanced("adding a second repository with a pull request")
+            .pull_requests_advanced("adding the second repository's pull request")
             .await;
         store
-            .replace_installation_repos(9, &[repo(1, 20)], 1_000)
+            .replace_installation_repos(9, &[repo(1, 30), repo(2, 30)], 1_000)
             .await
             .unwrap();
         follower
-            .advanced("an installation sync that drops a repository")
+            .repositories_advanced("an installation sync that keeps every repository")
+            .await;
+        store
+            .replace_installation_repos(9, &[repo(1, 40)], 1_000)
+            .await
+            .unwrap();
+        follower
+            .pull_requests_advanced(
+                "an installation sync that drops a repository and its pull request",
+            )
             .await;
         assert_eq!(store.get_pr(&PrKey::new(2, 1)).await.unwrap(), None);
 
         store.purge_installation(9).await.unwrap();
-        follower.advanced("purging the installation").await;
+        follower
+            .pull_requests_advanced("purging the installation")
+            .await;
     }
 
     /// Migration 0004 promises that a repository delete which cascades to its
     /// pull requests moves the revision as surely as an upsert. The store
     /// never issues such a delete — it removes the pull requests first so it
     /// can report them — so exercise the cascade itself: one tick for the
-    /// repository row and one for each pull request that went with it.
+    /// repository row and one for each pull request that went with it, of
+    /// which only the pull requests' count towards their own revision.
     #[tokio::test]
     async fn a_cascading_repository_delete_advances_the_projection_revision() {
         let (_directory, store) = test_store().await;
@@ -1766,7 +1834,13 @@ mod tests {
         assert_eq!(store.get_repo(1).await.unwrap(), None);
         assert_eq!(store.get_pr(&PrKey::new(1, 1)).await.unwrap(), None);
         assert_eq!(store.get_pr(&PrKey::new(1, 2)).await.unwrap(), None);
-        assert_eq!(store.projection_revision().await.unwrap(), before + 3);
+        assert_eq!(
+            store.projection_revision().await.unwrap(),
+            ProjectionRevision {
+                projection: before.projection + 3,
+                pull_requests: before.pull_requests + 2,
+            }
+        );
     }
 
     #[tokio::test]

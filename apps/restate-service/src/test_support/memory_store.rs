@@ -10,7 +10,8 @@ use std::{collections::BTreeMap, sync::Mutex};
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    BatchRecord, DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord, RepoRecord,
+    BatchRecord, DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord,
+    ProjectionRevision, RepoRecord,
 };
 use dependaboard_store::{PrStore, StoreError};
 
@@ -22,7 +23,7 @@ use dependaboard_store::{PrStore, StoreError};
 /// deleting a repository takes its pull requests with it, a pull request reads back
 /// with its repository's `installation_id`, as the store's `JOIN` gives it, and a batch
 /// recorded twice keeps its first record. What the service never asks of the store, the
-/// dashboard listing, its summary, the revision counter, and the recent batches, is not
+/// dashboard listing, its summary, the revision counters, and the recent batches, is not
 /// implemented and panics if called.
 #[derive(Default)]
 pub(crate) struct MemoryPrStore {
@@ -161,7 +162,7 @@ impl PrStore for MemoryPrStore {
         )
     }
 
-    async fn projection_revision(&self) -> Result<u64, StoreError> {
+    async fn projection_revision(&self) -> Result<ProjectionRevision, StoreError> {
         unimplemented!(
             "the Restate service never asks whether the projection moved; the dashboard polls it through the web app"
         )

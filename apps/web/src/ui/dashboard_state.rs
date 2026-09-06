@@ -109,8 +109,8 @@ pub(crate) struct DashboardState {
     /// relative times a component prints against it move without anything
     /// else happening.
     now: ReadSignal<u64>,
-    /// Whether a manual sync is in flight: asked for, and not yet followed by
-    /// a reload of the rows.
+    /// Whether a manual sync is in flight: asked for, and not yet seen to
+    /// reach the pull requests.
     syncing: Signal<bool>,
     /// Asks the read model again for the same filter and cursor.
     reload: Callback<()>,
@@ -165,13 +165,15 @@ impl DashboardState {
         *self.syncing.read()
     }
 
-    /// A manual sync has been asked for. It is in flight until the rows
-    /// reload, or until [`Self::end_sync`] says it never got going.
+    /// A manual sync has been asked for. It is in flight until
+    /// [`Self::end_sync`] says it is over: the live refresh has seen it
+    /// reach the pull requests, has stopped waiting for it, or Restate did
+    /// not take it.
     pub(crate) fn begin_sync(&mut self) {
         self.syncing.set(true);
     }
 
-    /// The manual sync is over without the rows having reloaded: Restate did
+    /// The manual sync is over: it reached the pull requests, Restate did
     /// not take it, or the dashboard has stopped waiting for it.
     pub(crate) fn end_sync(&mut self) {
         if *self.syncing.peek() {
@@ -180,9 +182,10 @@ impl DashboardState {
     }
 
     /// Asks the read model again for the same filter and cursor. A manual
-    /// sync in flight is over: the rows reloading is what it was waiting for.
+    /// sync in flight stays in flight: the rows reloading is not what it is
+    /// waiting for — a sweep writes every repository before it reaches a
+    /// pull request, and a retry after a failed read reloads them too.
     pub(crate) fn reload(&mut self) {
-        self.end_sync();
         self.reload.call(());
     }
 
@@ -459,10 +462,13 @@ mod tests {
     }
 
     /// The sync glyph spins from the moment a manual sync is asked for until
-    /// the rows reload, whatever reloaded them; a sync Restate did not take
-    /// is over at once.
+    /// the live refresh sees the sweep reach the pull requests and ends it.
+    /// Reloading the rows is not what ends it — a retry after a failed
+    /// read, or a repository the sweep wrote ahead of its pull requests,
+    /// reloads them with the sweep still running — so a reload leaves the
+    /// sync in flight; a sync Restate did not take is over at once.
     #[test]
-    fn a_manual_sync_is_in_flight_until_the_rows_reload_or_it_is_ended() {
+    fn a_manual_sync_is_in_flight_until_it_is_ended_however_often_the_rows_reload() {
         let (dom, mut state) = mount();
 
         dom.in_runtime(|| {
@@ -470,10 +476,9 @@ mod tests {
             state.begin_sync();
             assert!(state.syncing());
             state.reload();
-            assert!(!state.syncing());
+            assert!(state.syncing(), "a reload alone does not end the sync");
             assert_eq!(reloads(&dom), 1);
 
-            state.begin_sync();
             state.end_sync();
             assert!(!state.syncing());
             assert_eq!(reloads(&dom), 1, "ending a sync does not reload");

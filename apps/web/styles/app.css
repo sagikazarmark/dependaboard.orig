@@ -260,7 +260,7 @@ code,
   font-size: 15px;
 }
 
-/* A manual sync is in flight: the glyph turns until the rows reload. */
+/* A manual sync is in flight: the glyph turns until the sweep reaches the pull requests. */
 .sync-glyph.spinning {
   animation: spin 0.8s linear infinite;
 }

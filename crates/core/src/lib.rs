@@ -579,6 +579,20 @@ pub struct DashboardSummary {
     pub last_synced_at: Option<u64>,
 }
 
+/// Where the read model stands: two counters the store moves as rows change,
+/// cheap enough to poll. A dashboard acts on an answer only where it differs
+/// from the one it last saw, and the two answer different questions: whether
+/// anything it shows may have moved, and whether a sync has reached the pull
+/// requests — which the repositories a sweep writes first cannot say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionRevision {
+    /// Moves whenever any row of the read model changes, however it changes.
+    pub projection: u64,
+    /// Moves whenever a pull request row changes, however it changes; a
+    /// repository row changing on its own leaves it where it is.
+    pub pull_requests: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeMethod {

@@ -5,11 +5,13 @@
 //! polling the projection's revision, one cheap read, and reloading the rows
 //! only when the answer has moved. The same poll is what tells a manual sync
 //! apart from nothing happening: while one is in flight the dashboard asks
-//! every second, and the sync glyph spins until the rows reload.
+//! every second, and the sync glyph spins until the pull requests' own
+//! revision moves — the sweep writes every repository before it reaches a
+//! pull request, and those writes are not what the glyph is waiting for.
 
 use std::time::Duration;
 
-use dependaboard_core::unix_seconds;
+use dependaboard_core::{ProjectionRevision, unix_seconds};
 use dioxus::logger::tracing;
 use dioxus::prelude::*;
 
@@ -23,8 +25,9 @@ pub(crate) const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How long a manual sync is followed, asked about every poll interval,
 /// before the dashboard stops waiting for it and reloads anyway. A sync that
-/// reaches the store moves the revision within seconds; one that does not is
-/// not going to.
+/// reaches the pull requests moves their revision within seconds; one that
+/// does not — nothing reached the store, or the installation has no pull
+/// requests for it to reach — is not going to.
 pub(crate) const SYNC_FOLLOW_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How often the relative times are brought up to date.
@@ -47,6 +50,20 @@ pub(crate) enum Step {
     Reload,
 }
 
+/// What an answer to the poll said had moved since the answer before it.
+/// The two are read apart rather than ranked: a pull request row moves both
+/// counters, so the second seldom moves alone — but a database reset can
+/// leave either where it was while moving the other, and each flag is still
+/// right about its own rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Moved {
+    /// A row of the read model changed: the rows must be reloaded.
+    pub(crate) projection: bool,
+    /// A pull request row changed: a manual sync in flight has reached the
+    /// pull requests, which is what it was being followed for.
+    pub(crate) pull_requests: bool,
+}
+
 /// The dashboard's refresh, decided one tick at a time: when to ask for the
 /// revision, and whether an answer means the rows have moved.
 ///
@@ -64,7 +81,7 @@ pub(crate) struct Refresh {
     /// Visible ticks spent following the manual sync in flight.
     followed: u32,
     /// The revision the server last answered.
-    seen: Option<u64>,
+    seen: Option<ProjectionRevision>,
 }
 
 impl Refresh {
@@ -105,14 +122,23 @@ impl Refresh {
         }
     }
 
-    /// Takes in the revision the server answered; whether it differs from the
-    /// last answer, in which case the rows have moved and must be reloaded.
-    /// The first answer is only remembered: it is asked for as the rows are,
-    /// so it is what they show, give or take a write that lands between the
-    /// two reads — which the next write, the hourly sweep's at the latest,
-    /// brings in.
-    pub(crate) fn observe(&mut self, revision: u64) -> bool {
-        let moved = self.seen.is_some_and(|seen| seen != revision);
+    /// Takes in the revision the server answered; which of its counters
+    /// differ from the last answer, in which case the rows they count have
+    /// moved. The first answer is only remembered: it is asked for as the
+    /// rows are, so it is what they show, give or take a write that lands
+    /// between the two reads — which the next write, the hourly sweep's at
+    /// the latest, brings in.
+    pub(crate) fn observe(&mut self, revision: ProjectionRevision) -> Moved {
+        let moved = match self.seen {
+            Some(seen) => Moved {
+                projection: seen.projection != revision.projection,
+                pull_requests: seen.pull_requests != revision.pull_requests,
+            },
+            None => Moved {
+                projection: false,
+                pull_requests: false,
+            },
+        };
         self.seen = Some(revision);
         moved
     }
@@ -167,10 +193,13 @@ pub(crate) fn use_clock(visible: ReadSignal<bool>) -> ReadSignal<u64> {
 }
 
 /// Keeps the rows current: asks for the projection's revision as [`Refresh`]
-/// schedules it and reloads the rows when it has moved. The first tick is
-/// taken at once, alongside the first read of the rows, so the revision
-/// remembered is the one they were read at. An answer that does not come is
-/// noted and waited out; the next tick asks again.
+/// schedules it, reloads the rows when it has moved, and ends the manual
+/// sync in flight, if any, when the pull requests' own revision has: that is
+/// the sweep reaching the pull requests, which is what the sync glyph was
+/// spinning for. The first tick is taken at once, alongside the first read
+/// of the rows, so the revision remembered is the one they were read at. An
+/// answer that does not come is noted and waited out; the next tick asks
+/// again.
 pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bool>) {
     use_future(move || async move {
         let mut refresh = Refresh::new();
@@ -179,7 +208,11 @@ pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bo
                 Step::Wait => {}
                 Step::Poll => match load_projection_revision().await {
                     Ok(revision) => {
-                        if refresh.observe(revision) {
+                        let moved = refresh.observe(revision);
+                        if moved.pull_requests {
+                            state.end_sync();
+                        }
+                        if moved.projection {
                             state.reload();
                         }
                     }
@@ -187,7 +220,10 @@ pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bo
                         tracing::debug!(%error, "the projection's revision could not be read");
                     }
                 },
-                Step::Reload => state.reload(),
+                Step::Reload => {
+                    state.end_sync();
+                    state.reload();
+                }
             }
             sleep(POLL_INTERVAL).await;
         }
@@ -244,7 +280,8 @@ mod tests {
         }
         assert_eq!(refresh.tick(true, true), Step::Reload);
 
-        // The reload ended the sync; the idle cadence takes over.
+        // The dashboard ended the sync as it reloaded; the idle cadence
+        // takes over.
         wait(&mut refresh, REFRESH_TICKS - 1, true, false);
         assert_eq!(refresh.tick(true, false), Step::Poll);
     }
@@ -266,15 +303,54 @@ mod tests {
 
     /// The rows were read moments before the first answer, so it is only
     /// remembered. Any other answer afterwards — a lower one too, which is a
-    /// database that was reset — means the rows have moved.
+    /// database that was reset — means the rows have moved. The two counters
+    /// are told apart: a repository written on its own moves the rows, and
+    /// says nothing of a sync having reached the pull requests.
     #[test]
-    fn the_first_revision_is_remembered_and_any_other_one_means_a_reload() {
+    fn the_first_revision_is_remembered_and_any_other_one_says_which_rows_moved() {
         let mut refresh = Refresh::new();
+        let at = |projection, pull_requests| ProjectionRevision {
+            projection,
+            pull_requests,
+        };
+        let still = Moved {
+            projection: false,
+            pull_requests: false,
+        };
 
-        assert!(!refresh.observe(5));
-        assert!(!refresh.observe(5));
-        assert!(refresh.observe(6));
-        assert!(!refresh.observe(6));
-        assert!(refresh.observe(2));
+        assert_eq!(
+            refresh.observe(at(5, 2)),
+            still,
+            "the first answer is only remembered"
+        );
+        assert_eq!(refresh.observe(at(5, 2)), still);
+
+        assert_eq!(
+            refresh.observe(at(6, 2)),
+            Moved {
+                projection: true,
+                pull_requests: false,
+            },
+            "a repository row alone"
+        );
+        assert_eq!(refresh.observe(at(6, 2)), still);
+
+        assert_eq!(
+            refresh.observe(at(7, 3)),
+            Moved {
+                projection: true,
+                pull_requests: true,
+            },
+            "a pull request row"
+        );
+
+        assert_eq!(
+            refresh.observe(at(1, 0)),
+            Moved {
+                projection: true,
+                pull_requests: true,
+            },
+            "a database that was reset"
+        );
     }
 }

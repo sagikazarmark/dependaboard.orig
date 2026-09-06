@@ -63,8 +63,9 @@ pub(crate) fn TopBar(
                 "Batches"
             }
             // The sync is one-way: Restate takes it and the sweep runs on
-            // its own. The glyph spins until the rows reload, which the live
-            // refresh sees to once the sweep's first change lands.
+            // its own. The glyph spins until the live refresh sees the sweep
+            // reach the pull requests — not its first write, which is a
+            // repository row, refreshed before any pull request is.
             Button {
                 size: ButtonSize::Sm,
                 class: "sync-button",

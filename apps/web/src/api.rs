@@ -4,7 +4,7 @@
 
 use dependaboard_core::{
     BatchProgress, BatchRecord, BulkActionKind, DashboardPage, DashboardSummary, Page, PrFilter,
-    PrRecord, PrState, PrTarget,
+    PrRecord, PrState, PrTarget, ProjectionRevision,
 };
 use dioxus::prelude::*;
 
@@ -63,11 +63,13 @@ pub(crate) async fn load_matching(filter: PrFilter) -> Result<DashboardPage, Ser
         .map_err(store_failure)
 }
 
-/// The read model's revision: a counter that moves whenever a row changes.
-/// Cheap enough for the dashboard to poll, so it can reload the rows only
-/// when the answer has moved since it last asked.
+/// The read model's revision: a counter that moves whenever a row changes,
+/// beside one that moves only when a pull request row does. Cheap enough for
+/// the dashboard to poll, so it can reload the rows only when the answer has
+/// moved since it last asked, and tell a sweep's first repository write from
+/// its pull requests landing.
 #[server(state: Extension<ServerState>)]
-pub(crate) async fn load_projection_revision() -> Result<u64, ServerFnError> {
+pub(crate) async fn load_projection_revision() -> Result<ProjectionRevision, ServerFnError> {
     state
         .store
         .projection_revision()
