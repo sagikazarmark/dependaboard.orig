@@ -15,7 +15,10 @@ use tracing::warn;
 use crate::{
     handler::{HandlerOutcome, handler_cause, traced, traced_read},
     pull_request::PullRequestClient,
-    store::{brief_store_retry_policy, persistent_store_retry_policy, store_failure},
+    store::{
+        batch_record_failure, brief_store_retry_policy, persistent_store_retry_policy,
+        store_failure, store_retry_policy,
+    },
 };
 
 const BATCH_PROGRESS: &str = "progress";
@@ -85,14 +88,18 @@ trait BulkActionEffects {
     ) -> impl Future<Output = HandlerResult<()>> + Send;
     /// Stops listing the batch as running without recording it, for a workflow that
     /// ends with no finished batch to record: cancelled, or failed past what a target's
-    /// own verdict can carry. Best effort, as the listing was.
+    /// own verdict can carry. Best effort, as the listing was, though with the ordinary
+    /// store budget rather than the listing's short one: nothing waits behind it.
     fn unlist_batch(&mut self) -> impl Future<Output = HandlerResult<()>> + Send;
     /// Writes the finished batch to the projection, where it outlives the workflow's
     /// retention. Written once per batch: the store keeps the first record and Restate
     /// journals the step, so neither a retry nor a replay writes a second. Nothing would
-    /// redo this write, so it is retried until the store takes it rather than given up,
-    /// and once it has been pending past [`RECORD_PENDING_QUIETLY_FOR`] each failed
-    /// attempt is logged, so a wedged store shows in the service log.
+    /// redo this write, so every store failure is retried — the ones the store calls
+    /// terminal too — and the step is never given up: a store that refuses the record
+    /// stalls the workflow, in the Restate UI and, once the record has been pending past
+    /// [`RECORD_PENDING_QUIETLY_FOR`], in the service log on every failed attempt, until
+    /// an operator has put the store right. The only way this ends without writing is
+    /// the operator cancelling the workflow.
     fn record_batch(
         &mut self,
         record: &BatchRecord,
@@ -212,7 +219,7 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
                 store.unlist_batch(&batch_id).await.map_err(store_failure)?;
                 Ok(())
             })
-            .retry_policy(brief_store_retry_policy())
+            .retry_policy(store_retry_policy())
             .name("unlist-batch")
             .await?;
         Ok(())
@@ -224,8 +231,9 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
         self.ctx
             .run(move || async move {
                 store.record_batch(&record).await.map_err(|error| {
-                    warn_if_record_stuck(&record, unix_seconds(), &error);
-                    store_failure(error)
+                    let failure = batch_record_failure(error);
+                    warn_if_record_stuck(&record, unix_seconds(), &handler_cause(&failure));
+                    failure
                 })?;
                 Ok(())
             })
@@ -244,9 +252,11 @@ const RECORD_PENDING_QUIETLY_FOR: Duration = Duration::from_secs(30);
 
 /// Logs, at `warn`, a failed attempt to write a finished batch's record, once the record
 /// has been pending for longer than [`RECORD_PENDING_QUIETLY_FOR`] since the batch
-/// finished. `now` is Unix seconds. Restate owns the retrying and re-runs the handler
-/// for each attempt, so no attempt can count the ones before it; the record's age, from
-/// the journaled `completed_at`, is what every attempt knows.
+/// finished. `now` is Unix seconds; `cause` is the failure as Restate sees it, which
+/// carries whether the store expected the failure to clear on its own. Restate owns the
+/// retrying and re-runs the handler for each attempt, so no attempt can count the ones
+/// before it; the record's age, from the journaled `completed_at`, is what every attempt
+/// knows.
 fn warn_if_record_stuck(record: &BatchRecord, now: u64, cause: &impl fmt::Display) {
     let pending_for = now.saturating_sub(record.completed_at);
     if pending_for <= RECORD_PENDING_QUIETLY_FOR.as_secs() {
@@ -279,9 +289,11 @@ fn warn_if_record_stuck(record: &BatchRecord, now: u64, cause: &impl fmt::Displa
 /// batch carries on: one pull request's problem is not a reason to leave the rest queued.
 /// Once every target has settled the batch is recorded, with who asked for it and when
 /// it ran, so its outcome is still there after Restate has forgotten the workflow. The
-/// record is retried until it lands, so the batch still ends with its tally rather than
-/// an error when the store is away for a while; only a store that rejects the record
-/// outright fails it.
+/// record is retried until it lands, whatever the store's failure, so the batch ends
+/// with its tally rather than an error however long the store is away or wrong; a
+/// batch that has completed and still ends in error was cancelled by an operator after
+/// its last target settled — while stalled on the store, most likely — and it keeps its
+/// running listing as evidence rather than vanishing from the audit view altogether.
 async fn run_bulk_action<E: BulkActionEffects>(
     restate: &mut E,
     request: &BulkRequest,
@@ -306,6 +318,7 @@ async fn run_bulk_action<E: BulkActionEffects>(
     }
     let outcome = drive(restate, request, &mut progress, &mut publish, started_at).await;
     if outcome.is_err()
+        && !progress.completed
         && let Err(error) = restate.unlist_batch().await
     {
         warn!(
@@ -318,7 +331,8 @@ async fn run_bulk_action<E: BulkActionEffects>(
 }
 
 /// Runs the batch's targets and records the finished batch; the body of
-/// [`run_bulk_action`] between listing the batch and, if this fails, unlisting it.
+/// [`run_bulk_action`] between listing the batch and, if this fails before the batch has
+/// completed, unlisting it.
 async fn drive<E: BulkActionEffects>(
     restate: &mut E,
     request: &BulkRequest,
@@ -581,6 +595,8 @@ mod tests {
         start_fails: bool,
         /// Whether the first round ends the workflow, as a cancellation does.
         round_fails: bool,
+        /// A failure the record step ends with instead of writing, taken once.
+        record_failure: Option<HandlerError>,
         /// Every batch id whose running listing was taken away, in order.
         unlisted: Vec<String>,
         /// Every batch record written to the projection, in order.
@@ -683,6 +699,9 @@ mod tests {
         }
 
         async fn record_batch(&mut self, record: &BatchRecord) -> HandlerResult<()> {
+            if let Some(failure) = self.record_failure.take() {
+                return Err(failure);
+            }
             self.recorded.push(record.clone());
             Ok(())
         }
@@ -1090,6 +1109,30 @@ mod tests {
         assert_eq!(restate.started.len(), 1);
         assert_eq!(restate.unlisted, vec!["batch-1"]);
         assert!(restate.recorded.is_empty(), "{:?}", restate.recorded);
+    }
+
+    /// The record step retries every store failure, so the one way it ends without
+    /// writing is an operator cancelling the workflow while it is stalled on the store.
+    /// Every target has settled by then and the merges stand on GitHub; the running
+    /// listing is the last evidence of the batch, and it is kept rather than taken away.
+    #[tokio::test]
+    async fn a_completed_batch_whose_record_step_is_cancelled_keeps_its_running_listing() {
+        let request = request(BulkActionKind::Merge, vec![pull(7, 1), pull(8, 4)]);
+        let mut restate = RecordedBulkAction {
+            record_failure: Some(TerminalError::new("cancelled").into()),
+            ..Default::default()
+        };
+
+        let outcome = run_bulk_action(&mut restate, &request, |_| {}).await;
+
+        assert!(outcome.is_err(), "the cancellation ends the workflow");
+        assert_eq!(restate.sent, vec![1, 4], "every target had settled");
+        assert!(restate.recorded.is_empty(), "{:?}", restate.recorded);
+        assert!(
+            restate.unlisted.is_empty(),
+            "the running row is kept as evidence: {:?}",
+            restate.unlisted
+        );
     }
 
     #[test]

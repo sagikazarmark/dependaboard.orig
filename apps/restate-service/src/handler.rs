@@ -15,6 +15,10 @@ pub(crate) enum RetryableServiceError {
     Github(String),
     #[error("transient projection-store failure: {0}")]
     Store(String),
+    /// The finished batch's record met a failure the store does not expect to clear on
+    /// its own, and the step retries regardless, since nothing later would redo it.
+    #[error("batch record met a terminal-class store error; retrying regardless: {0}")]
+    StoreRefusedRecord(String),
 }
 
 /// How a handler's successful result reads in its completion log line.

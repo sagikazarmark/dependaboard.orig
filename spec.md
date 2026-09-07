@@ -193,8 +193,9 @@ fan-out" below.
 **A target that fails terminally does not stop the batch.** The callee's `TerminalError`
 is recorded against that target as `Failed` with its reason and the batch carries on;
 the workflow completes with the tally, never with an error, once any target was
-attempted — the recording step that follows retries until the store takes it rather
-than giving up, so a store outage delays the workflow's end without failing it. One pull
+attempted — the recording step that follows retries every store failure until the store
+takes the record, so a store outage, or a store that is wrong, delays the workflow's end
+without failing it. One pull
 request's problem is not a reason to leave the other ninety-nine
 queued. This holds for configuration-wide fatals too (bad credentials, a 404 on a
 resource never read): every target gets its own verdict rather than the batch aborting
@@ -211,8 +212,17 @@ batch is gone from Restate for good. So the last step of `run` writes the finish
 to the projection — kind, requester, when it started and finished, the tally, and every
 target's verdict with the pull request named in full and linked — inside `ctx.run`, so
 a replay does not write it again, against a store write that keeps the first record for
-a batch id, so a retry of the step does not either. The step's retries are unbounded:
-nothing later would redo this write, so giving up would lose the record for good. The
+a batch id, so a retry of the step does not either. The step is never given up: nothing
+later would redo this write, so giving up would lose the record for good while the merges
+it describes stand on GitHub. Its retries are unbounded, and — unlike every other store
+write, which lets the store's `Terminal` class end the step — every store failure is
+retried, the terminal-class ones too: a schema a migration behind, a full disk, a remote
+store whose failure the classifier does not know. Such a store stalls the workflow, in
+plain sight rather than silently: the invocation shows as retrying in the Restate UI, and
+once the record has been pending past a short grace period every failed attempt is logged
+at `warn` with the batch id, its age, and the failure, marked as terminal-class when the
+store did not expect it to clear on its own.
+The intended recovery is to put the store right, after which the next attempt lands. The
 dashboard's **Batches** button lists what was written, newest first; that list is the
 audit view, and it does not care how old a batch is. A merged pull request leaves
 `pull_requests`, so the targets are copied rather than referenced.
@@ -228,9 +238,16 @@ finished record. The listing is for finding the batch, not the batch itself, and
 stands in the way of the work: its `ctx.run` step gets a retry budget of seconds, and a
 store that will not take it fails the step alone — the batch runs unlisted and the
 refusal is logged. The web edge does not write this row: a row written before a send
-that then fails is a phantom, and the projection is Restate's to write. The **Batches**
-drawer lists the running batches first, each with **Follow**, which attaches the pill
-and drawer to it through `progress`.
+that then fails is a phantom, and the projection is Restate's to write. A workflow that
+ends with no finished batch to record — cancelled, or failed past what a target's own
+verdict can carry — takes its listing away itself on the way out, under the ordinary
+bounded store budget, since nothing waits behind it; a lost unlisting leaves a stale
+running row, a wart, not a lost record. The one workflow that ends in error with its
+listing kept is a completed batch cancelled while stalled on the record step: every
+target has settled and the merges stand on GitHub, so the running row is the last
+evidence of the batch and stays rather than the batch vanishing from both lists. The
+**Batches** drawer lists the running batches first, each with **Follow**, which
+attaches the pill and drawer to it through `progress`.
 
 **The dashboard follows a batch by id, and never calls it lost.** The followed batch id
 is in the URL (`batch`, beside `pr`), so a reload re-attaches through `progress`, and a
@@ -345,7 +362,9 @@ client has already refreshed the token and retried once by the time it surfaces.
 marked failed, not an aborted batch (see `BulkAction` above). Of the DB constraint
 violations, only the foreign key one (see the FK race in `InstallationSync`) is
 `Retryable`: a primary key or unique violation is a programming error that a fresh
-attempt would hit again, so it is `Fatal`.
+attempt would hit again, so it is `Fatal`. One store write overrides the class: the
+finished batch's record is retried whatever the store said, because nothing later would
+redo it (see `BulkAction`).
 
 **One 405 is special-cased, and it's the one bulk merging hits most.**
 `PUT /pulls/{n}/merge` returns 405 `"Base branch was modified. Review and try the merge
@@ -900,7 +919,10 @@ pub trait PrStore {
     /// List a batch as running until it is recorded. A batch id already listed is left
     /// as it was, for the same reason.
     async fn start_batch(&self, batch: &RunningBatch) -> Result<()>;
-    /// Every batch started and not yet recorded, newest first.
+    /// Stop listing a batch as running without recording it, for a workflow that ended
+    /// with no finished batch to keep. A batch not listed is left as it is.
+    async fn unlist_batch(&self, batch_id: &str) -> Result<()>;
+    /// Every batch started and not yet recorded or given up, newest first.
     async fn running_batches(&self) -> Result<Vec<RunningBatch>>;
 }
 
