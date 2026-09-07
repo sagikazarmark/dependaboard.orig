@@ -25,7 +25,7 @@ These are what the existing issues (see #50–#54) already do; keep to them.
   - `## Context` — the files touched and the issues it follows.
   - `## Blocked by` — `#N — why`, one per line. Omit when unblocked.
 - **Labels.** `bug` or `enhancement` (or `documentation`) says what kind; `question` says decisions are still open; `ready-for-agent` says scoped, decisions recorded, blockers closed. A ticket moves from `question` to `ready-for-agent` when its decisions are written into the issue as comments.
-- **Decisions live in the issue.** Record each resolved decision as a comment on the ticket before implementing. If the decision changes `spec.md`, the spec edit is part of the ticket's commit.
+- **Decisions live in the issue.** Record each resolved decision as a comment on the ticket before implementing. The documents carry the outcome, in the ticket's commit: `spec.md` for a contract, `README.md` for what the user sees, both when both, and the acceptance criteria say which (ADR-0001).
 - **Cite the issue in the commit.** The commit body carries `Closes #N`, so a review can trace a change back to what asked for it.
 
 ## Pull requests as a triage surface

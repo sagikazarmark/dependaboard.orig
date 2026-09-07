@@ -1,6 +1,6 @@
 # Dependaboard — notes for agents
 
-`README.md` is the operator's and user's document: how to run it, what each control does, and the *Live Acceptance* checklist. `spec.md` is the architecture: Restate entities, the storage trait, the error taxonomy, and what is deliberately out of the MVP. Read the section of each that touches the area you are about to change.
+`README.md` is the operator's and user's document: how to run it, what each control does, and the *Live Acceptance* checklist. `spec.md` is the architecture: Restate entities, the storage trait, the error taxonomy, and what is deliberately out of the MVP. Read the section of each that touches the area you are about to change, and edit the one that owns what you change, in the same commit — a contract change edits the spec, a change to what the user sees edits the README, one that does both edits both (ADR-0001).
 
 ## Agent skills
 

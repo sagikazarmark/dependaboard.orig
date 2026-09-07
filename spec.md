@@ -3,6 +3,17 @@
 Scope: one GitHub App installation, one org, single user. Filterable table of open
 Dependabot PRs. Three bulk actions: merge, rebase, update branch.
 
+**What this document owns.** The architecture: the Restate entities and their handler
+contracts (§2), the call flow (§3), which handlers the ingress exposes (§3b), the storage
+trait and the schema (§4), the update-type and check-rollup rules (§5, §5b), the GitHub App
+constraint, the crate choices, and the user token's path to the service (§6–§6c), and what
+is deliberately out of the MVP (§7). What a user or operator can *observe* — the controls
+and their wording, the notices and their timings, the environment, the *Live Acceptance*
+checklist — is the README's, and where a mechanism here has a user-facing side this
+document names the mechanism and points there. A change to a contract edits this file in
+the same commit; a change to what the user sees edits the README. The split is
+[ADR-0001](docs/adr/0001-spec-owns-contracts-readme-owns-behaviour.md).
+
 ---
 
 ## 1. Components
@@ -98,7 +109,7 @@ refresh. It also makes the webhook Worker trivially boring, which is the point.
 | `sync(SyncRequest)` | exclusive | Debounce, then fetch canonical state from GitHub, update state, write through to `PrStore`. Idempotent. |
 | `closed(synced_before?)` | exclusive | PR merged or closed: clear the object's state keys, `delete_pr()` from the read model. A sweep's drain passes the fence the prune recorded — the instant its listing started; the object stands down if it has synced since (reopened behind the sweep). Webhooks and purges pass nothing: unconditional. |
 | `merge(MergeRequest)` | exclusive | Guard `expected_sha == snapshot.sha`; `PUT /pulls/{n}/merge` with an explicit `merge_method`; on success `delete_pr()`. |
-| `command(DependabotCommand)` | exclusive | Post `@dependabot <cmd>` + attribution footer. **User token required** — see §6. Fire-and-forget. |
+| `command(DependabotCommand)` | exclusive | Post `@dependabot <cmd>` + attribution footer. **Needs the optional user token** — see §6; without one the handler answers `Rejected(NoUserToken)` before the target is guarded or GitHub is asked. Fire-and-forget. |
 | `update_branch()` | exclusive | `PUT /pulls/{n}/update-branch` with `expected_head_sha`. App-identity alternative to rebase; on success, one-way self-send of `sync` so the row catches up before the webhook does. |
 | `status()` | **shared** | Read-only, for UI drill-down without blocking actions. |
 
@@ -202,6 +213,8 @@ request's problem is not a reason to leave the other ninety-nine
 queued. This holds for configuration-wide fatals too (bad credentials, a 404 on a
 resource never read): every target gets its own verdict rather than the batch aborting
 on a guess about which failures are shared, so the drawer shows the same reason on each.
+(An earlier draft aborted the batch on such a fatal; the change is annotated as a decision
+in the error taxonomy below.)
 
 **Update progress per target, not after `collect`.** If state is only written once the
 whole fan-out finishes, `progress()` returns nothing useful for the entire duration of
@@ -331,13 +344,15 @@ targets are — and the store keeps it as a plain column rather than a foreign k
 record that names a batch the projection never kept is a dangling link, and refusing it
 would lose the record that names it. Only
 `StaleSha` and `NotMergeable` are worth the trip: the head is what moved, and GitHub
-judges mergeability anew on every attempt. `Forbidden` and `MergeMethodDisallowed` are
-over the configuration, the same whatever the head, and are left out unrefreshed with
-that said, or the retry would only reject them again and write a second audit row each. A
+judges mergeability anew on every attempt. `Forbidden`, `MergeMethodDisallowed` and
+`NoUserToken` are over the configuration, the same whatever the head, and are left out
+unrefreshed with that said, or the retry would only reject them again and write a second
+audit row each. A
 target rejected as `NotFound`, or whose row is gone by the time it is refreshed, is left
 out; so is one whose refresh failed, since sending it with the SHA it was just rejected
 over would only reject it again. The targets left out are named in a notice, and the rest
-go on. The refresh can take a while; a retry that finds another batch queued in the
+go on; a batch whose every rejection is of a kind left out offers no retry at all. The
+refresh can take a while; a retry that finds another batch queued in the
 meantime stands down rather than take the drawer from the one running. The confirmation
 dialog's promise that moved pull requests are "rejected, not silently retried against new
 code" stands: the retry is the user's, and the SHAs it carries are the ones the dashboard
@@ -369,8 +384,16 @@ enum RejectReason {
     MergeMethodDisallowed,
     Forbidden,          // e.g. the Dependabot-command refusal
     NotFound,           // PR closed/deleted underneath us
+    NoUserToken,        // the deployment has no user identity to post a command under;
+                        // the handler's own verdict, made before GitHub is asked (§6)
 }
 ```
+
+The first five are verdicts on the request as sent — GitHub's, or the object's guard on
+its own snapshot. `NoUserToken` is the deployment's: `command` checks for a user identity
+before it guards the target, so a rebase sent to a merge-only deployment is rejected per
+pull request — every target in the batch, with the same reason — rather than posted and
+refused, or failed as if the service were wrong. The classifier never produces it.
 
 Everything else — 5xx, connection resets, 403 with `retry-after`, secondary rate limits —
 is an *error*, propagated so Restate retries it. And anything genuinely unrecoverable
@@ -418,12 +441,38 @@ credentials is `Rejected(Forbidden)` — branch protection, a repository the ins
 can see but not push to — while a 401 is `Fatal` whatever came before it, because the
 client has already refreshed the token and retried once by the time it surfaces. A
 `Fatal` fails the `PullRequest` handler terminally; inside a batch that is one target
-marked failed, not an aborted batch (see `BulkAction` above). Of the DB constraint
-violations, only the foreign key one (see the FK race in `InstallationSync`) is
-`Retryable`: a primary key or unique violation is a programming error that a fresh
-attempt would hit again, so it is `Fatal`. One store write overrides the class: the
-finished batch's record is retried whatever the store said, because nothing later would
-redo it (see `BulkAction`).
+marked failed, not an aborted batch (see `BulkAction` above).
+
+> **Decision, 2f6142f / 0f40f2a.** This paragraph once said "404 across many targets at
+> once is a configuration `Fatal` worth failing the batch over", and the workflow aborted
+> on the first terminal target. It was relaxed to per-target verdicts when the code was:
+> a shared cause is a guess from the counts, and acting on the guess leaves the other
+> ninety-nine queued. The relaxation stands; the completion toast (§2 "announced by its
+> tally") and the submit-time left-out (§3) both build on it.
+
+**Store failures have a class of their own, decided by the store rather than the handler.**
+
+```rust
+enum StoreErrorClass { Retryable, Terminal }   // StoreError::class()
+```
+
+`Retryable` is contention (`SQLITE_BUSY`, `SQLITE_LOCKED`, `SQLITE_IOERR`, a failed
+connection, a WAL conflict) and *one* constraint failure, the foreign-key one (the FK race
+in `InstallationSync`). Everything else is `Terminal`: a primary-key or unique violation is
+a programming error a fresh attempt would hit again, and so are a corrupt row, an integer
+out of range, and a `libsql` error the classifier does not know. (Against a remote store
+that last case swallows too much — every remote failure arrives as one variant — which is
+#66, open.) The handlers map the class onto Restate under three budgets: the ordinary
+write something later would redo — a webhook's upsert, a sweep's prune, a drain's read —
+retries a `Retryable` for up to five minutes and fails the step on a `Terminal`
+(`store_retry_policy`, `store_failure`); the running-batch listing, a convenience that
+stands in the way of the work, gets fifteen seconds and then the batch runs unlisted
+(`brief_store_retry_policy`); and the finished batch's record, which nothing later would
+redo, overrides the class — every failure is retried, with no budget, the terminal ones
+named as such in the failure Restate shows (`persistent_store_retry_policy`,
+`batch_record_failure`; see `BulkAction`). The unlisting a failed or cancelled workflow
+does on its way out uses the ordinary budget: nothing waits behind it, and a lost unlist
+is a stale row, not a lost record.
 
 **One 405 is special-cased, and it's the one bulk merging hits most.**
 `PUT /pulls/{n}/merge` returns 405 `"Base branch was modified. Review and try the merge
@@ -533,6 +582,13 @@ HTML marker — nobody reads it.
 
 ### `DashboardIngress` — service (unkeyed)
 
+- `capabilities() -> Capabilities` — what this deployment can do, so the dashboard offers
+  only the actions the service would not refuse: today one flag, `rebase_enabled`, true
+  when a user token is configured (§6). Answered from settings the service resolved at
+  startup, fixed for the life of the process; no side effect, nothing to journal. The
+  dashboard asks once per page and withholds **Request rebase** on a definite `false`
+  only — while the answer is in flight or failed, rebase stays on offer, since the
+  service guards the command itself (§2 `PullRequest.command`).
 - `sync_installation()` — the dashboard's global **Sync**: one-way
   `InstallationSync.sync_now` for the configured installation. No input; the service
   serves exactly one installation, as `SchedulerIngress.start` already assumes.
@@ -616,9 +672,10 @@ one repository; only a cursor-paged listing could rule that out.
 One race survives the ordering: a `pull_request.opened` webhook for a freshly added repo
 can reach `upsert_pr` before `sync_now`'s transaction has inserted the parent row. This
 self-heals — the FK violation is an error inside `ctx.run`, Restate retries, and the repo
-row lands well within the backoff window — but *only* if DB constraint failures classify
-as `Retryable`. Leave a comment in the classifier saying so, so nobody "fixes" it into a
-`TerminalError` later.
+row lands well within the backoff window — but *only* if the foreign-key constraint
+failure classifies as `Retryable`, which it alone of the constraint failures does (see
+"Store failures" in the error taxonomy). The classifier carries a comment saying so, so
+nobody "fixes" it into a `TerminalError` later.
 
 **Be authoritative about repositories, not just PRs.** If a repo is removed from the
 installation, the next enumeration simply never calls `RepoSync` for it — so its PR rows
@@ -723,9 +780,25 @@ enumeration that finds live PRs is exactly the set you diff against.
 ## 3. Call flow
 
 ```
-Table render      UI → server fn → PrStore::list(filter, page)
+Table render      UI → server fn → PrStore::list_prs(filter, page)
+                       one page and the total, from one snapshot
 
-Select all        UI → server fn → PrStore::list(filter, page of MAX_BATCH_TARGETS)
+Facets            UI → server fn → PrStore::dashboard_summary(filter)
+                       the sidebar's counts, each scoped to the filter minus its own
+                       dimension, and the read model's freshness; asked per filter, not
+                       per page
+
+Live refresh      UI polls → server fn → PrStore::projection_revision()
+                       two counters the schema's triggers move; the UI reloads rows and
+                       facets when the first moves and stops the Sync glyph when the
+                       second does. Cadence, the disconnected banner, and the 401 rule
+                       are the README's (Live refresh)
+
+Capabilities      UI → server fn → POST /restate/call/DashboardIngress/capabilities
+                       once per page; what the deployment can do, so an action the
+                       service would reject is withheld rather than offered (§6)
+
+Select all        UI → server fn → PrStore::list_prs(filter, page of MAX_BATCH_TARGETS)
 matching               the selection is resolved server side, newest update first,
                        and capped at one batch's worth; the total comes back with the
                        rows so the UI can say when the filter matched more than it took
@@ -938,28 +1011,37 @@ reachability is. Anything an external caller invokes must be public, which is wh
 
 | Public (ingress-reachable) | Private (Restate-internal only) |
 |---|---|
-| `BulkAction.run`, `BulkAction.progress` | `PullRequest.*` |
-| `WebhookIngress.dispatch` | `InstallationSync.*`, `RepoSync.*`, `TokenStore.*` |
-| `DashboardIngress.sync_installation`, `DashboardIngress.sync_pull_request` | |
+| `BulkAction.run`, `BulkAction.progress` | `PullRequest.sync`, `.closed`, `.merge`, `.command`, `.update_branch` |
+| `WebhookIngress.dispatch` | `InstallationSync.*`, `RepoSync.*` |
+| `DashboardIngress.capabilities`, `.sync_installation`, `.sync_pull_request` | |
+| `PullRequest.status` — the shared read the drawer polls | |
+| `SchedulerIngress.start` — arms the reconcile chain at startup | |
 
-Marking whole services private is simpler to reason about than per-handler flags; reach
-for handler-level only if you later need one shared handler exposed from an otherwise
-private service.
+Marking whole services private is simpler to reason about than per-handler flags, and
+that is how `InstallationSync` and `RepoSync` are marked. `PullRequest` is the one
+mixed-visibility object: its mutations are private one by one and `status` is left public
+for the drawer, which is exactly the "one shared handler exposed from an otherwise private
+service" case. Discovery tests pin the mixed `PullRequest` object and the public
+`DashboardIngress` service, and the README's *Restate ingress visibility* table is the
+operator's copy of this one; change them together.
 
 ---
 
 ## 4. Storage trait
 
-> **Test this abstraction early.** `?Send` suits the single-threaded Workers runtime, but
-> the Restate binary is a normal multi-threaded tokio process where `Send` futures are the
-> norm — and it's now the primary writer. Forcing one boxed-future contract onto both
-> runtimes may fight you. Two `cfg`-gated impls (or two traits) can be cleaner than one
-> lowest-common-denominator signature. Cheap to find out in an afternoon; expensive to
-> discover after the store layer is written.
+> **Resolved: `Send`.** An earlier draft had `#[async_trait(?Send)]` for a single-threaded
+> Workers runtime. The Restate binary is a normal multi-threaded tokio process and the
+> web app runs on Axum, so the trait is plain `#[async_trait]` with `Send + Sync`
+> supertraits and one production implementation, `LibSqlPrStore`, shared by both binaries
+> (the Restate service's tests carry an in-memory one). A Workers port would need its own
+> impl or a second trait; nothing today asks for it.
+
+The excerpt below is the trait's method set at HEAD, with the doc comments shortened and
+`Result<T, StoreError>` written `Result<T>`; the crate's comments are the contract.
 
 ```rust
-#[async_trait(?Send)]   // ?Send: Workers runtime is single-threaded
-pub trait PrStore {
+#[async_trait]
+pub trait PrStore: Send + Sync {
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<()>;
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>>;
     async fn delete_pr(&self, key: &PrKey) -> Result<()>;
@@ -970,8 +1052,23 @@ pub trait PrStore {
     /// `synced_before` in the delete's own transaction, so the caller need not trust
     /// this call's return value to reach them.
     async fn retain_prs(&self, repository_id: u64, live: &[u64], synced_before: u64) -> Result<Vec<PrKey>>;
-    async fn list_prs(&self, f: &PrFilter, page: Page) -> Result<Vec<PrRecord>>;
+    /// One keyset page of the pull requests `filter` matches, newest update first,
+    /// plus how many match in all, from one snapshot (count and page in one
+    /// transaction).
+    async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage>;
+    /// What frames the rows for `filter`: every facet's counts, each scoped to the
+    /// filter minus its own dimension, and the read model's freshness. Independent
+    /// of paging, so a caller moving to the next page need not ask again.
+    async fn dashboard_summary(&self, filter: &PrFilter) -> Result<DashboardSummary>;
+    /// Two counters, one that moves whenever a row of the read model changes and one
+    /// that moves only when a pull request row does (see the schema's triggers). Cheap
+    /// to read, so a dashboard can ask often and act only when an answer differs from
+    /// the one it last saw. How the dashboard uses them is the README's *Live refresh*.
+    async fn projection_revision(&self) -> Result<ProjectionRevision>;
+    /// The webhook SHA lookup (§3): open pull requests of this repo at this head.
+    async fn prs_for_sha(&self, repository_id: u64, sha: &str) -> Result<Vec<PrRecord>>;
     async fn upsert_repo(&self, repo: &RepoRecord) -> Result<()>;
+    async fn get_repo(&self, repository_id: u64) -> Result<Option<RepoRecord>>;
     /// Drop repos (and cascade their PRs) no longer in the installation.
     /// Same `synced_before` guard as retain_prs, for the same race. Returns the
     /// cascaded PR keys, queued for retirement under `synced_before`.
@@ -1007,13 +1104,30 @@ pub trait PrStore {
     async fn get_batch(&self, batch_id: &str) -> Result<Option<ProjectedBatch>>;
 }
 
+/// What the dashboard narrows the pull requests by. Every field is one the dashboard's
+/// controls can set and its URL carries; the store applies them all together.
 pub struct PrFilter {
-    pub repos: Vec<String>,
+    pub query: Option<String>,             // case-insensitive, over owner/repo, title,
+                                           // and every dependency name
+    pub repos: Vec<String>,                // owner/repo, as the repository tree selects
     pub update_types: Vec<UpdateType>,     // Major | Minor | Patch | Unknown
-    pub check_status: Option<CheckStatus>, // Success | Failure | Pending | None
-    pub labels: Vec<String>,
-    pub dependency: Option<String>,
+    pub check_statuses: Vec<CheckStatus>,  // Success | Failure | Pending | None; any of
+    pub labels: Vec<String>,               // every one must be present
+    pub dependency: Option<String>,        // one name, case-insensitively; alone or in a
+                                           // group (§4 "Grouped updates")
+    pub needs_attention: bool,             // red or no checks, a merge conflict, a major
+                                           // bump, or a row not synced for 45 minutes
 }
+// Decision: `owner: Option<String>` was removed in 151fbcb (#48). Nothing on the
+// dashboard could set an owner alone — the repository tree selects an owner's
+// repositories by name, which `repos` carries — so the field, its SQL clause and the
+// index that led with it (`idx_pr_filter`, migration 0006) went. An owner filter
+// would come back as a control first and a field second.
+
+pub struct Page { pub limit: u32, pub after: Option<String> }   // keyset cursor, see below
+pub struct DashboardPage { pub rows: Vec<PrRecord>, pub total: u64, pub next_cursor: Option<String> }
+pub struct DashboardSummary { pub facets: FacetCounts, pub last_synced_at: Option<u64> }
+pub struct ProjectionRevision { pub projection: u64, pub pull_requests: u64 }
 ```
 
 **D1 is the wrong choice once Restate is a separate binary.** D1 is only comfortably
@@ -1032,14 +1146,19 @@ local-file story, gains ubiquity.
 
 **Schema**
 
+The net shape after every migration in `migrations/` at HEAD (0001–0010); the migrations
+are the source, the README's *Schema migrations* says how they are applied. Comments here
+explain columns, the migrations' comments explain changes.
+
 ```sql
 CREATE TABLE repositories (
   repository_id   INTEGER PRIMARY KEY,   -- GitHub's immutable id
   installation_id INTEGER NOT NULL,
   owner           TEXT NOT NULL,
   repo            TEXT NOT NULL,
-  merge_method    TEXT,                  -- per-repo override; NULL = global default
-  synced_at       INTEGER NOT NULL
+  synced_at       INTEGER NOT NULL,
+  merge_method    TEXT                   -- the method to use when the configured one is
+                                         -- disallowed here; NULL = the preference (0003)
 );
 CREATE INDEX idx_repo_install ON repositories(installation_id);
 
@@ -1051,11 +1170,12 @@ CREATE TABLE pull_requests (
   number         INTEGER NOT NULL,
   title          TEXT NOT NULL,
   html_url       TEXT NOT NULL,
-  dependency     TEXT,               -- NULL for grouped updates
+  dependency     TEXT COLLATE NOCASE,  -- NULL for grouped updates; package names compare
+                                       -- case-insensitively, and the index inherits it
   from_version   TEXT,               -- NULL for grouped updates
   to_version     TEXT,               -- NULL for grouped updates
   dependencies   TEXT NOT NULL DEFAULT '[]',  -- JSON: full updated-dependencies list
-  update_type    TEXT,               -- major|minor|patch|unknown; highest in the group
+  update_type    TEXT NOT NULL,      -- major|minor|patch|unknown; highest in the group
   head_sha       TEXT NOT NULL,
   check_status   TEXT NOT NULL,
   mergeable      TEXT,               -- GraphQL mergeStateStatus lowercased (= REST mergeable_state):
@@ -1073,6 +1193,24 @@ CREATE INDEX idx_pr_sha        ON pull_requests(repository_id, head_sha);  -- we
 CREATE INDEX idx_pr_order      ON pull_requests(updated_at DESC, id DESC); -- stable paging
 CREATE INDEX idx_pr_dependency ON pull_requests(dependency);               -- the dependency filter
 
+-- Two counters the dashboard polls instead of comparing rows (PrStore::projection_revision;
+-- README "Live refresh"). Triggers keep them, so no writer can forget to: a repository
+-- delete that cascades to its pull requests moves them as surely as an upsert. `revision`
+-- moves on any row of either table; `pull_requests` only when a pull request row does, so
+-- the Sync glyph can tell "the sweep reached the pull requests" from "the sweep wrote a
+-- repository row". MAX(synced_at) could not do this: a delete leaves no newer stamp.
+-- A migration that rebuilds either table (as 0002 did) must recreate its triggers.
+CREATE TABLE projection_revision (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  revision      INTEGER NOT NULL,
+  pull_requests INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO projection_revision (id, revision) VALUES (1, 0);
+-- AFTER INSERT / UPDATE / DELETE ON pull_requests:
+--   UPDATE projection_revision SET revision = revision + 1, pull_requests = pull_requests + 1 WHERE id = 1;
+-- AFTER INSERT / UPDATE / DELETE ON repositories:
+--   UPDATE projection_revision SET revision = revision + 1 WHERE id = 1;
+
 -- Finished bulk actions, for audit; append-only, written once per batch id by the
 -- BulkAction workflow's last step. Not tied to pull_requests: a merged PR leaves that
 -- table, and the record must not go with it.
@@ -1080,13 +1218,13 @@ CREATE TABLE batches (
   batch_id     TEXT PRIMARY KEY,   -- the workflow key, a UUIDv7
   action       TEXT NOT NULL,      -- merge | rebase | update branch
   requested_by TEXT NOT NULL,      -- the dashboard user who confirmed it
-  retried_from TEXT,               -- the batch whose rejected targets this one retries;
-                                   -- not a foreign key: a dangling link is not a lost record
   started_at   INTEGER NOT NULL,
   completed_at INTEGER NOT NULL,
   succeeded    INTEGER NOT NULL,
   rejected     INTEGER NOT NULL,
-  failed       INTEGER NOT NULL
+  failed       INTEGER NOT NULL,
+  retried_from TEXT                -- the batch whose rejected targets this one retries;
+                                   -- not a foreign key: a dangling link is not a lost record
 );
 CREATE INDEX idx_batch_completed ON batches(completed_at DESC, batch_id DESC);
 
@@ -1099,8 +1237,8 @@ CREATE TABLE batch_targets (
   number        INTEGER NOT NULL,
   title         TEXT NOT NULL,
   html_url      TEXT NOT NULL,
-  head_sha      TEXT,              -- the head the target was sent against, which the guard checked
   outcome       TEXT NOT NULL,     -- JSON: succeeded { detail, merge_sha? } | rejected { reason } | failed { detail }
+  head_sha      TEXT,              -- the head the target was sent against, which the guard checked
   PRIMARY KEY (batch_id, position)
 );
 
@@ -1111,9 +1249,9 @@ CREATE TABLE running_batches (
   batch_id     TEXT PRIMARY KEY,
   action       TEXT NOT NULL,
   requested_by TEXT NOT NULL,
-  retried_from TEXT,
   started_at   INTEGER NOT NULL,
-  target_count INTEGER NOT NULL
+  target_count INTEGER NOT NULL,
+  retried_from TEXT
 );
 
 -- The retirement outbox (§2 RepoSync): the pull requests a prune removed whose
@@ -1130,12 +1268,12 @@ CREATE TABLE pull_request_retirements (
 
 **Grouped updates need the list, not just the scalars.** The `updated-dependencies` block
 can hold many entries (§5). Keep the scalar columns for the common single-dependency case
-— they keep the single-dependency filter a plain column comparison (add an index on
-`dependency` if that filter turns out to be hot) — but set them NULL when there's more
-than one and put the full list in `dependencies`. Without this the dependency filter's
-behaviour on grouped PRs is undefined, which is exactly the sort of thing that silently
-hides PRs from a triage view. Decide now whether the filter matches *any* dependency in a
-group (it probably should).
+— they keep the single-dependency filter a plain column comparison on `idx_pr_dependency`
+— but set them NULL when there's more than one and put the full list in `dependencies`.
+Without this the dependency filter's behaviour on grouped PRs is undefined, which is
+exactly the sort of thing that silently hides PRs from a triage view. Decided: the filter
+matches *any* dependency in a group — `dependency = ?` on the scalar, or, where the scalar
+is NULL, a `json_each` over the list — case-insensitively either way.
 
 **`retain_repos` cascades.** With the FK above, deleting a repository row removes its PRs
 in one statement — which is what makes the §2 installation-level reconciliation actually
@@ -1287,12 +1425,16 @@ user-scoped token *only* for posting Dependabot commands.
 
 ```
 InstallationToken  →  list repos, list PRs, read checks, merge, update-branch
-UserToken          →  @dependabot <command> comments
+UserToken          →  @dependabot <command> comments            (optional)
 ```
 
-This makes "impersonation" load-bearing rather than a deferred nicety. For a single-user
-MVP a fine-grained PAT is proportionate; user-to-server OAuth is the multi-user version of
-the same mechanism.
+The user token is load-bearing for rebase and for nothing else, so it is optional: a
+merge-only deployment leaves it unset, the service answers `capabilities` with
+`rebase_enabled: false`, the dashboard withholds **Request rebase**, and a rebase that
+reaches `PullRequest.command` anyway is `Rejected(NoUserToken)` per pull request before
+GitHub is asked (§2). Merge and update branch run as the App and are unaffected. For a
+single-user MVP a fine-grained PAT is proportionate; user-to-server OAuth is the multi-user
+version of the same mechanism.
 
 > **Unverified.** PATs are confirmed to work. User-to-server tokens *should* behave
 > identically since the comment is authored by the user — but this is documented nowhere.
@@ -1399,7 +1541,8 @@ Return the comment id, never the credential.
 
 GitHub refresh tokens are single-use. Two concurrent refreshes and the loser invalidates
 the grant, dropping the user's authorization entirely — they have to re-authorize by hand.
-You already have the tool for this: a `TokenStore` virtual object keyed by user id.
+You already have the tool for this: a `TokenStore` virtual object keyed by user id. (This
+is the shape for the OAuth version; no such object exists in the MVP, see below.)
 
 ```rust
 // serialise the refresh; returns unit so nothing sensitive crosses a journal boundary
@@ -1420,19 +1563,24 @@ Keyed concurrency then serialises the refresh for free.
 
 ### For the MVP, skip all of it
 
-A fine-grained PAT is one env var in the Restate service. Put it behind the interface now
-so the OAuth version drops in without touching call sites:
+A fine-grained PAT is one optional env var in the Restate service, `GITHUB_USER_PAT`;
+unset or blank means no user identity, and rebase is withheld as §6 describes. Put it
+behind the interface now so the OAuth version drops in without touching call sites:
 
 ```rust
 #[async_trait]
-trait TokenProvider {
-    async fn user_token(&self, user: UserId) -> Result<SecretString>;
+trait TokenProvider: Send + Sync {
+    async fn user_token(&self, user: &UserId) -> Result<SecretString, GithubError>;
 }
 ```
 
-`EnvPatProvider` today, `DbOAuthProvider` when there are real users. Store tokens
-encrypted at rest in libSQL, not in Restate state — Restate state is for orchestration,
-not secrets.
+The MVP's provider holds the one configured user and its PAT, if any: it answers with the
+token for that user, refuses another user by name, and, with no PAT, refuses everyone with
+the variable to set. The handler never reaches it in that case — `command` checks
+`can_post_commands` first, so the refusal is `Rejected(NoUserToken)` rather than a
+terminal error — but the provider refuses too, so a caller that forgot the guard cannot
+post as nobody. The OAuth provider, when there are real users, stores tokens encrypted at
+rest in libSQL, not in Restate state — Restate state is for orchestration, not secrets.
 
 > **Resolved:** creating a PR conversation comment requires *either* `issues: write` or
 > `pull_requests: write`. You already have the latter, so nothing to add.
@@ -1456,7 +1604,12 @@ not secrets.
 
   Signals 1 and 2 are the load-bearing pair. Signal 3 is a bonus if the spike pans out.
 - PR preview / check-log tailing
-- Permission layers and audit-log UI (but *not* user-token auth — that moved into scope, see §6)
+- Permission layers, and a *searchable* audit log — by requester, repository, pull request
+  or date, or of anything but batches. The **Batches** drawer *is* the audit view of what
+  is in scope: every finished batch, newest first, paged, each target's verdict with the
+  head it was sent against and the commit a merge made (§2 `BulkAction`). What is out is
+  finding one among thousands, and anyone but the one deployment identity asking. (Nor is
+  user-token auth excluded here — it moved into scope as an option, see §6.)
 - App-submitted approvals + branch protection bypass
 - Close, plain comments, arbitrary Dependabot commands
 - Multi-org, multi-user

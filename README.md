@@ -2,6 +2,8 @@
 
 A focused operational dashboard for open Dependabot pull requests. Dependaboard combines a Dioxus fullstack UI, a libSQL read model, GitHub App authentication, and Restate workflows for durable merge, rebase, branch update, webhook, and reconciliation processing.
 
+This README is the operator's and user's document: how to run the system, what each control does and says, and the [*Live Acceptance*](#live-acceptance) checklist. The architecture — the Restate entities and their contracts, the storage trait and schema, the error taxonomy, and what is deliberately out of the MVP — is [`spec.md`](spec.md); where a section below names a mechanism, the contract behind it is there. A change to what a user can observe edits this file; a change to a contract edits the spec ([ADR-0001](docs/adr/0001-spec-owns-contracts-readme-owns-behaviour.md)).
+
 ## Quickstart
 
 This guide starts the complete application locally. Restate and its CLI run through Docker Compose; the two Dependaboard binaries run on the host. A Tailscale Funnel, Cloudflare Quick Tunnel, or equivalent HTTPS tunnel exposes only the web app to GitHub.
