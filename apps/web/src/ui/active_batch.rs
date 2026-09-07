@@ -17,6 +17,7 @@ use crate::ui::batch::{
     follow_batch, run_batch,
 };
 use crate::ui::dashboard_state::{DashboardState, use_dashboard};
+use crate::ui::format::{relative_time, verdict_tally};
 use crate::ui::progress_drawer::ProgressDrawer;
 use crate::ui::retry::{LeftOut, ServerRefresh, left_out_notice, refresh_rejected};
 use crate::ui::{PendingAction, sticky};
@@ -77,24 +78,33 @@ pub(crate) fn ActiveBatch(
         state: use_dashboard(),
     };
     let retrying = use_signal(|| false);
+    // Read here, not only for the drawer: the pill flips to waiting on the
+    // clock's tick, and it has to hear the tick with the drawer closed.
+    let now = host.state.now();
     let current = followed.read();
     let Some(current) = &*current else {
         return rsx! {};
     };
     let (dot, label) = match &current.progress {
-        Some(progress) => (
-            if progress.completed {
-                "progress-live complete"
-            } else {
-                "progress-live"
-            },
-            format!(
+        Some(progress) => {
+            let count = format!(
                 "{}: {}/{}",
                 progress.action,
                 progress.settled(),
                 progress.targets.len()
-            ),
-        ),
+            );
+            if progress.completed {
+                ("progress-live complete", count)
+            } else if current.stands_still(now) {
+                let standing = relative_time(now, current.since);
+                (
+                    "progress-live waiting",
+                    format!("{count} · no progress {standing}"),
+                )
+            } else {
+                ("progress-live", count)
+            }
+        }
         None => ("progress-live", "batch: following...".to_owned()),
     };
     rsx! {
@@ -107,7 +117,7 @@ pub(crate) fn ActiveBatch(
         if open() {
             ProgressDrawer {
                 followed: current.clone(),
-                now: host.state.now(),
+                now,
                 retrying: retrying(),
                 onretry: move |_| {
                     let finished = followed
@@ -276,31 +286,45 @@ fn retry_rejected(finished: BatchProgress, mut retrying: Signal<bool>, host: Bat
     });
 }
 
-/// Announces a finished batch. A batch always runs to the end now; what varies is whether
-/// every target settled cleanly or some failed, in which case the drawer has their reasons.
+/// Announces a finished batch. A batch always runs to the end; what varies is
+/// whether every target settled cleanly, in which case that is all there is
+/// to say, or some were rejected or failed, in which case the toast carries
+/// the tally and stays until it is read: the drawer has the reasons, and the
+/// user has to go and look.
 fn toast_completion(toast: &Toasts, progress: &BatchProgress) {
-    if progress.failed == 0 {
-        toast.success("Batch complete".to_owned(), ToastOptions::new());
-    } else {
-        toast.warning(
-            format!(
-                "Batch complete: {} of {} targets failed. Open the batch for their reasons.",
-                progress.failed,
-                progress.targets.len()
-            ),
-            sticky(),
-        );
+    match completion_notice(progress) {
+        None => toast.success("Batch complete".to_owned(), ToastOptions::new()),
+        Some(notice) => toast.warning(notice, sticky()),
     }
+}
+
+/// What the completion toast says past a clean "Batch complete", if anything:
+/// nothing while every target succeeded; otherwise the whole verdict tally,
+/// in the drawer's words. A rejected target counts as much as a failed one —
+/// GitHub said no to the request as sent, which is not what the user asked
+/// for — but is not called a failure, and the drawer's summary reads the
+/// same. A batch rejected whole falls under the same rule as one rejected in
+/// part: the tally says so, and no inference about a shared cause is made
+/// from the counts, as none is made from the verdicts.
+fn completion_notice(progress: &BatchProgress) -> Option<String> {
+    if progress.rejected == 0 && progress.failed == 0 {
+        return None;
+    }
+    Some(format!(
+        "Batch complete: {}. Open the batch for their reasons.",
+        verdict_tally(progress.succeeded, progress.rejected, progress.failed)
+    ))
 }
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use dependaboard_core::{ActionOutcome, RejectReason};
+    use dependaboard_core::{ActionOutcome, BulkActionKind, RejectReason};
 
     use super::*;
+    use crate::ui::batch::WAITING_NOTICE_AFTER;
     use crate::ui::pr_target;
     use crate::ui::test_support::{
-        DashboardFixture, FIXTURE_NOW, followed, half_done_merge, render, serde_row,
+        DashboardFixture, FIXTURE_NOW, followed, grouped_row, half_done_merge, render, serde_row,
     };
 
     #[test]
@@ -335,9 +359,42 @@ mod tests {
             html.contains(r#"<span class="progress-live"></span>merge: 1/2"#),
             "{html}"
         );
+        assert!(!html.contains("no progress"), "{html}");
         assert!(!html.contains("progress-drawer"), "{html}");
     }
 
+    /// The pill is what shows while the drawer is closed, so it is the pill
+    /// that has to say the batch has stopped moving: from the drawer's notice
+    /// on, the count carries how long, and the dot stops throbbing. It does
+    /// not say the batch is stalled or lost — it is neither, as far as anyone
+    /// can tell — and it flips on the dashboard's clock, which it reads
+    /// whether or not the drawer is open.
+    #[test]
+    fn a_pill_whose_batch_has_stood_still_says_for_how_long_and_stops_throbbing() {
+        fn Fixture() -> Element {
+            let followed = use_signal(|| Some(followed(half_done_merge())));
+            let follower = use_signal(|| None);
+            let open = use_signal(|| false);
+            rsx! {
+                DashboardFixture { now: FIXTURE_NOW + WAITING_NOTICE_AFTER.as_secs(),
+                    ActiveBatch { followed, follower, open }
+                }
+            }
+        }
+        let html = render(Fixture);
+
+        assert!(
+            html.contains(
+                r#"<span class="progress-live waiting"></span>merge: 1/2 · no progress 1m"#
+            ),
+            "{html}"
+        );
+        assert!(!html.to_lowercase().contains("stall"), "{html}");
+        assert!(!html.to_lowercase().contains("lost"), "{html}");
+    }
+
+    /// A finished batch stood still for good; that is not a wait, and the
+    /// pill marks it complete however long ago it finished.
     #[test]
     fn an_open_drawer_follows_the_batch_and_a_finished_one_marks_the_pill() {
         fn Fixture() -> Element {
@@ -352,15 +409,17 @@ mod tests {
             let follower = use_signal(|| None);
             let open = use_signal(|| true);
             rsx! {
-                DashboardFixture { ActiveBatch { followed, follower, open } }
+                DashboardFixture { now: FIXTURE_NOW + 24 * 3600,
+                    ActiveBatch { followed, follower, open }
+                }
             }
         }
         let html = render(Fixture);
 
         assert!(html.contains(r#"class="progress-live complete""#), "{html}");
         assert!(
-            html.contains("merge: 2/2"),
-            "the pill counts the failed target too: {html}"
+            html.contains("merge: 2/2<"),
+            "the pill counts the failed target too, and says nothing of a wait: {html}"
         );
         assert!(html.contains("merge progress"), "{html}");
         assert!(html.contains("1 succeeded, 0 rejected, 1 failed"), "{html}");
@@ -421,5 +480,109 @@ mod tests {
         let html = render(Fixture);
 
         assert!(html.contains(">Retry rejected<"), "{html}");
+    }
+
+    /// [`half_done_merge`] with the second target settled by `outcome`.
+    fn finished(outcome: ActionOutcome) -> BatchProgress {
+        let mut progress = half_done_merge();
+        progress.record(&pr_target(&serde_row()).key(), outcome);
+        progress
+    }
+
+    /// [`half_done_merge`] with every target rejected: the first's verdict
+    /// replaced, as the worst case of a rebase submitted without a user token.
+    fn all_rejected() -> BatchProgress {
+        let targets = [pr_target(&grouped_row()), pr_target(&serde_row())];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        for target in &targets {
+            progress.record(
+                &target.key(),
+                ActionOutcome::Rejected {
+                    reason: RejectReason::NoUserToken,
+                },
+            );
+        }
+        progress
+    }
+
+    /// Three targets, one to each terminal column.
+    fn one_of_each() -> BatchProgress {
+        let mut third = grouped_row();
+        third.number = 77;
+        let targets = [
+            pr_target(&grouped_row()),
+            pr_target(&serde_row()),
+            pr_target(&third),
+        ];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        progress.record(
+            &targets[0].key(),
+            ActionOutcome::Succeeded {
+                detail: "merged".to_owned(),
+            },
+        );
+        progress.record(
+            &targets[1].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::NotMergeable,
+            },
+        );
+        progress.record_failure(
+            &targets[2].key(),
+            "GitHub mutation failed with HTTP 500: Internal Server Error",
+        );
+        progress
+    }
+
+    /// A batch every target of which settled cleanly is announced as
+    /// complete and nothing more; one with a rejected or a failed target is
+    /// announced with the whole tally, in the drawer's words, so a rejection
+    /// — GitHub said no to the request as sent — is not congratulated as a
+    /// success, and is not called a failure either. Every tally is a warning
+    /// that stays: the user has to go and read the reasons.
+    #[test]
+    fn a_finished_batch_is_announced_clean_or_with_its_whole_tally() {
+        assert_eq!(
+            completion_notice(&finished(ActionOutcome::Succeeded {
+                detail: "merged".to_owned(),
+            })),
+            None
+        );
+        assert_eq!(
+            completion_notice(&finished(ActionOutcome::Rejected {
+                reason: RejectReason::NotMergeable,
+            })),
+            Some(
+                "Batch complete: 1 succeeded, 1 rejected, 0 failed. Open the batch for their reasons."
+                    .to_owned()
+            )
+        );
+        let mut one_failed = half_done_merge();
+        one_failed.record_failure(
+            &pr_target(&serde_row()).key(),
+            "GitHub mutation failed with HTTP 500: Internal Server Error",
+        );
+        assert_eq!(
+            completion_notice(&one_failed),
+            Some(
+                "Batch complete: 1 succeeded, 0 rejected, 1 failed. Open the batch for their reasons."
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            completion_notice(&one_of_each()),
+            Some(
+                "Batch complete: 1 succeeded, 1 rejected, 1 failed. Open the batch for their reasons."
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            completion_notice(&all_rejected()),
+            Some(
+                "Batch complete: 0 succeeded, 2 rejected, 0 failed. Open the batch for their reasons."
+                    .to_owned()
+            ),
+            "a batch rejected whole is announced by the same rule as one rejected in part"
+        );
     }
 }

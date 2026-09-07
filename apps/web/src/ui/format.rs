@@ -55,6 +55,16 @@ pub(crate) fn repositories(count: usize) -> String {
     }
 }
 
+/// A batch's verdicts as one tally: "95 succeeded, 5 rejected, 0 failed".
+/// Every column is named, zero or not, and in this order wherever a batch's
+/// tally is printed — the toast that announces one, the drawer that follows
+/// one, the audit list of the ones that have run — so a rejection is never
+/// mistaken for a failure or hidden behind a success, and the same batch
+/// reads the same everywhere.
+pub(crate) fn verdict_tally(succeeded: u64, rejected: u64, failed: u64) -> String {
+    format!("{succeeded} succeeded, {rejected} rejected, {failed} failed")
+}
+
 /// The state of a checkbox that speaks for a set of things: none of them
 /// selected, some, or every one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,6 +205,18 @@ mod tests {
             "status-dot offline"
         );
         assert_eq!(connection_label(Connection::SignedOut), "signed out");
+    }
+
+    /// The batch's three terminal columns, in one order, wherever the tally
+    /// is printed: the toast that announces the batch, the drawer that
+    /// follows it, and the audit list read the same words.
+    #[test]
+    fn a_verdict_tally_names_every_column_in_the_same_words_everywhere() {
+        assert_eq!(
+            verdict_tally(95, 5, 0),
+            "95 succeeded, 5 rejected, 0 failed"
+        );
+        assert_eq!(verdict_tally(0, 0, 0), "0 succeeded, 0 rejected, 0 failed");
     }
 
     /// The largest whole unit of time since the timestamp, down to a minute;

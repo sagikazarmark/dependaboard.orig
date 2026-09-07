@@ -12,7 +12,7 @@ use dioxus::prelude::*;
 use crate::api::load_recent_batches;
 use crate::components::button::{Button, ButtonSize};
 use crate::ui::dashboard_state::{Remote, use_dashboard};
-use crate::ui::format::{pull_requests, relative_time};
+use crate::ui::format::{pull_requests, relative_time, verdict_tally};
 use crate::ui::progress_drawer::TargetRow;
 use crate::ui::side_panel::SidePanel;
 
@@ -147,7 +147,7 @@ fn BatchEntry(batch: BatchRecord, now: u64) -> Element {
                 div {
                     strong { class: "batch-action", "{batch.action}" }
                     span { class: "batch-tally",
-                        "{batch.succeeded} succeeded, {batch.rejected} rejected, {batch.failed} failed"
+                        "{verdict_tally(batch.succeeded, batch.rejected, batch.failed)}"
                     }
                 }
                 small { class: "batch-meta",

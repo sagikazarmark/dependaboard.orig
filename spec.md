@@ -258,10 +258,23 @@ from a 5xx backoff, and the honest budget for one target runs to hours (a guard 
 a mutation, each up to four thirty-minute retry budgets and three rate-limit waits of up
 to an hour), so there is no timeout the dashboard could put on "lost" that would not
 either fire inside the budget or say nothing. It keeps polling for as long as Restate
-answers; after a minute without change the drawer says on what it waits and since when.
-The follow gives up only on an id Restate has never had progress for — a stale or
-foreign link — after thirty seconds; a batch the dashboard submitted itself is waited
-for however long Restate takes to start it.
+answers; after a minute without change the pill says so beside its count, with how long,
+and the drawer says the same at length. Neither names GitHub as the cause: the workflow
+publishes progress only as verdicts land, so a batch that stands still looks the same
+from the dashboard whether a call is being retried inside its budgets or the service
+that moves it has died, and the dashboard says only what it can see. (While Restate has
+not yet spoken for a batch the dashboard submitted, the wait *is* on Restate to start
+it, and the drawer says that.) The follow gives up only on an id Restate has never had
+progress for — a stale or foreign link — after thirty seconds; a batch the dashboard
+submitted itself is waited for however long Restate takes to start it.
+
+**A finished batch is announced by its tally, not by its failures alone.** The
+completion toast is a plain success only when every target succeeded. Any rejected or
+failed target makes it a warning that stays, carrying the same three-column tally the
+drawer's summary shows — `95 succeeded, 5 rejected, 0 failed` — so a rejection is never
+congratulated as a success and never called a failure. No inference about a shared cause
+is drawn from the counts: a batch rejected whole reads by the same rule as one rejected
+in part, as each target carries its own verdict rather than the batch guessing at one.
 
 **Retrying rejected targets is a new batch, refreshed first.** A rejection is the last
 word on the request *as it was sent*; most often the head moved, and the fix is to send

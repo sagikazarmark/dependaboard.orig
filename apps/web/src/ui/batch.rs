@@ -36,6 +36,19 @@ pub(crate) const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`ATTACH_TIMEOUT`] in answered polls.
 const ATTACH_LIMIT: u32 = (ATTACH_TIMEOUT.as_secs() / POLL_INTERVAL.as_secs()) as u32;
 
+/// How long a batch may stand unchanged before the pill and the drawer say
+/// so. A healthy GitHub call answers in seconds, and a round of three lands
+/// its first within them; a minute without a change is a call being retried,
+/// a rate limit being waited out, or a workflow that has stopped for a reason
+/// of its own — and the dashboard cannot tell which: the workflow publishes
+/// progress only as verdicts land, so every kind of stall looks the same from
+/// here, and the dashboard says only for how long the batch has stood. It
+/// does not guess when that will end: one call's budgets run to hours — four
+/// half-hour retry budgets and three rate-limit waits of up to an hour, for
+/// the guard read and again for the mutation — and the batch is durable for
+/// all of them.
+pub(crate) const WAITING_NOTICE_AFTER: Duration = Duration::from_secs(60);
+
 /// The server as the follow sees it, so the follow can be driven by a script
 /// in tests. Errors are already in their user-facing form.
 pub(crate) trait BatchGateway {
@@ -154,6 +167,18 @@ impl Followed {
     /// How long the batch has stood unchanged, against `now`.
     pub(crate) fn unchanged_for(&self, now: u64) -> Duration {
         Duration::from_secs(now.saturating_sub(self.since))
+    }
+
+    /// Whether the batch has stood still long enough to be said so: not while
+    /// it changed within [`WAITING_NOTICE_AFTER`], not once it has run to the
+    /// end, and not while there is no progress to date — a batch known by id
+    /// alone is being asked after, not waited on. The pill and the drawer
+    /// both read this, so they say the batch stands at the same moment; how
+    /// long it has stood is [`since`](Self::since), which each puts in words.
+    pub(crate) fn stands_still(&self, now: u64) -> bool {
+        self.progress.is_some()
+            && !self.completed()
+            && self.unchanged_for(now) >= WAITING_NOTICE_AFTER
     }
 
     /// Whether the batch has run to the end, as far as the dashboard has heard.
@@ -715,6 +740,51 @@ mod tests {
         assert_eq!(outcome, BatchOutcome::Completed(after(2)));
         assert_eq!(reported[0].trouble, Some(unavailable()));
         assert_eq!(reported[0].progress, None);
+    }
+
+    /// The one word on whether a batch has stood still, which the pill and the
+    /// drawer both take so they say so at the same moment: not while the
+    /// batch changed within the notice, however long the follow has run; yes
+    /// from the notice on; not once it has finished, however long ago; and
+    /// not for a batch with no progress to date.
+    #[test]
+    fn a_batch_stands_still_once_unchanged_for_the_notice_unless_finished_or_never_heard() {
+        let notice = WAITING_NOTICE_AFTER.as_secs();
+        let running = Followed {
+            batch_id: "batch-1".to_owned(),
+            progress: Some(after(1)),
+            heard: true,
+            since: EPOCH,
+            trouble: None,
+        };
+
+        assert!(!running.stands_still(EPOCH + notice - 1));
+        assert!(
+            running.stands_still(EPOCH + notice),
+            "the notice is the first second the batch is said to stand"
+        );
+        assert!(running.stands_still(EPOCH + 47 * 60));
+
+        let finished = Followed {
+            progress: Some(after(2)),
+            ..running.clone()
+        };
+        assert!(
+            !finished.stands_still(EPOCH + 24 * 3600),
+            "a finished batch waits on nothing"
+        );
+
+        let queued = Followed::queued("batch-1", BulkActionKind::Merge, &targets(), EPOCH);
+        assert!(
+            queued.stands_still(EPOCH + 3 * 60),
+            "the dashboard's own snapshot stands as Restate's word does"
+        );
+
+        let attaching = Followed::attaching("batch-1", EPOCH);
+        assert!(
+            !attaching.stands_still(EPOCH + 3 * 60),
+            "a batch with no progress yet has nothing that could stand"
+        );
     }
 
     /// Once Restate has spoken for the batch it is known to have it; polls

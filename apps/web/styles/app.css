@@ -1067,6 +1067,12 @@ code,
   animation: throb 1.3s infinite;
 }
 
+/* The batch has stood still past the notice: the dot holds rather than
+   throbs, and stays the warning colour — it is a wait, not a failure. */
+.progress-live.waiting {
+  animation: none;
+}
+
 .progress-live.complete {
   background: var(--color-success);
   animation: none;

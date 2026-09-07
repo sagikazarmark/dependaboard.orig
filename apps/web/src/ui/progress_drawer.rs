@@ -4,26 +4,14 @@
 //! retry and rate-limit budgets, and the batch is durable in Restate for all
 //! of them.
 
-use std::time::Duration;
-
 use dependaboard_core::TargetProgressState;
 use dioxus::prelude::*;
 
 use crate::components::button::{Button, ButtonSize};
 use crate::ui::batch::Followed;
-use crate::ui::format::relative_time;
+use crate::ui::format::{relative_time, verdict_tally};
 use crate::ui::retry::can_retry;
 use crate::ui::side_panel::SidePanel;
-
-/// How long a batch may stand unchanged before the drawer says it is waiting.
-/// A healthy GitHub call answers in seconds, and a round of three lands its
-/// first within them; a minute without a change is a call being retried or a
-/// rate limit being waited out. The drawer says so, and for how long, rather
-/// than guess when that will end: one call's budgets run to hours — four
-/// half-hour retry budgets and three rate-limit waits of up to an hour, for
-/// the guard read and again for the mutation — and the batch is durable for
-/// all of them.
-pub(crate) const WAITING_NOTICE_AFTER: Duration = Duration::from_secs(60);
 
 /// `followed` is the batch as the dashboard knows it, read against `now`, the
 /// dashboard's clock. `retrying` says the drawer's rejected targets are being
@@ -65,7 +53,7 @@ pub(crate) fn ProgressDrawer(
             onclose,
             div { class: "progress-summary",
                 strong { "{settled}/{total}" }
-                span { "{progress.succeeded} succeeded, {progress.rejected} rejected, {progress.failed} failed" }
+                span { "{verdict_tally(progress.succeeded, progress.rejected, progress.failed)}" }
                 progress { class: "progress progress-primary", max: "100", value: "{percentage}" }
             }
             if let Some(note) = waiting_note(&followed, now) {
@@ -103,19 +91,23 @@ pub(crate) fn ProgressDrawer(
 }
 
 /// What the drawer says about a batch that is not moving, if anything: nothing
-/// while the batch has changed within [`WAITING_NOTICE_AFTER`], or has run to
-/// the end. Past that, since when and on whom it waits: on GitHub, once
-/// Restate has spoken for the batch, or on Restate to start it, while it has
-/// not.
+/// while [`Followed::stands_still`] says it does not. Past that, for how long
+/// and what the dashboard can tell of why: while Restate has not spoken for a
+/// batch the dashboard submitted, the wait is on Restate to start it. Once it
+/// has, the dashboard cannot tell a call being retried inside its budgets from
+/// a service that has died — the workflow publishes progress only as verdicts
+/// land, so the two look the same from here — so it says only for how long,
+/// and does not name GitHub as the cause.
 fn waiting_note(followed: &Followed, now: u64) -> Option<String> {
-    if followed.completed() || followed.unchanged_for(now) < WAITING_NOTICE_AFTER {
+    if !followed.stands_still(now) {
         return None;
     }
     let standing = relative_time(now, followed.since);
     Some(if followed.heard {
         format!(
-            "Waiting on GitHub for {standing}: a call is being retried, or a rate limit waited out. \
-             The batch carries on in Restate."
+            "No progress for {standing}. Whether a call is being retried or the service is down, \
+             the dashboard cannot tell; one call may take hours inside its budgets, and the batch \
+             is durable in Restate for all of them."
         )
     } else {
         format!(
@@ -184,6 +176,7 @@ mod tests {
     use dependaboard_core::{ActionOutcome, BatchProgress, BulkActionKind, RejectReason};
 
     use super::*;
+    use crate::ui::batch::WAITING_NOTICE_AFTER;
     use crate::ui::pr_target;
     use crate::ui::test_support::{
         FIXTURE_NOW, followed, grouped_row, half_done_merge, render, serde_row,
@@ -331,19 +324,23 @@ mod tests {
     }
 
     /// Nothing moved for longer than a healthy call takes. The batch is not
-    /// lost, and the drawer does not say so: it says on what the batch waits
-    /// and for how long, and that the batch carries on.
+    /// lost, and the drawer does not say so; nor does it say the wait is on
+    /// GitHub, which it cannot know — progress is published only as verdicts
+    /// land, so a call being retried and a service that has died look the
+    /// same from here. It says for how long the batch has stood, that it
+    /// cannot tell why, and that the batch carries on.
     #[test]
-    fn a_batch_standing_still_says_since_when_it_waits_on_github_and_never_that_it_is_lost() {
+    fn a_batch_standing_still_says_for_how_long_and_neither_that_it_is_lost_nor_whose_fault() {
         let html = render_followed(followed(half_done_merge()), FIXTURE_NOW + 47 * 60, false);
 
         assert!(
             html.contains(
-                r#"<p class="progress-note">Waiting on GitHub for 47m: a call is being retried, or a rate limit waited out. The batch carries on in Restate.</p>"#
+                r#"<p class="progress-note">No progress for 47m. Whether a call is being retried or the service is down, the dashboard cannot tell; one call may take hours inside its budgets, and the batch is durable in Restate for all of them.</p>"#
             ),
             "{html}"
         );
         assert!(!html.to_lowercase().contains("lost"), "{html}");
+        assert!(!html.contains("GitHub"), "{html}");
     }
 
     /// The dashboard's own snapshot of what it queued is not Restate's word;
@@ -363,7 +360,7 @@ mod tests {
             html.contains("Waiting on Restate to start the batch, 3m after it took it"),
             "{html}"
         );
-        assert!(!html.contains("Waiting on GitHub"), "{html}");
+        assert!(!html.contains("No progress for"), "{html}");
     }
 
     /// A finished batch waits on nothing, however long ago it finished.
