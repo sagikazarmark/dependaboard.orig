@@ -8,11 +8,12 @@ use restate_sdk::prelude::*;
 
 use crate::handler::RetryableServiceError;
 
-/// Bounded backoff for projection-store writes: SQLite contention and the FK race between
-/// a fresh repository's first webhook and its enumeration resolve within seconds, so back
-/// off from 100ms to five seconds and give up after five minutes with a terminal failure.
-/// A webhook that outlives the budget is not lost: the next reconcile syncs the same pull
-/// request once its repository row exists.
+/// Bounded backoff for projection-store writes: SQLite contention, the FK race between a
+/// fresh repository's first webhook and its enumeration, and a remote store's blip — a
+/// dropped stream, a 5xx, a restart — resolve within seconds, so back off from 100ms to
+/// five seconds and give up after five minutes with a terminal failure. A webhook that
+/// outlives the budget is not lost: the next reconcile syncs the same pull request once
+/// its repository row exists.
 pub(crate) fn store_retry_policy() -> RunRetryPolicy {
     RunRetryPolicy::new()
         .initial_delay(Duration::from_millis(100))
@@ -60,11 +61,11 @@ pub(crate) fn store_failure(error: StoreError) -> HandlerError {
 /// whatever the store said. [`store_failure`] lets a terminal-class error end the step,
 /// because every other write has a later chance; this one has none, and a record given
 /// up on is an audit row lost while the merges it describes stand on GitHub. So a schema
-/// that does not match, a disk that is full, or a remote store whose failure the
-/// classifier does not know are all retried under [`persistent_store_retry_policy`], and
-/// the workflow stalls in plain sight until an operator has put the store right. The
-/// store's class is kept in the message, so the failure Restate shows says whether the
-/// store expected it to clear on its own.
+/// that does not match, a disk that is full, or a `libsql` error the classifier does not
+/// know are all retried under [`persistent_store_retry_policy`], and the workflow stalls
+/// in plain sight until an operator has put the store right. The store's class is kept in
+/// the message, so the failure Restate shows says whether the store expected it to clear
+/// on its own.
 pub(crate) fn batch_record_failure(error: StoreError) -> HandlerError {
     match error.class() {
         StoreErrorClass::Retryable => store_failure(error),

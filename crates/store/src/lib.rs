@@ -1215,10 +1215,23 @@ impl StoreError {
 fn retryable_database_error(error: &libsql::Error) -> bool {
     match error {
         libsql::Error::SqliteFailure(code, _) => retryable_sqlite_code(*code),
+        // Only the embedded-replica connection reports this way; a store built
+        // with `Builder::new_remote` never does.
         libsql::Error::RemoteSqliteFailure(code, extended_code, _) => {
             retryable_sqlite_code(*code) || retryable_sqlite_code(*extended_code)
         }
         libsql::Error::ConnectionFailed(_) | libsql::Error::WalConflict => true,
+        // Every failure a store built with `Builder::new_remote` reports — a
+        // transport error, a dropped stream, an HTTP 5xx or 429, and even a
+        // server-side SQLITE_BUSY or constraint violation — arrives here, as a
+        // boxed `HranaError` whose module libsql (0.9) keeps private, so it can
+        // be neither matched nor downcast. Treat the whole variant as
+        // transient: every caller that consults the class has a bounded retry,
+        // so a request that is genuinely bad costs at most its budget before
+        // the same terminal report, while the alternative fails every blip on
+        // the first attempt. Revisit if libsql exports the type or a
+        // structured code.
+        libsql::Error::Hrana(_) => true,
         _ => false,
     }
 }
@@ -2938,13 +2951,31 @@ mod tests {
             let error = StoreError::Database(libsql::Error::SqliteFailure(code, "busy".into()));
             assert_eq!(error.class(), StoreErrorClass::Retryable, "code {code}");
         }
-        // A remote server reports the primary and extended codes separately.
+        // An embedded replica reports the primary and extended codes separately.
         let remote = StoreError::Database(libsql::Error::RemoteSqliteFailure(
             19,
             19 | (3 << 8),
             "constraint".into(),
         ));
         assert_eq!(remote.class(), StoreErrorClass::Retryable);
+    }
+
+    /// The messages are what libsql's remote connection puts in `Hrana` for a
+    /// transport error, a dropped stream, a server error, a rate limit and a
+    /// server-side SQLITE_BUSY; the class rests on the variant alone, for the
+    /// reason `retryable_database_error` gives.
+    #[test]
+    fn classifies_a_remote_store_failure_as_retryable() {
+        for message in [
+            "http error: `connection reset by peer`",
+            "stream closed: `stream expired`",
+            "api error: `status=503, body=`",
+            "api error: `status=429, body=too many requests`",
+            "stream error: `Error { message: \"database is locked\", code: \"SQLITE_BUSY\" }`",
+        ] {
+            let error = StoreError::Database(libsql::Error::Hrana(message.into()));
+            assert_eq!(error.class(), StoreErrorClass::Retryable, "{message}");
+        }
     }
 
     #[test]

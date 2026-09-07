@@ -231,12 +231,12 @@ a batch id, so a retry of the step does not either. The step is never given up: 
 later would redo this write, so giving up would lose the record for good while the merges
 it describes stand on GitHub. Its retries are unbounded, and — unlike every other store
 write, which lets the store's `Terminal` class end the step — every store failure is
-retried, the terminal-class ones too: a schema a migration behind, a full disk, a remote
-store whose failure the classifier does not know. Such a store stalls the workflow, in
-plain sight rather than silently: the invocation shows as retrying in the Restate UI, and
-once the record has been pending past a short grace period every failed attempt is logged
-at `warn` with the batch id, its age, and the failure, marked as terminal-class when the
-store did not expect it to clear on its own.
+retried, the terminal-class ones too: a schema a migration behind, a full disk, a `libsql`
+error the classifier does not know. Such a store stalls the workflow, in plain sight rather
+than silently: the invocation shows as retrying in the Restate UI, and once the record has
+been pending past a short grace period every failed attempt is logged at `warn` with the
+batch id, its age, and the failure, marked as terminal-class when the store did not expect
+it to clear on its own.
 The intended recovery is to put the store right, after which the next attempt lands. The
 dashboard's **Batches** button lists what was written, newest first; that list is the
 audit view, and it does not care how old a batch is. A merged pull request leaves
@@ -460,19 +460,25 @@ enum StoreErrorClass { Retryable, Terminal }   // StoreError::class()
 connection, a WAL conflict) and *one* constraint failure, the foreign-key one (the FK race
 in `InstallationSync`). Everything else is `Terminal`: a primary-key or unique violation is
 a programming error a fresh attempt would hit again, and so are a corrupt row, an integer
-out of range, and a `libsql` error the classifier does not know. (Against a remote store
-that last case swallows too much — every remote failure arrives as one variant — which is
-#66, open.) The handlers map the class onto Restate under three budgets: the ordinary
-write something later would redo — a webhook's upsert, a sweep's prune, a drain's read —
-retries a `Retryable` for up to five minutes and fails the step on a `Terminal`
-(`store_retry_policy`, `store_failure`); the running-batch listing, a convenience that
-stands in the way of the work, gets fifteen seconds and then the batch runs unlisted
-(`brief_store_retry_policy`); and the finished batch's record, which nothing later would
-redo, overrides the class — every failure is retried, with no budget, the terminal ones
-named as such in the failure Restate shows (`persistent_store_retry_policy`,
-`batch_record_failure`; see `BulkAction`). The unlisting a failed or cancelled workflow
-does on its way out uses the ordinary budget: nothing waits behind it, and a lost unlist
-is a stale row, not a lost record.
+out of range, and a `libsql` error the classifier does not know. Against a remote store —
+a `libsql://`, `https://` or `http://` URL, built with `Builder::new_remote` — the
+structured codes above never arrive: every failure it reports, a transport error, a dropped
+stream, an HTTP 5xx or 429, a server-side `SQLITE_BUSY` and a server-side constraint
+violation alike, is one variant, `libsql::Error::Hrana`, boxing a type libsql (0.9) keeps
+private. That variant is `Retryable` as a whole: it cannot be taken apart without matching
+on message text, every caller that consults the class has a bounded retry, and the cost of
+a genuinely bad request is its budget before the same report, where the cost of the other
+choice was every blip failing a webhook, a sync or a retirement on its first attempt. The
+handlers map the class onto Restate under three budgets: the ordinary write something later
+would redo — a webhook's upsert, a sweep's prune, a drain's read — retries a `Retryable`
+for up to five minutes and fails the step on a `Terminal` (`store_retry_policy`,
+`store_failure`); the running-batch listing, a convenience that stands in the way of the
+work, gets fifteen seconds and then the batch runs unlisted (`brief_store_retry_policy`);
+and the finished batch's record, which nothing later would redo, overrides the class —
+every failure is retried, with no budget, the terminal ones named as such in the failure
+Restate shows (`persistent_store_retry_policy`, `batch_record_failure`; see `BulkAction`).
+The unlisting a failed or cancelled workflow does on its way out uses the ordinary budget:
+nothing waits behind it, and a lost unlist is a stale row, not a lost record.
 
 **One 405 is special-cased, and it's the one bulk merging hits most.**
 `PUT /pulls/{n}/merge` returns 405 `"Base branch was modified. Review and try the merge
