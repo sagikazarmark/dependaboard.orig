@@ -13,7 +13,7 @@ use dioxus::prelude::*;
 
 use crate::components::toast::{ToastOptions, Toasts, use_toast};
 use crate::ui::batch::{
-    ATTACH_TIMEOUT, BatchOutcome, Followed, SUBMIT_ATTEMPTS, ServerBatch, ServerFollow,
+    ATTACH_TIMEOUT, BatchOutcome, Followed, Listing, SUBMIT_ATTEMPTS, ServerBatch, ServerFollow,
     follow_batch, run_batch,
 };
 use crate::ui::dashboard_state::{Connection, DashboardState, use_dashboard};
@@ -108,7 +108,10 @@ pub(crate) fn ActiveBatch(
             }
         }
         None if current.signed_out() => ("progress-live waiting", "batch: signed out".to_owned()),
-        None => ("progress-live", "batch: following...".to_owned()),
+        None => match current.listing.action() {
+            Some(action) => ("progress-live", format!("{action}: following...")),
+            None => ("progress-live", "batch: following...".to_owned()),
+        },
     };
     rsx! {
         button {
@@ -192,10 +195,13 @@ fn account_for(pending: &PendingAction, receipt: &BatchReceipt, mut host: BatchH
 
 /// Follows the batch `batch_id` names, known by its id alone — from the URL
 /// after a reload, or picked from the audit view — to the end, as
-/// [`queue_batch`] follows one it queued. Following the batch already
-/// followed changes nothing. A batch found already finished is shown as it
-/// stands and not announced: it was announced when it finished, and the page
-/// has nothing to reload for it.
+/// [`queue_batch`] follows one it queued. The projection is asked first: a
+/// batch it holds finished opens from the record at once, without a poll; one
+/// it lists as running is polled for as long as it takes; only an id it has
+/// never heard of is left to Restate to vouch for, within [`ATTACH_TIMEOUT`].
+/// Following the batch already followed changes nothing. A batch found
+/// already finished is shown as it stands and not announced: it was announced
+/// when it finished, and the page has nothing to reload for it.
 pub(crate) fn attach_batch(batch_id: String, mut host: BatchHost) {
     if host.follows(&batch_id) {
         return;
@@ -241,21 +247,39 @@ fn conclude(outcome: BatchOutcome, mut host: BatchHost) {
             }
         }
         BatchOutcome::Unknown => {
-            let batch_id = host
+            let notice = host
                 .followed
                 .peek()
                 .as_ref()
-                .map_or_else(String::new, |followed| followed.batch_id.clone());
-            host.toast.warning(
-                format!(
-                    "Restate has no progress for batch {batch_id} after {} seconds: it may never have run, or its workflow has been retired since. A finished batch is under Batches.",
-                    ATTACH_TIMEOUT.as_secs()
-                ),
-                sticky(),
-            );
+                .map_or_else(String::new, unknown_notice);
+            host.toast.warning(notice, sticky());
             host.followed.set(None);
         }
         BatchOutcome::SignedOut => host.state.poll_missed(Connection::SignedOut),
+    }
+}
+
+/// What the toast says of a batch nobody would vouch for, `followed` being
+/// the follow as it ended: the projection had no record of it and Restate no
+/// progress, which is a stale or foreign link — or, when the projection could
+/// not be read, Restate's word alone, with the audit view left as the place a
+/// finished batch would still be. A follow the projection listed as running,
+/// or never answered, does not end this way: the one is waited for however
+/// long, the other is answered before a poll is taken; the words are Restate's
+/// alone all the same.
+fn unknown_notice(followed: &Followed) -> String {
+    let batch_id = &followed.batch_id;
+    let seconds = ATTACH_TIMEOUT.as_secs();
+    match followed.listing {
+        Listing::Unlisted => format!(
+            "No batch {batch_id}: the projection has no record of it, running or finished, and Restate has had no progress for it in {seconds} seconds of asking. The link is stale, or from another deployment."
+        ),
+        Listing::Unreadable => format!(
+            "Restate has no progress for batch {batch_id} after {seconds} seconds, and the projection could not be read: it may never have run, or its workflow has been retired since. A finished batch is under Batches."
+        ),
+        Listing::Unasked | Listing::Running(_) => format!(
+            "Restate has no progress for batch {batch_id} after {seconds} seconds: it may never have run, or its workflow has been retired since. A finished batch is under Batches."
+        ),
     }
 }
 
@@ -483,7 +507,7 @@ mod tests {
     }
 
     /// After a reload the dashboard follows the batch its URL names by id
-    /// alone: the pill is up and the drawer open on it before Restate has
+    /// alone: the pill is up and the drawer open on it before anything has
     /// answered, so the operator sees at once that the batch is being found.
     #[test]
     fn a_batch_followed_by_id_alone_shows_a_pill_and_an_open_drawer_asking_after_it() {
@@ -502,10 +526,7 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("Batch batch-1"), "{html}");
-        assert!(
-            html.contains("Asking Restate where the batch stands..."),
-            "{html}"
-        );
+        assert!(html.contains("Looking the batch up..."), "{html}");
     }
 
     /// The retry needs the toasts and the dashboard around the drawer, which

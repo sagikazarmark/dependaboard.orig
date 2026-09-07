@@ -4,8 +4,8 @@
 
 use dependaboard_core::{
     BatchList, BatchProgress, BatchReceipt, BulkActionKind, Capabilities, DashboardPage,
-    DashboardSummary, Page, PrFilter, PrRecord, PrState, ProjectionRevision, SubmittedTarget,
-    UserId,
+    DashboardSummary, Page, PrFilter, PrRecord, PrState, ProjectedBatch, ProjectionRevision,
+    SubmittedTarget, UserId,
 };
 use dioxus::prelude::*;
 
@@ -195,6 +195,27 @@ pub(crate) async fn load_recent_batches(limit: u32) -> Result<BatchList, ServerF
     Ok(BatchList { running, finished })
 }
 
+/// What the projection holds of the batch `batch_id` names: its finished
+/// record, its listing while it runs, or `None` for an id it has never heard
+/// of. A dashboard handed an id alone — from a link — asks this before it
+/// asks Restate, so a finished batch opens from the record at once, however
+/// long ago its workflow was retired, and only an id the projection has
+/// never heard of is asked after through `progress`. An id the dashboard
+/// could not have minted is refused, as [`load_batch_progress`] refuses it.
+#[server(state: Extension<ServerState>)]
+pub(crate) async fn load_batch_projection(
+    batch_id: String,
+) -> Result<Option<ProjectedBatch>, ServerFnError> {
+    if !dependaboard_core::valid_batch_id(&batch_id) {
+        return Err(ServerFnError::new(InvalidBatch::BatchId.to_string()));
+    }
+    state
+        .store
+        .get_batch(&batch_id)
+        .await
+        .map_err(store_failure)
+}
+
 /// The durable state Restate holds for a pull request, or `None` for one the
 /// projection does not have: the `PullRequest` object knows nothing of
 /// installations, so the key is held to the projection before Restate is
@@ -323,7 +344,7 @@ fn restate_unavailable(error: String) -> ServerFnError {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use dependaboard_core::{
-        BatchRecord, BatchTargetRecord, CursorError, RunningBatch, TargetOutcome,
+        BatchRecord, BatchTargetRecord, CursorError, ProjectedBatch, RunningBatch, TargetOutcome,
     };
     use reqwest::StatusCode;
     use serde_json::json;
@@ -413,6 +434,84 @@ mod tests {
                 running: vec![running],
                 finished: vec![finished],
             }
+        );
+    }
+
+    /// A dashboard handed a batch id alone asks the projection first, and
+    /// gets the finished record whole, the running listing, or word that the
+    /// projection has never heard of the id — each from the store, not
+    /// Restate, which is not asked. An id the dashboard could not have minted
+    /// is refused, as the progress read refuses it.
+    #[tokio::test]
+    async fn one_batch_is_read_from_the_projection_as_finished_running_or_unknown() {
+        let dashboard = dashboard().await;
+        let running = RunningBatch {
+            batch_id: OTHER_BATCH.to_owned(),
+            action: BulkActionKind::Merge,
+            requested_by: UserId::new(USERNAME),
+            started_at: 2_000,
+            target_count: 3,
+        };
+        let finished = BatchRecord {
+            batch_id: BATCH.to_owned(),
+            action: BulkActionKind::Rebase,
+            requested_by: UserId::new(USERNAME),
+            started_at: 1_000,
+            completed_at: 1_030,
+            succeeded: 1,
+            rejected: 0,
+            failed: 0,
+            targets: vec![BatchTargetRecord {
+                repository_id: 7,
+                owner: "acme".to_owned(),
+                repo: "api".to_owned(),
+                number: 9,
+                title: GROUPED_ROW_TITLE.to_owned(),
+                html_url: "https://github.example/acme/api/pull/9".to_owned(),
+                outcome: TargetOutcome::Succeeded {
+                    detail: "@dependabot rebase posted".to_owned(),
+                },
+            }],
+        };
+        dashboard.store().start_batch(&running).await.unwrap();
+        dashboard.store().record_batch(&finished).await.unwrap();
+
+        let read = |batch_id: &str| {
+            dashboard
+                .call("load_batch_projection", json!({ "batch_id": batch_id }))
+                .send()
+        };
+        let recorded = read(BATCH).await.unwrap();
+        assert_eq!(recorded.status(), StatusCode::OK);
+        assert_eq!(
+            recorded.json::<Option<ProjectedBatch>>().await.unwrap(),
+            Some(ProjectedBatch::Finished(finished))
+        );
+        let listed = read(OTHER_BATCH).await.unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(
+            listed.json::<Option<ProjectedBatch>>().await.unwrap(),
+            Some(ProjectedBatch::Running(running))
+        );
+        let never_heard_of = read("01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1c").await.unwrap();
+        assert_eq!(never_heard_of.status(), StatusCode::OK);
+        assert_eq!(
+            never_heard_of
+                .json::<Option<ProjectedBatch>>()
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            dashboard.forwards().is_empty(),
+            "the projection answers; Restate is not asked"
+        );
+
+        let refused = read("batch-1").await.unwrap();
+        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error_message(refused).await,
+            InvalidBatch::BatchId.to_string()
         );
     }
 

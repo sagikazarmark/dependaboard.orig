@@ -2,15 +2,17 @@
 //! long the batch has stood still and whether the server is answering. It
 //! never says the batch is lost: a target may sit for hours inside GitHub's
 //! retry and rate-limit budgets, and the batch is durable in Restate for all
-//! of them. Once the server has refused the credentials it says the follow
-//! has stopped, and that the reload which signs in again picks it up.
+//! of them. For a batch known by id alone it says which way of finding it the
+//! follow is on until there is progress to show. Once the server has refused
+//! the credentials it says the follow has stopped, and that the reload which
+//! signs in again picks it up.
 
 use dependaboard_core::TargetProgressState;
 use dioxus::prelude::*;
 
 use crate::components::button::{Button, ButtonSize};
-use crate::ui::batch::Followed;
-use crate::ui::format::{relative_time, verdict_tally};
+use crate::ui::batch::{Followed, Listing};
+use crate::ui::format::{ago, pull_requests, relative_time, verdict_tally};
 use crate::ui::retry::can_retry;
 use crate::ui::side_panel::SidePanel;
 
@@ -26,14 +28,18 @@ pub(crate) fn ProgressDrawer(
     onclose: EventHandler<()>,
 ) -> Element {
     let Some(progress) = &followed.progress else {
+        let title = match followed.listing.action() {
+            Some(action) => format!("{action} progress"),
+            None => "Batch progress".to_owned(),
+        };
         return rsx! {
             SidePanel {
                 class: "progress-drawer",
                 eyebrow: "Batch {followed.batch_id}",
-                title: rsx! { "Batch progress" },
+                title: rsx! { "{title}" },
                 onclose,
                 if !followed.signed_out() {
-                    p { class: "progress-note", "Asking Restate where the batch stands..." }
+                    p { class: "progress-note", "{finding_note(&followed, now)}" }
                 }
                 if let Some(note) = trouble_note(&followed) {
                     p { class: "progress-note progress-trouble", "{note}" }
@@ -88,6 +94,34 @@ pub(crate) fn ProgressDrawer(
                 }
             }
         }
+    }
+}
+
+/// What the drawer says of a batch followed by id alone while there is no
+/// progress to show: which of the ways of finding a batch the follow is on.
+/// The projection is asked first, so until it has answered the batch is being
+/// looked up; a listing as running is passed on — what was asked, over how
+/// many, by whom, since when — with Restate asked for the rest; an id the
+/// projection has never heard of is said to be, with why that need not be the
+/// end of it, while Restate is given its say; and a projection that could not
+/// be read is said to be, with Restate asked as it always was. The fault
+/// itself is the trouble note's to pass on, for as long as it lasts.
+fn finding_note(followed: &Followed, now: u64) -> String {
+    match &followed.listing {
+        Listing::Unasked => "Looking the batch up...".to_owned(),
+        Listing::Unreadable => {
+            "The projection could not be read. Asking Restate where the batch stands...".to_owned()
+        }
+        Listing::Unlisted => "The projection has no batch by this id, running or finished; one \
+                              just queued may not be listed yet. Asking Restate where it stands..."
+            .to_owned(),
+        Listing::Running(listing) => format!(
+            "Listed as running: {} over {}, by {}, started {}. Asking Restate where it stands...",
+            listing.action,
+            pull_requests(listing.target_count),
+            listing.requested_by,
+            ago(now, listing.started_at)
+        ),
     }
 }
 
@@ -203,11 +237,13 @@ fn progress_detail(state: &TargetProgressState) -> String {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use dependaboard_core::{ActionOutcome, BatchProgress, BulkActionKind, RejectReason};
+    use dependaboard_core::{
+        ActionOutcome, BatchProgress, BulkActionKind, RejectReason, RunningBatch, UserId,
+    };
 
     use super::*;
     use crate::ui::Fault;
-    use crate::ui::batch::WAITING_NOTICE_AFTER;
+    use crate::ui::batch::{Listing, WAITING_NOTICE_AFTER};
     use crate::ui::pr_target;
     use crate::ui::test_support::{
         FIXTURE_NOW, followed, grouped_row, half_done_merge, render, serde_row,
@@ -476,21 +512,95 @@ mod tests {
         assert!(html.contains("Batch batch-1"), "{html}");
     }
 
-    /// After a reload the dashboard has the id alone; until Restate answers
-    /// the drawer names the batch and says it is asking.
+    /// After a reload the dashboard has the id alone; until the projection has
+    /// answered the drawer names the batch and says it is looking it up — not
+    /// that it is asking Restate, which is the second word, not the first.
     #[test]
-    fn a_batch_followed_by_id_alone_says_it_is_asking_restate() {
+    fn a_batch_followed_by_id_alone_says_it_is_being_looked_up() {
         let attaching = Followed::attaching("batch-1", FIXTURE_NOW);
 
         let html = render_followed(attaching, FIXTURE_NOW, false);
 
         assert!(html.contains("Batch batch-1"), "{html}");
         assert!(
-            html.contains("Asking Restate where the batch stands..."),
+            html.contains(r#"<p class="progress-note">Looking the batch up...</p>"#),
+            "{html}"
+        );
+        assert!(!html.contains("Asking Restate"), "{html}");
+        assert!(!html.contains("progress-summary"), "{html}");
+        assert!(!html.contains(RETRY_BUTTON), "{html}");
+    }
+
+    /// The projection lists the batch as running: the drawer says so, with
+    /// what the listing knows of it — what was asked, over how many, by whom,
+    /// since when — and that Restate is being asked for the rest. The title
+    /// names the action, as it does once the progress is in.
+    #[test]
+    fn a_batch_the_projection_lists_as_running_is_described_from_the_listing_while_restate_is_asked()
+     {
+        let listed = Followed {
+            listing: Listing::Running(RunningBatch {
+                batch_id: "batch-1".to_owned(),
+                action: BulkActionKind::Merge,
+                requested_by: UserId::new("alice"),
+                started_at: FIXTURE_NOW - 3 * 60,
+                target_count: 12,
+            }),
+            ..Followed::attaching("batch-1", FIXTURE_NOW)
+        };
+
+        let html = render_followed(listed, FIXTURE_NOW, false);
+
+        assert!(html.contains("merge progress"), "{html}");
+        assert!(
+            html.contains(
+                r#"<p class="progress-note">Listed as running: merge over 12 pull requests, by alice, started 3m ago. Asking Restate where it stands...</p>"#
+            ),
             "{html}"
         );
         assert!(!html.contains("progress-summary"), "{html}");
-        assert!(!html.contains(RETRY_BUTTON), "{html}");
+    }
+
+    /// The projection could not be read, and the store's fault has since
+    /// cleared from the polls: the drawer still says the batch is on Restate's
+    /// word alone, rather than that it is being looked up, which it no longer
+    /// is.
+    #[test]
+    fn a_batch_whose_projection_could_not_be_read_says_so_while_restate_is_asked() {
+        let unreadable = Followed {
+            listing: Listing::Unreadable,
+            ..Followed::attaching("batch-1", FIXTURE_NOW)
+        };
+
+        let html = render_followed(unreadable, FIXTURE_NOW, false);
+
+        assert!(
+            html.contains(
+                r#"<p class="progress-note">The projection could not be read. Asking Restate where the batch stands...</p>"#
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("Looking the batch up"), "{html}");
+    }
+
+    /// The projection has never heard of the id: the drawer says so, and why
+    /// that need not be the end of it, and that Restate is being asked.
+    #[test]
+    fn a_batch_the_projection_has_never_heard_of_says_so_while_restate_is_asked() {
+        let unlisted = Followed {
+            listing: Listing::Unlisted,
+            ..Followed::attaching("batch-1", FIXTURE_NOW)
+        };
+
+        let html = render_followed(unlisted, FIXTURE_NOW, false);
+
+        assert!(html.contains("Batch batch-1"), "{html}");
+        assert!(
+            html.contains(
+                r#"<p class="progress-note">The projection has no batch by this id, running or finished; one just queued may not be listed yet. Asking Restate where it stands...</p>"#
+            ),
+            "{html}"
+        );
     }
 
     /// A target's row links to the pull request on GitHub when its URL is known;

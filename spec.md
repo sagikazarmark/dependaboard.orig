@@ -264,9 +264,27 @@ publishes progress only as verdicts land, so a batch that stands still looks the
 from the dashboard whether a call is being retried inside its budgets or the service
 that moves it has died, and the dashboard says only what it can see. (While Restate has
 not yet spoken for a batch the dashboard submitted, the wait *is* on Restate to start
-it, and the drawer says that.) The follow gives up only on an id Restate has never had
-progress for — a stale or foreign link — after thirty seconds; a batch the dashboard
-submitted itself is waited for however long Restate takes to start it.
+it, and the drawer says that.) The follow gives up only on an id nobody will vouch for — a
+stale or foreign link — after thirty seconds of Restate answering that it has no
+progress; a batch the dashboard submitted itself is waited for however long Restate takes
+to start it.
+
+**A batch followed by id alone is read from the projection before Restate is asked.** The
+projection holds every finished batch for good and lists every running one; Restate holds
+a batch's progress for seven days. So a link's id goes to the projection first, through
+one server function that reads the record or the listing by id in one snapshot. A
+finished record opens the drawer at once as the completed progress it was written from —
+the record is the inverse of `completed_record`, less the head SHA each target was sent
+against, which nothing that reads a finished batch needs — and is not polled: there is
+nothing left to follow, and it reads as any finished batch does, retry offer included. A
+running listing opens the drawer on what the listing says and polls `progress` as a batch
+Restate is known to have: the workflow wrote the listing itself, after publishing its
+first progress, so the listing vouches for the batch as a submission receipt does, and the
+thirty-second give-up does not apply. Only an id the projection has never heard of is left
+to Restate under that give-up, since a batch just queued is not listed until its workflow
+starts. A projection that could not be read is reported as a failing poll is, and Restate
+is asked as before. The drawer says which of the three the follow is on while it has no
+progress to show.
 
 **A finished batch is announced by its tally, not by its failures alone.** The
 completion toast is a plain success only when every target succeeded. Any rejected or
@@ -701,6 +719,13 @@ Progress          UI polls → server fn →
                        POST /restate/call/BulkAction/{batch_id}/progress
                        the batch id is in the URL, so a reload polls on
 
+Batch by id       UI → server fn → PrStore::get_batch(batch_id)
+                       what the projection holds of a batch followed by id alone, asked
+                       before Restate is: the finished record, which opens the drawer
+                       at once and is not polled; the running listing, which is polled
+                       through progress without the give-up; or nothing, which leaves
+                       the id to Restate under it
+
 Drawer            UI → server fn → PrStore::get_pr
                        the drawer names a pull request by key: the row it opens on
                        and reads back after a sync, and the durable state it polls,
@@ -948,6 +973,9 @@ pub trait PrStore {
     async fn unlist_batch(&self, batch_id: &str) -> Result<()>;
     /// Every batch started and not yet recorded or given up, newest first.
     async fn running_batches(&self) -> Result<Vec<RunningBatch>>;
+    /// One batch by id: its finished record or its running listing, from one snapshot;
+    /// None for an id the projection has never heard of.
+    async fn get_batch(&self, batch_id: &str) -> Result<Option<ProjectedBatch>>;
 }
 
 pub struct PrFilter {

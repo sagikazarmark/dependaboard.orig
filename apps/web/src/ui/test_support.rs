@@ -10,7 +10,7 @@ use dependaboard_core::{
 use dioxus::prelude::*;
 
 use crate::components::toast::ToastProvider;
-use crate::ui::batch::Followed;
+use crate::ui::batch::{Followed, Listing};
 use crate::ui::dashboard_state::{
     Answers, CapabilitiesStatus, Connection, DashboardState, PageStatus, Selection, SummaryStatus,
 };
@@ -148,6 +148,7 @@ pub(crate) fn followed(progress: BatchProgress) -> Followed {
         heard: true,
         since: FIXTURE_NOW,
         trouble: None,
+        listing: Listing::Unasked,
     }
 }
 

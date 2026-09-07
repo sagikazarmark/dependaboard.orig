@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time:
 use async_trait::async_trait;
 use dependaboard_core::{
     BatchRecord, BatchTargetRecord, CursorError, DashboardPage, DashboardSummary, FacetCounts,
-    LabelFacet, Mergeable, Page, PageCursor, PrFilter, PrKey, PrRecord, ProjectionRevision,
-    RepoFacet, RepoRecord, Retirement, RunningBatch, UserId, unix_seconds,
+    LabelFacet, Mergeable, Page, PageCursor, PrFilter, PrKey, PrRecord, ProjectedBatch,
+    ProjectionRevision, RepoFacet, RepoRecord, Retirement, RunningBatch, UserId, unix_seconds,
 };
 use libsql::{Builder, Row, Value};
 use secrecy::{ExposeSecret, SecretString};
@@ -184,6 +184,11 @@ pub trait PrStore: Send + Sync {
     async fn unlist_batch(&self, batch_id: &str) -> Result<(), StoreError>;
     /// Every batch started and not yet recorded or given up, newest first.
     async fn running_batches(&self) -> Result<Vec<RunningBatch>, StoreError>;
+    /// What the projection holds of the batch `batch_id` names: its finished
+    /// record, targets and all, or its running listing; `None` for an id it
+    /// has never heard of. One answer from one snapshot, so a batch finishing
+    /// under the read is found as one or the other, not neither.
+    async fn get_batch(&self, batch_id: &str) -> Result<Option<ProjectedBatch>, StoreError>;
 }
 
 #[async_trait]
@@ -527,11 +532,10 @@ impl PrStore for LibSqlPrStore {
         let connection = self.connection().await;
         let mut rows = connection
             .query(
-                r#"SELECT batch_id, action, requested_by, started_at, completed_at,
-                          succeeded, rejected, failed
-                   FROM batches
-                   ORDER BY completed_at DESC, batch_id DESC
-                   LIMIT ?1"#,
+                &format!(
+                    "{} ORDER BY completed_at DESC, batch_id DESC LIMIT ?1",
+                    select_batches_sql()
+                ),
                 vec![Value::Integer(i64::from(limit))],
             )
             .await?;
@@ -549,8 +553,8 @@ impl PrStore for LibSqlPrStore {
         let mut targets = connection
             .query(
                 &format!(
-                    "SELECT batch_id, repository_id, owner, repo, number, title, html_url, outcome \
-                     FROM batch_targets WHERE batch_id IN ({placeholders}) ORDER BY batch_id, position"
+                    "{} WHERE batch_id IN ({placeholders}) ORDER BY batch_id, position",
+                    select_batch_targets_sql()
                 ),
                 batches
                     .iter()
@@ -607,24 +611,87 @@ impl PrStore for LibSqlPrStore {
             .connection()
             .await
             .query(
-                r#"SELECT batch_id, action, requested_by, started_at, target_count
-                   FROM running_batches
-                   ORDER BY started_at DESC, batch_id DESC"#,
+                &format!(
+                    "{} ORDER BY started_at DESC, batch_id DESC",
+                    select_running_batches_sql()
+                ),
                 (),
             )
             .await?;
         let mut batches = Vec::new();
         while let Some(row) = rows.next().await? {
-            batches.push(RunningBatch {
-                batch_id: row.get(0)?,
-                action: stored_enum(row.get(1)?)?,
-                requested_by: UserId::new(row.get::<String>(2)?),
-                started_at: unsigned(row.get::<i64>(3)?)?,
-                target_count: unsigned(row.get::<i64>(4)?)?,
-            });
+            batches.push(running_batch_from_row(row)?);
         }
         Ok(batches)
     }
+
+    async fn get_batch(&self, batch_id: &str) -> Result<Option<ProjectedBatch>, StoreError> {
+        let connection = self.connection().await;
+        // The record and the listing are one answer, so they read one
+        // snapshot: a batch finishing between the two reads must not be found
+        // as neither.
+        let transaction = connection.transaction().await?;
+        let key = vec![Value::Text(batch_id.to_owned())];
+        let recorded = transaction
+            .query(
+                &format!("{} WHERE batch_id = ?1", select_batches_sql()),
+                key.clone(),
+            )
+            .await?
+            .next()
+            .await?
+            .map(batch_from_row)
+            .transpose()?;
+        let projected = match recorded {
+            Some(mut batch) => {
+                let mut targets = transaction
+                    .query(
+                        &format!(
+                            "{} WHERE batch_id = ?1 ORDER BY position",
+                            select_batch_targets_sql()
+                        ),
+                        key,
+                    )
+                    .await?;
+                while let Some(row) = targets.next().await? {
+                    batch.targets.push(batch_target_from_row(row)?);
+                }
+                Some(ProjectedBatch::Finished(batch))
+            }
+            None => transaction
+                .query(
+                    &format!("{} WHERE batch_id = ?1", select_running_batches_sql()),
+                    key,
+                )
+                .await?
+                .next()
+                .await?
+                .map(running_batch_from_row)
+                .transpose()?
+                .map(ProjectedBatch::Running),
+        };
+        transaction.commit().await?;
+        Ok(projected)
+    }
+}
+
+/// The `batches` columns in the order [`batch_from_row`] reads them.
+fn select_batches_sql() -> &'static str {
+    r#"SELECT batch_id, action, requested_by, started_at, completed_at,
+              succeeded, rejected, failed
+       FROM batches"#
+}
+
+/// The `batch_targets` columns in the order [`batch_target_from_row`] reads
+/// them.
+fn select_batch_targets_sql() -> &'static str {
+    "SELECT batch_id, repository_id, owner, repo, number, title, html_url, outcome FROM batch_targets"
+}
+
+/// The `running_batches` columns in the order [`running_batch_from_row`]
+/// reads them.
+fn select_running_batches_sql() -> &'static str {
+    "SELECT batch_id, action, requested_by, started_at, target_count FROM running_batches"
 }
 
 /// A `batches` row, without its targets.
@@ -642,8 +709,8 @@ fn batch_from_row(row: Row) -> Result<BatchRecord, StoreError> {
     })
 }
 
-/// A `batch_targets` row as [`recent_batches`](PrStore::recent_batches)
-/// selects it: the batch id in column 0, the target from column 1 on.
+/// A `batch_targets` row as [`select_batch_targets_sql`] selects it: the
+/// batch id in column 0, the target from column 1 on.
 fn batch_target_from_row(row: Row) -> Result<BatchTargetRecord, StoreError> {
     Ok(BatchTargetRecord {
         repository_id: unsigned(row.get::<i64>(1)?)?,
@@ -653,6 +720,17 @@ fn batch_target_from_row(row: Row) -> Result<BatchTargetRecord, StoreError> {
         title: row.get(5)?,
         html_url: row.get(6)?,
         outcome: serde_json::from_str(&row.get::<String>(7)?)?,
+    })
+}
+
+/// A `running_batches` row.
+fn running_batch_from_row(row: Row) -> Result<RunningBatch, StoreError> {
+    Ok(RunningBatch {
+        batch_id: row.get(0)?,
+        action: stored_enum(row.get(1)?)?,
+        requested_by: UserId::new(row.get::<String>(2)?),
+        started_at: unsigned(row.get::<i64>(3)?)?,
+        target_count: unsigned(row.get::<i64>(4)?)?,
     })
 }
 
@@ -2648,6 +2726,30 @@ mod tests {
                 "https://github.com/acme/repo-1/pull/2"
             ]
         );
+    }
+
+    /// A dashboard handed a batch id alone — from a link — asks the projection
+    /// what it holds of the batch before it asks Restate: the finished record,
+    /// targets and all, for a batch that has run; the running listing for one
+    /// still going; nothing for an id it has never heard of.
+    #[tokio::test]
+    async fn one_batch_is_read_back_by_id_as_finished_running_or_unknown() {
+        let (_directory, store) = test_store().await;
+        let finished = batch("batch-finished", 2_000);
+        let still_running = running("batch-running", 3_000);
+        store.record_batch(&finished).await.unwrap();
+        store.start_batch(&still_running).await.unwrap();
+
+        assert_eq!(
+            store.get_batch("batch-finished").await.unwrap(),
+            Some(ProjectedBatch::Finished(finished)),
+            "the record comes back whole, targets in batch order"
+        );
+        assert_eq!(
+            store.get_batch("batch-running").await.unwrap(),
+            Some(ProjectedBatch::Running(still_running))
+        );
+        assert_eq!(store.get_batch("batch-never-run").await.unwrap(), None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

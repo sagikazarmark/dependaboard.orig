@@ -1,7 +1,11 @@
 //! The bulk-action flow after confirmation: submit the batch to Restate, then
 //! follow its progress until it completes. A batch the dashboard knows only by
 //! id — after a reload, or picked from the audit view — is followed the same
-//! way, without the submission.
+//! way, without the submission, once the projection has been asked what it
+//! holds of it: a finished record is the batch as it stands and needs no
+//! follow, a running listing vouches for the batch as a receipt would, and
+//! only an id the projection has never heard of is Restate's alone to answer
+//! for.
 //!
 //! A batch is never declared lost: it is durable in Restate, and a target may
 //! legitimately sit for hours behind GitHub's retry and rate-limit budgets. The
@@ -16,10 +20,11 @@
 use std::time::Duration;
 
 use dependaboard_core::{
-    BatchProgress, BatchReceipt, BulkActionKind, PrKey, PrTarget, SubmittedTarget, unix_seconds,
+    BatchProgress, BatchReceipt, BulkActionKind, PrKey, PrTarget, ProjectedBatch, RunningBatch,
+    SubmittedTarget, unix_seconds,
 };
 
-use crate::api::{load_batch_progress, submit_batch};
+use crate::api::{load_batch_progress, load_batch_projection, submit_batch};
 use crate::ui::dashboard_state::DashboardState;
 use crate::ui::{Fault, POLL_INTERVAL, logged_fault, sleep};
 
@@ -28,14 +33,16 @@ use crate::ui::{Fault, POLL_INTERVAL, logged_fault, sleep};
 /// credentials, which is not tried again.
 pub(crate) const SUBMIT_ATTEMPTS: u32 = 5;
 
-/// How long a batch followed by id alone may go with Restate answering that it
-/// has no progress for it before the id is taken to name no batch. A stale
-/// link, or one from another deployment, is given up in this time; a live
-/// batch answers its first poll. Only answers count: a poll the server did not
-/// answer says nothing about the batch, so an outage stretches the time rather
-/// than spending it. A batch the dashboard submitted itself is not held to
-/// this at all: Restate took it, and a service that is down or deploying
-/// starts it late, not never.
+/// How long a batch followed by id alone, which the projection has never heard
+/// of, may go with Restate answering that it has no progress for it before the
+/// id is taken to name no batch. A stale link, or one from another
+/// deployment, is given up in this time; a live batch answers its first poll.
+/// Only answers count: a poll the server did not answer says nothing about
+/// the batch, so an outage stretches the time rather than spending it. A
+/// batch the dashboard submitted itself is not held to this at all: Restate
+/// took it, and a service that is down or deploying starts it late, not
+/// never. Nor is one the projection lists as running: the workflow wrote the
+/// listing, so Restate has the batch.
 pub(crate) const ATTACH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// [`ATTACH_TIMEOUT`] in answered polls.
@@ -71,6 +78,14 @@ pub(crate) trait SubmitGateway: BatchGateway {
     async fn submit(&mut self) -> Result<BatchReceipt, Fault>;
 }
 
+/// A [`BatchGateway`] for a batch known by id alone, which the projection is
+/// asked about before Restate is.
+pub(crate) trait AttachGateway: BatchGateway {
+    /// What the projection holds of the batch: its finished record, its
+    /// listing while it runs, or nothing for an id it has never heard of.
+    async fn projected(&mut self) -> Result<Option<ProjectedBatch>, Fault>;
+}
+
 /// A batch known by id alone, followed through the server functions, on the
 /// page whose line to the server `state` carries.
 pub(crate) struct ServerFollow {
@@ -98,6 +113,19 @@ impl BatchGateway for ServerFollow {
 
     fn now(&self) -> u64 {
         unix_seconds()
+    }
+}
+
+impl AttachGateway for ServerFollow {
+    /// Not asked from a page the server has already refused, as
+    /// [`ServerFollow::progress`] does not ask from one.
+    async fn projected(&mut self) -> Result<Option<ProjectedBatch>, Fault> {
+        if self.state.signed_out() {
+            return Err(Fault::SignedOut);
+        }
+        load_batch_projection(self.batch_id.clone())
+            .await
+            .map_err(|error| logged_fault(&error))
     }
 }
 
@@ -156,6 +184,44 @@ pub(crate) struct Followed {
     /// refusal of the credentials is the last poll's word for good: the
     /// follow ends on it.
     pub(crate) trouble: Option<Fault>,
+    /// The projection's word on a batch followed by id alone, which is asked
+    /// before Restate is: what the drawer can say of the batch until Restate
+    /// answers, and which of the ways of finding a batch this follow is on.
+    pub(crate) listing: Listing,
+}
+
+/// What the projection said of a batch followed by id alone. A finished
+/// record is not a case here: it is taken as the batch's `progress`, and the
+/// follow ends on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Listing {
+    /// Not asked, or not answered yet. A batch the dashboard queued itself is
+    /// never asked after: it has its own snapshot to show.
+    #[default]
+    Unasked,
+    /// The projection could not be read — the store was away, or the line to
+    /// the server — so it has no word on the batch, and Restate is asked as it
+    /// always was, within [`ATTACH_TIMEOUT`].
+    Unreadable,
+    /// The projection has never heard of the id, running or finished: a stale
+    /// or foreign link, or a batch so new the workflow has not listed it yet.
+    /// Restate is the second word, and is given [`ATTACH_TIMEOUT`] to give it.
+    Unlisted,
+    /// The projection lists the batch as running. The workflow wrote the
+    /// listing itself, after it published its first progress, so Restate has
+    /// the batch and is asked where it stands for as long as it takes.
+    Running(RunningBatch),
+}
+
+impl Listing {
+    /// The action the batch runs, as far as the projection has said: the pill
+    /// and the drawer name it in place of "batch" once it is known.
+    pub(crate) fn action(&self) -> Option<BulkActionKind> {
+        match self {
+            Self::Running(listing) => Some(listing.action),
+            Self::Unasked | Self::Unreadable | Self::Unlisted => None,
+        }
+    }
 }
 
 impl Followed {
@@ -173,10 +239,11 @@ impl Followed {
             heard: false,
             since: now,
             trouble: None,
+            listing: Listing::Unasked,
         }
     }
 
-    /// A batch the dashboard knows by id alone and is asking Restate about.
+    /// A batch the dashboard knows by id alone and is asking after.
     pub(crate) fn attaching(batch_id: &str, now: u64) -> Self {
         Self {
             batch_id: batch_id.to_owned(),
@@ -184,6 +251,7 @@ impl Followed {
             heard: false,
             since: now,
             trouble: None,
+            listing: Listing::Unasked,
         }
     }
 
@@ -332,27 +400,62 @@ pub(crate) async fn run_batch<G: SubmitGateway>(
 
 /// Follows `followed`, a batch known by id alone, calling `report` with each
 /// change in what is known of it, until it completes or Restate proves never
-/// to have had it.
-pub(crate) async fn follow_batch<G: BatchGateway>(
+/// to have had it. The projection is asked first: a batch it holds finished is
+/// shown from the record and the follow ends on it, without a poll — the
+/// workflow may have been retired days ago, and the record is the batch as it
+/// stands. One it lists as running is polled as a batch Restate is known to
+/// have, for as long as it takes. One it has never heard of is Restate's to
+/// vouch for, within [`ATTACH_TIMEOUT`]; so is one the projection could not be
+/// asked about, with the fault passed on as a failing poll's is — except a
+/// refusal of the credentials, which ends the follow as it ends a poll.
+pub(crate) async fn follow_batch<G: AttachGateway>(
     gateway: &mut G,
-    followed: Followed,
-    report: impl FnMut(&Followed),
+    mut followed: Followed,
+    mut report: impl FnMut(&Followed),
 ) -> BatchOutcome {
-    poll(gateway, followed, false, report).await
+    let known = match gateway.projected().await {
+        Ok(Some(ProjectedBatch::Finished(record))) => {
+            let progress = BatchProgress::from(record);
+            followed.hear(progress.clone(), gateway.now());
+            report(&followed);
+            return BatchOutcome::Completed(progress);
+        }
+        Ok(Some(ProjectedBatch::Running(listing))) => {
+            followed.listing = Listing::Running(listing);
+            report(&followed);
+            true
+        }
+        Ok(None) => {
+            followed.listing = Listing::Unlisted;
+            report(&followed);
+            false
+        }
+        Err(fault) => {
+            followed.listing = Listing::Unreadable;
+            followed.answered(Some(fault));
+            report(&followed);
+            if followed.signed_out() {
+                return BatchOutcome::SignedOut;
+            }
+            false
+        }
+    };
+    poll(gateway, followed, known, report).await
 }
 
 /// Polls until the batch completes. `known` says Restate is known to have the
-/// batch — it took the submission, or has reported progress — in which case a
-/// poll it answers with nothing is waited out, however many: the workflow has
-/// not started yet, or has been retired, and neither is a reason to say the
-/// batch is lost. A batch not known to Restate is given up as [`Unknown`] once
-/// [`ATTACH_LIMIT`] answered polls have found nothing. A poll that fails is
-/// noted and the next is taken, and counts for nothing either way: the batch
-/// is durable, and the line to the server is reported over the page in its
-/// own right. The one fault not waited out is the server refusing the
-/// credentials: the next poll would be refused the same, and each refusal
-/// the browser gets it turns into a credential prompt, so the follow ends as
-/// [`SignedOut`], with the refusal reported as the last poll's word.
+/// batch — it took the submission, the projection lists it as running, or it
+/// has reported progress — in which case a poll it answers with nothing is
+/// waited out, however many: the workflow has not started yet, or has been
+/// retired, and neither is a reason to say the batch is lost. A batch not
+/// known to Restate is given up as [`Unknown`] once [`ATTACH_LIMIT`] answered
+/// polls have found nothing. A poll that fails is noted and the next is taken,
+/// and counts for nothing either way: the batch is durable, and the line to
+/// the server is reported over the page in its own right. The one fault not
+/// waited out is the server refusing the credentials: the next poll would be
+/// refused the same, and each refusal the browser gets it turns into a
+/// credential prompt, so the follow ends as [`SignedOut`], with the refusal
+/// reported as the last poll's word.
 ///
 /// [`Unknown`]: BatchOutcome::Unknown
 /// [`SignedOut`]: BatchOutcome::SignedOut
@@ -435,18 +538,23 @@ async fn submit<G: SubmitGateway>(gateway: &mut G) -> Result<Taken, Fault> {
 mod tests {
     use std::collections::VecDeque;
 
-    use dependaboard_core::{ActionOutcome, BulkActionKind, PrTarget};
+    use dependaboard_core::{
+        ActionOutcome, BatchRecord, BulkActionKind, PrTarget, ProjectedBatch, RunningBatch, UserId,
+    };
 
     use super::*;
     use crate::ui::pr_target;
     use crate::ui::test_support::grouped_row;
 
     /// A server whose answers are scripted: each call pops the next answer,
-    /// and the last one repeats once the script runs out. The clock reads the
+    /// and the last one repeats once the script runs out. The projection's
+    /// word is one answer, asked once; it is that the projection has never
+    /// heard of the batch unless the test says otherwise. The clock reads the
     /// epoch plus one second per tick, as the real one would.
     struct Scripted {
         submits: VecDeque<Result<BatchReceipt, Fault>>,
         progress: VecDeque<Result<Option<BatchProgress>, Fault>>,
+        projected: Result<Option<ProjectedBatch>, Fault>,
         submit_calls: u32,
         progress_calls: u32,
         ticks: u32,
@@ -463,10 +571,16 @@ mod tests {
             Self {
                 submits: submits.into_iter().collect(),
                 progress: progress.into_iter().collect(),
+                projected: Ok(None),
                 submit_calls: 0,
                 progress_calls: 0,
                 ticks: 0,
             }
+        }
+
+        /// With `projected` as the projection's word on the batch.
+        fn projecting(self, projected: Result<Option<ProjectedBatch>, Fault>) -> Self {
+            Self { projected, ..self }
         }
     }
 
@@ -482,6 +596,12 @@ mod tests {
         async fn submit(&mut self) -> Result<BatchReceipt, Fault> {
             self.submit_calls += 1;
             next_or_repeat(&mut self.submits)
+        }
+    }
+
+    impl AttachGateway for Scripted {
+        async fn projected(&mut self) -> Result<Option<ProjectedBatch>, Fault> {
+            self.projected.clone()
         }
     }
 
@@ -832,21 +952,37 @@ mod tests {
         assert_eq!(outcome, BatchOutcome::Completed(after(2)));
         assert_eq!(gateway.submit_calls, 0);
         assert_eq!(heard(&reported), [after(1), after(2)]);
-        assert_eq!(reported[0].since, EPOCH + 3);
+        assert_eq!(
+            reported
+                .iter()
+                .find(|followed| followed.heard)
+                .map(|followed| followed.since),
+            Some(EPOCH + 3),
+            "the first word from Restate is dated by when it was heard"
+        );
     }
 
-    /// A link may name a batch Restate never ran, or one it has retired. The
-    /// dashboard gives it up as unknown once the attach budget is spent,
-    /// rather than ask forever after a batch that is not there.
+    /// A link may name a batch Restate never ran, or one it has retired, and
+    /// the projection has never heard of either. That is said at once, so the
+    /// drawer can say which case it is in; Restate is the second word, and the
+    /// dashboard gives the batch up as unknown once the attach budget is
+    /// spent, rather than ask forever after a batch that is not there.
     #[tokio::test]
-    async fn a_batch_restate_has_never_had_is_given_up_as_unknown() {
-        let mut gateway = Scripted::new([], [Ok(None)]);
+    async fn a_batch_nobody_has_heard_of_is_said_to_be_and_given_up_as_unknown() {
+        let mut gateway = Scripted::new([], [Ok(None)]).projecting(Ok(None));
 
         let (outcome, reported) = attach(&mut gateway).await;
 
         assert_eq!(outcome, BatchOutcome::Unknown);
         assert_eq!(gateway.ticks, ATTACH_LIMIT);
-        assert!(reported.is_empty());
+        assert_eq!(
+            reported
+                .iter()
+                .map(|followed| (followed.listing.clone(), followed.progress.clone()))
+                .collect::<Vec<_>>(),
+            [(Listing::Unlisted, None)],
+            "the projection's word is reported once; the empty polls are not news"
+        );
     }
 
     /// Polls that fail are not polls that found nothing: a server that cannot
@@ -859,8 +995,12 @@ mod tests {
         let (outcome, reported) = attach(&mut gateway).await;
 
         assert_eq!(outcome, BatchOutcome::Completed(after(2)));
-        assert_eq!(reported[0].trouble, Some(unavailable()));
-        assert_eq!(reported[0].progress, None);
+        let troubled = reported
+            .iter()
+            .find(|followed| followed.trouble.is_some())
+            .expect("the failing polls are reported");
+        assert_eq!(troubled.trouble, Some(unavailable()));
+        assert_eq!(troubled.progress, None);
     }
 
     /// The one word on whether a batch has stood still, which the pill and the
@@ -877,6 +1017,7 @@ mod tests {
             heard: true,
             since: EPOCH,
             trouble: None,
+            listing: Listing::Unasked,
         };
 
         assert!(!running.stands_still(EPOCH + notice - 1));
@@ -921,5 +1062,126 @@ mod tests {
         let (outcome, _) = attach(&mut gateway).await;
 
         assert_eq!(outcome, BatchOutcome::Completed(after(2)));
+    }
+
+    /// [`after`]`(2)` as the projection recorded it once the workflow
+    /// finished: `alice` asked for it, it ran for thirty seconds.
+    fn recorded() -> BatchRecord {
+        after(2)
+            .completed_record(UserId::new("alice"), EPOCH - 30, EPOCH)
+            .expect("every target has settled")
+    }
+
+    /// [`after`]`(2)` as it reads back from the record: the record does not
+    /// keep the head each target was sent against, so the targets carry none.
+    fn read_back() -> BatchProgress {
+        let mut progress = after(2);
+        for item in &mut progress.targets {
+            item.target.expected_sha.clear();
+        }
+        progress
+    }
+
+    /// A link eight days on names a batch Restate has long retired, and the
+    /// projection has held the finished record the whole time. The record is
+    /// the batch as it stands, and the follow ends on it at once: Restate is
+    /// not asked, and nothing is waited for.
+    #[tokio::test]
+    async fn a_batch_the_projection_has_finished_is_shown_from_the_record_without_asking_restate() {
+        let mut gateway = Scripted::new([], [Ok(None)])
+            .projecting(Ok(Some(ProjectedBatch::Finished(recorded()))));
+
+        let (outcome, reported) = attach(&mut gateway).await;
+
+        assert_eq!(outcome, BatchOutcome::Completed(read_back()));
+        assert_eq!(gateway.progress_calls, 0, "Restate is not asked");
+        assert_eq!(gateway.ticks, 0, "and nothing is waited for");
+        assert_eq!(
+            reported
+                .iter()
+                .map(|followed| (followed.heard, followed.progress.clone(), followed.since))
+                .collect::<Vec<_>>(),
+            [(true, Some(read_back()), EPOCH)],
+            "the record is reported once, as the word on the batch"
+        );
+    }
+
+    /// The listing the workflow wrote when it started [`after`]`(0)`.
+    fn listed() -> RunningBatch {
+        RunningBatch {
+            batch_id: "batch-1".to_owned(),
+            action: BulkActionKind::Merge,
+            requested_by: UserId::new("alice"),
+            started_at: EPOCH - 30,
+            target_count: 2,
+        }
+    }
+
+    /// The workflow lists the batch as running itself, after it has published
+    /// its first progress, so the listing is the projection's word that
+    /// Restate has the batch — as good as a submission receipt. It is polled
+    /// for as long as Restate takes, well past what an id nobody has heard of
+    /// is given; and what the listing says of the batch is reported at once,
+    /// so the drawer has something to say before Restate answers.
+    #[tokio::test]
+    async fn a_batch_the_projection_lists_as_running_is_polled_without_the_give_up() {
+        let progress = repeat(Ok(None), 2 * ATTACH_LIMIT).chain([Ok(Some(after(2)))]);
+        let mut gateway =
+            Scripted::new([], progress).projecting(Ok(Some(ProjectedBatch::Running(listed()))));
+
+        let (outcome, reported) = attach(&mut gateway).await;
+
+        assert_eq!(outcome, BatchOutcome::Completed(after(2)));
+        assert_eq!(
+            (reported[0].listing.clone(), reported[0].progress.clone()),
+            (Listing::Running(listed()), None),
+            "the listing is the first word, before any progress"
+        );
+        assert_eq!(heard(&reported), [after(2)]);
+    }
+
+    /// The projection is the first word, not the only one: a read of it that
+    /// fails says nothing about the batch, and Restate is asked as it always
+    /// was, under the budget for an id nobody has vouched for. The fault is
+    /// passed on for the drawer, as a failing poll is.
+    #[tokio::test]
+    async fn a_projection_that_cannot_be_read_leaves_the_batch_to_restate() {
+        let store_down = Fault::Refused("The read model is unavailable".to_owned());
+        let mut gateway = Scripted::new([], [Ok(None)]).projecting(Err(store_down.clone()));
+
+        let (outcome, reported) = attach(&mut gateway).await;
+
+        assert_eq!(outcome, BatchOutcome::Unknown);
+        assert_eq!(gateway.ticks, ATTACH_LIMIT);
+        assert_eq!(
+            reported
+                .iter()
+                .map(|followed| (followed.listing.clone(), followed.trouble.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (Listing::Unreadable, Some(store_down)),
+                (Listing::Unreadable, None)
+            ],
+            "the fault is reported when it happens and again when the polls are answered"
+        );
+    }
+
+    /// A refusal of the credentials on the projection read is the same
+    /// refusal every poll would meet, with a credential prompt each; the
+    /// follow ends there, before a single poll, saying so.
+    #[tokio::test]
+    async fn a_projection_read_refused_the_credentials_ends_the_follow_before_any_poll() {
+        let mut gateway = Scripted::new([], [Ok(Some(after(2)))]).projecting(Err(Fault::SignedOut));
+
+        let (outcome, reported) = attach(&mut gateway).await;
+
+        assert_eq!(outcome, BatchOutcome::SignedOut);
+        assert_eq!(gateway.progress_calls, 0);
+        assert_eq!(
+            reported
+                .last()
+                .map(|followed| (followed.trouble.clone(), followed.progress.clone())),
+            Some((Some(Fault::SignedOut), None))
+        );
     }
 }

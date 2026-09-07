@@ -3,14 +3,14 @@
 //!
 //! It implements the writes and the lookups the Restate service makes, and only those:
 //! the dashboard's reads (`list_prs`, `dashboard_summary`, `projection_revision`,
-//! `recent_batches`, `running_batches`) are `unimplemented!`, so this is not a drop-in
-//! store for a test of the web app, which reads the projection through those.
+//! `recent_batches`, `running_batches`, `get_batch`) are `unimplemented!`, so this is not
+//! a drop-in store for a test of the web app, which reads the projection through those.
 
 use std::{collections::BTreeMap, sync::Mutex};
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    BatchRecord, DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord,
+    BatchRecord, DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord, ProjectedBatch,
     ProjectionRevision, RepoRecord, Retirement, RunningBatch,
 };
 use dependaboard_store::{PrStore, StoreError};
@@ -26,8 +26,8 @@ use dependaboard_store::{PrStore, StoreError};
 /// recorded twice keeps its first record, recording a batch stops listing it as
 /// running, and every prune queues the keys it removed for retirement under its fence.
 /// What the service never asks of the store, the dashboard listing, its summary, the
-/// revision counters, and the recent and running batches, is not implemented and panics
-/// if called.
+/// revision counters, and the recent and running batches and a batch by id, is not
+/// implemented and panics if called.
 #[derive(Default)]
 pub(crate) struct MemoryPrStore {
     tables: Mutex<Tables>,
@@ -328,6 +328,12 @@ impl PrStore for MemoryPrStore {
     async fn running_batches(&self) -> Result<Vec<RunningBatch>, StoreError> {
         unimplemented!(
             "the Restate service never lists the running batches; the dashboard reads them through the web app"
+        )
+    }
+
+    async fn get_batch(&self, _batch_id: &str) -> Result<Option<ProjectedBatch>, StoreError> {
+        unimplemented!(
+            "the Restate service never reads a batch back; the dashboard reads it through the web app"
         )
     }
 }

@@ -1100,6 +1100,41 @@ pub struct BatchRecord {
     pub targets: Vec<BatchTargetRecord>,
 }
 
+/// The record as the progress it was written from — the inverse of
+/// [`BatchProgress::completed_record`]: every target settled by its verdict, the batch
+/// complete, the tally as recorded. So a dashboard that reads a finished batch from the
+/// projection shows it as it would have shown Restate's last word on it. The head each
+/// target was sent against is not kept in the record, so the targets carry none;
+/// nothing that reads a finished batch needs it.
+impl From<BatchRecord> for BatchProgress {
+    fn from(record: BatchRecord) -> Self {
+        Self {
+            batch_id: record.batch_id,
+            action: record.action,
+            targets: record
+                .targets
+                .into_iter()
+                .map(|target| TargetProgress {
+                    target: PrTarget {
+                        repository_id: target.repository_id,
+                        owner: target.owner,
+                        repo: target.repo,
+                        number: target.number,
+                        expected_sha: String::new(),
+                        title: target.title,
+                        html_url: target.html_url,
+                    },
+                    state: target.outcome.into(),
+                })
+                .collect(),
+            completed: true,
+            succeeded: record.succeeded,
+            rejected: record.rejected,
+            failed: record.failed,
+        }
+    }
+}
+
 /// A bulk action the workflow is running, as the projection keeps it while it
 /// runs: what was asked, by whom, when it started, and how many pull requests it
 /// spans. Enough for the audit view to list the batch beside the finished ones
@@ -1124,6 +1159,20 @@ pub struct RunningBatch {
 pub struct BatchList {
     pub running: Vec<RunningBatch>,
     pub finished: Vec<BatchRecord>,
+}
+
+/// What the projection holds of one batch, asked for by id: its finished
+/// record, or its listing while it runs. A batch is one or the other, never
+/// both — the record's write takes the listing away — and an id the
+/// projection has never heard of is neither, which is a batch just queued
+/// that the workflow has not listed yet, or no batch at all.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectedBatch {
+    /// Listed as running by the workflow's first step; where it stands is Restate's
+    /// word, read through the workflow's progress.
+    Running(RunningBatch),
+    /// Recorded as finished by the workflow's last step, targets and verdicts included.
+    Finished(BatchRecord),
 }
 
 pub fn new_batch_id() -> String {
