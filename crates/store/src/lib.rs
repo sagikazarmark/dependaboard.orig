@@ -170,9 +170,15 @@ pub trait PrStore: Send + Sync {
     /// was: Restate may run the recording step again when the first attempt's
     /// result was lost, and the first word is the one that stands.
     async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError>;
-    /// The `limit` most recently finished batches, newest first, each with
-    /// every target's verdict in batch order.
-    async fn recent_batches(&self, limit: u32) -> Result<Vec<BatchRecord>, StoreError>;
+    /// The `limit` most recently finished batches of `installation_id`, newest
+    /// first, each with every target's verdict in batch order. Another
+    /// installation's batches are not counted against the limit, and a batch
+    /// attributed to no installation is nobody's to read.
+    async fn recent_batches(
+        &self,
+        installation_id: u64,
+        limit: u32,
+    ) -> Result<Vec<BatchRecord>, StoreError>;
     /// Lists a bulk action as running until [`PrStore::record_batch`] keeps
     /// it as finished, or [`PrStore::unlist_batch`] gives it up. A batch
     /// already listed is left as it was, for the same reason a recorded one
@@ -182,13 +188,21 @@ pub trait PrStore: Send + Sync {
     /// workflow ended without a finished batch to keep, as a cancelled one
     /// does. A batch not listed is left as it is.
     async fn unlist_batch(&self, batch_id: &str) -> Result<(), StoreError>;
-    /// Every batch started and not yet recorded or given up, newest first.
-    async fn running_batches(&self) -> Result<Vec<RunningBatch>, StoreError>;
-    /// What the projection holds of the batch `batch_id` names: its finished
-    /// record, targets and all, or its running listing; `None` for an id it
-    /// has never heard of. One answer from one snapshot, so a batch finishing
-    /// under the read is found as one or the other, not neither.
-    async fn get_batch(&self, batch_id: &str) -> Result<Option<ProjectedBatch>, StoreError>;
+    /// Every batch of `installation_id` started and not yet recorded or given
+    /// up, newest first.
+    async fn running_batches(&self, installation_id: u64) -> Result<Vec<RunningBatch>, StoreError>;
+    /// What the projection holds of the batch `batch_id` names within
+    /// `installation_id`: its finished record, targets and all, or its running
+    /// listing; `None` for an id it has never heard of — and, just the same,
+    /// for one it holds under another installation, so a foreign id is not
+    /// told apart from an unknown one. One answer from one snapshot, so a
+    /// batch finishing under the read is found as one or the other, not
+    /// neither.
+    async fn get_batch(
+        &self,
+        installation_id: u64,
+        batch_id: &str,
+    ) -> Result<Option<ProjectedBatch>, StoreError>;
 }
 
 #[async_trait]
@@ -483,12 +497,13 @@ impl PrStore for LibSqlPrStore {
         let inserted = transaction
             .execute(
                 r#"INSERT INTO batches (
-                    batch_id, action, requested_by, retried_from, started_at, completed_at,
-                    succeeded, rejected, failed
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    batch_id, installation_id, action, requested_by, retried_from, started_at,
+                    completed_at, succeeded, rejected, failed
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 ON CONFLICT(batch_id) DO NOTHING"#,
                 vec![
                     Value::Text(batch.batch_id.clone()),
+                    integer(batch.installation_id)?,
                     Value::Text(batch.action.to_string()),
                     Value::Text(batch.requested_by.to_string()),
                     option_text(batch.retried_from.clone()),
@@ -530,15 +545,19 @@ impl PrStore for LibSqlPrStore {
         Ok(())
     }
 
-    async fn recent_batches(&self, limit: u32) -> Result<Vec<BatchRecord>, StoreError> {
+    async fn recent_batches(
+        &self,
+        installation_id: u64,
+        limit: u32,
+    ) -> Result<Vec<BatchRecord>, StoreError> {
         let connection = self.connection().await;
         let mut rows = connection
             .query(
                 &format!(
-                    "{} ORDER BY completed_at DESC, batch_id DESC LIMIT ?1",
+                    "{} WHERE installation_id = ?1 ORDER BY completed_at DESC, batch_id DESC LIMIT ?2",
                     select_batches_sql()
                 ),
-                vec![Value::Integer(i64::from(limit))],
+                vec![integer(installation_id)?, Value::Integer(i64::from(limit))],
             )
             .await?;
         let mut batches = Vec::new();
@@ -582,11 +601,13 @@ impl PrStore for LibSqlPrStore {
             .await
             .execute(
                 r#"INSERT INTO running_batches (
-                    batch_id, action, requested_by, retried_from, started_at, target_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    batch_id, installation_id, action, requested_by, retried_from, started_at,
+                    target_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 ON CONFLICT(batch_id) DO NOTHING"#,
                 vec![
                     Value::Text(batch.batch_id.clone()),
+                    integer(batch.installation_id)?,
                     Value::Text(batch.action.to_string()),
                     Value::Text(batch.requested_by.to_string()),
                     option_text(batch.retried_from.clone()),
@@ -609,16 +630,16 @@ impl PrStore for LibSqlPrStore {
         Ok(())
     }
 
-    async fn running_batches(&self) -> Result<Vec<RunningBatch>, StoreError> {
+    async fn running_batches(&self, installation_id: u64) -> Result<Vec<RunningBatch>, StoreError> {
         let mut rows = self
             .connection()
             .await
             .query(
                 &format!(
-                    "{} ORDER BY started_at DESC, batch_id DESC",
+                    "{} WHERE installation_id = ?1 ORDER BY started_at DESC, batch_id DESC",
                     select_running_batches_sql()
                 ),
-                (),
+                vec![integer(installation_id)?],
             )
             .await?;
         let mut batches = Vec::new();
@@ -628,17 +649,25 @@ impl PrStore for LibSqlPrStore {
         Ok(batches)
     }
 
-    async fn get_batch(&self, batch_id: &str) -> Result<Option<ProjectedBatch>, StoreError> {
+    async fn get_batch(
+        &self,
+        installation_id: u64,
+        batch_id: &str,
+    ) -> Result<Option<ProjectedBatch>, StoreError> {
         let connection = self.connection().await;
         // The record and the listing are one answer, so they read one
         // snapshot: a batch finishing between the two reads must not be found
         // as neither.
         let transaction = connection.transaction().await?;
         let key = vec![Value::Text(batch_id.to_owned())];
+        let scoped_key = vec![Value::Text(batch_id.to_owned()), integer(installation_id)?];
         let recorded = transaction
             .query(
-                &format!("{} WHERE batch_id = ?1", select_batches_sql()),
-                key.clone(),
+                &format!(
+                    "{} WHERE batch_id = ?1 AND installation_id = ?2",
+                    select_batches_sql()
+                ),
+                scoped_key.clone(),
             )
             .await?
             .next()
@@ -663,8 +692,11 @@ impl PrStore for LibSqlPrStore {
             }
             None => transaction
                 .query(
-                    &format!("{} WHERE batch_id = ?1", select_running_batches_sql()),
-                    key,
+                    &format!(
+                        "{} WHERE batch_id = ?1 AND installation_id = ?2",
+                        select_running_batches_sql()
+                    ),
+                    scoped_key,
                 )
                 .await?
                 .next()
@@ -679,9 +711,14 @@ impl PrStore for LibSqlPrStore {
 }
 
 /// The `batches` columns in the order [`batch_from_row`] reads them.
+///
+/// `installation_id` is nullable — a row from before 0011 the migration could
+/// not attribute has none — and is read as if it were not: every read filters
+/// on it, so a `NULL` row is never selected. A read that dropped the filter
+/// would fail on such a row rather than return it.
 fn select_batches_sql() -> &'static str {
-    r#"SELECT batch_id, action, requested_by, retried_from, started_at, completed_at,
-              succeeded, rejected, failed
+    r#"SELECT batch_id, installation_id, action, requested_by, retried_from, started_at,
+              completed_at, succeeded, rejected, failed
        FROM batches"#
 }
 
@@ -693,9 +730,11 @@ fn select_batch_targets_sql() -> &'static str {
 }
 
 /// The `running_batches` columns in the order [`running_batch_from_row`]
-/// reads them.
+/// reads them. `installation_id` is nullable and read as if it were not, as
+/// on [`select_batches_sql`].
 fn select_running_batches_sql() -> &'static str {
-    r#"SELECT batch_id, action, requested_by, retried_from, started_at, target_count
+    r#"SELECT batch_id, installation_id, action, requested_by, retried_from, started_at,
+              target_count
        FROM running_batches"#
 }
 
@@ -703,14 +742,15 @@ fn select_running_batches_sql() -> &'static str {
 fn batch_from_row(row: Row) -> Result<BatchRecord, StoreError> {
     Ok(BatchRecord {
         batch_id: row.get(0)?,
-        action: stored_enum(row.get(1)?)?,
-        requested_by: UserId::new(row.get::<String>(2)?),
-        retried_from: row.get(3)?,
-        started_at: unsigned(row.get::<i64>(4)?)?,
-        completed_at: unsigned(row.get::<i64>(5)?)?,
-        succeeded: unsigned(row.get::<i64>(6)?)?,
-        rejected: unsigned(row.get::<i64>(7)?)?,
-        failed: unsigned(row.get::<i64>(8)?)?,
+        installation_id: unsigned(row.get::<i64>(1)?)?,
+        action: stored_enum(row.get(2)?)?,
+        requested_by: UserId::new(row.get::<String>(3)?),
+        retried_from: row.get(4)?,
+        started_at: unsigned(row.get::<i64>(5)?)?,
+        completed_at: unsigned(row.get::<i64>(6)?)?,
+        succeeded: unsigned(row.get::<i64>(7)?)?,
+        rejected: unsigned(row.get::<i64>(8)?)?,
+        failed: unsigned(row.get::<i64>(9)?)?,
         targets: Vec::new(),
     })
 }
@@ -734,11 +774,12 @@ fn batch_target_from_row(row: Row) -> Result<BatchTargetRecord, StoreError> {
 fn running_batch_from_row(row: Row) -> Result<RunningBatch, StoreError> {
     Ok(RunningBatch {
         batch_id: row.get(0)?,
-        action: stored_enum(row.get(1)?)?,
-        requested_by: UserId::new(row.get::<String>(2)?),
-        retried_from: row.get(3)?,
-        started_at: unsigned(row.get::<i64>(4)?)?,
-        target_count: unsigned(row.get::<i64>(5)?)?,
+        installation_id: unsigned(row.get::<i64>(1)?)?,
+        action: stored_enum(row.get(2)?)?,
+        requested_by: UserId::new(row.get::<String>(3)?),
+        retried_from: row.get(4)?,
+        started_at: unsigned(row.get::<i64>(5)?)?,
+        target_count: unsigned(row.get::<i64>(6)?)?,
     })
 }
 
@@ -2529,10 +2570,12 @@ mod tests {
     }
 
     /// A finished merge of two pull requests in `acme/repo-1`, asked for by `alice`
-    /// as a retry of `batch-0`, with the first merged and the second rejected.
+    /// as a retry of `batch-0`, with the first merged and the second rejected, run for
+    /// the installation the fixtures' repositories belong to.
     fn batch(batch_id: &str, completed_at: u64) -> BatchRecord {
         BatchRecord {
             batch_id: batch_id.to_owned(),
+            installation_id: 9,
             action: BulkActionKind::Merge,
             requested_by: UserId::new("alice"),
             retried_from: Some("batch-0".to_owned()),
@@ -2599,15 +2642,15 @@ mod tests {
         store.record_batch(&newer).await.unwrap();
 
         assert_eq!(
-            store.recent_batches(10).await.unwrap(),
+            store.recent_batches(9, 10).await.unwrap(),
             vec![newer.clone(), older],
             "every column and every target comes back, targets in batch order: the batch \
              retried, each head, and each merge's commit included, and a batch that retried \
              nothing as such"
         );
-        assert_eq!(store.recent_batches(1).await.unwrap(), vec![newer]);
+        assert_eq!(store.recent_batches(9, 1).await.unwrap(), vec![newer]);
         assert_eq!(
-            store.recent_batches(0).await.unwrap(),
+            store.recent_batches(9, 0).await.unwrap(),
             Vec::<BatchRecord>::new()
         );
     }
@@ -2629,7 +2672,7 @@ mod tests {
 
         store.record_batch(&again).await.unwrap();
 
-        assert_eq!(store.recent_batches(10).await.unwrap(), vec![first]);
+        assert_eq!(store.recent_batches(9, 10).await.unwrap(), vec![first]);
     }
 
     /// A merge of two pull requests `alice` asked for as a retry of `batch-0`, as
@@ -2637,6 +2680,7 @@ mod tests {
     fn running(batch_id: &str, started_at: u64) -> RunningBatch {
         RunningBatch {
             batch_id: batch_id.to_owned(),
+            installation_id: 9,
             action: BulkActionKind::Merge,
             requested_by: UserId::new("alice"),
             retried_from: Some("batch-0".to_owned()),
@@ -2663,7 +2707,7 @@ mod tests {
         store.start_batch(&newer).await.unwrap();
 
         assert_eq!(
-            store.running_batches().await.unwrap(),
+            store.running_batches(9).await.unwrap(),
             vec![newer, older],
             "every column comes back, the batch retried included, newest first"
         );
@@ -2686,9 +2730,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.running_batches().await.unwrap(), vec![still_running]);
+        assert_eq!(store.running_batches(9).await.unwrap(), vec![still_running]);
         assert_eq!(
-            store.recent_batches(10).await.unwrap(),
+            store.recent_batches(9, 10).await.unwrap(),
             vec![batch("batch-older", 3_000)]
         );
     }
@@ -2704,8 +2748,8 @@ mod tests {
         store.unlist_batch("batch-1").await.unwrap();
         store.unlist_batch("never-listed").await.unwrap();
 
-        assert_eq!(store.running_batches().await.unwrap(), Vec::new());
-        assert_eq!(store.recent_batches(10).await.unwrap(), Vec::new());
+        assert_eq!(store.running_batches(9).await.unwrap(), Vec::new());
+        assert_eq!(store.recent_batches(9, 10).await.unwrap(), Vec::new());
     }
 
     /// Restate may run the starting step again when the first attempt's result
@@ -2724,7 +2768,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.running_batches().await.unwrap(), vec![first]);
+        assert_eq!(store.running_batches(9).await.unwrap(), vec![first]);
     }
 
     /// The record is the audit trail, so it outlives what it is about: the pull
@@ -2743,7 +2787,7 @@ mod tests {
         store.delete_pr(&PrKey::new(1, 1)).await.unwrap();
         store.purge_installation(9).await.unwrap();
 
-        let listed = store.recent_batches(10).await.unwrap();
+        let listed = store.recent_batches(9, 10).await.unwrap();
         assert_eq!(listed, vec![long_ago]);
         assert_eq!(
             listed[0]
@@ -2771,21 +2815,100 @@ mod tests {
         store.start_batch(&still_running).await.unwrap();
 
         assert_eq!(
-            store.get_batch("batch-finished").await.unwrap(),
+            store.get_batch(9, "batch-finished").await.unwrap(),
             Some(ProjectedBatch::Finished(finished)),
             "the record comes back whole, targets in batch order"
         );
         assert_eq!(
-            store.get_batch("batch-running").await.unwrap(),
+            store.get_batch(9, "batch-running").await.unwrap(),
             Some(ProjectedBatch::Running(still_running))
         );
-        assert_eq!(store.get_batch("batch-never-run").await.unwrap(), None);
+        assert_eq!(store.get_batch(9, "batch-never-run").await.unwrap(), None);
+    }
+
+    /// Two deployments sharing one store each read their own batches: the listing and
+    /// the by-id read are held to the installation asked for, and a batch of another
+    /// installation is answered as one the projection has never heard of. A row the
+    /// migration could not attribute is nobody's, and read by nobody.
+    #[tokio::test]
+    async fn batches_from_another_installation_are_not_read() {
+        let (_directory, store) = test_store().await;
+        let ours = batch("batch-ours", 2_000);
+        let theirs = BatchRecord {
+            installation_id: 10,
+            ..batch("batch-theirs", 3_000)
+        };
+        let ours_running = running("batch-ours-running", 4_000);
+        let theirs_running = RunningBatch {
+            installation_id: 10,
+            ..running("batch-theirs-running", 5_000)
+        };
+        store.record_batch(&ours).await.unwrap();
+        store.record_batch(&theirs).await.unwrap();
+        store.start_batch(&ours_running).await.unwrap();
+        store.start_batch(&theirs_running).await.unwrap();
+        let connection = store.connection().await;
+        connection
+            .execute_batch(
+                r#"INSERT INTO batches (
+                    batch_id, action, requested_by, started_at, completed_at,
+                    succeeded, rejected, failed
+                ) VALUES ('batch-nobodys', 'merge', 'alice', 970, 9000, 1, 0, 0);
+                INSERT INTO running_batches (
+                    batch_id, action, requested_by, started_at, target_count
+                ) VALUES ('batch-nobodys-running', 'merge', 'alice', 9000, 2)"#,
+            )
+            .await
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            store.recent_batches(9, 10).await.unwrap(),
+            vec![ours.clone()]
+        );
+        assert_eq!(
+            store.recent_batches(10, 10).await.unwrap(),
+            vec![theirs.clone()]
+        );
+        assert_eq!(
+            store.recent_batches(9, 1).await.unwrap(),
+            vec![ours.clone()],
+            "the limit counts the installation's batches, not everyone's"
+        );
+        assert_eq!(
+            store.running_batches(9).await.unwrap(),
+            vec![ours_running.clone()]
+        );
+        assert_eq!(
+            store.running_batches(10).await.unwrap(),
+            vec![theirs_running.clone()]
+        );
+        assert_eq!(
+            store.get_batch(9, "batch-ours").await.unwrap(),
+            Some(ProjectedBatch::Finished(ours))
+        );
+        assert_eq!(
+            store.get_batch(9, "batch-ours-running").await.unwrap(),
+            Some(ProjectedBatch::Running(ours_running))
+        );
+        assert_eq!(store.get_batch(9, "batch-theirs").await.unwrap(), None);
+        assert_eq!(
+            store.get_batch(9, "batch-theirs-running").await.unwrap(),
+            None
+        );
+        assert_eq!(store.get_batch(9, "batch-nobodys").await.unwrap(), None);
+        assert_eq!(
+            store.get_batch(9, "batch-nobodys-running").await.unwrap(),
+            None
+        );
     }
 
     /// The rows from before a batch named the batch it retried, a target kept the head
     /// it was sent against, and a merge kept the commit it made are still here, and read
     /// as batches that retried nothing anyone recorded, over heads nobody kept, with
-    /// merges as what commit nobody knows — not as rows the store cannot read.
+    /// merges as what commit nobody knows — not as rows the store cannot read. The
+    /// installation is the one the migration attributed them to; a row it could not
+    /// attribute is nobody's to read, see `batches_from_another_installation_are_not_read`.
     #[tokio::test]
     async fn batches_recorded_before_the_link_the_heads_and_the_merge_commits_read_as_unknown() {
         let (_directory, store) = test_store().await;
@@ -2793,9 +2916,9 @@ mod tests {
         connection
             .execute(
                 r#"INSERT INTO batches (
-                    batch_id, action, requested_by, started_at, completed_at,
+                    batch_id, installation_id, action, requested_by, started_at, completed_at,
                     succeeded, rejected, failed
-                ) VALUES ('batch-old', 'merge', 'alice', 970, 1000, 1, 0, 0)"#,
+                ) VALUES ('batch-old', 9, 'merge', 'alice', 970, 1000, 1, 0, 0)"#,
                 (),
             )
             .await
@@ -2815,8 +2938,8 @@ mod tests {
         connection
             .execute(
                 r#"INSERT INTO running_batches (
-                    batch_id, action, requested_by, started_at, target_count
-                ) VALUES ('batch-old-running', 'merge', 'alice', 2000, 2)"#,
+                    batch_id, installation_id, action, requested_by, started_at, target_count
+                ) VALUES ('batch-old-running', 9, 'merge', 'alice', 2000, 2)"#,
                 (),
             )
             .await
@@ -2825,6 +2948,7 @@ mod tests {
 
         let old = BatchRecord {
             batch_id: "batch-old".to_owned(),
+            installation_id: 9,
             action: BulkActionKind::Merge,
             requested_by: UserId::new("alice"),
             retried_from: None,
@@ -2847,15 +2971,19 @@ mod tests {
                 },
             }],
         };
-        assert_eq!(store.recent_batches(10).await.unwrap(), vec![old.clone()]);
         assert_eq!(
-            store.get_batch("batch-old").await.unwrap(),
+            store.recent_batches(9, 10).await.unwrap(),
+            vec![old.clone()]
+        );
+        assert_eq!(
+            store.get_batch(9, "batch-old").await.unwrap(),
             Some(ProjectedBatch::Finished(old))
         );
         assert_eq!(
-            store.running_batches().await.unwrap(),
+            store.running_batches(9).await.unwrap(),
             vec![RunningBatch {
                 batch_id: "batch-old-running".to_owned(),
+                installation_id: 9,
                 action: BulkActionKind::Merge,
                 requested_by: UserId::new("alice"),
                 retried_from: None,

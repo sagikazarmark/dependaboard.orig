@@ -365,6 +365,7 @@ mod tests {
     fn running_batch() -> RunningBatch {
         RunningBatch {
             batch_id: "batch-3".to_owned(),
+            installation_id: 1,
             action: BulkActionKind::Merge,
             requested_by: UserId::new("carol"),
             retried_from: Some("batch-1".to_owned()),
@@ -401,6 +402,7 @@ mod tests {
         vec![
             BatchRecord {
                 batch_id: "batch-2".to_owned(),
+                installation_id: 1,
                 action: BulkActionKind::Rebase,
                 requested_by: UserId::new("bob"),
                 retried_from: Some("batch-0".to_owned()),
@@ -421,6 +423,7 @@ mod tests {
             },
             BatchRecord {
                 batch_id: "batch-1".to_owned(),
+                installation_id: 1,
                 action: BulkActionKind::Merge,
                 requested_by: UserId::new("alice"),
                 retried_from: None,

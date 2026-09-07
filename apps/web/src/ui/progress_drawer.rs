@@ -643,6 +643,7 @@ mod tests {
         let listed = Followed {
             listing: Listing::Running(RunningBatch {
                 batch_id: "batch-1".to_owned(),
+                installation_id: 1,
                 action: BulkActionKind::Merge,
                 requested_by: UserId::new("alice"),
                 retried_from: None,

@@ -31,6 +31,9 @@ const COMMENT_SPACING: Duration = Duration::from_millis(350);
 #[derive(Clone)]
 pub(crate) struct BulkAction {
     pub(crate) store: Arc<dyn PrStore>,
+    /// The one installation this service serves, stamped on every batch it lists and
+    /// records so the projection can hold its batch reads to the installation.
+    pub(crate) installation_id: u64,
 }
 
 impl HandlerOutcome for Json<BatchProgress> {
@@ -294,8 +297,13 @@ fn warn_if_record_stuck(record: &BatchRecord, now: u64, cause: &impl fmt::Displa
 /// batch that has completed and still ends in error was cancelled by an operator after
 /// its last target settled — while stalled on the store, most likely — and it keeps its
 /// running listing as evidence rather than vanishing from the audit view altogether.
+///
+/// The listing and the record both carry `installation_id`, the service's own: the
+/// store answers a batch read only within one installation, and the service, not the
+/// request, is the word on which one this batch is.
 async fn run_bulk_action<E: BulkActionEffects>(
     restate: &mut E,
+    installation_id: u64,
     request: &BulkRequest,
     mut publish: impl FnMut(&BatchProgress) + Send,
 ) -> HandlerResult<BatchProgress> {
@@ -304,6 +312,7 @@ async fn run_bulk_action<E: BulkActionEffects>(
     publish(&progress);
     let running = RunningBatch {
         batch_id: progress.batch_id.clone(),
+        installation_id,
         action: request.action,
         requested_by: request.user_id.clone(),
         retried_from: request.retried_from.clone(),
@@ -317,7 +326,15 @@ async fn run_bulk_action<E: BulkActionEffects>(
             "the running batch could not be listed in the projection; running it unlisted"
         );
     }
-    let outcome = drive(restate, request, &mut progress, &mut publish, started_at).await;
+    let outcome = drive(
+        restate,
+        installation_id,
+        request,
+        &mut progress,
+        &mut publish,
+        started_at,
+    )
+    .await;
     if outcome.is_err()
         && !progress.completed
         && let Err(error) = restate.unlist_batch().await
@@ -336,6 +353,7 @@ async fn run_bulk_action<E: BulkActionEffects>(
 /// completed, unlisting it.
 async fn drive<E: BulkActionEffects>(
     restate: &mut E,
+    installation_id: u64,
     request: &BulkRequest,
     progress: &mut BatchProgress,
     publish: &mut (impl FnMut(&BatchProgress) + Send),
@@ -380,6 +398,7 @@ async fn drive<E: BulkActionEffects>(
     let completed_at = restate.now("batch-finish-clock").await?;
     let record = progress
         .completed_record(
+            installation_id,
             request.user_id.clone(),
             request.retried_from.clone(),
             started_at,
@@ -445,10 +464,11 @@ impl BulkAction {
                 store: &self.store,
                 user_id: request.user_id.clone(),
             };
-            let progress = run_bulk_action(&mut restate, &request, |progress| {
-                ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
-            })
-            .await?;
+            let progress =
+                run_bulk_action(&mut restate, self.installation_id, &request, |progress| {
+                    ctx.set(BATCH_PROGRESS, Json::from(progress.clone()));
+                })
+                .await?;
             Ok(Json::from(progress))
         })
         .await
@@ -618,6 +638,9 @@ mod tests {
 
     /// The fake clock's first reading, in Unix seconds.
     const CLOCK_EPOCH: u64 = 1_700_000_000;
+    /// The installation the service under test serves, which every batch it runs is
+    /// stamped with.
+    const INSTALLATION_ID: u64 = 42;
 
     impl RecordedBulkAction {
         fn answering(
@@ -725,7 +748,7 @@ mod tests {
         request: &BulkRequest,
     ) -> (BatchProgress, Vec<BatchProgress>) {
         let mut published = Vec::new();
-        let progress = run_bulk_action(restate, request, |progress| {
+        let progress = run_bulk_action(restate, INSTALLATION_ID, request, |progress| {
             published.push(progress.clone());
         })
         .await
@@ -989,8 +1012,9 @@ mod tests {
 
     /// Restate forgets the workflow after its retention; the projection is where the
     /// batch's outcome lives on. It is written once, as the batch's last step, with the
-    /// requester, the batch it retried if any, when the batch started and finished, the
-    /// tally, and every verdict — a merge's with the commit it made.
+    /// installation the service serves, the requester, the batch it retried if any, when
+    /// the batch started and finished, the tally, and every verdict — a merge's with the
+    /// commit it made.
     #[tokio::test]
     async fn a_finished_batch_is_recorded_in_the_projection_once_with_its_tally_and_verdicts() {
         let request = BulkRequest {
@@ -1012,15 +1036,18 @@ mod tests {
             record,
             &progress
                 .completed_record(
+                    INSTALLATION_ID,
                     UserId::new("alice"),
                     Some("batch-0".to_owned()),
                     CLOCK_EPOCH,
                     CLOCK_EPOCH + 60,
                 )
                 .expect("the batch has finished"),
-            "the record is the finished progress, stamped with who asked, what it retried, and when"
+            "the record is the finished progress, stamped with the installation, who asked, \
+             what it retried, and when"
         );
         assert_eq!(record.batch_id, "batch-1");
+        assert_eq!(record.installation_id, INSTALLATION_ID);
         assert_eq!(record.retried_from.as_deref(), Some("batch-0"));
         assert_eq!(
             (record.succeeded, record.rejected, record.failed),
@@ -1060,8 +1087,8 @@ mod tests {
 
     /// A dashboard that lost the batch, or never followed it, finds it in the audit
     /// view while it runs: the workflow lists it as running before it sends the first
-    /// target, with what was asked, by whom, which batch it retries if any, since when,
-    /// and over how many pull requests.
+    /// target, with the installation it runs for, what was asked, by whom, which batch
+    /// it retries if any, since when, and over how many pull requests.
     #[tokio::test]
     async fn a_batch_is_listed_as_running_before_its_first_target_is_sent() {
         let request = BulkRequest {
@@ -1077,6 +1104,7 @@ mod tests {
             restate.started,
             vec![RunningBatch {
                 batch_id: "batch-1".to_owned(),
+                installation_id: INSTALLATION_ID,
                 action: BulkActionKind::Merge,
                 requested_by: UserId::new("alice"),
                 retried_from: Some("batch-0".to_owned()),
@@ -1131,7 +1159,7 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = run_bulk_action(&mut restate, &request, |_| {}).await;
+        let outcome = run_bulk_action(&mut restate, INSTALLATION_ID, &request, |_| {}).await;
 
         assert!(outcome.is_err(), "the cancellation ends the workflow");
         assert_eq!(restate.started.len(), 1);
@@ -1151,7 +1179,7 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = run_bulk_action(&mut restate, &request, |_| {}).await;
+        let outcome = run_bulk_action(&mut restate, INSTALLATION_ID, &request, |_| {}).await;
 
         assert!(outcome.is_err(), "the cancellation ends the workflow");
         assert_eq!(restate.sent, vec![1, 4], "every target had settled");
@@ -1183,7 +1211,13 @@ mod tests {
         let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
         progress.record(&targets[0].key(), merged());
         progress
-            .completed_record(UserId::new("alice"), None, CLOCK_EPOCH, CLOCK_EPOCH + 60)
+            .completed_record(
+                INSTALLATION_ID,
+                UserId::new("alice"),
+                None,
+                CLOCK_EPOCH,
+                CLOCK_EPOCH + 60,
+            )
             .expect("the batch has finished")
     }
 

@@ -87,7 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let endpoint = Endpoint::builder()
         .bind(pull_request)
-        .bind(BulkAction { store })
+        .bind(BulkAction {
+            store,
+            installation_id,
+        })
         .bind(WebhookIngress { installation_id })
         .bind(DashboardIngress {
             installation_id,

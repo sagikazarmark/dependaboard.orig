@@ -171,6 +171,12 @@ pub(crate) async fn submit_batch(
     Ok(BatchReceipt { left_out })
 }
 
+/// Where the batch stands, as Restate holds it, or `None` for a workflow this
+/// deployment's Restate has never heard of. Not held to the projection, as the
+/// other batch reads are: each deployment has its own Restate, so another
+/// installation's batch is unknown here whatever the shared store holds, a
+/// UUIDv7 is not to be enumerated, and a batch just queued is polled before
+/// the workflow's first step has listed it.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_batch_progress(
     batch_id: String,
@@ -190,14 +196,22 @@ pub(crate) async fn load_batch_progress(
 /// was asked, by whom, when, and — once finished — how each target went. Read
 /// from the store, not Restate, so a finished batch is still here after the
 /// workflow's retention has cleared its progress, and a running one is found
-/// without knowing its id. `limit` is held to
+/// without knowing its id. The configured installation's batches only: two
+/// deployments sharing a store do not list each other's. `limit` is held to
 /// [`MAX_RECENT_BATCHES`](dependaboard_core::MAX_RECENT_BATCHES).
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_recent_batches(limit: u32) -> Result<BatchList, ServerFnError> {
-    let running = state.store.running_batches().await.map_err(store_failure)?;
+    let running = state
+        .store
+        .running_batches(state.installation_id)
+        .await
+        .map_err(store_failure)?;
     let finished = state
         .store
-        .recent_batches(limit.clamp(1, dependaboard_core::MAX_RECENT_BATCHES))
+        .recent_batches(
+            state.installation_id,
+            limit.clamp(1, dependaboard_core::MAX_RECENT_BATCHES),
+        )
         .await
         .map_err(store_failure)?;
     Ok(BatchList { running, finished })
@@ -208,8 +222,11 @@ pub(crate) async fn load_recent_batches(limit: u32) -> Result<BatchList, ServerF
 /// of. A dashboard handed an id alone — from a link — asks this before it
 /// asks Restate, so a finished batch opens from the record at once, however
 /// long ago its workflow was retired, and only an id the projection has
-/// never heard of is asked after through `progress`. An id the dashboard
-/// could not have minted is refused, as [`load_batch_progress`] refuses it.
+/// never heard of is asked after through `progress`. Held to the configured
+/// installation: another installation's batch is answered as one the
+/// projection has never heard of, not refused, since a link to it is given up
+/// the same way a stale one is. An id the dashboard could not have minted is
+/// refused, as [`load_batch_progress`] refuses it.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_batch_projection(
     batch_id: String,
@@ -219,7 +236,7 @@ pub(crate) async fn load_batch_projection(
     }
     state
         .store
-        .get_batch(&batch_id)
+        .get_batch(state.installation_id, &batch_id)
         .await
         .map_err(store_failure)
 }
@@ -363,6 +380,59 @@ mod tests {
     };
     use crate::ui::test_support::{BATCH, GROUPED_ROW_TITLE, OTHER_BATCH, grouped_row, serde_row};
 
+    /// A well-formed id no batch has ever had.
+    const UNKNOWN_BATCH: &str = "01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1c";
+    /// A batch of another installation, as the workflow of a deployment sharing this
+    /// store would list it running.
+    const FOREIGN_RUNNING_BATCH: &str = "01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1e";
+    /// A batch of another installation, as the workflow of a deployment sharing this
+    /// store would record it finished.
+    const FOREIGN_FINISHED_BATCH: &str = "01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1f";
+
+    /// A running merge of three pull requests as the workflow serving
+    /// `installation_id` lists it.
+    fn listed(installation_id: u64, batch_id: &str) -> RunningBatch {
+        RunningBatch {
+            batch_id: batch_id.to_owned(),
+            installation_id,
+            action: BulkActionKind::Merge,
+            requested_by: UserId::new(USERNAME),
+            retried_from: None,
+            started_at: 2_000,
+            target_count: 3,
+        }
+    }
+
+    /// A finished one-target rebase as the workflow serving `installation_id`
+    /// records it.
+    fn recorded(installation_id: u64, batch_id: &str) -> BatchRecord {
+        BatchRecord {
+            batch_id: batch_id.to_owned(),
+            installation_id,
+            action: BulkActionKind::Rebase,
+            requested_by: UserId::new(USERNAME),
+            retried_from: None,
+            started_at: 1_000,
+            completed_at: 1_030,
+            succeeded: 1,
+            rejected: 0,
+            failed: 0,
+            targets: vec![BatchTargetRecord {
+                repository_id: 7,
+                owner: "acme".to_owned(),
+                repo: "api".to_owned(),
+                number: 9,
+                title: GROUPED_ROW_TITLE.to_owned(),
+                html_url: "https://github.example/acme/api/pull/9".to_owned(),
+                head_sha: Some("abc123".to_owned()),
+                outcome: TargetOutcome::Succeeded {
+                    detail: "@dependabot rebase posted".to_owned(),
+                    merge_sha: None,
+                },
+            }],
+        }
+    }
+
     #[test]
     fn infrastructure_failures_reach_the_browser_without_their_detail() {
         let detail = "libsql://db.internal: connection refused (token=abc)";
@@ -399,37 +469,10 @@ mod tests {
     async fn recent_batches_list_the_running_ones_beside_the_finished_ones() {
         let dashboard = dashboard().await;
         let running = RunningBatch {
-            batch_id: OTHER_BATCH.to_owned(),
-            action: BulkActionKind::Merge,
-            requested_by: UserId::new(USERNAME),
             retried_from: Some(BATCH.to_owned()),
-            started_at: 2_000,
-            target_count: 3,
+            ..listed(INSTALLATION_ID, OTHER_BATCH)
         };
-        let finished = BatchRecord {
-            batch_id: BATCH.to_owned(),
-            action: BulkActionKind::Rebase,
-            requested_by: UserId::new(USERNAME),
-            retried_from: None,
-            started_at: 1_000,
-            completed_at: 1_030,
-            succeeded: 1,
-            rejected: 0,
-            failed: 0,
-            targets: vec![BatchTargetRecord {
-                repository_id: 7,
-                owner: "acme".to_owned(),
-                repo: "api".to_owned(),
-                number: 9,
-                title: GROUPED_ROW_TITLE.to_owned(),
-                html_url: "https://github.example/acme/api/pull/9".to_owned(),
-                head_sha: Some("abc123".to_owned()),
-                outcome: TargetOutcome::Succeeded {
-                    detail: "@dependabot rebase posted".to_owned(),
-                    merge_sha: None,
-                },
-            }],
-        };
+        let finished = recorded(INSTALLATION_ID, BATCH);
         dashboard.store().start_batch(&running).await.unwrap();
         dashboard.store().record_batch(&finished).await.unwrap();
 
@@ -458,37 +501,10 @@ mod tests {
     async fn one_batch_is_read_from_the_projection_as_finished_running_or_unknown() {
         let dashboard = dashboard().await;
         let running = RunningBatch {
-            batch_id: OTHER_BATCH.to_owned(),
-            action: BulkActionKind::Merge,
-            requested_by: UserId::new(USERNAME),
             retried_from: Some(BATCH.to_owned()),
-            started_at: 2_000,
-            target_count: 3,
+            ..listed(INSTALLATION_ID, OTHER_BATCH)
         };
-        let finished = BatchRecord {
-            batch_id: BATCH.to_owned(),
-            action: BulkActionKind::Rebase,
-            requested_by: UserId::new(USERNAME),
-            retried_from: None,
-            started_at: 1_000,
-            completed_at: 1_030,
-            succeeded: 1,
-            rejected: 0,
-            failed: 0,
-            targets: vec![BatchTargetRecord {
-                repository_id: 7,
-                owner: "acme".to_owned(),
-                repo: "api".to_owned(),
-                number: 9,
-                title: GROUPED_ROW_TITLE.to_owned(),
-                html_url: "https://github.example/acme/api/pull/9".to_owned(),
-                head_sha: Some("abc123".to_owned()),
-                outcome: TargetOutcome::Succeeded {
-                    detail: "@dependabot rebase posted".to_owned(),
-                    merge_sha: None,
-                },
-            }],
-        };
+        let finished = recorded(INSTALLATION_ID, BATCH);
         dashboard.store().start_batch(&running).await.unwrap();
         dashboard.store().record_batch(&finished).await.unwrap();
 
@@ -509,7 +525,7 @@ mod tests {
             listed.json::<Option<ProjectedBatch>>().await.unwrap(),
             Some(ProjectedBatch::Running(running))
         );
-        let never_heard_of = read("01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1c").await.unwrap();
+        let never_heard_of = read(UNKNOWN_BATCH).await.unwrap();
         assert_eq!(never_heard_of.status(), StatusCode::OK);
         assert_eq!(
             never_heard_of
@@ -931,5 +947,94 @@ mod tests {
         assert_eq!(own.status(), StatusCode::OK);
         assert_eq!(own.json::<Option<PrState>>().await.unwrap(), Some(synced));
         dashboard.the_one_forward("/restate/call/PullRequest/7%239/status");
+    }
+
+    /// Two deployments on one store each see their own **Batches**: the audit
+    /// view lists the batches the configured installation's workflow listed
+    /// and recorded, and none of another's — not their repositories, not
+    /// their pull requests' titles, not who asked.
+    #[tokio::test]
+    async fn recent_batches_are_listed_only_within_the_installation() {
+        let dashboard = dashboard().await;
+        let store = dashboard.store();
+        store
+            .start_batch(&listed(INSTALLATION_ID, OTHER_BATCH))
+            .await
+            .unwrap();
+        store
+            .record_batch(&recorded(INSTALLATION_ID, BATCH))
+            .await
+            .unwrap();
+        store
+            .start_batch(&listed(INSTALLATION_ID + 1, FOREIGN_RUNNING_BATCH))
+            .await
+            .unwrap();
+        store
+            .record_batch(&recorded(INSTALLATION_ID + 1, FOREIGN_FINISHED_BATCH))
+            .await
+            .unwrap();
+
+        let response = dashboard
+            .call("load_recent_batches", json!({ "limit": 20 }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<BatchList>().await.unwrap(),
+            BatchList {
+                running: vec![listed(INSTALLATION_ID, OTHER_BATCH)],
+                finished: vec![recorded(INSTALLATION_ID, BATCH)],
+            }
+        );
+    }
+
+    /// A link to another installation's batch is answered as a link to a batch
+    /// the projection has never heard of — not refused, since a stale or
+    /// foreign link is given up the same way after the attach polls — while
+    /// a link to this installation's batch opens from the record.
+    #[tokio::test]
+    async fn a_batch_is_read_by_id_only_within_the_installation() {
+        let dashboard = dashboard().await;
+        let store = dashboard.store();
+        store
+            .record_batch(&recorded(INSTALLATION_ID, BATCH))
+            .await
+            .unwrap();
+        store
+            .start_batch(&listed(INSTALLATION_ID + 1, FOREIGN_RUNNING_BATCH))
+            .await
+            .unwrap();
+        store
+            .record_batch(&recorded(INSTALLATION_ID + 1, FOREIGN_FINISHED_BATCH))
+            .await
+            .unwrap();
+        let read = |batch_id: &str| {
+            dashboard
+                .call("load_batch_projection", json!({ "batch_id": batch_id }))
+                .send()
+        };
+
+        for foreign in [FOREIGN_RUNNING_BATCH, FOREIGN_FINISHED_BATCH] {
+            let response = read(foreign).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.json::<Option<ProjectedBatch>>().await.unwrap(),
+                None,
+                "{foreign} is another installation's, and told apart from no batch at all by nothing"
+            );
+        }
+        assert!(
+            dashboard.forwards().is_empty(),
+            "the projection answers; Restate is not asked"
+        );
+
+        let own = read(BATCH).await.unwrap();
+        assert_eq!(own.status(), StatusCode::OK);
+        assert_eq!(
+            own.json::<Option<ProjectedBatch>>().await.unwrap(),
+            Some(ProjectedBatch::Finished(recorded(INSTALLATION_ID, BATCH)))
+        );
     }
 }

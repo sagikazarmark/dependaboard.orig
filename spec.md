@@ -183,15 +183,16 @@ progress from the UI.
 
 ```
 run(BulkRequest { action, targets: Vec<PrTarget>, user_id, retried_from })
-  ├─ ctx.run: PrStore::start_batch(kind, requester, retried_from, started at, target count)
-  │                                                                          // best effort
+  ├─ ctx.run: PrStore::start_batch(installation, kind, requester, retried_from, started at,
+  │                                 target count)                            // best effort
   ├─ for each target (bounded concurrency; merges grouped per repo, see below):
   │     ctx.object_client::<PullRequest>(key).call(action)
   │       → ActionOutcome, or a TerminalError the callee gave up with
   │     write the outcome into workflow state AS IT COMPLETES
   ├─ terminal state: Completed { succeeded, rejected, failed }
-  └─ ctx.run: PrStore::record_batch(kind, requester, retried_from, started/completed at,
-                                     per-target verdicts with the head each was sent against)
+  └─ ctx.run: PrStore::record_batch(installation, kind, requester, retried_from,
+                                     started/completed at, per-target verdicts with the
+                                     head each was sent against)
                                      // …and stops listing the batch as running
 
 progress() -> BatchProgress    // shared handler, UI polls this
@@ -263,6 +264,25 @@ target has settled and the merges stand on GitHub, so the running row is the las
 evidence of the batch and stays rather than the batch vanishing from both lists. The
 **Batches** drawer lists the running batches first, each with **Follow**, which
 attaches the pill and drawer to it through `progress`.
+
+**Both rows carry the installation, and every batch read is held to it.** The service
+serves one installation, and the workflow stamps it on the listing and the record as it
+writes them — the service's word, not the request's, which carries none. The store's
+batch reads (`recent_batches`, `running_batches`, `get_batch`) take the installation and
+filter on it, so two deployments sharing one libSQL URL do not list each other's batches,
+and a batch id of another installation is answered as one the projection has never heard
+of rather than refused: a link to it falls to the thirty-poll attach and is given up as a
+stale or foreign one, the same as any unknown id, so the by-id path needs no new words.
+Nothing is derived from `batch_targets.repository_id` at read time: the record is meant
+to outlive the repositories it names. Rows from before the column was kept were
+attributed once, at migration time, through their targets' repositories where those were
+still projected; a row that could not be — every repository purged since, or a running
+listing, which has no targets to go through — is left `NULL`, which no read matches, so a
+batch nobody can be sure of is shown to nobody and kept rather than dropped.
+`BulkAction.progress` is not held to the projection: it is this deployment's Restate's
+answer, which has never heard of another deployment's workflow, a UUIDv7 is not to be
+enumerated, and a batch just queued is polled before the workflow's first step has listed
+it.
 
 **The dashboard follows a batch by id, and never calls it lost.** The followed batch id
 is in the URL (`batch`, beside `pr`), so a reload re-attaches through `progress`, and a
@@ -816,22 +836,28 @@ Bulk action       UI → server fn → Restate ingress
                        and leaves out one the projection no longer has: the batch runs
                        over the rest, and the receipt names the keys left out
                        POST /restate/send/BulkAction/{batch_id}/run
-                     → workflow lists the batch as running: PrStore::start_batch
+                     → workflow lists the batch as running: PrStore::start_batch,
+                       stamped with the installation the service serves
                      → workflow fans out to PullRequest objects
                      → objects call GitHub API, write through to PrStore
                      → workflow writes the finished batch: PrStore::record_batch,
-                       which also stops listing it as running
+                       stamped the same, which also stops listing it as running
 
 Progress          UI polls → server fn →
                        POST /restate/call/BulkAction/{batch_id}/progress
-                       the batch id is in the URL, so a reload polls on
+                       the batch id is in the URL, so a reload polls on; not held to
+                       the projection, since this deployment's Restate has never heard
+                       of another's workflow and a batch just queued is polled before
+                       it is listed
 
-Batch by id       UI → server fn → PrStore::get_batch(batch_id)
+Batch by id       UI → server fn → PrStore::get_batch(installation, batch_id)
                        what the projection holds of a batch followed by id alone, asked
                        before Restate is: the finished record, which opens the drawer
                        at once and is not polled; the running listing, which is polled
                        through progress without the give-up; or nothing, which leaves
-                       the id to Restate under it
+                       the id to Restate under it — the answer for an id it has never
+                       heard of and for another installation's batch alike, so a
+                       foreign link is given up as a stale one is
 
 Drawer            UI → server fn → PrStore::get_pr
                        the drawer names a pull request by key: the row it opens on
@@ -844,10 +870,13 @@ Drawer            UI → server fn → PrStore::get_pr
                        for is answered with nothing, which the drawer reads as no
                        longer open
 
-Recent batches    UI → server fn → PrStore::running_batches() + recent_batches(limit)
+Recent batches    UI → server fn → PrStore::running_batches(installation)
+                                   + recent_batches(installation, limit)
                        the running batches, then the finished ones, newest first, from
                        the projection rather than Restate, so a finished batch outlives
-                       the workflow retention and a running one is found without its id
+                       the workflow retention and a running one is found without its id;
+                       the configured installation's only, so two deployments sharing a
+                       store do not list each other's
 
 All ingress endpoints live under `/restate/`: `/restate/call/...` waits for the handler's
 result, `/restate/send/...` returns as soon as the invocation is accepted. Use `send` for
@@ -1090,24 +1119,26 @@ pub trait PrStore: Send + Sync {
     /// Forget every retirement up to and including `through`, the last one read; ids
     /// only grow, so anything queued since stays for the next drain.
     async fn acknowledge_retirements(&self, through: u64) -> Result<()>;
-    /// Keep a finished batch for audit — the batch it retried, each target's head and
-    /// verdict, a merge's commit inside the verdict — and stop listing it as running. A
-    /// batch id already recorded is left as it was, so the workflow's recording step is
-    /// safe to run again.
+    /// Keep a finished batch for audit — the installation it ran for, the batch it
+    /// retried, each target's head and verdict, a merge's commit inside the verdict — and
+    /// stop listing it as running. A batch id already recorded is left as it was, so the
+    /// workflow's recording step is safe to run again.
     async fn record_batch(&self, batch: &BatchRecord) -> Result<()>;
-    /// The most recently finished batches, newest first, targets and verdicts included.
-    async fn recent_batches(&self, limit: u32) -> Result<Vec<BatchRecord>>;
-    /// List a batch as running until it is recorded, the batch it retries included. A
-    /// batch id already listed is left as it was, for the same reason.
+    /// The installation's most recently finished batches, newest first, targets and
+    /// verdicts included; the limit counts its batches, not everyone's.
+    async fn recent_batches(&self, installation_id: u64, limit: u32) -> Result<Vec<BatchRecord>>;
+    /// List a batch as running until it is recorded, the installation and the batch it
+    /// retries included. A batch id already listed is left as it was, for the same reason.
     async fn start_batch(&self, batch: &RunningBatch) -> Result<()>;
     /// Stop listing a batch as running without recording it, for a workflow that ended
     /// with no finished batch to keep. A batch not listed is left as it is.
     async fn unlist_batch(&self, batch_id: &str) -> Result<()>;
-    /// Every batch started and not yet recorded or given up, newest first.
-    async fn running_batches(&self) -> Result<Vec<RunningBatch>>;
-    /// One batch by id: its finished record or its running listing, from one snapshot;
-    /// None for an id the projection has never heard of.
-    async fn get_batch(&self, batch_id: &str) -> Result<Option<ProjectedBatch>>;
+    /// Every batch of the installation started and not yet recorded or given up, newest first.
+    async fn running_batches(&self, installation_id: u64) -> Result<Vec<RunningBatch>>;
+    /// One batch by id within the installation: its finished record or its running
+    /// listing, from one snapshot; None for an id the projection has never heard of, and
+    /// just the same for one it holds under another installation.
+    async fn get_batch(&self, installation_id: u64, batch_id: &str) -> Result<Option<ProjectedBatch>>;
 }
 
 /// What the dashboard narrows the pull requests by. Every field is one the dashboard's
@@ -1152,7 +1183,7 @@ local-file story, gains ubiquity.
 
 **Schema**
 
-The net shape after every migration in `migrations/` at HEAD (0001–0010); the migrations
+The net shape after every migration in `migrations/` at HEAD (0001–0011); the migrations
 are the source, the README's *Schema migrations* says how they are applied. Comments here
 explain columns, the migrations' comments explain changes.
 
@@ -1219,18 +1250,23 @@ INSERT INTO projection_revision (id, revision) VALUES (1, 0);
 
 -- Finished bulk actions, for audit; append-only, written once per batch id by the
 -- BulkAction workflow's last step. Not tied to pull_requests: a merged PR leaves that
--- table, and the record must not go with it.
+-- table, and the record must not go with it. Every read is held to one installation
+-- (§2): two deployments sharing a store do not read each other's batches.
 CREATE TABLE batches (
-  batch_id     TEXT PRIMARY KEY,   -- the workflow key, a UUIDv7
-  action       TEXT NOT NULL,      -- merge | rebase | update branch
-  requested_by TEXT NOT NULL,      -- the dashboard user who confirmed it
-  started_at   INTEGER NOT NULL,
-  completed_at INTEGER NOT NULL,
-  succeeded    INTEGER NOT NULL,
-  rejected     INTEGER NOT NULL,
-  failed       INTEGER NOT NULL,
-  retried_from TEXT                -- the batch whose rejected targets this one retries;
-                                   -- not a foreign key: a dangling link is not a lost record
+  batch_id        TEXT PRIMARY KEY,   -- the workflow key, a UUIDv7
+  action          TEXT NOT NULL,      -- merge | rebase | update branch
+  requested_by    TEXT NOT NULL,      -- the dashboard user who confirmed it
+  started_at      INTEGER NOT NULL,
+  completed_at    INTEGER NOT NULL,
+  succeeded       INTEGER NOT NULL,
+  rejected        INTEGER NOT NULL,
+  failed          INTEGER NOT NULL,
+  retried_from    TEXT,               -- the batch whose rejected targets this one retries;
+                                      -- not a foreign key: a dangling link is not a lost record
+  installation_id INTEGER             -- the installation the workflow ran it for, stamped by
+                                      -- the service (0011); NULL only on a row from before,
+                                      -- which the migration could not attribute through its
+                                      -- targets' repositories, and which no read matches
 );
 CREATE INDEX idx_batch_completed ON batches(completed_at DESC, batch_id DESC);
 
@@ -1249,15 +1285,17 @@ CREATE TABLE batch_targets (
 );
 
 -- Bulk actions the workflow is running (§2): written as its first step, taken away by
--- the finished record's write. Says only that the batch runs, what was asked, by whom,
--- what it retries, since when, and over how many pull requests.
+-- the finished record's write. Says only that the batch runs, for which installation,
+-- what was asked, by whom, what it retries, since when, and over how many pull requests.
 CREATE TABLE running_batches (
-  batch_id     TEXT PRIMARY KEY,
-  action       TEXT NOT NULL,
-  requested_by TEXT NOT NULL,
-  started_at   INTEGER NOT NULL,
-  target_count INTEGER NOT NULL,
-  retried_from TEXT
+  batch_id        TEXT PRIMARY KEY,
+  action          TEXT NOT NULL,
+  requested_by    TEXT NOT NULL,
+  started_at      INTEGER NOT NULL,
+  target_count    INTEGER NOT NULL,
+  retried_from    TEXT,
+  installation_id INTEGER             -- as on batches (0011); a listing from before has no
+                                      -- targets to be attributed through and stays NULL
 );
 
 -- The retirement outbox (§2 RepoSync): the pull requests a prune removed whose

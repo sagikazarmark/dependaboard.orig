@@ -1035,13 +1035,14 @@ impl BatchProgress {
         self.completed = self.settled() == self.targets.len() as u64;
     }
 
-    /// This batch as the projection keeps it once it has run: who asked for it, which
-    /// batch it retried if any, when it started and finished, the tally, and every
-    /// target's verdict in batch order with the head it was sent against. `None` while
-    /// any target is still queued or running: there is no record to keep of a batch that
-    /// has not finished.
+    /// This batch as the projection keeps it once it has run: the installation it ran
+    /// for, who asked for it, which batch it retried if any, when it started and
+    /// finished, the tally, and every target's verdict in batch order with the head it
+    /// was sent against. `None` while any target is still queued or running: there is no
+    /// record to keep of a batch that has not finished.
     pub fn completed_record(
         &self,
+        installation_id: u64,
         requested_by: UserId,
         retried_from: Option<String>,
         started_at: u64,
@@ -1065,6 +1066,7 @@ impl BatchProgress {
             .collect::<Option<Vec<_>>>()?;
         Some(BatchRecord {
             batch_id: self.batch_id.clone(),
+            installation_id,
             action: self.action,
             requested_by,
             retried_from,
@@ -1165,6 +1167,10 @@ pub struct BatchTargetRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatchRecord {
     pub batch_id: String,
+    /// The installation the batch ran for, stamped by the workflow that ran it. The
+    /// store answers a batch read only within one installation, so two deployments
+    /// sharing a store do not read each other's batches.
+    pub installation_id: u64,
     pub action: BulkActionKind,
     pub requested_by: UserId,
     /// The batch this one was queued to retry the rejected targets of, by id, when it
@@ -1228,6 +1234,9 @@ impl From<BatchRecord> for BatchProgress {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunningBatch {
     pub batch_id: String,
+    /// See [`BatchRecord::installation_id`]: the same stamp, from the moment the batch
+    /// is listed.
+    pub installation_id: u64,
     pub action: BulkActionKind,
     pub requested_by: UserId,
     /// See [`BatchRecord::retried_from`]: the same link, from the moment the batch is
@@ -2049,7 +2058,7 @@ mod tests {
             },
         );
         assert_eq!(
-            progress.completed_record(requester.clone(), Some("batch-0".to_owned()), 100, 160),
+            progress.completed_record(42, requester.clone(), Some("batch-0".to_owned()), 100, 160),
             None,
             "one target is still queued"
         );
@@ -2057,9 +2066,10 @@ mod tests {
         progress.record_failure(&targets[2].key(), "boom");
 
         assert_eq!(
-            progress.completed_record(requester, Some("batch-0".to_owned()), 100, 160),
+            progress.completed_record(42, requester, Some("batch-0".to_owned()), 100, 160),
             Some(BatchRecord {
                 batch_id: "batch-1".to_owned(),
+                installation_id: 42,
                 action: BulkActionKind::Merge,
                 requested_by: UserId::new("alice"),
                 retried_from: Some("batch-0".to_owned()),
@@ -2133,7 +2143,7 @@ mod tests {
             },
         );
         let record = progress
-            .completed_record(UserId::new("alice"), None, 100, 160)
+            .completed_record(42, UserId::new("alice"), None, 100, 160)
             .unwrap();
 
         assert_eq!(BatchProgress::from(record.clone()), progress);
@@ -2207,6 +2217,7 @@ mod tests {
         assert_eq!(request.retried_from, None);
         let running: RunningBatch = serde_json::from_value(serde_json::json!({
             "batch_id": "batch-1",
+            "installation_id": 42,
             "action": "merge",
             "requested_by": "alice",
             "started_at": 100,

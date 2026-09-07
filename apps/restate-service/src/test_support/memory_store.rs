@@ -304,7 +304,11 @@ impl PrStore for MemoryPrStore {
         Ok(())
     }
 
-    async fn recent_batches(&self, _limit: u32) -> Result<Vec<BatchRecord>, StoreError> {
+    async fn recent_batches(
+        &self,
+        _installation_id: u64,
+        _limit: u32,
+    ) -> Result<Vec<BatchRecord>, StoreError> {
         unimplemented!(
             "the Restate service never lists the recorded batches; the dashboard reads them through the web app"
         )
@@ -325,13 +329,20 @@ impl PrStore for MemoryPrStore {
         Ok(())
     }
 
-    async fn running_batches(&self) -> Result<Vec<RunningBatch>, StoreError> {
+    async fn running_batches(
+        &self,
+        _installation_id: u64,
+    ) -> Result<Vec<RunningBatch>, StoreError> {
         unimplemented!(
             "the Restate service never lists the running batches; the dashboard reads them through the web app"
         )
     }
 
-    async fn get_batch(&self, _batch_id: &str) -> Result<Option<ProjectedBatch>, StoreError> {
+    async fn get_batch(
+        &self,
+        _installation_id: u64,
+        _batch_id: &str,
+    ) -> Result<Option<ProjectedBatch>, StoreError> {
         unimplemented!(
             "the Restate service never reads a batch back; the dashboard reads it through the web app"
         )

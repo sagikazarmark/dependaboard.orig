@@ -1068,7 +1068,7 @@ mod tests {
     /// finished: `alice` asked for it, it ran for thirty seconds.
     fn recorded() -> BatchRecord {
         after(2)
-            .completed_record(UserId::new("alice"), None, EPOCH - 30, EPOCH)
+            .completed_record(1, UserId::new("alice"), None, EPOCH - 30, EPOCH)
             .expect("every target has settled")
     }
 
@@ -1101,6 +1101,7 @@ mod tests {
     fn listed() -> RunningBatch {
         RunningBatch {
             batch_id: "batch-1".to_owned(),
+            installation_id: 1,
             action: BulkActionKind::Merge,
             requested_by: UserId::new("alice"),
             retried_from: None,

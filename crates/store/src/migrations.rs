@@ -68,6 +68,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "batch_provenance",
         sql: include_str!("../../../migrations/0010_batch_provenance.sql"),
     },
+    Migration {
+        version: 11,
+        name: "batch_installation",
+        sql: include_str!("../../../migrations/0011_batch_installation.sql"),
+    },
 ];
 
 const CREATE_SCHEMA_MIGRATIONS: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -85,10 +90,19 @@ const CREATE_SCHEMA_MIGRATIONS: &str = "CREATE TABLE IF NOT EXISTS schema_migrat
 /// version, the second waits for the first's write lock and then finds the
 /// version recorded, instead of both running the same DDL.
 pub(crate) async fn apply(connection: &Connection) -> Result<Vec<u32>, StoreError> {
+    apply_registered(connection, MIGRATIONS).await
+}
+
+/// [`apply`] over a given registry, so a test can bring a database to the
+/// version before a migration and seed it with the rows that migration meets.
+async fn apply_registered(
+    connection: &Connection,
+    migrations: &[Migration],
+) -> Result<Vec<u32>, StoreError> {
     connection.execute(CREATE_SCHEMA_MIGRATIONS, ()).await?;
     let recorded = recorded_versions(connection).await?;
     let mut applied = Vec::new();
-    for migration in MIGRATIONS
+    for migration in migrations
         .iter()
         .filter(|migration| !recorded.contains(&migration.version))
     {
@@ -273,6 +287,71 @@ mod tests {
         assert_eq!(schema(&legacy).await, schema(&fresh).await);
         assert_eq!(count(&legacy, "pull_requests").await, 1);
         assert_eq!(count(&legacy, "repositories").await, 1);
+    }
+
+    /// The batch tables from before 0011 carry no installation id. The migration
+    /// attributes a finished batch through its targets' repositories, where they are
+    /// still there; a batch whose repositories were all purged since, and a running
+    /// listing, which has no targets to go through, are left unattributed.
+    #[tokio::test]
+    async fn batches_from_before_the_installation_was_kept_are_attributed_through_their_repositories()
+     {
+        let connection = connection().await;
+        let before = MIGRATIONS
+            .iter()
+            .position(|migration| migration.name == "batch_installation")
+            .expect("the migration under test is registered");
+        apply_registered(&connection, &MIGRATIONS[..before])
+            .await
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO repositories (repository_id, installation_id, owner, repo, synced_at)
+                 VALUES (1, 9, 'acme', 'api', 10);
+                 INSERT INTO batches (batch_id, action, requested_by, started_at, completed_at,
+                                      succeeded, rejected, failed)
+                 VALUES ('attributed', 'merge', 'alice', 100, 160, 1, 0, 0),
+                        ('orphaned', 'merge', 'alice', 200, 260, 1, 0, 0);
+                 INSERT INTO batch_targets (batch_id, position, repository_id, owner, repo,
+                                            number, title, html_url, outcome)
+                 VALUES ('attributed', 0, 1, 'acme', 'api', 7, 'Bump serde', 'https://x', '{}'),
+                        ('orphaned', 0, 2, 'acme', 'gone', 8, 'Bump tokio', 'https://y', '{}');
+                 INSERT INTO running_batches (batch_id, action, requested_by, started_at,
+                                              target_count)
+                 VALUES ('running', 'merge', 'alice', 300, 2);",
+            )
+            .await
+            .unwrap();
+
+        apply(&connection).await.unwrap();
+
+        let attributed = rows(
+            &connection,
+            "SELECT batch_id, installation_id FROM batches ORDER BY batch_id",
+            |row| {
+                (
+                    row.get::<String>(0).unwrap(),
+                    row.get::<Option<i64>>(1).unwrap(),
+                )
+            },
+        )
+        .await;
+        assert_eq!(
+            attributed,
+            [
+                ("attributed".to_owned(), Some(9)),
+                ("orphaned".to_owned(), None)
+            ]
+        );
+        assert_eq!(
+            rows(
+                &connection,
+                "SELECT installation_id FROM running_batches",
+                |row| row.get::<Option<i64>>(0).unwrap(),
+            )
+            .await,
+            [None]
+        );
     }
 
     #[tokio::test]
