@@ -7,6 +7,11 @@
 //! identity GitHub refuses, the merge method the repository disallows, the
 //! user token the deployment has none of — would be rejected the same way
 //! whatever the head, and is left out with that said.
+//!
+//! The notice that names the targets left out is shared with the submission
+//! itself, which leaves out a target the projection no longer has by the
+//! time the batch is submitted; both name the pull request with its
+//! repository, in one voice.
 
 use dependaboard_core::{BatchProgress, PrRecord, PrTarget, RejectReason};
 use futures_util::future::join_all;
@@ -47,32 +52,38 @@ pub(crate) struct Refreshed {
 impl Refreshed {
     /// What to tell the user about the targets left out; nothing if none were.
     pub(crate) fn notice(&self) -> Option<String> {
-        if self.left_out.is_empty() {
-            return None;
-        }
-        let entries = self
-            .left_out
-            .iter()
-            .map(|left_out| {
-                let target = &left_out.target;
-                let why = match &left_out.why {
-                    LeftOutReason::NoLongerOpen => "is no longer open".to_owned(),
-                    LeftOutReason::WouldBeRejectedAgain(reason) => {
-                        format!("would be rejected again ({reason})")
-                    }
-                    LeftOutReason::CouldNotRefresh(error) => {
-                        format!("could not be refreshed ({error})")
-                    }
-                };
-                format!("{}/{}#{} {why}", target.owner, target.repo, target.number)
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        Some(format!("Left out of the retry: {entries}."))
+        left_out_notice("the retry", &self.left_out)
     }
 }
 
-/// A rejected target the retry does not carry, and why.
+/// What to tell the user about the targets left out of `what` — "the retry",
+/// "the batch" — each named with its repository and why; nothing if none
+/// were.
+pub(crate) fn left_out_notice(what: &str, left_out: &[LeftOut]) -> Option<String> {
+    if left_out.is_empty() {
+        return None;
+    }
+    let entries = left_out
+        .iter()
+        .map(|left_out| {
+            let target = &left_out.target;
+            let why = match &left_out.why {
+                LeftOutReason::NoLongerOpen => "is no longer open".to_owned(),
+                LeftOutReason::WouldBeRejectedAgain(reason) => {
+                    format!("would be rejected again ({reason})")
+                }
+                LeftOutReason::CouldNotRefresh(error) => {
+                    format!("could not be refreshed ({error})")
+                }
+            };
+            format!("{}/{}#{} {why}", target.owner, target.repo, target.number)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!("Left out of {what}: {entries}."))
+}
+
+/// A target a retry, or a batch, does not carry, and why.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LeftOut {
     pub(crate) target: PrTarget,
@@ -80,7 +91,7 @@ pub(crate) struct LeftOut {
 }
 
 impl LeftOut {
-    fn no_longer_open(target: &PrTarget) -> Self {
+    pub(crate) fn no_longer_open(target: &PrTarget) -> Self {
         Self {
             target: target.clone(),
             why: LeftOutReason::NoLongerOpen,
@@ -88,11 +99,12 @@ impl LeftOut {
     }
 }
 
-/// Why a rejected target is not in the retry.
+/// Why a target is not in the retry, or the batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LeftOutReason {
-    /// The pull request was closed or merged: rejected as not found, or gone
-    /// by the time it was refreshed.
+    /// The pull request was closed or merged: rejected as not found, gone by
+    /// the time it was refreshed, or gone from the projection by the time the
+    /// batch was submitted.
     NoLongerOpen,
     /// The rejection was over the configuration, not the head, and a fresh
     /// attempt would meet it again; carries the reason.
@@ -302,6 +314,26 @@ mod tests {
             refreshed.notice().as_deref(),
             Some("Left out of the retry: acme/web#13 is no longer open.")
         );
+    }
+
+    /// The same voice names the targets a batch was submitted without: a pull
+    /// request the projection no longer had at submit is named with its
+    /// repository, as the retry names the ones it leaves out, rather than by
+    /// a bare number.
+    #[test]
+    fn a_target_left_out_of_a_batch_is_named_with_its_repository() {
+        let left_out = [
+            LeftOut::no_longer_open(&pr_target(&serde_row())),
+            LeftOut::no_longer_open(&pr_target(&off_page_row())),
+        ];
+
+        assert_eq!(
+            left_out_notice("the batch", &left_out).as_deref(),
+            Some(
+                "Left out of the batch: acme/web#12 is no longer open; acme/web#13 is no longer open."
+            )
+        );
+        assert_eq!(left_out_notice("the batch", &[]), None);
     }
 
     /// A rejected pull request may have been merged or closed since: the

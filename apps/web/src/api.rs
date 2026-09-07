@@ -3,8 +3,9 @@
 //! the store and Restate through [`crate::server::state::ServerState`].
 
 use dependaboard_core::{
-    BatchList, BatchProgress, BulkActionKind, Capabilities, DashboardPage, DashboardSummary, Page,
-    PrFilter, PrRecord, PrState, ProjectionRevision, SubmittedTarget, UserId,
+    BatchList, BatchProgress, BatchReceipt, BulkActionKind, Capabilities, DashboardPage,
+    DashboardSummary, Page, PrFilter, PrRecord, PrState, ProjectionRevision, SubmittedTarget,
+    UserId,
 };
 use dioxus::prelude::*;
 
@@ -105,21 +106,31 @@ pub(crate) async fn load_capabilities() -> Result<Capabilities, ServerFnError> {
 /// rather than refused for the workflow already existing.
 ///
 /// The browser names each target by key and the head it saw; the rest of the
-/// target is resolved here from the projection, and a target the dashboard
-/// does not know, or one from another installation, refuses the batch. The
-/// submission is held to the batch rules first, so a submission that could
-/// not run resolves nothing.
+/// target is resolved here from the projection. A target the projection no
+/// longer has — merged or closed between the selection and the click — is one
+/// pull request's business, not the batch's: it is left out, named by key in
+/// the receipt, and the batch runs over the rest. A target from another
+/// installation is no race but a client that should not exist, and refuses
+/// the batch whole; so does a submission that leaves nothing to run. The
+/// submission is held to the batch rules first, so one that could not run
+/// resolves nothing.
 #[server(state: Extension<ServerState>, user: Extension<UserId>)]
 pub(crate) async fn submit_batch(
     batch_id: String,
     action: BulkActionKind,
     targets: Vec<SubmittedTarget>,
-) -> Result<(), ServerFnError> {
+) -> Result<BatchReceipt, ServerFnError> {
     validate_batch(&batch_id, targets.iter().map(SubmittedTarget::key))
         .map_err(|invalid| ServerFnError::new(invalid.to_string()))?;
-    let mut resolved = Vec::with_capacity(targets.len());
+    let submitted = targets.len();
+    let mut resolved = Vec::with_capacity(submitted);
+    let mut left_out = Vec::new();
     for target in targets {
-        let row = projected_pr(&state, &target.key()).await?;
+        let key = target.key();
+        let Some(row) = projected_pr(&state, &key).await? else {
+            left_out.push(key);
+            continue;
+        };
         resolved.push(PrTarget {
             repository_id: row.repository_id,
             owner: row.owner,
@@ -129,6 +140,11 @@ pub(crate) async fn submit_batch(
             title: row.title,
             html_url: row.html_url,
         });
+    }
+    if resolved.is_empty() {
+        return Err(ServerFnError::new(format!(
+            "none of the {submitted} pull requests submitted are still in the dashboard"
+        )));
     }
     let request = BulkRequest {
         action,
@@ -143,7 +159,8 @@ pub(crate) async fn submit_batch(
             Some(&batch_id),
         )
         .await
-        .map_err(restate_unavailable)
+        .map_err(restate_unavailable)?;
+    Ok(BatchReceipt { left_out })
 }
 
 #[server(state: Extension<ServerState>)]
@@ -216,7 +233,10 @@ pub(crate) async fn request_pr_sync(
     repository_id: u64,
     number: u64,
 ) -> Result<String, ServerFnError> {
-    let row = projected_pr(&state, &PrKey::new(repository_id, number)).await?;
+    let key = PrKey::new(repository_id, number);
+    let row = projected_pr(&state, &key)
+        .await?
+        .ok_or_else(|| no_longer_in_the_dashboard(&key))?;
     let completion_id = new_batch_id();
     let request = ManualSyncRequest {
         repository_id: row.repository_id,
@@ -233,31 +253,34 @@ pub(crate) async fn request_pr_sync(
     Ok(completion_id)
 }
 
-/// The pull request the browser named, as the projection has it. A key the
-/// dashboard does not know is refused, as is one whose repository belongs to
-/// another installation: the browser only ever names a key, and the
-/// projection's row is the word on which installation the pull request is
-/// in and what it is.
+/// The pull request the browser named, as the projection has it, or `None`
+/// for one the projection does not: the browser only ever names a key, and
+/// the projection's row is the word on which installation the pull request
+/// is in and what it is. A key whose repository belongs to another
+/// installation is refused outright rather than answered with nothing: the
+/// projection never showed it, so no dashboard could have named it.
 #[cfg(feature = "server")]
-async fn projected_pr(state: &ServerState, key: &PrKey) -> Result<PrRecord, ServerFnError> {
-    let row = state
-        .store
-        .get_pr(key)
-        .await
-        .map_err(store_failure)?
-        .ok_or_else(|| {
-            ServerFnError::new(format!(
-                "pull request #{} is no longer in the dashboard",
-                key.number
-            ))
-        })?;
+async fn projected_pr(state: &ServerState, key: &PrKey) -> Result<Option<PrRecord>, ServerFnError> {
+    let Some(row) = state.store.get_pr(key).await.map_err(store_failure)? else {
+        return Ok(None);
+    };
     if row.installation_id != state.installation_id {
         return Err(ServerFnError::new(format!(
             "pull request #{} does not belong to the configured installation",
             key.number
         )));
     }
-    Ok(row)
+    Ok(Some(row))
+}
+
+/// Refuses a request for a pull request the projection no longer has, where
+/// the request has nothing to do without it.
+#[cfg(feature = "server")]
+fn no_longer_in_the_dashboard(key: &PrKey) -> ServerFnError {
+    ServerFnError::new(format!(
+        "pull request #{} is no longer in the dashboard",
+        key.number
+    ))
 }
 
 /// Turns a read-model failure into the browser's error. A page cursor the
@@ -479,40 +502,90 @@ mod tests {
         );
     }
 
-    /// One target the dashboard cannot vouch for refuses the whole batch: a
-    /// pull request from another installation, or one the projection no
-    /// longer has. Nothing reaches Restate for a batch that was refused.
+    /// A pull request the projection no longer has — merged by hand, or
+    /// superseded, between the selection and the click — is one target's
+    /// business, not the batch's: it is left out, named by key in the answer
+    /// so the browser can account for it, and the batch runs over the rest.
     #[tokio::test]
-    async fn a_batch_with_a_target_the_dashboard_cannot_vouch_for_is_refused_whole() {
+    async fn a_target_gone_from_the_projection_is_left_out_and_the_rest_run() {
+        let dashboard = dashboard().await;
+        dashboard.project(INSTALLATION_ID, &grouped_row()).await;
+        let batch_id = new_batch_id();
+
+        let response = submit(
+            &dashboard,
+            &batch_id,
+            json!([target(7, 9, "abc123"), target(7, 10, "abc124")]),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<BatchReceipt>().await.unwrap(),
+            BatchReceipt {
+                left_out: vec![PrKey::new(7, 10)],
+            }
+        );
+        let request = the_one_request(
+            &dashboard,
+            &format!("/restate/send/BulkAction/{batch_id}/run"),
+        );
+        assert_eq!(
+            request["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|target| target["number"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [9],
+            "the batch carries only the targets the projection vouched for"
+        );
+    }
+
+    /// A submission none of whose targets the projection has is no batch to
+    /// run: it is refused as a whole, before Restate hears of it.
+    #[tokio::test]
+    async fn a_submission_with_no_resolvable_target_is_refused_whole() {
+        let dashboard = dashboard().await;
+        dashboard.project(INSTALLATION_ID, &grouped_row()).await;
+
+        let response = submit(
+            &dashboard,
+            &new_batch_id(),
+            json!([target(7, 10, "abc124"), target(7, 11, "abc125")]),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error_message(response).await,
+            "none of the 2 pull requests submitted are still in the dashboard"
+        );
+        assert!(dashboard.forwards().is_empty());
+    }
+
+    /// A pull request from another installation is not a race the dashboard
+    /// can lose: the projection never showed it, so a submission naming one
+    /// comes from a client that should not exist. It refuses the whole batch,
+    /// and nothing reaches Restate.
+    #[tokio::test]
+    async fn a_batch_with_a_target_from_another_installation_is_refused_whole() {
         let dashboard = dashboard().await;
         dashboard.project(INSTALLATION_ID, &grouped_row()).await;
         dashboard.project(INSTALLATION_ID + 1, &serde_row()).await;
-        let own = target(7, 9, "abc123");
 
-        let foreign = submit(
+        let response = submit(
             &dashboard,
             &new_batch_id(),
-            json!([own, target(8, 12, "def456")]),
+            json!([target(7, 9, "abc123"), target(8, 12, "def456")]),
         )
         .await;
-        assert_eq!(foreign.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
-            error_message(foreign).await,
+            error_message(response).await,
             "pull request #12 does not belong to the configured installation"
         );
-
-        let gone = submit(
-            &dashboard,
-            &new_batch_id(),
-            json!([own, target(7, 10, "abc124")]),
-        )
-        .await;
-        assert_eq!(gone.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            error_message(gone).await,
-            "pull request #10 is no longer in the dashboard"
-        );
-
         assert!(dashboard.forwards().is_empty());
     }
 

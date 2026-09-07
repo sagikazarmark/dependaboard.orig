@@ -12,7 +12,9 @@
 
 use std::time::Duration;
 
-use dependaboard_core::{BatchProgress, BulkActionKind, PrTarget, SubmittedTarget, unix_seconds};
+use dependaboard_core::{
+    BatchProgress, BatchReceipt, BulkActionKind, PrKey, PrTarget, SubmittedTarget, unix_seconds,
+};
 
 use crate::api::{load_batch_progress, submit_batch};
 use crate::ui::{POLL_INTERVAL, sleep, user_facing};
@@ -46,7 +48,7 @@ pub(crate) trait BatchGateway {
 
 /// A [`BatchGateway`] with a batch to submit.
 pub(crate) trait SubmitGateway: BatchGateway {
-    async fn submit(&mut self) -> Result<(), String>;
+    async fn submit(&mut self) -> Result<BatchReceipt, String>;
 }
 
 /// A batch known by id alone, followed through the server functions.
@@ -96,7 +98,7 @@ impl BatchGateway for ServerBatch {
 }
 
 impl SubmitGateway for ServerBatch {
-    async fn submit(&mut self) -> Result<(), String> {
+    async fn submit(&mut self) -> Result<BatchReceipt, String> {
         let targets = self.targets.iter().map(SubmittedTarget::from).collect();
         submit_batch(self.follow.batch_id.clone(), self.action, targets)
             .await
@@ -172,6 +174,41 @@ impl Followed {
         true
     }
 
+    /// Drops the targets `keys` name from the dashboard's own snapshot: the
+    /// server left them out of the batch, so Restate will never report them.
+    /// Restate's word, once heard, already counts only what it runs, and is
+    /// left alone.
+    fn leave_out(&mut self, keys: &[PrKey]) {
+        if self.heard {
+            return;
+        }
+        if let Some(progress) = self.progress.as_mut() {
+            progress
+                .targets
+                .retain(|item| !keys.contains(&item.target.key()));
+        }
+    }
+
+    /// The targets the dashboard queued that `progress`, Restate's word on
+    /// the batch, does not run: the receipt a lost response would have
+    /// carried, read off what Restate has instead.
+    fn left_out_of(&self, progress: &BatchProgress) -> Vec<PrKey> {
+        let Some(queued) = self.progress.as_ref().filter(|_| !self.heard) else {
+            return Vec::new();
+        };
+        queued
+            .targets
+            .iter()
+            .map(|item| item.target.key())
+            .filter(|key| {
+                !progress
+                    .targets
+                    .iter()
+                    .any(|item| item.target.key() == *key)
+            })
+            .collect()
+    }
+
     /// Notes how the last poll went, if that is news.
     fn answered(&mut self, trouble: Option<String>) -> bool {
         if self.trouble == trouble {
@@ -195,22 +232,40 @@ pub(crate) enum BatchOutcome {
 
 /// Submits `followed` and follows it, calling `report` with each change in
 /// what is known of it, until it completes or cannot be submitted.
+/// `on_accepted` is called once, when Restate is known to have the batch,
+/// with the receipt: which of the targets submitted the server left out of
+/// it. A round trip that failed after Restate took the batch has no receipt
+/// to hand over, so the receipt is read off Restate's progress instead: what
+/// the dashboard queued that Restate does not run was left out.
 pub(crate) async fn run_batch<G: SubmitGateway>(
     gateway: &mut G,
     mut followed: Followed,
     mut report: impl FnMut(&Followed),
+    on_accepted: impl FnOnce(BatchReceipt),
 ) -> BatchOutcome {
     match submit(gateway).await {
-        Ok(Some(progress)) => {
+        Ok(Taken::Accepted(receipt)) => {
+            if !receipt.left_out.is_empty() {
+                followed.leave_out(&receipt.left_out);
+                report(&followed);
+            }
+            on_accepted(receipt);
+        }
+        Ok(Taken::Running(progress)) => {
+            // Read against the dashboard's own snapshot, before Restate's
+            // word replaces it.
+            let receipt = BatchReceipt {
+                left_out: followed.left_out_of(&progress),
+            };
             let now = gateway.now();
             if followed.hear(progress, now) {
                 report(&followed);
             }
+            on_accepted(receipt);
             if let Some(progress) = followed.progress.as_ref().filter(|it| it.completed) {
                 return BatchOutcome::Completed(progress.clone());
             }
         }
-        Ok(None) => {}
         Err(error) => return BatchOutcome::NotSubmitted(error),
     }
     poll(gateway, followed, true, report).await
@@ -271,22 +326,30 @@ async fn poll<G: BatchGateway>(
     }
 }
 
-/// Gets the batch accepted. `Ok(None)` is a clean acceptance; `Ok(Some)` means
-/// a round trip failed after Restate had already taken the batch, and carries
-/// the progress that proved it.
-async fn submit<G: SubmitGateway>(gateway: &mut G) -> Result<Option<BatchProgress>, String> {
+/// How Restate came to have the batch.
+enum Taken {
+    /// The submission was answered: a clean acceptance, with its receipt.
+    Accepted(BatchReceipt),
+    /// A round trip failed after Restate had already taken the batch; carries
+    /// the progress that proved it.
+    Running(BatchProgress),
+}
+
+/// Gets the batch accepted, or gives up after [`SUBMIT_ATTEMPTS`] with the
+/// last error.
+async fn submit<G: SubmitGateway>(gateway: &mut G) -> Result<Taken, String> {
     let mut attempt = 0;
     loop {
         attempt += 1;
         let error = match gateway.submit().await {
-            Ok(()) => return Ok(None),
+            Ok(receipt) => return Ok(Taken::Accepted(receipt)),
             Err(error) => error,
         };
         // A failed round trip does not mean Restate did not take the batch;
         // the workflow's own progress is the authority, and a batch that is
         // running must not be submitted again.
         if let Ok(Some(progress)) = gateway.progress().await {
-            return Ok(Some(progress));
+            return Ok(Taken::Running(progress));
         }
         if attempt == SUBMIT_ATTEMPTS {
             return Err(error);
@@ -309,7 +372,7 @@ mod tests {
     /// and the last one repeats once the script runs out. The clock reads the
     /// epoch plus one second per tick, as the real one would.
     struct Scripted {
-        submits: VecDeque<Result<(), String>>,
+        submits: VecDeque<Result<BatchReceipt, String>>,
         progress: VecDeque<Result<Option<BatchProgress>, String>>,
         submit_calls: u32,
         ticks: u32,
@@ -320,7 +383,7 @@ mod tests {
 
     impl Scripted {
         fn new(
-            submits: impl IntoIterator<Item = Result<(), String>>,
+            submits: impl IntoIterator<Item = Result<BatchReceipt, String>>,
             progress: impl IntoIterator<Item = Result<Option<BatchProgress>, String>>,
         ) -> Self {
             Self {
@@ -341,7 +404,7 @@ mod tests {
     }
 
     impl SubmitGateway for Scripted {
-        async fn submit(&mut self) -> Result<(), String> {
+        async fn submit(&mut self) -> Result<BatchReceipt, String> {
             self.submit_calls += 1;
             next_or_repeat(&mut self.submits)
         }
@@ -401,14 +464,20 @@ mod tests {
             .collect()
     }
 
-    async fn run(gateway: &mut Scripted) -> (BatchOutcome, Vec<Followed>) {
+    async fn run(gateway: &mut Scripted) -> (BatchOutcome, Vec<Followed>, Option<BatchReceipt>) {
         let followed = Followed::queued("batch-1", BulkActionKind::Merge, &targets(), EPOCH);
         let mut reported = Vec::new();
-        let outcome = run_batch(gateway, followed, |followed| {
-            reported.push(followed.clone());
-        })
+        let mut accepted = None;
+        let outcome = run_batch(
+            gateway,
+            followed,
+            |followed| {
+                reported.push(followed.clone());
+            },
+            |receipt| accepted = Some(receipt),
+        )
         .await;
-        (outcome, reported)
+        (outcome, reported, accepted)
     }
 
     async fn attach(gateway: &mut Scripted) -> (BatchOutcome, Vec<Followed>) {
@@ -424,11 +493,85 @@ mod tests {
     async fn a_submission_that_keeps_failing_is_given_up_after_the_attempt_budget() {
         let mut gateway = Scripted::new([Err(unavailable())], [Ok(None)]);
 
-        let (outcome, reported) = run(&mut gateway).await;
+        let (outcome, reported, accepted) = run(&mut gateway).await;
 
         assert_eq!(outcome, BatchOutcome::NotSubmitted(unavailable()));
         assert_eq!(gateway.submit_calls, SUBMIT_ATTEMPTS);
         assert!(reported.is_empty());
+        assert_eq!(
+            accepted, None,
+            "a batch Restate never took was not accepted"
+        );
+    }
+
+    /// The batch as Restate runs it when the server left the second fixture
+    /// target out: the first alone.
+    fn without_the_second() -> BatchProgress {
+        BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets()[..1])
+    }
+
+    /// [`without_the_second`], run to the end.
+    fn done_without_the_second() -> BatchProgress {
+        let mut done = without_the_second();
+        done.record(
+            &targets()[0].key(),
+            ActionOutcome::Succeeded {
+                detail: "merged".to_owned(),
+            },
+        );
+        done
+    }
+
+    /// The server took the batch over the targets the projection still had
+    /// and named the one it did not. That is an acceptance, not a failure:
+    /// the batch is not submitted again, the target left out is handed back
+    /// at once for the dashboard to name, and the dashboard's own snapshot
+    /// of the batch drops it, so the pill and drawer count what Restate runs.
+    #[tokio::test]
+    async fn a_target_the_server_left_out_is_handed_back_and_the_batch_followed_without_it() {
+        let receipt = BatchReceipt {
+            left_out: vec![targets()[1].key()],
+        };
+        let mut gateway =
+            Scripted::new([Ok(receipt.clone())], [Ok(Some(done_without_the_second()))]);
+
+        let (outcome, reported, accepted) = run(&mut gateway).await;
+
+        assert_eq!(
+            gateway.submit_calls, 1,
+            "a partial acceptance is not retried"
+        );
+        assert_eq!(accepted, Some(receipt));
+        assert_eq!(outcome, BatchOutcome::Completed(done_without_the_second()));
+        assert_eq!(
+            (reported[0].heard, reported[0].progress.clone()),
+            (false, Some(without_the_second())),
+            "the dashboard's own snapshot is reported without the target left out"
+        );
+    }
+
+    /// A round trip that failed after Restate took the batch carries no
+    /// receipt; Restate's progress is the word on which targets it runs, and
+    /// a target the submission named that Restate does not was left out.
+    #[tokio::test]
+    async fn a_batch_already_running_names_what_was_left_out_by_what_restate_runs() {
+        let mut gateway = Scripted::new(
+            [Err(unavailable())],
+            [
+                Ok(Some(without_the_second())),
+                Ok(Some(done_without_the_second())),
+            ],
+        );
+
+        let (outcome, _, accepted) = run(&mut gateway).await;
+
+        assert_eq!(outcome, BatchOutcome::Completed(done_without_the_second()));
+        assert_eq!(
+            accepted,
+            Some(BatchReceipt {
+                left_out: vec![targets()[1].key()],
+            })
+        );
     }
 
     #[tokio::test]
@@ -438,11 +581,16 @@ mod tests {
             [Ok(Some(after(1))), Ok(Some(after(2)))],
         );
 
-        let (outcome, reported) = run(&mut gateway).await;
+        let (outcome, reported, accepted) = run(&mut gateway).await;
 
         assert_eq!(outcome, BatchOutcome::Completed(after(2)));
         assert_eq!(gateway.submit_calls, 1);
         assert_eq!(heard(&reported), [after(1), after(2)]);
+        assert_eq!(
+            accepted,
+            Some(BatchReceipt::default()),
+            "Restate runs every target, so none was left out"
+        );
     }
 
     /// Restate took the batch; a service that is down or deploying starts it
@@ -452,12 +600,13 @@ mod tests {
     async fn a_submitted_batch_restate_has_not_started_is_waited_for() {
         let progress =
             repeat(Ok(None), 4 * ATTACH_LIMIT).chain([Ok(Some(queued())), Ok(Some(after(2)))]);
-        let mut gateway = Scripted::new([Ok(())], progress);
+        let mut gateway = Scripted::new([Ok(BatchReceipt::default())], progress);
 
-        let (outcome, reported) = run(&mut gateway).await;
+        let (outcome, reported, accepted) = run(&mut gateway).await;
 
         assert_eq!(outcome, BatchOutcome::Completed(after(2)));
         assert_eq!(heard(&reported), [queued(), after(2)]);
+        assert_eq!(accepted, Some(BatchReceipt::default()));
     }
 
     /// Nothing has moved for as long as GitHub's budgets allow, and the
@@ -471,9 +620,9 @@ mod tests {
             .into_iter()
             .chain(repeat(Ok(Some(after(1))), three_hours))
             .chain([Ok(Some(after(2)))]);
-        let mut gateway = Scripted::new([Ok(())], progress);
+        let mut gateway = Scripted::new([Ok(BatchReceipt::default())], progress);
 
-        let (outcome, reported) = run(&mut gateway).await;
+        let (outcome, reported, _) = run(&mut gateway).await;
 
         assert_eq!(outcome, BatchOutcome::Completed(after(2)));
         assert_eq!(
@@ -503,9 +652,9 @@ mod tests {
             Ok(Some(after(1))),
             Ok(Some(after(2))),
         ];
-        let mut gateway = Scripted::new([Ok(())], progress);
+        let mut gateway = Scripted::new([Ok(BatchReceipt::default())], progress);
 
-        let (outcome, reported) = run(&mut gateway).await;
+        let (outcome, reported, _) = run(&mut gateway).await;
 
         assert_eq!(outcome, BatchOutcome::Completed(after(2)));
         assert_eq!(

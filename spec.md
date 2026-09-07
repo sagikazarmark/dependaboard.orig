@@ -655,7 +655,9 @@ matching               the selection is resolved server side, newest update firs
 Bulk action       UI → server fn → Restate ingress
                        the UI names each target by key and the head SHA it saw; the
                        server fn resolves the rest — repository, title, link — from
-                       PrStore::get_pr and refuses a target of another installation
+                       PrStore::get_pr, refuses a target of another installation whole,
+                       and leaves out one the projection no longer has: the batch runs
+                       over the rest, and the receipt names the keys left out
                        POST /restate/send/BulkAction/{batch_id}/run
                      → workflow lists the batch as running: PrStore::start_batch
                      → workflow fans out to PullRequest objects
@@ -677,6 +679,22 @@ result, `/restate/send/...` returns as soon as the invocation is accepted. Use `
 `run` — a call would block the server function for the whole batch, which is deliberately
 rate-limited and could be minutes. (The older unversioned paths and the `/send` suffix
 still work, but Restate says new code should use these.)
+
+**A target the projection no longer has is one pull request's business, not the batch's.**
+The selection remembers a row the page has stopped showing, so a pull request merged by
+hand or superseded between the selection and the click is still submitted; refusing the
+whole batch over it would send the other seventy-nine nowhere. The server fn leaves such a
+target out and runs the batch over the rest, the same verdict the objects give a pull
+request gone since the guard. It cannot vouch for the target — no row, no `owner/repo`,
+nothing the audit record could name in full — so the target does not go to Restate as a
+`PrTarget` and the batch record never knows of it; the receipt names it by key, and the
+UI, which still holds what it asked for, names it with its repository in the same notice
+the retry uses for the targets it leaves out. A submission that resolves nothing is
+refused whole, before anything reaches Restate, as is one naming a target of another
+installation: the projection never showed such a row, so that is not a race but a client
+that should not exist. The UI takes the rows out of the selection only once Restate has
+the batch — the ones queued and the ones left out alike — so a submission refused whole
+leaves the selection standing to try again.
 
 Submitting the same workflow id twice fails with "Previously accepted" — which is exactly
 the deduplication the client-generated batch id is there to exploit. Exploiting it means

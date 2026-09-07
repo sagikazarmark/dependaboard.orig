@@ -723,6 +723,18 @@ impl From<&PrTarget> for SubmittedTarget {
     }
 }
 
+/// What the browser gets back for a batch submission Restate took. The batch
+/// runs over every target the projection vouched for; `left_out` names the
+/// ones it could not — pull requests no longer in the dashboard, merged or
+/// closed between the selection and the click — which the batch does not
+/// carry. They are named by key alone, since the projection has nothing else
+/// to say about them; the browser still holds what it asked for and is the
+/// one to say which pull requests these were.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchReceipt {
+    pub left_out: Vec<PrKey>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BulkRequest {
     pub action: BulkActionKind,

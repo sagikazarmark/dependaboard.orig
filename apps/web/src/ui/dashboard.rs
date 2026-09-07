@@ -196,13 +196,12 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
                     .collect()
             }),
             oncancel: move |_| pending.set(None),
-            onconfirm: move |action: PendingAction| {
-                // The rows queued leave the selection; the rest of it stands,
-                // so one pull request merged from its drawer does not drop
-                // the twenty picked for the next batch.
-                state.deselect(&action.rows);
-                queue_batch(action, host);
-            },
+            // The rows leave the selection once Restate has the batch, not
+            // before: a submission refused whole leaves them standing to try
+            // again, and the rest of the selection stands either way, so one
+            // pull request merged from its drawer does not drop the twenty
+            // picked for the next batch.
+            onconfirm: move |action: PendingAction| queue_batch(action, host),
         }
     }
 }

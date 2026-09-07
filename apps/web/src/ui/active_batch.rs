@@ -7,7 +7,7 @@
 //! One batch is followed at a time. Following another, however it comes, ends
 //! the follow before it, so two never report into the one pill.
 
-use dependaboard_core::{BatchProgress, new_batch_id, unix_seconds};
+use dependaboard_core::{BatchProgress, BatchReceipt, new_batch_id, unix_seconds};
 use dioxus::core::Task;
 use dioxus::prelude::*;
 
@@ -18,7 +18,7 @@ use crate::ui::batch::{
 };
 use crate::ui::dashboard_state::{DashboardState, use_dashboard};
 use crate::ui::progress_drawer::ProgressDrawer;
-use crate::ui::retry::{ServerRefresh, refresh_rejected};
+use crate::ui::retry::{LeftOut, ServerRefresh, left_out_notice, refresh_rejected};
 use crate::ui::{PendingAction, sticky};
 
 /// Where a followed batch lands: what is known of it, which the pill and
@@ -127,7 +127,9 @@ pub(crate) fn ActiveBatch(
 /// Queues `pending` as a bulk action and follows it to the end: the host's
 /// followed batch carries each poll's answer and its drawer opens on it, the
 /// outcome becomes a toast, and a batch that ran to completion reloads the
-/// page.
+/// page. Once Restate has the batch its rows leave the selection and any
+/// target the server left out is named; a submission Restate never took
+/// leaves the selection as it was, so the user has the rows to try again.
 pub(crate) fn queue_batch(pending: PendingAction, mut host: BatchHost) {
     let action = pending.action;
     let targets = pending.targets();
@@ -139,12 +141,37 @@ pub(crate) fn queue_batch(pending: PendingAction, mut host: BatchHost) {
             action,
             targets,
         };
-        let outcome = run_batch(&mut batch, followed, |update| {
-            host.followed.set(Some(update.clone()));
-        })
+        let mut followed_signal = host.followed;
+        let outcome = run_batch(
+            &mut batch,
+            followed,
+            |update| {
+                followed_signal.set(Some(update.clone()));
+            },
+            |receipt| account_for(&pending, &receipt, host),
+        )
         .await;
         conclude(outcome, host);
     });
+}
+
+/// Accounts for `pending` once Restate has the batch it was queued as. Its
+/// rows leave the selection — the ones queued and the ones left out alike,
+/// since neither is for a next batch — and the targets the server left out,
+/// pull requests the projection no longer had by the time the batch was
+/// submitted, are named with their repositories, as the retry names the
+/// targets it leaves out.
+fn account_for(pending: &PendingAction, receipt: &BatchReceipt, mut host: BatchHost) {
+    host.state.deselect(&pending.rows);
+    let left_out: Vec<LeftOut> = pending
+        .targets()
+        .iter()
+        .filter(|target| receipt.left_out.contains(&target.key()))
+        .map(LeftOut::no_longer_open)
+        .collect();
+    if let Some(notice) = left_out_notice("the batch", &left_out) {
+        host.toast.warning(notice, sticky());
+    }
 }
 
 /// Follows the batch `batch_id` names, known by its id alone — from the URL
