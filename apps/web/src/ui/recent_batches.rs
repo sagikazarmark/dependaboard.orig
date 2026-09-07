@@ -12,7 +12,7 @@ use dioxus::prelude::*;
 use crate::api::load_recent_batches;
 use crate::components::button::{Button, ButtonSize};
 use crate::ui::dashboard_state::{Remote, use_dashboard};
-use crate::ui::format::{pull_requests, relative_time, verdict_tally};
+use crate::ui::format::{pull_requests, relative_time, utc_timestamp, verdict_tally};
 use crate::ui::progress_drawer::TargetRow;
 use crate::ui::side_panel::SidePanel;
 
@@ -115,6 +115,7 @@ pub(crate) fn RecentBatchList(
 #[component]
 fn RunningEntry(batch: RunningBatch, now: u64, onfollow: EventHandler<String>) -> Element {
     let batch_id = batch.batch_id.clone();
+    let started = utc_timestamp(batch.started_at);
     rsx! {
         div { class: "batch-entry batch-running",
             div { class: "batch-headline",
@@ -123,8 +124,12 @@ fn RunningEntry(batch: RunningBatch, now: u64, onfollow: EventHandler<String>) -
                     span { class: "batch-tally", "running" }
                 }
                 small { class: "batch-meta",
-                    "{pull_requests(batch.target_count)} · by {batch.requested_by} · started {relative_time(now, batch.started_at)}"
+                    "{pull_requests(batch.target_count)} · by {batch.requested_by} · started "
+                    time { datetime: "{started}", title: "started {started}",
+                        "{relative_time(now, batch.started_at)}"
+                    }
                 }
+                BatchId { batch_id: batch.batch_id.clone() }
             }
             div { class: "progress-footer",
                 Button {
@@ -138,9 +143,21 @@ fn RunningEntry(batch: RunningBatch, now: u64, onfollow: EventHandler<String>) -
     }
 }
 
+/// A batch that has run, folded to a headline — what was asked, how it went in
+/// all, over how many pull requests, by whom, how long ago it finished, and
+/// its id — and opened to when it started and finished, to the second, and to
+/// every target with its verdict. The age keeps the headline; the instants
+/// behind it are on the age for a hover and in the opened entry for a touch,
+/// since an age floors a fortnight-old batch and a three-week-old one to the
+/// same "2w".
 #[component]
 fn BatchEntry(batch: BatchRecord, now: u64) -> Element {
     let total = batch.targets.len() as u64;
+    let finished = utc_timestamp(batch.completed_at);
+    let times = format!(
+        "started {} · finished {finished}",
+        utc_timestamp(batch.started_at)
+    );
     rsx! {
         details { class: "batch-entry",
             summary { class: "batch-headline",
@@ -151,19 +168,63 @@ fn BatchEntry(batch: BatchRecord, now: u64) -> Element {
                     }
                 }
                 small { class: "batch-meta",
-                    "{pull_requests(total)} · by {batch.requested_by} · finished {relative_time(now, batch.completed_at)}"
+                    "{pull_requests(total)} · by {batch.requested_by} · finished "
+                    time { datetime: "{finished}", title: "{times}",
+                        "{relative_time(now, batch.completed_at)}"
+                    }
                 }
+                BatchId { batch_id: batch.batch_id.clone() }
             }
+            small { class: "batch-times", "{times}" }
             div { class: "progress-list",
                 for target in &batch.targets {
                     TargetRow {
                         owner: target.owner.clone(),
                         repo: target.repo.clone(),
                         number: target.number,
+                        title: target.title.clone(),
                         html_url: target.html_url.clone(),
                         state: TargetProgressState::from(target.outcome.clone()),
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Puts the id the page receives on the clipboard: the browser's clipboard
+/// takes a string, and the id is sent rather than spliced into the script so
+/// that no id, whatever it holds, is read as code.
+const COPY_SCRIPT: &str = r#"
+    const id = await dioxus.recv();
+    await navigator.clipboard.writeText(id);
+"#;
+
+/// A batch's id, as the `?batch=<id>` link carries it, with a copy of it on
+/// offer: an entry is matched to a link by its id, and a link is made from
+/// one. The copy says it has copied and stays saying so; the drawer's next
+/// opening starts it over. Inside a `<summary>`, so the click is kept from
+/// folding or unfolding the entry.
+#[component]
+fn BatchId(batch_id: String) -> Element {
+    let mut copied = use_signal(|| false);
+    let id = batch_id.clone();
+    rsx! {
+        div { class: "batch-id-line",
+            code { class: "batch-id", "{batch_id}" }
+            button {
+                class: "copy-button",
+                r#type: "button",
+                title: "Copy the batch id",
+                onclick: move |event: MouseEvent| {
+                    event.prevent_default();
+                    event.stop_propagation();
+                    let eval = document::eval(COPY_SCRIPT);
+                    if eval.send(id.clone()).is_ok() {
+                        copied.set(true);
+                    }
+                },
+                if copied() { "copied" } else { "copy" }
             }
         }
     }
@@ -285,13 +346,15 @@ mod tests {
         assert!(html.contains("0 succeeded, 0 rejected, 1 failed"), "{html}");
         assert!(html.contains("1 succeeded, 1 rejected, 0 failed"), "{html}");
         assert!(
-            html.contains("1 pull request · by bob · finished now"),
+            html.contains("1 pull request · by bob · finished <time"),
             "{html}"
         );
+        assert!(html.contains(">now</time>"), "{html}");
         assert!(
-            html.contains("2 pull requests · by alice · finished 2h"),
+            html.contains("2 pull requests · by alice · finished <time"),
             "{html}"
         );
+        assert!(html.contains(">2h</time>"), "{html}");
         for href in [
             "https://github.example/acme/api/pull/9",
             "https://github.example/acme/api/pull/10",
@@ -320,6 +383,113 @@ mod tests {
         assert!(
             !html.contains(OLDER_BUTTON),
             "nothing older to show: {html}"
+        );
+    }
+
+    /// A batch told of by its link — `?batch=<id>` — is found in the list by
+    /// the id its entry shows, in the headline, so the entries need not be
+    /// opened one by one to match it; the id is there to copy, for the link
+    /// the other way. The age is the headline's, kept, and the instant behind
+    /// it is on the age itself, for a hover, and on the opened entry, for a
+    /// touch: two batches an age floors to the same "2w" are told apart by
+    /// when each started and finished, to the second, in UTC.
+    #[test]
+    fn a_batch_entry_shows_its_id_to_copy_and_its_start_and_finish_in_full() {
+        fn Fixture() -> Element {
+            rsx! {
+                RecentBatchList {
+                    batches: Remote::Loaded(finished()),
+                    now: FIXTURE_NOW,
+                    may_have_older: false,
+                    onolder: move |_| {},
+                    onfollow: move |_| {},
+                }
+            }
+        }
+        let html = render(Fixture);
+
+        let headline = html
+            .find(r#"<summary class="batch-headline">"#)
+            .expect("the newest batch has a headline");
+        let id = html
+            .find(r#"<code class="batch-id">batch-2</code>"#)
+            .expect("the newest batch shows its id");
+        let opened = html
+            .find(r#"<div class="progress-list">"#)
+            .expect("the newest batch opens to its targets");
+        assert!(
+            headline < id && id < opened,
+            "the id is in the headline, not the opened entry: {html}"
+        );
+        assert!(
+            html.contains(r#"<code class="batch-id">batch-1</code>"#),
+            "{html}"
+        );
+        assert_eq!(
+            html.matches(COPY_BUTTON).count(),
+            2,
+            "each id has a copy: {html}"
+        );
+        assert!(html.contains(">copy</button>"), "{html}");
+
+        // The rebase: started forty seconds before the fixture's clock,
+        // finished ten seconds before it.
+        assert!(
+            html.contains(r#"datetime="2023-11-14T22:13:10Z""#),
+            "the age is a <time> with the instant behind it: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"title="started 2023-11-14T22:12:40Z · finished 2023-11-14T22:13:10Z""#
+            ),
+            "the instant is on the age, for a hover: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"<small class="batch-times">started 2023-11-14T22:12:40Z · finished 2023-11-14T22:13:10Z</small>"#
+            ),
+            "and in the opened entry: {html}"
+        );
+        // The merge: two hours and thirty seconds to two hours before it.
+        assert!(
+            html.contains(
+                r#"<small class="batch-times">started 2023-11-14T20:12:50Z · finished 2023-11-14T20:13:20Z</small>"#
+            ),
+            "{html}"
+        );
+    }
+
+    const COPY_BUTTON: &str = "copy-button";
+
+    /// The reference says where each target is; the title, kept beside it in
+    /// the record, says which dependency and which versions. Both show, and
+    /// the reference is still the link.
+    #[test]
+    fn each_target_of_a_batch_entry_shows_its_title_beside_its_reference() {
+        fn Fixture() -> Element {
+            rsx! {
+                RecentBatchList {
+                    batches: Remote::Loaded(finished()),
+                    now: FIXTURE_NOW,
+                    may_have_older: false,
+                    onolder: move |_| {},
+                    onfollow: move |_| {},
+                }
+            }
+        }
+        let html = render(Fixture);
+
+        assert_eq!(
+            html.matches(r#"<span class="progress-title" title="Bump serde">Bump serde</span>"#)
+                .count(),
+            3,
+            "every target has its title: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"<a class="github-pr-link" href="https://github.example/acme/api/pull/9" target="_blank" rel="noreferrer"><strong>acme/api#9</strong>"#
+            ),
+            "the reference is still the link: {html}"
         );
     }
 
@@ -369,14 +539,25 @@ mod tests {
         let html = render(Fixture);
 
         let running = html
-            .find("3 pull requests · by carol · started 5m")
+            .find("3 pull requests · by carol · started <time")
             .expect("the running batch is listed");
         let rebase = html.find("rebase").expect("the rebase is listed");
         assert!(running < rebase, "running first: {html}");
+        assert!(html.contains(">5m</time>"), "{html}");
         assert!(
             html.contains(r#"<span class="batch-tally">running</span>"#),
             "{html}"
         );
+        assert!(
+            html.contains(r#"<code class="batch-id">batch-3</code>"#),
+            "a running batch shows its id too: {html}"
+        );
+        // Five minutes before the fixture's clock; nothing finished to say.
+        assert!(
+            html.contains(r#"title="started 2023-11-14T22:08:20Z""#),
+            "{html}"
+        );
+        assert!(!html.contains("started 2023-11-14T22:08:20Z · "), "{html}");
         assert!(html.contains(FOLLOW_BUTTON), "{html}");
         assert!(html.contains(">Follow<"), "{html}");
         assert_eq!(

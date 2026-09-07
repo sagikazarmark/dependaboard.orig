@@ -129,6 +129,48 @@ pub(crate) fn ago(now: u64, timestamp: u64) -> String {
     }
 }
 
+/// `timestamp`, Unix seconds, as the instant itself in UTC to the second:
+/// "2023-11-14T22:13:20Z". ISO 8601, so it reads the same in a log, a link,
+/// and a `<time>`'s `datetime`, and is valid in all three. Where a relative
+/// age floors a fortnight-old batch and a three-week-old one to the same
+/// "2w", this tells them apart. Done by hand: the browser bundle carries no
+/// calendar library, and the proleptic Gregorian calendar from days is a
+/// handful of integer operations.
+pub(crate) fn utc_timestamp(timestamp: u64) -> String {
+    let days = timestamp / 86_400;
+    let seconds = timestamp % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3_600,
+        seconds % 3_600 / 60,
+        seconds % 60
+    )
+}
+
+/// The proleptic Gregorian date `days` after 1970-01-01, as (year, month,
+/// day). Howard Hinnant's `civil_from_days`: the calendar is shifted so that
+/// each year starts on March 1st and every 400-year era has the same 146,097
+/// days, which puts the leap day at the end of the year where the arithmetic
+/// need not treat it specially.
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let shifted = days + 719_468;
+    let era = shifted / 146_097;
+    let day_of_era = shifted % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    (year, month, day)
+}
+
 /// The footer's dot for the line to the read model: green only while the
 /// polls are answered.
 pub(crate) fn connection_class(connection: Connection) -> &'static str {
@@ -236,6 +278,46 @@ mod tests {
         assert_eq!(relative_time(now, now - 604_799), "6d");
         assert_eq!(relative_time(now, now - 604_800), "1w");
         assert_eq!(relative_time(now, now - 3 * 604_800), "3w");
+    }
+
+    /// The instant itself, in UTC, to the second, in the one form that reads
+    /// the same in a log, a link, and a `datetime` attribute; every field
+    /// zero-padded, and the calendar's leap days and year ends in the right
+    /// place.
+    #[test]
+    fn a_utc_timestamp_is_the_instant_to_the_second_in_iso_8601() {
+        assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_timestamp(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(
+            utc_timestamp(951_782_400),
+            "2000-02-29T00:00:00Z",
+            "a leap day"
+        );
+        assert_eq!(
+            utc_timestamp(1_709_251_199),
+            "2024-02-29T23:59:59Z",
+            "a leap day's end"
+        );
+        assert_eq!(
+            utc_timestamp(1_709_251_200),
+            "2024-03-01T00:00:00Z",
+            "the day after"
+        );
+        assert_eq!(
+            utc_timestamp(1_704_067_199),
+            "2023-12-31T23:59:59Z",
+            "a year's end"
+        );
+        assert_eq!(
+            utc_timestamp(1_704_067_200),
+            "2024-01-01T00:00:00Z",
+            "a year's start"
+        );
+        assert_eq!(
+            utc_timestamp(1_041_379_205),
+            "2003-01-01T00:00:05Z",
+            "single digits padded"
+        );
     }
 }
 

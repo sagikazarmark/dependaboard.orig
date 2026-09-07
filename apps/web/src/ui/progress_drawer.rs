@@ -77,6 +77,7 @@ pub(crate) fn ProgressDrawer(
                         owner: item.target.owner.clone(),
                         repo: item.target.repo.clone(),
                         number: item.target.number,
+                        title: item.target.title.clone(),
                         html_url: item.target.html_url.clone(),
                         state: item.state.clone(),
                     }
@@ -183,13 +184,16 @@ fn trouble_note(followed: &Followed) -> Option<String> {
 
 /// One target of a batch: its state as a dot, the pull request as a link to
 /// GitHub when its URL is known (a target recorded before URLs travelled with
-/// it has none), and the state's detail. Shared by the drawer that follows a
-/// running batch and the list of the batches that have run.
+/// it has none), its title beside the reference — the reference says where,
+/// the title says which dependency and versions — and the state's detail.
+/// Shared by the drawer that follows a running batch and the list of the
+/// batches that have run.
 #[component]
 pub(crate) fn TargetRow(
     owner: String,
     repo: String,
     number: u64,
+    title: String,
     html_url: String,
     state: TargetProgressState,
 ) -> Element {
@@ -197,16 +201,21 @@ pub(crate) fn TargetRow(
         div { class: "progress-row",
             span { class: "progress-state {progress_class(&state)}" }
             div {
-                if html_url.is_empty() {
-                    strong { "{owner}/{repo}#{number}" }
-                } else {
-                    a {
-                        class: "github-pr-link",
-                        href: html_url,
-                        target: "_blank",
-                        rel: "noreferrer",
+                div { class: "progress-target",
+                    if html_url.is_empty() {
                         strong { "{owner}/{repo}#{number}" }
-                        span { class: "external-link-glyph", "↗" }
+                    } else {
+                        a {
+                            class: "github-pr-link",
+                            href: html_url,
+                            target: "_blank",
+                            rel: "noreferrer",
+                            strong { "{owner}/{repo}#{number}" }
+                            span { class: "external-link-glyph", "↗" }
+                        }
+                    }
+                    if !title.is_empty() {
+                        span { class: "progress-title", title: "{title}", "{title}" }
                     }
                 }
                 small { "{progress_detail(&state)}" }
@@ -613,6 +622,7 @@ mod tests {
                     owner: "acme",
                     repo: "api",
                     number: 9,
+                    title: "build(deps): bump serde from 1.0.1 to 1.0.2",
                     html_url: "https://github.example/acme/api/pull/9",
                     state: TargetProgressState::Queued,
                 }
@@ -632,6 +642,7 @@ mod tests {
                     owner: "acme",
                     repo: "api",
                     number: 9,
+                    title: "build(deps): bump serde from 1.0.1 to 1.0.2",
                     html_url: "",
                     state: TargetProgressState::Queued,
                 }
@@ -642,6 +653,81 @@ mod tests {
         assert!(
             unlinked.contains("<strong>acme/api#9</strong>"),
             "{unlinked}"
+        );
+    }
+
+    /// The reference says where the pull request is; its title, beside it,
+    /// says what — the dependency and the versions — whether or not the
+    /// reference is linked, and whole on hover where the row is too narrow
+    /// for it. A target with no title on record has nothing beside it.
+    #[test]
+    fn a_target_row_shows_the_pull_requests_title_beside_its_reference() {
+        fn Linked() -> Element {
+            rsx! {
+                TargetRow {
+                    owner: "acme",
+                    repo: "api",
+                    number: 9,
+                    title: "build(deps): bump serde from 1.0.1 to 1.0.2",
+                    html_url: "https://github.example/acme/api/pull/9",
+                    state: TargetProgressState::Queued,
+                }
+            }
+        }
+        let linked = render(Linked);
+        assert!(
+            linked.contains(
+                r#"</a><span class="progress-title" title="build(deps): bump serde from 1.0.1 to 1.0.2">build(deps): bump serde from 1.0.1 to 1.0.2</span>"#
+            ),
+            "{linked}"
+        );
+
+        fn Unlinked() -> Element {
+            rsx! {
+                TargetRow {
+                    owner: "acme",
+                    repo: "api",
+                    number: 9,
+                    title: "build(deps): bump serde from 1.0.1 to 1.0.2",
+                    html_url: "",
+                    state: TargetProgressState::Queued,
+                }
+            }
+        }
+        let unlinked = render(Unlinked);
+        assert!(
+            unlinked.contains(
+                r#"<strong>acme/api#9</strong><span class="progress-title" title="build(deps): bump serde from 1.0.1 to 1.0.2">build(deps): bump serde from 1.0.1 to 1.0.2</span>"#
+            ),
+            "{unlinked}"
+        );
+
+        fn Untitled() -> Element {
+            rsx! {
+                TargetRow {
+                    owner: "acme",
+                    repo: "api",
+                    number: 9,
+                    title: "",
+                    html_url: "",
+                    state: TargetProgressState::Queued,
+                }
+            }
+        }
+        let untitled = render(Untitled);
+        assert!(!untitled.contains("progress-title"), "{untitled}");
+    }
+
+    /// The drawer that follows a batch and the list of the batches that have
+    /// run share the row, so a target's title is beside its reference here
+    /// too, from the target the batch was submitted with.
+    #[test]
+    fn a_followed_batchs_rows_carry_each_targets_title() {
+        let html = render_drawer(half_done_merge(), false);
+
+        assert!(
+            html.contains(">build(deps): bump serde from 1.0.1 to 1.0.2</span>"),
+            "{html}"
         );
     }
 }

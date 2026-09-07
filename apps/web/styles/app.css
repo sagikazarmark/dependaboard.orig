@@ -1421,6 +1421,19 @@ code,
   min-width: 0;
 }
 
+/* The reference and, beside it, the title: the reference is never cut, the
+   title gives way and is whole on hover. */
+.progress-target {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.progress-target > strong,
+.progress-target > .github-pr-link {
+  flex: none;
+}
+
 .progress-row .github-pr-link {
   max-width: 100%;
 }
@@ -1430,7 +1443,8 @@ code,
 }
 
 .progress-row strong,
-.progress-row small {
+.progress-row small,
+.progress-title {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1440,10 +1454,19 @@ code,
   font-weight: 500;
 }
 
-.progress-row small {
-  margin-top: 3px;
+.progress-row small,
+.progress-title {
   color: var(--muted);
   font-weight: 400;
+}
+
+.progress-row small {
+  margin-top: 3px;
+}
+
+.progress-title {
+  flex: 1;
+  min-width: 0;
 }
 
 /* The recent batches drawer: each batch folds to a headline until opened. */
@@ -1505,6 +1528,60 @@ code,
 
 .batch-meta {
   font-family: "IBM Plex Mono", monospace;
+}
+
+/* The age carries the instant behind it for a hover; the dotted line says so. */
+.batch-meta time {
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: help;
+}
+
+/* The id, as the link carries it, with its copy: matched to a link by eye,
+   or copied to make one. */
+.batch-id-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.batch-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+  user-select: all;
+}
+
+.copy-button {
+  flex: none;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 9px;
+  line-height: 14px;
+}
+
+.copy-button:hover {
+  color: var(--color-base-content);
+  border-color: var(--color-base-content);
+}
+
+/* When the batch started and finished, to the second: the first line of the
+   opened entry, over the targets. */
+.batch-times {
+  display: block;
+  padding: 0 18px 10px;
+  color: var(--muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
 }
 
 .batch-entry .progress-list {
