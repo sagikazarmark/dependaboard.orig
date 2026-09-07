@@ -29,6 +29,7 @@ mod url_state;
 mod url_sync;
 
 use std::collections::BTreeSet;
+use std::fmt;
 use std::time::Duration;
 
 use dependaboard_core::{BulkActionKind, PrRecord, PrTarget};
@@ -199,18 +200,32 @@ pub(crate) const SIGNED_OUT_MESSAGE: &str = "You are no longer signed in — rel
 /// What the user reads when the server could not be reached.
 pub(crate) const UNREACHABLE_MESSAGE: &str = "The dashboard server could not be reached";
 
-/// The text a failed server call shows the user. The server has already
-/// reduced its own failures to a message that names the component, so that
-/// message is shown as is; a refusal of the credentials says to sign in
-/// again, and anything else is the server not being reached. The error
-/// itself goes to the log in full either way.
-pub(crate) fn user_facing(error: &ServerFnError) -> String {
-    dioxus::logger::tracing::warn!(%error, "server call failed");
-    match fault(error) {
-        Fault::SignedOut => SIGNED_OUT_MESSAGE.to_owned(),
-        Fault::Refused(message) => message,
-        Fault::Unreachable => UNREACHABLE_MESSAGE.to_owned(),
+/// The text the user reads for a fault: the server's own message where it
+/// gave one, and otherwise what the class of fault says — to sign in again,
+/// or that the server was not reached.
+impl fmt::Display for Fault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SignedOut => f.write_str(SIGNED_OUT_MESSAGE),
+            Self::Refused(message) => f.write_str(message),
+            Self::Unreachable => f.write_str(UNREACHABLE_MESSAGE),
+        }
     }
+}
+
+/// [`fault`], with the error itself put on the log in full: what a failed
+/// call that the user is told about goes through, so that the text they read
+/// — the class of fault, or the server's curated message — has the detail
+/// behind it on record.
+pub(crate) fn logged_fault(error: &ServerFnError) -> Fault {
+    dioxus::logger::tracing::warn!(%error, "server call failed");
+    fault(error)
+}
+
+/// The text a failed server call shows the user: its [`logged_fault`], in
+/// words.
+pub(crate) fn user_facing(error: &ServerFnError) -> String {
+    logged_fault(error).to_string()
 }
 
 #[cfg(test)]
@@ -260,5 +275,18 @@ mod tests {
             ))),
             UNREACHABLE_MESSAGE
         );
+    }
+
+    /// A fault reads as the user sees it wherever it is kept as one — the
+    /// batch follow keeps the last poll's — so it says the same as the call
+    /// that failed would have.
+    #[test]
+    fn a_fault_reads_as_the_failed_call_would_have() {
+        assert_eq!(Fault::SignedOut.to_string(), SIGNED_OUT_MESSAGE);
+        assert_eq!(
+            Fault::Refused("The read model is unavailable".to_owned()).to_string(),
+            "The read model is unavailable"
+        );
+        assert_eq!(Fault::Unreachable.to_string(), UNREACHABLE_MESSAGE);
     }
 }

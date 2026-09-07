@@ -247,6 +247,14 @@ impl DashboardState {
         *self.connection.read()
     }
 
+    /// Whether the server has refused the credentials the page holds, as any
+    /// poll found. Nothing that would ask the server is done on a page that
+    /// is: the answer would be the same refusal, and a credential prompt for
+    /// it, until the page is reloaded.
+    pub(crate) fn signed_out(&self) -> bool {
+        self.connection() == Connection::SignedOut
+    }
+
     /// When a poll was last answered, in Unix seconds; `None` before the
     /// first. It stands through the misses that follow, so once the line is
     /// down it is the age of the rows on screen.
@@ -261,8 +269,9 @@ impl DashboardState {
         self.set_connection(Connection::Online);
     }
 
-    /// A poll got no revision, and the polls in a row say the line is
-    /// `connection`.
+    /// A poll got no answer, and what it got instead says the line is
+    /// `connection`: the live refresh's count of misses, or — from any poll,
+    /// a batch follow's included — the server refusing the credentials.
     pub(crate) fn poll_missed(&mut self, connection: Connection) {
         self.set_connection(connection);
     }

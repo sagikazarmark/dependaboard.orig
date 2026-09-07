@@ -5,7 +5,7 @@
 //! read model's revision and reloads when it moves — and says so, over the
 //! page, when the polls that follow it stop being answered.
 
-use dependaboard_core::{Page, PrRecord};
+use dependaboard_core::{Page, PrRecord, unix_seconds};
 use dioxus::core::Task;
 use dioxus::logger::tracing;
 use dioxus::prelude::*;
@@ -60,7 +60,9 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     let follower = use_signal(|| None::<Task>);
     let progress_open = use_signal(|| false);
     let visible = use_visibility();
-    let now = use_clock(visible);
+    // The clock the relative times are read against; driven once the state
+    // is up, since it stops with the polls when the page is signed out.
+    let now = use_signal(unix_seconds);
 
     let mut rows = use_resource(move || {
         let filter = filter();
@@ -131,6 +133,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     // the drawer reopens on the batch the page was following.
     let onbatch = use_callback(move |batch_id: String| attach_batch(batch_id, host));
     use_url_sync(state, detail, followed, onbatch);
+    use_clock(now, visible, state);
     use_live_refresh(state, visible);
     let user = signed_in
         .read()

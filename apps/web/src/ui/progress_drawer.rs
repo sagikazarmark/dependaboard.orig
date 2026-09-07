@@ -2,7 +2,8 @@
 //! long the batch has stood still and whether the server is answering. It
 //! never says the batch is lost: a target may sit for hours inside GitHub's
 //! retry and rate-limit budgets, and the batch is durable in Restate for all
-//! of them.
+//! of them. Once the server has refused the credentials it says the follow
+//! has stopped, and that the reload which signs in again picks it up.
 
 use dependaboard_core::TargetProgressState;
 use dioxus::prelude::*;
@@ -31,9 +32,11 @@ pub(crate) fn ProgressDrawer(
                 eyebrow: "Batch {followed.batch_id}",
                 title: rsx! { "Batch progress" },
                 onclose,
-                p { class: "progress-note", "Asking Restate where the batch stands..." }
-                if let Some(trouble) = &followed.trouble {
-                    p { class: "progress-note progress-trouble", "{trouble}" }
+                if !followed.signed_out() {
+                    p { class: "progress-note", "Asking Restate where the batch stands..." }
+                }
+                if let Some(note) = trouble_note(&followed) {
+                    p { class: "progress-note progress-trouble", "{note}" }
                 }
             }
         };
@@ -59,10 +62,8 @@ pub(crate) fn ProgressDrawer(
             if let Some(note) = waiting_note(&followed, now) {
                 p { class: "progress-note", "{note}" }
             }
-            if let Some(trouble) = &followed.trouble {
-                p { class: "progress-note progress-trouble",
-                    "{trouble}. The batch carries on in Restate; the dashboard keeps asking after it."
-                }
+            if let Some(note) = trouble_note(&followed) {
+                p { class: "progress-note progress-trouble", "{note}" }
             }
             div { class: "progress-list",
                 for item in &progress.targets {
@@ -114,6 +115,35 @@ fn waiting_note(followed: &Followed, now: u64) -> Option<String> {
             "Waiting on Restate to start the batch, {standing} after it took it: its service may be \
              down or deploying, and the batch starts when it is back."
         )
+    })
+}
+
+/// What the drawer says about the polls, if anything: nothing while they are
+/// answered. While they are not, the fault — and, once Restate has been heard
+/// on the batch, that it carries on and the dashboard keeps asking after it,
+/// since a poll that fails says nothing about the batch; before Restate has
+/// been heard, the line above already says the dashboard is asking. Once the
+/// server has refused the credentials the dashboard has stopped asking, since
+/// asking again would be refused again and prompt for them each time, and the
+/// note says so and what brings the follow back: the reload that signs in
+/// again, which picks the batch up from the URL.
+fn trouble_note(followed: &Followed) -> Option<String> {
+    let trouble = followed.trouble.as_ref()?;
+    Some(match (followed.signed_out(), followed.progress.is_some()) {
+        (true, true) => format!(
+            "{trouble}. The batch carries on in Restate; the dashboard has stopped asking after it, \
+             and picks it up again once the page is reloaded."
+        ),
+        (true, false) => format!(
+            "{trouble}. The dashboard has stopped asking where the batch stands, and asks again once \
+             the page is reloaded."
+        ),
+        (false, true) => {
+            format!(
+                "{trouble}. The batch carries on in Restate; the dashboard keeps asking after it."
+            )
+        }
+        (false, false) => trouble.to_string(),
     })
 }
 
@@ -176,6 +206,7 @@ mod tests {
     use dependaboard_core::{ActionOutcome, BatchProgress, BulkActionKind, RejectReason};
 
     use super::*;
+    use crate::ui::Fault;
     use crate::ui::batch::WAITING_NOTICE_AFTER;
     use crate::ui::pr_target;
     use crate::ui::test_support::{
@@ -381,7 +412,7 @@ mod tests {
     #[test]
     fn a_failing_poll_is_reported_over_the_progress_last_heard() {
         let troubled = Followed {
-            trouble: Some("Restate is unavailable".to_owned()),
+            trouble: Some(Fault::Refused("Restate is unavailable".to_owned())),
             ..followed(half_done_merge())
         };
 
@@ -395,6 +426,54 @@ mod tests {
         );
         assert!(html.contains("merge progress"), "{html}");
         assert!(html.contains("1/2"), "{html}");
+    }
+
+    /// The server refused the credentials the poll carried, and the follow
+    /// stopped there rather than prompt for them every second. The drawer
+    /// says so over the progress last heard — the batch carries on without
+    /// being asked after — and that the reload that signs in again is what
+    /// picks it up; it does not claim to be still asking.
+    #[test]
+    fn a_refusal_of_the_credentials_says_the_follow_has_stopped_and_what_brings_it_back() {
+        let refused = Followed {
+            trouble: Some(Fault::SignedOut),
+            ..followed(half_done_merge())
+        };
+
+        let html = render_followed(refused, FIXTURE_NOW, false);
+
+        assert!(
+            html.contains(
+                r#"<p class="progress-note progress-trouble">You are no longer signed in — reload to sign in again. The batch carries on in Restate; the dashboard has stopped asking after it, and picks it up again once the page is reloaded.</p>"#
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("keeps asking"), "{html}");
+        assert!(html.contains("1/2"), "{html}");
+    }
+
+    /// A batch known by id alone whose polls were refused before Restate
+    /// answered any: the dashboard is no longer asking where it stands, and
+    /// does not say it is; there is nothing to say the batch carries on in
+    /// Restate either, since Restate was never heard on it.
+    #[test]
+    fn a_batch_followed_by_id_alone_refused_the_credentials_no_longer_says_it_is_asking() {
+        let refused = Followed {
+            trouble: Some(Fault::SignedOut),
+            ..Followed::attaching("batch-1", FIXTURE_NOW)
+        };
+
+        let html = render_followed(refused, FIXTURE_NOW, false);
+
+        assert!(!html.contains("Asking Restate"), "{html}");
+        assert!(
+            html.contains(
+                r#"<p class="progress-note progress-trouble">You are no longer signed in — reload to sign in again. The dashboard has stopped asking where the batch stands, and asks again once the page is reloaded.</p>"#
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("carries on in Restate"), "{html}");
+        assert!(html.contains("Batch batch-1"), "{html}");
     }
 
     /// After a reload the dashboard has the id alone; until Restate answers

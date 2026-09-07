@@ -14,7 +14,12 @@
 //! that get no revision are counted, and enough in a row mean the rows on
 //! screen are no longer being kept current, which the dashboard says rather
 //! than leave a green dot over stale rows; the server refusing the
-//! credentials is told apart, since only signing in again cures that.
+//! credentials is told apart, since only signing in again cures that — and
+//! it ends the polling, and the clock with it. Every 401 the browser gets
+//! carries the server's challenge, which a same-origin fetch turns into the
+//! browser's own credential prompt; asking again every ten seconds would
+//! prompt every ten seconds. The banner says to reload, and the reload is
+//! what starts the refresh over.
 
 use std::time::Duration;
 
@@ -62,6 +67,11 @@ pub(crate) enum Step {
     Poll,
     /// Stop following the manual sync in flight and reload the rows anyway.
     Reload,
+    /// Ask nothing more: the server has refused the credentials, and every
+    /// further ask would be refused the same — and turned into a credential
+    /// prompt by the browser. Only a reload of the page signs in again, and
+    /// a reload starts the refresh over.
+    Stop,
 }
 
 /// What an answer to the poll said had moved since the answer before it.
@@ -99,7 +109,8 @@ pub(crate) struct Refresh {
     seen: Option<ProjectionRevision>,
     /// Polls in a row that got no revision, since the last one that did.
     misses: u32,
-    /// Whether one of those misses was the server refusing the credentials.
+    /// Whether one of those misses was the server refusing the credentials,
+    /// which ends the refresh: nothing is asked after it.
     refused: bool,
 }
 
@@ -130,8 +141,12 @@ impl Refresh {
     }
 
     /// One poll interval has passed with the tab `visible` or not and a
-    /// manual sync in flight (`syncing`) or not.
+    /// manual sync in flight (`syncing`) or not. Once the credentials have
+    /// been refused every tick says to stop, whatever the two are doing.
     pub(crate) fn tick(&mut self, visible: bool, syncing: bool) -> Step {
+        if self.refused {
+            return Step::Stop;
+        }
         if !syncing {
             self.followed = 0;
         }
@@ -166,11 +181,12 @@ impl Refresh {
     /// An answer after a poll that got none puts the line back online and
     /// says the rows moved whatever the revision: a read of the rows that
     /// failed in the gap is not retried by anything else, and it is the
-    /// reload that clears the failure from the screen.
+    /// reload that clears the failure from the screen. A refusal of the
+    /// credentials is not put back: nothing is asked after one, so no answer
+    /// comes, and the page that signs in again is a fresh one.
     pub(crate) fn observe(&mut self, revision: ProjectionRevision) -> Moved {
         let restored = self.misses > 0;
         self.misses = 0;
-        self.refused = false;
         let moved = match self.seen {
             Some(seen) => Moved {
                 projection: restored || seen.projection != revision.projection,
@@ -187,8 +203,9 @@ impl Refresh {
 
     /// A poll got no revision, and `fault` is why; what the line to the
     /// server is now. The credentials being refused signs out at once,
-    /// whatever the count stood at; any other miss counts towards
-    /// [`DISCONNECT_THRESHOLD`].
+    /// whatever the count stood at, and for good: every tick from then on is
+    /// a [`Step::Stop`]. Any other miss counts towards
+    /// [`DISCONNECT_THRESHOLD`], and the polls go on.
     pub(crate) fn miss(&mut self, fault: &Fault) -> Connection {
         self.misses += 1;
         self.refused |= *fault == Fault::SignedOut;
@@ -220,28 +237,33 @@ pub(crate) fn use_visibility() -> ReadSignal<bool> {
     visible.into()
 }
 
-/// The dashboard's clock, in Unix seconds: brought up to date once a
-/// [`CLOCK_INTERVAL`] while the tab shows, and the moment it shows again
-/// after being hidden, so nothing it dates is left saying what it said
-/// before the tab was left.
-pub(crate) fn use_clock(visible: ReadSignal<bool>) -> ReadSignal<u64> {
-    let mut now = use_signal(unix_seconds);
+/// Drives `now`, the dashboard's clock in Unix seconds: brought up to date
+/// once a [`CLOCK_INTERVAL`] while the tab shows, and the moment it shows
+/// again after being hidden, so nothing it dates is left saying what it said
+/// before the tab was left. It stops with the polls once the server has
+/// refused the credentials: nothing on the page is being kept current from
+/// then on, and the times it dates are the page's as it was left, until the
+/// reload the banner asks for.
+pub(crate) fn use_clock(mut now: Signal<u64>, visible: ReadSignal<bool>, state: DashboardState) {
     let mut was_showing = use_hook(|| CopyValue::new(true));
     use_effect(move || {
         let showing = visible();
-        if showing && !was_showing.replace(showing) {
+        let was_showing = was_showing.replace(showing);
+        if showing && !was_showing && !state.signed_out() {
             now.set(unix_seconds());
         }
     });
     use_future(move || async move {
         loop {
             sleep(CLOCK_INTERVAL).await;
+            if state.signed_out() {
+                break;
+            }
             if *visible.peek() {
                 now.set(unix_seconds());
             }
         }
     });
-    now.into()
 }
 
 /// Keeps the rows current: asks for the projection's revision as [`Refresh`]
@@ -256,12 +278,20 @@ pub(crate) fn use_clock(visible: ReadSignal<bool>) -> ReadSignal<u64> {
 /// the state is told when the count says the line is down or the server
 /// says the credentials are no longer good. The first answer after a miss
 /// reloads the rows, which is what clears a read that failed in the gap.
+///
+/// A refusal of the credentials ends the refresh. [`Refresh`] says to stop
+/// once its own poll was refused; and a step that would reach the server is
+/// not taken once the state says the page is signed out on any poll's word —
+/// a batch being followed asks every second, so its poll is often the one
+/// refused first. Either way the answer would be another refusal, and
+/// another credential prompt. The reload the banner asks for starts it over.
 pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bool>) {
     use_future(move || async move {
         let mut refresh = Refresh::new();
         loop {
             match refresh.tick(*visible.peek(), state.syncing()) {
                 Step::Wait => {}
+                Step::Poll | Step::Reload if state.signed_out() => break,
                 Step::Poll => match load_projection_revision().await {
                     Ok(revision) => {
                         let moved = refresh.observe(revision);
@@ -282,6 +312,7 @@ pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bo
                     state.end_sync();
                     state.reload();
                 }
+                Step::Stop => break,
             }
             sleep(POLL_INTERVAL).await;
         }
@@ -477,28 +508,43 @@ mod tests {
 
     /// The server answering 401 is definitive — it was reached, and refused
     /// the credentials the browser holds — so one is enough, whatever the
-    /// count stood at. An answer afterwards (the password rotated back, say)
-    /// is a recovery like any other.
+    /// count stood at, and there is no asking again: every 401 the browser
+    /// gets carries a challenge it turns into a credential prompt, and only
+    /// the reload the banner asks for signs in again. From the refusal on
+    /// the refresh says to stop, whatever the tab and the sync are doing.
     #[test]
-    fn one_refusal_of_the_credentials_signs_out_at_once() {
+    fn one_refusal_of_the_credentials_signs_out_at_once_and_nothing_is_asked_after_it() {
         let mut refresh = Refresh::new();
+        assert_eq!(refresh.tick(true, true), Step::Poll);
 
         assert_eq!(refresh.miss(&Fault::SignedOut), Connection::SignedOut);
         assert_eq!(refresh.connection(), Connection::SignedOut);
-        assert_eq!(
-            refresh.miss(&Fault::Unreachable),
-            Connection::SignedOut,
-            "a miss after a refusal does not make it an outage"
-        );
 
-        assert_eq!(
-            refresh.observe(at(1, 1)),
-            Moved {
-                projection: true,
-                pull_requests: false,
-            },
-            "the first answer is remembered, and the rows reloaded after the misses"
-        );
-        assert_eq!(refresh.connection(), Connection::Online);
+        for (visible, syncing) in [(true, false), (true, true), (false, false), (false, true)] {
+            for tick in 1..=REFRESH_TICKS + 1 {
+                assert_eq!(
+                    refresh.tick(visible, syncing),
+                    Step::Stop,
+                    "tick {tick} (visible: {visible}, syncing: {syncing})"
+                );
+            }
+        }
+        assert_eq!(refresh.connection(), Connection::SignedOut);
+    }
+
+    /// A line that is down is asked again: the first answer after a miss is
+    /// what clears the banner and reloads the rows, and a dead server answers
+    /// nothing that the browser would turn into a prompt.
+    #[test]
+    fn a_disconnected_line_is_still_polled() {
+        let mut refresh = Refresh::new();
+        assert_eq!(refresh.tick(true, false), Step::Poll);
+        for _ in 0..DISCONNECT_THRESHOLD {
+            refresh.miss(&Fault::Unreachable);
+        }
+        assert_eq!(refresh.connection(), Connection::Disconnected);
+
+        wait(&mut refresh, REFRESH_TICKS - 1, true, false);
+        assert_eq!(refresh.tick(true, false), Step::Poll);
     }
 }

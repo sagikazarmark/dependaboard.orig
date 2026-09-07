@@ -16,11 +16,11 @@ use crate::ui::batch::{
     ATTACH_TIMEOUT, BatchOutcome, Followed, SUBMIT_ATTEMPTS, ServerBatch, ServerFollow,
     follow_batch, run_batch,
 };
-use crate::ui::dashboard_state::{DashboardState, use_dashboard};
+use crate::ui::dashboard_state::{Connection, DashboardState, use_dashboard};
 use crate::ui::format::{relative_time, verdict_tally};
 use crate::ui::progress_drawer::ProgressDrawer;
 use crate::ui::retry::{LeftOut, ServerRefresh, left_out_notice, refresh_rejected};
-use crate::ui::{PendingAction, sticky};
+use crate::ui::{Fault, PendingAction, sticky};
 
 /// Where a followed batch lands: what is known of it, which the pill and
 /// drawer read, the task following it, whether the drawer is showing, the
@@ -95,6 +95,8 @@ pub(crate) fn ActiveBatch(
             );
             if progress.completed {
                 ("progress-live complete", count)
+            } else if current.signed_out() {
+                ("progress-live waiting", format!("{count} · signed out"))
             } else if current.stands_still(now) {
                 let standing = relative_time(now, current.since);
                 (
@@ -105,6 +107,7 @@ pub(crate) fn ActiveBatch(
                 ("progress-live", count)
             }
         }
+        None if current.signed_out() => ("progress-live waiting", "batch: signed out".to_owned()),
         None => ("progress-live", "batch: following...".to_owned()),
     };
     rsx! {
@@ -147,7 +150,10 @@ pub(crate) fn queue_batch(pending: PendingAction, mut host: BatchHost) {
     let followed = Followed::queued(&batch_id, action, &targets, unix_seconds());
     host.take_over(followed.clone(), async move {
         let mut batch = ServerBatch {
-            follow: ServerFollow { batch_id },
+            follow: ServerFollow {
+                batch_id,
+                state: host.state,
+            },
             action,
             targets,
         };
@@ -196,7 +202,10 @@ pub(crate) fn attach_batch(batch_id: String, mut host: BatchHost) {
     }
     let followed = Followed::attaching(&batch_id, unix_seconds());
     host.take_over(followed.clone(), async move {
-        let mut batch = ServerFollow { batch_id };
+        let mut batch = ServerFollow {
+            batch_id,
+            state: host.state,
+        };
         let mut seen_running = false;
         let outcome = follow_batch(&mut batch, followed, |update| {
             seen_running |= update.heard && !update.completed();
@@ -213,19 +222,23 @@ pub(crate) fn attach_batch(batch_id: String, mut host: BatchHost) {
 /// Says how the follow ended. A batch that ran to the end is announced and
 /// the page reloaded. One Restate would not take, or has no progress for, is
 /// no batch to follow: the pill and drawer stand down, which also takes it
-/// out of the URL.
+/// out of the URL. A follow the server refused the credentials of stands as
+/// it was — the drawer says why, and the batch stays in the URL for the
+/// reload to pick up — and the page is told it is signed out, as it is when
+/// the submission itself was refused, so the banner goes up at once and the
+/// live refresh asks nothing more either.
 fn conclude(outcome: BatchOutcome, mut host: BatchHost) {
     match outcome {
         BatchOutcome::Completed(progress) => {
             toast_completion(&host.toast, &progress);
             host.state.reload();
         }
-        BatchOutcome::NotSubmitted(error) => {
-            host.toast.error(
-                format!("Batch was not submitted after {SUBMIT_ATTEMPTS} attempts: {error}"),
-                sticky(),
-            );
+        BatchOutcome::NotSubmitted(fault) => {
+            host.toast.error(not_submitted_notice(&fault), sticky());
             host.followed.set(None);
+            if fault == Fault::SignedOut {
+                host.state.poll_missed(Connection::SignedOut);
+            }
         }
         BatchOutcome::Unknown => {
             let batch_id = host
@@ -242,6 +255,18 @@ fn conclude(outcome: BatchOutcome, mut host: BatchHost) {
             );
             host.followed.set(None);
         }
+        BatchOutcome::SignedOut => host.state.poll_missed(Connection::SignedOut),
+    }
+}
+
+/// What the toast says of a batch Restate never took, `fault` being the
+/// submission's last: how often it was tried, unless the credentials were
+/// refused, in which case it was tried once and asking again would only
+/// have prompted for them again.
+fn not_submitted_notice(fault: &Fault) -> String {
+    match fault {
+        Fault::SignedOut => format!("Batch was not submitted: {fault}"),
+        _ => format!("Batch was not submitted after {SUBMIT_ATTEMPTS} attempts: {fault}"),
     }
 }
 
@@ -391,6 +416,34 @@ mod tests {
         );
         assert!(!html.to_lowercase().contains("stall"), "{html}");
         assert!(!html.to_lowercase().contains("lost"), "{html}");
+    }
+
+    /// The throb says the batch is being followed. Once the server has
+    /// refused the credentials it is not, and the pill — what shows with the
+    /// drawer closed — says so beside the count last heard and stops
+    /// throbbing, rather than stand over a follow that has ended as if it
+    /// were live.
+    #[test]
+    fn a_pill_whose_follow_was_refused_the_credentials_says_so_and_stops_throbbing() {
+        fn Fixture() -> Element {
+            let followed = use_signal(|| {
+                Some(Followed {
+                    trouble: Some(Fault::SignedOut),
+                    ..followed(half_done_merge())
+                })
+            });
+            let follower = use_signal(|| None);
+            let open = use_signal(|| false);
+            rsx! {
+                DashboardFixture { ActiveBatch { followed, follower, open } }
+            }
+        }
+        let html = render(Fixture);
+
+        assert!(
+            html.contains(r#"<span class="progress-live waiting"></span>merge: 1/2 · signed out"#),
+            "{html}"
+        );
     }
 
     /// A finished batch stood still for good; that is not a wait, and the
@@ -583,6 +636,22 @@ mod tests {
                     .to_owned()
             ),
             "a batch rejected whole is announced by the same rule as one rejected in part"
+        );
+    }
+
+    /// A submission that kept failing is announced with how often it was
+    /// tried; one the server refused the credentials of was tried once —
+    /// trying again would only prompt for them again — and the toast does
+    /// not claim otherwise.
+    #[test]
+    fn a_batch_not_submitted_says_how_often_it_was_tried_unless_the_credentials_were_refused() {
+        assert_eq!(
+            not_submitted_notice(&Fault::Refused("Restate is unavailable".to_owned())),
+            "Batch was not submitted after 5 attempts: Restate is unavailable"
+        );
+        assert_eq!(
+            not_submitted_notice(&Fault::SignedOut),
+            "Batch was not submitted: You are no longer signed in — reload to sign in again"
         );
     }
 }

@@ -7,8 +7,11 @@
 //! legitimately sit for hours behind GitHub's retry and rate-limit budgets. The
 //! follow reports since when the batch has gone unchanged and whether its polls
 //! are being answered, and leaves saying so to the drawer. It ends only when the
-//! batch completes, when Restate would not take it, or when Restate has never
-//! had progress for the id it was given.
+//! batch completes, when Restate would not take it, when Restate has never
+//! had progress for the id it was given — or when the server refuses the
+//! credentials the polls carry, since asking again would only be refused
+//! again, and the browser turns each refusal into a credential prompt; the
+//! batch carries on, and the reload that signs in again picks it up.
 
 use std::time::Duration;
 
@@ -17,10 +20,12 @@ use dependaboard_core::{
 };
 
 use crate::api::{load_batch_progress, submit_batch};
-use crate::ui::{POLL_INTERVAL, sleep, user_facing};
+use crate::ui::dashboard_state::DashboardState;
+use crate::ui::{Fault, POLL_INTERVAL, logged_fault, sleep};
 
 /// How many times a submission is tried, one poll interval apart, before the
-/// batch is reported as not submitted.
+/// batch is reported as not submitted — unless the server refuses the
+/// credentials, which is not tried again.
 pub(crate) const SUBMIT_ATTEMPTS: u32 = 5;
 
 /// How long a batch followed by id alone may go with Restate answering that it
@@ -50,9 +55,11 @@ const ATTACH_LIMIT: u32 = (ATTACH_TIMEOUT.as_secs() / POLL_INTERVAL.as_secs()) a
 pub(crate) const WAITING_NOTICE_AFTER: Duration = Duration::from_secs(60);
 
 /// The server as the follow sees it, so the follow can be driven by a script
-/// in tests. Errors are already in their user-facing form.
+/// in tests. A call that failed says what it said about the line to the
+/// server, since a refusal of the credentials ends the follow where any
+/// other fault is waited out.
 pub(crate) trait BatchGateway {
-    async fn progress(&mut self) -> Result<Option<BatchProgress>, String>;
+    async fn progress(&mut self) -> Result<Option<BatchProgress>, Fault>;
     /// Waits one poll interval.
     async fn tick(&mut self);
     /// The wall clock, in Unix seconds.
@@ -61,19 +68,28 @@ pub(crate) trait BatchGateway {
 
 /// A [`BatchGateway`] with a batch to submit.
 pub(crate) trait SubmitGateway: BatchGateway {
-    async fn submit(&mut self) -> Result<BatchReceipt, String>;
+    async fn submit(&mut self) -> Result<BatchReceipt, Fault>;
 }
 
-/// A batch known by id alone, followed through the server functions.
+/// A batch known by id alone, followed through the server functions, on the
+/// page whose line to the server `state` carries.
 pub(crate) struct ServerFollow {
     pub(crate) batch_id: String,
+    pub(crate) state: DashboardState,
 }
 
 impl BatchGateway for ServerFollow {
-    async fn progress(&mut self) -> Result<Option<BatchProgress>, String> {
+    /// A page the server has already refused — the live refresh's poll got
+    /// the 401 — is not asked on behalf of: the answer would be the same
+    /// refusal, with a credential prompt for it, so the follow is handed the
+    /// refusal as if it had asked.
+    async fn progress(&mut self) -> Result<Option<BatchProgress>, Fault> {
+        if self.state.signed_out() {
+            return Err(Fault::SignedOut);
+        }
         load_batch_progress(self.batch_id.clone())
             .await
-            .map_err(|error| user_facing(&error))
+            .map_err(|error| logged_fault(&error))
     }
 
     async fn tick(&mut self) {
@@ -97,7 +113,7 @@ pub(crate) struct ServerBatch {
 }
 
 impl BatchGateway for ServerBatch {
-    async fn progress(&mut self) -> Result<Option<BatchProgress>, String> {
+    async fn progress(&mut self) -> Result<Option<BatchProgress>, Fault> {
         self.follow.progress().await
     }
 
@@ -111,11 +127,16 @@ impl BatchGateway for ServerBatch {
 }
 
 impl SubmitGateway for ServerBatch {
-    async fn submit(&mut self) -> Result<BatchReceipt, String> {
+    /// Not submitted from a page the server has already refused, as
+    /// [`ServerFollow::progress`] does not ask from one.
+    async fn submit(&mut self) -> Result<BatchReceipt, Fault> {
+        if self.follow.state.signed_out() {
+            return Err(Fault::SignedOut);
+        }
         let targets = self.targets.iter().map(SubmittedTarget::from).collect();
         submit_batch(self.follow.batch_id.clone(), self.action, targets)
             .await
-            .map_err(|error| user_facing(&error))
+            .map_err(|error| logged_fault(&error))
     }
 }
 
@@ -131,8 +152,10 @@ pub(crate) struct Followed {
     pub(crate) heard: bool,
     /// Unix seconds when `progress` last changed, or the follow began.
     pub(crate) since: u64,
-    /// Why the last poll was not answered, while the polls are failing.
-    pub(crate) trouble: Option<String>,
+    /// Why the last poll was not answered, while the polls are failing. A
+    /// refusal of the credentials is the last poll's word for good: the
+    /// follow ends on it.
+    pub(crate) trouble: Option<Fault>,
 }
 
 impl Followed {
@@ -188,6 +211,13 @@ impl Followed {
             .is_some_and(|progress| progress.completed)
     }
 
+    /// Whether the server refused the credentials the last poll carried,
+    /// which is where the follow stopped: the batch is no longer being asked
+    /// after, and will not be until the page is reloaded.
+    pub(crate) fn signed_out(&self) -> bool {
+        self.trouble == Some(Fault::SignedOut)
+    }
+
     /// Takes `progress` as Restate's latest word, if it is news.
     fn hear(&mut self, progress: BatchProgress, now: u64) -> bool {
         if self.heard && self.progress.as_ref() == Some(&progress) {
@@ -235,7 +265,7 @@ impl Followed {
     }
 
     /// Notes how the last poll went, if that is news.
-    fn answered(&mut self, trouble: Option<String>) -> bool {
+    fn answered(&mut self, trouble: Option<Fault>) -> bool {
         if self.trouble == trouble {
             return false;
         }
@@ -247,12 +277,16 @@ impl Followed {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BatchOutcome {
     Completed(BatchProgress),
-    /// Restate never accepted the batch; carries the last submission error.
-    NotSubmitted(String),
+    /// Restate never accepted the batch; carries the last submission fault.
+    NotSubmitted(Fault),
     /// Restate has no progress for the batch and never had any while it was
     /// followed: the id names no batch it has run, or one whose workflow has
     /// been retired since.
     Unknown,
+    /// The server refused the credentials the polls carried, so the follow
+    /// stopped: the batch carries on in Restate, and the dashboard asks after
+    /// it again once the page is reloaded and signed in.
+    SignedOut,
 }
 
 /// Submits `followed` and follows it, calling `report` with each change in
@@ -315,9 +349,13 @@ pub(crate) async fn follow_batch<G: BatchGateway>(
 /// [`ATTACH_LIMIT`] answered polls have found nothing. A poll that fails is
 /// noted and the next is taken, and counts for nothing either way: the batch
 /// is durable, and the line to the server is reported over the page in its
-/// own right.
+/// own right. The one fault not waited out is the server refusing the
+/// credentials: the next poll would be refused the same, and each refusal
+/// the browser gets it turns into a credential prompt, so the follow ends as
+/// [`SignedOut`], with the refusal reported as the last poll's word.
 ///
 /// [`Unknown`]: BatchOutcome::Unknown
+/// [`SignedOut`]: BatchOutcome::SignedOut
 async fn poll<G: BatchGateway>(
     gateway: &mut G,
     mut followed: Followed,
@@ -345,6 +383,9 @@ async fn poll<G: BatchGateway>(
         if changed {
             report(&followed);
         }
+        if followed.signed_out() {
+            return BatchOutcome::SignedOut;
+        }
         if let Some(progress) = followed.progress.as_ref().filter(|it| it.completed) {
             return BatchOutcome::Completed(progress.clone());
         }
@@ -361,20 +402,27 @@ enum Taken {
 }
 
 /// Gets the batch accepted, or gives up after [`SUBMIT_ATTEMPTS`] with the
-/// last error.
-async fn submit<G: SubmitGateway>(gateway: &mut G) -> Result<Taken, String> {
+/// last fault. A refusal of the credentials — of the submission, or of the
+/// ask whether a failed one was taken — is given up at once: it came from
+/// the auth edge, before any function ran, so Restate has nothing to ask
+/// after, and every further call would be refused the same, with a
+/// credential prompt each time.
+async fn submit<G: SubmitGateway>(gateway: &mut G) -> Result<Taken, Fault> {
     let mut attempt = 0;
     loop {
         attempt += 1;
         let error = match gateway.submit().await {
             Ok(receipt) => return Ok(Taken::Accepted(receipt)),
+            Err(Fault::SignedOut) => return Err(Fault::SignedOut),
             Err(error) => error,
         };
         // A failed round trip does not mean Restate did not take the batch;
         // the workflow's own progress is the authority, and a batch that is
         // running must not be submitted again.
-        if let Ok(Some(progress)) = gateway.progress().await {
-            return Ok(Taken::Running(progress));
+        match gateway.progress().await {
+            Ok(Some(progress)) => return Ok(Taken::Running(progress)),
+            Err(Fault::SignedOut) => return Err(Fault::SignedOut),
+            Ok(None) | Err(_) => {}
         }
         if attempt == SUBMIT_ATTEMPTS {
             return Err(error);
@@ -397,9 +445,10 @@ mod tests {
     /// and the last one repeats once the script runs out. The clock reads the
     /// epoch plus one second per tick, as the real one would.
     struct Scripted {
-        submits: VecDeque<Result<BatchReceipt, String>>,
-        progress: VecDeque<Result<Option<BatchProgress>, String>>,
+        submits: VecDeque<Result<BatchReceipt, Fault>>,
+        progress: VecDeque<Result<Option<BatchProgress>, Fault>>,
         submit_calls: u32,
+        progress_calls: u32,
         ticks: u32,
     }
 
@@ -408,13 +457,14 @@ mod tests {
 
     impl Scripted {
         fn new(
-            submits: impl IntoIterator<Item = Result<BatchReceipt, String>>,
-            progress: impl IntoIterator<Item = Result<Option<BatchProgress>, String>>,
+            submits: impl IntoIterator<Item = Result<BatchReceipt, Fault>>,
+            progress: impl IntoIterator<Item = Result<Option<BatchProgress>, Fault>>,
         ) -> Self {
             Self {
                 submits: submits.into_iter().collect(),
                 progress: progress.into_iter().collect(),
                 submit_calls: 0,
+                progress_calls: 0,
                 ticks: 0,
             }
         }
@@ -429,14 +479,15 @@ mod tests {
     }
 
     impl SubmitGateway for Scripted {
-        async fn submit(&mut self) -> Result<BatchReceipt, String> {
+        async fn submit(&mut self) -> Result<BatchReceipt, Fault> {
             self.submit_calls += 1;
             next_or_repeat(&mut self.submits)
         }
     }
 
     impl BatchGateway for Scripted {
-        async fn progress(&mut self) -> Result<Option<BatchProgress>, String> {
+        async fn progress(&mut self) -> Result<Option<BatchProgress>, Fault> {
+            self.progress_calls += 1;
             next_or_repeat(&mut self.progress)
         }
 
@@ -449,8 +500,8 @@ mod tests {
         }
     }
 
-    fn unavailable() -> String {
-        "Restate is unavailable".to_owned()
+    fn unavailable() -> Fault {
+        Fault::Refused("Restate is unavailable".to_owned())
     }
 
     fn targets() -> Vec<PrTarget> {
@@ -527,6 +578,45 @@ mod tests {
             accepted, None,
             "a batch Restate never took was not accepted"
         );
+    }
+
+    /// A submission the server refused the credentials of never reached
+    /// Restate — the auth edge refuses before any function runs — and trying
+    /// again, or asking whether the batch is running, would be refused the
+    /// same, each time with a credential prompt. It is given up at once as
+    /// not submitted, for that reason.
+    #[tokio::test]
+    async fn a_submission_refused_the_credentials_is_given_up_at_once_without_asking_after_the_batch()
+     {
+        let mut gateway = Scripted::new([Err(Fault::SignedOut)], [Ok(Some(after(1)))]);
+
+        let (outcome, reported, accepted) = run(&mut gateway).await;
+
+        assert_eq!(outcome, BatchOutcome::NotSubmitted(Fault::SignedOut));
+        assert_eq!(gateway.submit_calls, 1, "the refusal is not tried again");
+        assert_eq!(
+            gateway.progress_calls, 0,
+            "nor is the batch asked after, which would be refused the same"
+        );
+        assert!(reported.is_empty());
+        assert_eq!(accepted, None);
+    }
+
+    /// The credentials may be refused on the way to finding out whether a
+    /// failed submission was taken: that is the same refusal, and trying the
+    /// submission again would meet it again, with a prompt. It is given up
+    /// there and then.
+    #[tokio::test]
+    async fn a_refusal_while_asking_whether_a_failed_submission_was_taken_gives_it_up_too() {
+        let mut gateway = Scripted::new([Err(unavailable())], [Err(Fault::SignedOut)]);
+
+        let (outcome, reported, accepted) = run(&mut gateway).await;
+
+        assert_eq!(outcome, BatchOutcome::NotSubmitted(Fault::SignedOut));
+        assert_eq!(gateway.submit_calls, 1);
+        assert_eq!(gateway.progress_calls, 1);
+        assert!(reported.is_empty());
+        assert_eq!(accepted, None);
     }
 
     /// The batch as Restate runs it when the server left the second fixture
@@ -694,6 +784,37 @@ mod tests {
                 (None, Some(after(2))),
             ],
             "the trouble is reported once when it starts and once when it ends, over the progress last heard"
+        );
+    }
+
+    /// A poll the server refused the credentials for is the last one taken.
+    /// Every further poll would be refused the same, and each 401 the
+    /// browser gets carries a challenge it turns into a credential prompt;
+    /// the batch carries on in Restate without being asked after, and the
+    /// follow ends saying so, over the progress last heard, so the drawer can
+    /// say why the batch is no longer followed.
+    #[tokio::test]
+    async fn a_poll_refused_the_credentials_is_the_last_one_taken_and_the_follow_ends_saying_so() {
+        let progress = [
+            Ok(Some(after(1))),
+            Err(Fault::SignedOut),
+            Ok(Some(after(2))),
+        ];
+        let mut gateway = Scripted::new([Ok(BatchReceipt::default())], progress);
+
+        let (outcome, reported, _) = run(&mut gateway).await;
+
+        assert_eq!(outcome, BatchOutcome::SignedOut);
+        assert_eq!(
+            gateway.progress_calls, 2,
+            "nothing is asked after the refusal"
+        );
+        assert_eq!(
+            reported
+                .last()
+                .map(|followed| (followed.trouble.clone(), followed.progress.clone())),
+            Some((Some(Fault::SignedOut), Some(after(1)))),
+            "the last word is the refusal, over the progress last heard"
         );
     }
 
