@@ -11,7 +11,8 @@ use crate::server::restate::RestateIngress;
 pub(crate) struct ServerState {
     pub(crate) ingress: RestateIngress,
     pub(crate) store: LibSqlPrStore,
-    /// A per-PR sync or a batch target is refused for a pull request of any
-    /// other installation.
+    /// Any request that names a pull request by key — a per-PR sync, a batch
+    /// target, or the drawer's reads of a row and its durable state — is
+    /// refused for a pull request of any other installation.
     pub(crate) installation_id: u64,
 }

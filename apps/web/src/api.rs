@@ -195,28 +195,37 @@ pub(crate) async fn load_recent_batches(limit: u32) -> Result<BatchList, ServerF
     Ok(BatchList { running, finished })
 }
 
+/// The durable state Restate holds for a pull request, or `None` for one the
+/// projection does not have: the `PullRequest` object knows nothing of
+/// installations, so the key is held to the projection before Restate is
+/// asked, and a key with no row is answered with no state, which is how the
+/// drawer learns the pull request is no longer open.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_pr_status(
     repository_id: u64,
     number: u64,
 ) -> Result<Option<PrState>, ServerFnError> {
+    let key = PrKey::new(repository_id, number);
+    if projected_pr(&state, &key).await?.is_none() {
+        return Ok(None);
+    }
     state
         .ingress
-        .call(&pr_status_path(repository_id, number))
+        .call(&pr_status_path(key.repository_id, key.number))
         .await
         .map_err(restate_unavailable)
 }
 
+/// The pull request's row as the projection has it, or `None` for one the
+/// projection does not: what the drawer opens on, and reads back after a
+/// sync. Held to the installation like every other read of a key the browser
+/// names; see [`projected_pr`].
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_pr_projection(
     repository_id: u64,
     number: u64,
 ) -> Result<Option<PrRecord>, ServerFnError> {
-    state
-        .store
-        .get_pr(&PrKey::new(repository_id, number))
-        .await
-        .map_err(store_failure)
+    projected_pr(&state, &PrKey::new(repository_id, number)).await
 }
 
 #[server(state: Extension<ServerState>)]
@@ -259,6 +268,10 @@ pub(crate) async fn request_pr_sync(
 /// is in and what it is. A key whose repository belongs to another
 /// installation is refused outright rather than answered with nothing: the
 /// projection never showed it, so no dashboard could have named it.
+///
+/// Every server function that takes a key from the browser — a read as much
+/// as a sync or a batch target — resolves it here, so the installation is
+/// held to in one place rather than remembered at each.
 #[cfg(feature = "server")]
 async fn projected_pr(state: &ServerState, key: &PrKey) -> Result<Option<PrRecord>, ServerFnError> {
     let Some(row) = state.store.get_pr(key).await.map_err(store_failure)? else {
@@ -678,5 +691,99 @@ mod tests {
                 "completion_id": completion_id,
             })
         );
+    }
+
+    /// Calls `name` for `row` the way the drawer names a pull request: by key.
+    async fn read_by_key(dashboard: &Dashboard, name: &str, row: PrRecord) -> reqwest::Response {
+        dashboard
+            .call(
+                name,
+                json!({ "repository_id": row.repository_id, "number": row.number }),
+            )
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The drawer reads a row by the key the browser holds, and the key is
+    /// held to the installation the same way a sync or a batch target is: a
+    /// row of another installation is refused, not shown, while a key the
+    /// projection has no row for is answered with nothing, which is how the
+    /// drawer learns a pull request is no longer open.
+    #[tokio::test]
+    async fn a_pull_request_row_is_read_only_within_the_installation() {
+        let dashboard = dashboard().await;
+        dashboard.project(INSTALLATION_ID, &grouped_row()).await;
+        dashboard.project(INSTALLATION_ID + 1, &serde_row()).await;
+        let read = |row: PrRecord| read_by_key(&dashboard, "load_pr_projection", row);
+
+        let foreign = read(serde_row()).await;
+        assert_eq!(foreign.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error_message(foreign).await,
+            "pull request #12 does not belong to the configured installation"
+        );
+
+        let unknown = read(PrRecord {
+            number: 99,
+            ..grouped_row()
+        })
+        .await;
+        assert_eq!(unknown.status(), StatusCode::OK);
+        assert_eq!(unknown.json::<Option<PrRecord>>().await.unwrap(), None);
+
+        let own = read(grouped_row()).await;
+        assert_eq!(own.status(), StatusCode::OK);
+        assert_eq!(
+            own.json::<Option<PrRecord>>().await.unwrap(),
+            Some(PrRecord {
+                installation_id: INSTALLATION_ID,
+                ..grouped_row()
+            })
+        );
+    }
+
+    /// The durable state lives in Restate, whose `PullRequest` objects know
+    /// nothing of installations: whatever key is asked for is answered. So
+    /// the key is held to the projection first. A key whose row is another
+    /// installation's is refused before Restate is asked, whatever Restate
+    /// holds for it; a key with no row is answered with no state without
+    /// asking either, the answer the drawer reads as "no longer open"; and
+    /// a key of this installation is answered with what Restate holds.
+    #[tokio::test]
+    async fn a_pull_request_status_is_read_only_within_the_installation() {
+        let dashboard = dashboard().await;
+        dashboard.project(INSTALLATION_ID, &grouped_row()).await;
+        dashboard.project(INSTALLATION_ID + 1, &serde_row()).await;
+        let mut synced = PrState::default();
+        synced.complete_sync("sync-1".to_owned());
+        for (repository_id, number) in [(7, 9), (7, 99), (8, 12)] {
+            dashboard.restate_answers(&pr_status_path(repository_id, number), json!(synced));
+        }
+        let read = |row: PrRecord| read_by_key(&dashboard, "load_pr_status", row);
+
+        let foreign = read(serde_row()).await;
+        assert_eq!(foreign.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error_message(foreign).await,
+            "pull request #12 does not belong to the configured installation"
+        );
+
+        let unknown = read(PrRecord {
+            number: 99,
+            ..grouped_row()
+        })
+        .await;
+        assert_eq!(unknown.status(), StatusCode::OK);
+        assert_eq!(unknown.json::<Option<PrState>>().await.unwrap(), None);
+        assert!(
+            dashboard.forwards().is_empty(),
+            "a key the projection does not vouch for is not asked of Restate"
+        );
+
+        let own = read(grouped_row()).await;
+        assert_eq!(own.status(), StatusCode::OK);
+        assert_eq!(own.json::<Option<PrState>>().await.unwrap(), Some(synced));
+        dashboard.the_one_forward("/restate/call/PullRequest/7%239/status");
     }
 }

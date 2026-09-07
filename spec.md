@@ -701,6 +701,17 @@ Progress          UI polls → server fn →
                        POST /restate/call/BulkAction/{batch_id}/progress
                        the batch id is in the URL, so a reload polls on
 
+Drawer            UI → server fn → PrStore::get_pr
+                       the drawer names a pull request by key: the row it opens on
+                       and reads back after a sync, and the durable state it polls,
+                       POST /restate/call/PullRequest/{repository_id}%23{number}/status
+                       both go through the resolution a sync and a batch target use,
+                       so a key of another installation is refused on the row's word,
+                       before Restate — whose PullRequest object knows nothing of
+                       installations — is asked, and a key the projection has no row
+                       for is answered with nothing, which the drawer reads as no
+                       longer open
+
 Recent batches    UI → server fn → PrStore::running_batches() + recent_batches(limit)
                        the running batches, then the finished ones, newest first, from
                        the projection rather than Restate, so a finished batch outlives

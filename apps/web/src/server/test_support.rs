@@ -1,5 +1,6 @@
 //! Shared fixtures for the server modules' unit tests.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -43,31 +44,50 @@ pub(crate) async fn serve(router: axum::Router) -> SocketAddr {
     address
 }
 
-/// What the fake Restate ingress saw for one `/restate/send` request.
+/// What the fake Restate ingress saw for one request: a send it was asked to
+/// enqueue, or a call made of it.
 #[derive(Clone)]
-pub(crate) struct ForwardedSend {
+pub(crate) struct ForwardedRequest {
     pub(crate) path: String,
     pub(crate) idempotency_key: Option<String>,
     pub(crate) body: Bytes,
 }
 
-/// Serves a stand-in for the Restate ingress that accepts every send and
-/// records what it was asked to enqueue.
-pub(crate) async fn fake_restate_ingress() -> (RestateIngress, Arc<Mutex<Vec<ForwardedSend>>>) {
-    let forwarded = Arc::new(Mutex::new(Vec::new()));
-    let recorder = Arc::clone(&forwarded);
+/// Where the ingress takes a request/response call, under the handler's path.
+const RESTATE_CALL: &str = "/restate/call/";
+
+/// The stand-in Restate ingress as a test sees it: what it was sent, and
+/// what it answers a call with, by the call's path.
+#[derive(Clone, Default)]
+pub(crate) struct FakeRestate {
+    forwarded: Arc<Mutex<Vec<ForwardedRequest>>>,
+    answers: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+}
+
+/// Serves a stand-in for the Restate ingress that accepts every send,
+/// recording what it was asked to enqueue, and answers a call with the output
+/// held for its path, or with nothing, as a virtual object with no state
+/// would.
+pub(crate) async fn fake_restate() -> (RestateIngress, FakeRestate) {
+    let fake = FakeRestate::default();
+    let restate = fake.clone();
     let router = axum::Router::new().fallback(
         move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
-            let recorder = Arc::clone(&recorder);
+            let restate = restate.clone();
             async move {
-                recorder.lock().unwrap().push(ForwardedSend {
-                    path: uri.path().to_owned(),
+                let path = uri.path().to_owned();
+                restate.forwarded.lock().unwrap().push(ForwardedRequest {
+                    path: path.clone(),
                     idempotency_key: headers
                         .get("idempotency-key")
                         .and_then(|value| value.to_str().ok())
                         .map(str::to_owned),
                     body,
                 });
+                if path.starts_with(RESTATE_CALL) {
+                    let output = restate.answers.lock().unwrap().get(&path).cloned();
+                    return axum::Json(serde_json::json!({ "output": output }));
+                }
                 axum::Json(serde_json::json!({
                     "invocationId": "inv_1aiqX0vFEFNH1Umgre58JiCLgHfTtztYK5",
                     "status": "Accepted"
@@ -76,20 +96,27 @@ pub(crate) async fn fake_restate_ingress() -> (RestateIngress, Arc<Mutex<Vec<For
         },
     );
     let address = serve(router).await;
-    (ingress_at(address), forwarded)
+    (ingress_at(address), fake)
+}
+
+/// [`fake_restate`], for a test that only sends.
+pub(crate) async fn fake_restate_ingress() -> (RestateIngress, Arc<Mutex<Vec<ForwardedRequest>>>) {
+    let (ingress, fake) = fake_restate().await;
+    (ingress, fake.forwarded)
 }
 
 /// The whole server as a test reaches it over HTTP: the routes as `main`
 /// mounts them, minus the static assets, on loopback; behind them an empty
-/// in-memory read model and a Restate stand-in that records what it is sent.
+/// in-memory read model and a Restate stand-in that records what it is sent
+/// and answers what it is asked with what the test put there.
 pub(crate) struct Dashboard {
     address: SocketAddr,
     store: LibSqlPrStore,
-    forwarded: Arc<Mutex<Vec<ForwardedSend>>>,
+    restate: FakeRestate,
 }
 
 pub(crate) async fn dashboard() -> Dashboard {
-    let (ingress, forwarded) = fake_restate_ingress().await;
+    let (ingress, restate) = fake_restate().await;
     let store = LibSqlPrStore::connect(&StoreConfig::local(":memory:"))
         .await
         .unwrap();
@@ -108,7 +135,7 @@ pub(crate) async fn dashboard() -> Dashboard {
     Dashboard {
         address,
         store,
-        forwarded,
+        restate,
     }
 }
 
@@ -118,16 +145,27 @@ impl Dashboard {
     }
 
     /// Every request Restate was sent so far, in order.
-    pub(crate) fn forwards(&self) -> Vec<ForwardedSend> {
-        self.forwarded.lock().unwrap().clone()
+    pub(crate) fn forwards(&self) -> Vec<ForwardedRequest> {
+        self.restate.forwarded.lock().unwrap().clone()
     }
 
     /// The one request Restate was sent, which went to `path`.
-    pub(crate) fn the_one_forward(&self, path: &str) -> ForwardedSend {
+    pub(crate) fn the_one_forward(&self, path: &str) -> ForwardedRequest {
         let forwards = self.forwards();
         assert_eq!(forwards.len(), 1, "one request reaches Restate");
         assert_eq!(forwards[0].path, path);
         forwards.into_iter().next().unwrap()
+    }
+
+    /// Holds `output` as what Restate answers a call to `path` with: what the
+    /// handler there would return, for putting there what the Restate service
+    /// would hold.
+    pub(crate) fn restate_answers(&self, path: &str, output: serde_json::Value) {
+        self.restate
+            .answers
+            .lock()
+            .unwrap()
+            .insert(format!("{RESTATE_CALL}{path}"), output);
     }
 
     /// The read model behind the server, for putting there what the Restate
