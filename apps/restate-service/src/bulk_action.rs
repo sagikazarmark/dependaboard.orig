@@ -306,6 +306,7 @@ async fn run_bulk_action<E: BulkActionEffects>(
         batch_id: progress.batch_id.clone(),
         action: request.action,
         requested_by: request.user_id.clone(),
+        retried_from: request.retried_from.clone(),
         started_at,
         target_count: request.targets.len() as u64,
     };
@@ -378,7 +379,12 @@ async fn drive<E: BulkActionEffects>(
     }
     let completed_at = restate.now("batch-finish-clock").await?;
     let record = progress
-        .completed_record(request.user_id.clone(), started_at, completed_at)
+        .completed_record(
+            request.user_id.clone(),
+            request.retried_from.clone(),
+            started_at,
+            completed_at,
+        )
         .ok_or_else(|| {
             TerminalError::new("every target was attempted, yet the batch is not complete")
         })?;
@@ -531,24 +537,31 @@ mod tests {
             action,
             targets,
             user_id: UserId::new("dashboard"),
+            retried_from: None,
         }
     }
+
+    /// The commit every merge in these tests makes.
+    const MERGE_SHA: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6";
 
     fn merged() -> ActionOutcome {
         ActionOutcome::Succeeded {
             detail: "merged".to_owned(),
+            merge_sha: Some(MERGE_SHA.to_owned()),
         }
     }
 
     fn updated() -> ActionOutcome {
         ActionOutcome::Succeeded {
             detail: "Updating pull request branch.".to_owned(),
+            merge_sha: None,
         }
     }
 
     fn commented() -> ActionOutcome {
         ActionOutcome::Succeeded {
             detail: "@dependabot rebase posted".to_owned(),
+            merge_sha: None,
         }
     }
 
@@ -757,7 +770,8 @@ mod tests {
         assert_eq!(
             state_of(&progress, 3),
             &TargetProgressState::Succeeded {
-                detail: "merged".to_owned()
+                detail: "merged".to_owned(),
+                merge_sha: Some(MERGE_SHA.to_owned()),
             }
         );
     }
@@ -780,7 +794,8 @@ mod tests {
         assert!(
             progress.targets.iter().all(|target| target.state
                 == TargetProgressState::Succeeded {
-                    detail: "merged".to_owned()
+                    detail: "merged".to_owned(),
+                    merge_sha: Some(MERGE_SHA.to_owned()),
                 }),
             "{:?}",
             progress.targets
@@ -827,7 +842,8 @@ mod tests {
         assert_eq!(
             state_of(&progress, 1),
             &TargetProgressState::Succeeded {
-                detail: "merged".to_owned()
+                detail: "merged".to_owned(),
+                merge_sha: Some(MERGE_SHA.to_owned()),
             }
         );
         assert_eq!(
@@ -892,7 +908,8 @@ mod tests {
         assert_eq!(
             state_of(&progress, 1),
             &TargetProgressState::Succeeded {
-                detail: "Updating pull request branch.".to_owned()
+                detail: "Updating pull request branch.".to_owned(),
+                merge_sha: None,
             }
         );
         assert_eq!(
@@ -972,11 +989,13 @@ mod tests {
 
     /// Restate forgets the workflow after its retention; the projection is where the
     /// batch's outcome lives on. It is written once, as the batch's last step, with the
-    /// requester, when the batch started and finished, the tally, and every verdict.
+    /// requester, the batch it retried if any, when the batch started and finished, the
+    /// tally, and every verdict — a merge's with the commit it made.
     #[tokio::test]
     async fn a_finished_batch_is_recorded_in_the_projection_once_with_its_tally_and_verdicts() {
         let request = BulkRequest {
             user_id: UserId::new("alice"),
+            retried_from: Some("batch-0".to_owned()),
             ..request(
                 BulkActionKind::Merge,
                 vec![pull(7, 1), pull(8, 4), pull(9, 2)],
@@ -992,11 +1011,17 @@ mod tests {
         assert_eq!(
             record,
             &progress
-                .completed_record(UserId::new("alice"), CLOCK_EPOCH, CLOCK_EPOCH + 60)
+                .completed_record(
+                    UserId::new("alice"),
+                    Some("batch-0".to_owned()),
+                    CLOCK_EPOCH,
+                    CLOCK_EPOCH + 60,
+                )
                 .expect("the batch has finished"),
-            "the record is the finished progress, stamped with who asked and when"
+            "the record is the finished progress, stamped with who asked, what it retried, and when"
         );
         assert_eq!(record.batch_id, "batch-1");
+        assert_eq!(record.retried_from.as_deref(), Some("batch-0"));
         assert_eq!(
             (record.succeeded, record.rejected, record.failed),
             (1, 1, 1)
@@ -1011,7 +1036,8 @@ mod tests {
                 (
                     1,
                     TargetOutcome::Succeeded {
-                        detail: "merged".to_owned()
+                        detail: "merged".to_owned(),
+                        merge_sha: Some(MERGE_SHA.to_owned()),
                     }
                 ),
                 (
@@ -1034,12 +1060,13 @@ mod tests {
 
     /// A dashboard that lost the batch, or never followed it, finds it in the audit
     /// view while it runs: the workflow lists it as running before it sends the first
-    /// target, with what was asked, by whom, since when, and over how many pull
-    /// requests.
+    /// target, with what was asked, by whom, which batch it retries if any, since when,
+    /// and over how many pull requests.
     #[tokio::test]
     async fn a_batch_is_listed_as_running_before_its_first_target_is_sent() {
         let request = BulkRequest {
             user_id: UserId::new("alice"),
+            retried_from: Some("batch-0".to_owned()),
             ..request(BulkActionKind::Merge, vec![pull(7, 1), pull(8, 4)])
         };
         let mut restate = RecordedBulkAction::default();
@@ -1052,6 +1079,7 @@ mod tests {
                 batch_id: "batch-1".to_owned(),
                 action: BulkActionKind::Merge,
                 requested_by: UserId::new("alice"),
+                retried_from: Some("batch-0".to_owned()),
                 started_at: CLOCK_EPOCH,
                 target_count: 2,
             }]
@@ -1155,7 +1183,7 @@ mod tests {
         let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
         progress.record(&targets[0].key(), merged());
         progress
-            .completed_record(UserId::new("alice"), CLOCK_EPOCH, CLOCK_EPOCH + 60)
+            .completed_record(UserId::new("alice"), None, CLOCK_EPOCH, CLOCK_EPOCH + 60)
             .expect("the batch has finished")
     }
 

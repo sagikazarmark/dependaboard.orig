@@ -10,7 +10,9 @@ use dependaboard_core::{
     GithubErrorResponse, MergeMethod, MergeRequest, Mergeable, Operation, PrRecord, PrTarget,
     SyncRequest, UpdateBranchRequest, UpdateType, UserId, unix_seconds,
 };
-use dependaboard_github::{GithubApi, GithubClient, GithubConfig, GithubError, ProtocolError};
+use dependaboard_github::{
+    GithubApi, GithubClient, GithubConfig, GithubError, Merged, ProtocolError,
+};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use wiremock::{
@@ -1041,10 +1043,12 @@ fn assert_stale_sha(error: &GithubError) {
     );
 }
 
+/// [`dependabot_pull`] once GitHub has merged it, as [`MERGE_SHA`].
 fn merged_pull() -> Value {
     let mut pull = dependabot_pull();
     pull["merged"] = json!(true);
     pull["state"] = json!("closed");
+    pull["merge_commit_sha"] = json!(MERGE_SHA);
     pull
 }
 
@@ -1090,9 +1094,21 @@ fn merge_endpoint() -> MockBuilder {
 
 const MERGED_MESSAGE: &str = "Pull Request successfully merged";
 const CONFIRMED_MERGE: &str = "merged (confirmed after an ambiguous response)";
+/// The commit the merge made, as GitHub names it in the merge's answer and on the
+/// merged pull request alike.
+const MERGE_SHA: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6";
 
 fn merged_response() -> ResponseTemplate {
-    ok_json(json!({ "sha": "merge-sha", "merged": true, "message": MERGED_MESSAGE }))
+    ok_json(json!({ "sha": MERGE_SHA, "merged": true, "message": MERGED_MESSAGE }))
+}
+
+/// The merge as the client reports it once it is known to have landed, with `detail`
+/// as the words for how that came to be known.
+fn merged(detail: &str) -> Merged {
+    Merged {
+        detail: detail.to_owned(),
+        sha: Some(MERGE_SHA.to_owned()),
+    }
 }
 
 #[tokio::test]
@@ -1106,9 +1122,13 @@ async fn merge_succeeds_when_the_head_matches() {
         .mount(&server)
         .await;
 
-    let detail = client(&server).merge(&merge_request(), None).await.unwrap();
+    let outcome = client(&server).merge(&merge_request(), None).await.unwrap();
 
-    assert_eq!(detail, MERGED_MESSAGE);
+    assert_eq!(
+        outcome,
+        merged(MERGED_MESSAGE),
+        "the merge names the commit it made"
+    );
     server.verify().await;
 }
 
@@ -1130,12 +1150,12 @@ async fn merge_uses_the_repository_method_when_it_disallows_the_configured_one()
         .mount(&server)
         .await;
 
-    let detail = client(&server)
+    let outcome = client(&server)
         .merge(&merge_request(), Some(MergeMethod::Merge))
         .await
         .unwrap();
 
-    assert_eq!(detail, MERGED_MESSAGE);
+    assert_eq!(outcome, merged(MERGED_MESSAGE));
     server.verify().await;
 }
 
@@ -1149,9 +1169,13 @@ async fn merge_confirms_success_after_a_transport_failure() {
         .mount(&server)
         .await;
 
-    let detail = client(&server).merge(&merge_request(), None).await.unwrap();
+    let outcome = client(&server).merge(&merge_request(), None).await.unwrap();
 
-    assert_eq!(detail, CONFIRMED_MERGE);
+    assert_eq!(
+        outcome,
+        merged(CONFIRMED_MERGE),
+        "the merge confirmed on the pull request names the commit the pull request does"
+    );
 }
 
 #[tokio::test]
@@ -1165,9 +1189,9 @@ async fn merge_confirms_success_after_an_unparsable_response() {
         .mount(&server)
         .await;
 
-    let detail = client(&server).merge(&merge_request(), None).await.unwrap();
+    let outcome = client(&server).merge(&merge_request(), None).await.unwrap();
 
-    assert_eq!(detail, CONFIRMED_MERGE);
+    assert_eq!(outcome, merged(CONFIRMED_MERGE));
     server.verify().await;
 }
 
@@ -1230,10 +1254,35 @@ async fn merge_is_a_no_op_when_github_already_merged_the_pull_request() {
         .mount(&server)
         .await;
 
-    let detail = client(&server).merge(&merge_request(), None).await.unwrap();
+    let outcome = client(&server).merge(&merge_request(), None).await.unwrap();
 
-    assert_eq!(detail, "already merged");
+    assert_eq!(
+        outcome,
+        merged("already merged"),
+        "a merge found already done still names the commit"
+    );
     server.verify().await;
+}
+
+/// GitHub's `merge_commit_sha` is nullable. A pull request found merged without one
+/// is still a merge that happened; the client says so, with no commit to name.
+#[tokio::test]
+async fn merge_found_already_done_without_a_commit_named_reports_the_merge_without_one() {
+    let server = MockServer::start().await;
+    mount_token(&server).await;
+    let mut pull = merged_pull();
+    pull["merge_commit_sha"] = Value::Null;
+    mount_pull(&server, pull).await;
+
+    let outcome = client(&server).merge(&merge_request(), None).await.unwrap();
+
+    assert_eq!(
+        outcome,
+        Merged {
+            detail: "already merged".to_owned(),
+            sha: None,
+        }
+    );
 }
 
 #[tokio::test]

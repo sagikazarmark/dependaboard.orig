@@ -1574,6 +1574,49 @@ code,
   border-color: var(--color-base-content);
 }
 
+/* Where the batch stands in a line of retries: the batch it retries, and the
+   ones that retry it, each a link to that entry. */
+.batch-lineage {
+  display: block;
+  color: var(--muted);
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+}
+
+.batch-link {
+  color: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.batch-link:hover {
+  color: var(--color-primary);
+}
+
+.batch-link code {
+  font: inherit;
+}
+
+/* The commit a merge made, in passing beside the words for it. */
+.commit-link,
+.commit-ref {
+  font: inherit;
+}
+
+.commit-link {
+  color: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.commit-link:hover {
+  color: var(--color-primary);
+}
+
+.commit-link code {
+  font: inherit;
+}
+
 /* When the batch started and finished, to the second: the first line of the
    opened entry, over the targets. */
 .batch-times {

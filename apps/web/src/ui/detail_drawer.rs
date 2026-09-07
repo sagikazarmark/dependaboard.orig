@@ -227,6 +227,7 @@ pub(crate) fn DetailDrawer(
         onaction.call(PendingAction {
             action,
             rows: vec![subject.clone()],
+            retried_from: None,
         });
     });
     rsx! {

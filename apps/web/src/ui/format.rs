@@ -189,9 +189,35 @@ pub(crate) fn connection_label(connection: Connection) -> &'static str {
     }
 }
 
+/// Where the commit `sha` is on GitHub, going by the page of the pull request it was
+/// made from: the repository's page is what comes before `/pull/`, and its commits are
+/// under it. The dashboard knows GitHub's host no other way — the client is configured
+/// with the API's, and a GitHub Enterprise serves the two apart — so a target with no
+/// page to go by, recorded before URLs travelled with it, has no commit link either.
+pub(crate) fn commit_url(pull_request_url: &str, sha: &str) -> Option<String> {
+    let (repository, _) = pull_request_url.rsplit_once("/pull/")?;
+    Some(format!("{repository}/commit/{sha}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The commit is under the repository the pull request is, whatever the host; a
+    /// repository or an owner called `pull` does not throw it off, and a target with no
+    /// page has no link.
+    #[test]
+    fn a_commit_is_found_under_the_repository_of_the_pull_request_it_was_made_from() {
+        assert_eq!(
+            commit_url("https://github.com/acme/api/pull/9", "9f8e7d6").as_deref(),
+            Some("https://github.com/acme/api/commit/9f8e7d6")
+        );
+        assert_eq!(
+            commit_url("https://ghe.example.com/pull/pull/pull/9", "9f8e7d6").as_deref(),
+            Some("https://ghe.example.com/pull/pull/commit/9f8e7d6")
+        );
+        assert_eq!(commit_url("", "9f8e7d6"), None);
+    }
 
     #[test]
     fn a_pull_request_count_reads_as_a_phrase() {

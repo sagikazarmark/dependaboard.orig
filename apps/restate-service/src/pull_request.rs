@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     github::{
-        GithubApiHandle, RestateGithubStep, Settled, action_result, read_result, rejected,
-        run_github_step,
+        GithubApiHandle, RestateGithubStep, Settled, action_result, merge_result, read_result,
+        rejected, run_github_step,
     },
     handler::{HandlerOutcome, traced, traced_read},
     store::{store_failure, store_retry_policy},
@@ -282,7 +282,7 @@ impl PullRequest {
                 },
             })
             .await?;
-            let outcome = action_result(result)?;
+            let outcome = merge_result(result)?;
             if matches!(outcome, ActionOutcome::Succeeded { .. }) {
                 let store = self.store.clone();
                 let key = request.target.key();
@@ -473,7 +473,7 @@ async fn repository_merge_method(
 
 fn outcome_detail(outcome: &ActionOutcome) -> String {
     match outcome {
-        ActionOutcome::Succeeded { detail } => detail.clone(),
+        ActionOutcome::Succeeded { detail, .. } => detail.clone(),
         ActionOutcome::Rejected { reason } => reason.to_string(),
     }
 }

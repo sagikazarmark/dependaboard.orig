@@ -7,12 +7,12 @@
 //! the credentials it says the follow has stopped, and that the reload which
 //! signs in again picks it up.
 
-use dependaboard_core::TargetProgressState;
+use dependaboard_core::{TargetProgressState, short_sha};
 use dioxus::prelude::*;
 
 use crate::components::button::{Button, ButtonSize};
 use crate::ui::batch::{Followed, Listing};
-use crate::ui::format::{ago, pull_requests, relative_time, verdict_tally};
+use crate::ui::format::{ago, commit_url, pull_requests, relative_time, verdict_tally};
 use crate::ui::retry::can_retry;
 use crate::ui::side_panel::SidePanel;
 
@@ -185,9 +185,9 @@ fn trouble_note(followed: &Followed) -> Option<String> {
 /// One target of a batch: its state as a dot, the pull request as a link to
 /// GitHub when its URL is known (a target recorded before URLs travelled with
 /// it has none), its title beside the reference — the reference says where,
-/// the title says which dependency and versions — and the state's detail.
-/// Shared by the drawer that follows a running batch and the list of the
-/// batches that have run.
+/// the title says which dependency and versions — and the state's detail, with
+/// the commit a merge made beside it once it is known. Shared by the drawer
+/// that follows a running batch and the list of the batches that have run.
 #[component]
 pub(crate) fn TargetRow(
     owner: String,
@@ -197,6 +197,7 @@ pub(crate) fn TargetRow(
     html_url: String,
     state: TargetProgressState,
 ) -> Element {
+    let merge_sha = state.merge_sha().map(str::to_owned);
     rsx! {
         div { class: "progress-row",
             span { class: "progress-state {progress_class(&state)}" }
@@ -207,7 +208,7 @@ pub(crate) fn TargetRow(
                     } else {
                         a {
                             class: "github-pr-link",
-                            href: html_url,
+                            href: html_url.clone(),
                             target: "_blank",
                             rel: "noreferrer",
                             strong { "{owner}/{repo}#{number}" }
@@ -218,9 +219,38 @@ pub(crate) fn TargetRow(
                         span { class: "progress-title", title: "{title}", "{title}" }
                     }
                 }
-                small { "{progress_detail(&state)}" }
+                small {
+                    "{progress_detail(&state)}"
+                    if let Some(sha) = merge_sha {
+                        " · "
+                        CommitRef { sha, pull_request_url: html_url }
+                    }
+                }
             }
         }
+    }
+}
+
+/// The commit `sha` in passing — its first seven characters, the whole on
+/// hover — as a link to the commit on GitHub when the pull request it was
+/// made from has a page to find it under, and as plain text when it has none.
+#[component]
+fn CommitRef(sha: String, pull_request_url: String) -> Element {
+    let short = short_sha(&sha).to_owned();
+    match commit_url(&pull_request_url, &sha) {
+        Some(href) => rsx! {
+            a {
+                class: "commit-link",
+                href,
+                target: "_blank",
+                rel: "noreferrer",
+                title: "{sha}",
+                code { "{short}" }
+            }
+        },
+        None => rsx! {
+            code { class: "commit-ref", title: "{sha}", "{short}" }
+        },
     }
 }
 
@@ -234,11 +264,13 @@ fn progress_class(state: &TargetProgressState) -> &'static str {
     }
 }
 
+/// The state in words: the words GitHub had for what it did, or the reason it
+/// did not. A merge's commit is not among them; [`TargetRow`] sets it beside.
 fn progress_detail(state: &TargetProgressState) -> String {
     match state {
         TargetProgressState::Queued => "queued".to_owned(),
         TargetProgressState::Running => "running".to_owned(),
-        TargetProgressState::Succeeded { detail } => detail.clone(),
+        TargetProgressState::Succeeded { detail, .. } => detail.clone(),
         TargetProgressState::Rejected { reason } => reason.to_string(),
         TargetProgressState::Failed { detail } => detail.clone(),
     }
@@ -300,6 +332,67 @@ mod tests {
     }
 
     const RETRY_BUTTON: &str = "retry-rejected-button";
+
+    /// A merge that has landed names the commit it made the moment Restate
+    /// reports it, as a short sha linked to the commit on the pull request's
+    /// GitHub, beside the words for it; one reported without a commit —
+    /// journaled before the commit was kept, or one GitHub named none for —
+    /// keeps the words alone. A target whose pull request has no page to go by
+    /// names the commit without a link: the host is not known any other way.
+    #[test]
+    fn a_merged_target_links_the_commit_it_made_by_its_short_sha() {
+        let sha = "9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6";
+        let mut without_a_page = pr_target(&grouped_row());
+        without_a_page.html_url = String::new();
+        let mut unknown_commit = pr_target(&serde_row());
+        unknown_commit.number = 99;
+        let targets = [
+            pr_target(&serde_row()),
+            without_a_page.clone(),
+            unknown_commit.clone(),
+        ];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        for target in [&targets[0], &without_a_page] {
+            progress.record(
+                &target.key(),
+                ActionOutcome::Succeeded {
+                    detail: "merged".to_owned(),
+                    merge_sha: Some(sha.to_owned()),
+                },
+            );
+        }
+        progress.record(
+            &unknown_commit.key(),
+            ActionOutcome::Succeeded {
+                detail: "merged".to_owned(),
+                merge_sha: None,
+            },
+        );
+
+        let html = render_drawer(progress, false);
+
+        let serde_page = &serde_row().html_url;
+        let repository = serde_page.trim_end_matches("/pull/12");
+        assert!(
+            html.contains(&format!(
+                r#"merged · <a class="commit-link" href="{repository}/commit/{sha}" target="_blank" rel="noreferrer" title="{sha}"><code>9f8e7d6</code></a>"#
+            )),
+            "the commit is linked under the pull request's repository: {html}"
+        );
+        assert!(
+            html.contains(r#"merged · <code class="commit-ref" title="9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6">9f8e7d6</code>"#),
+            "without a page to go by the commit is named unlinked: {html}"
+        );
+        assert_eq!(
+            html.matches(">9f8e7d6</code>").count(),
+            2,
+            "two merges named their commit, and no more: {html}"
+        );
+        assert!(
+            html.contains("<small>merged</small>"),
+            "a merge with no commit named keeps the words alone: {html}"
+        );
+    }
 
     #[test]
     fn a_finished_batch_with_a_rejected_target_offers_to_retry_the_rejected_ones() {
@@ -552,6 +645,7 @@ mod tests {
                 batch_id: "batch-1".to_owned(),
                 action: BulkActionKind::Merge,
                 requested_by: UserId::new("alice"),
+                retried_from: None,
                 started_at: FIXTURE_NOW - 3 * 60,
                 target_count: 12,
             }),

@@ -584,24 +584,28 @@ impl GithubClient {
     ///
     /// A lost answer (transport failure) or an unreadable one (a 2xx whose body does not
     /// parse) is not yet a failure: `confirm` reads back whether the write landed and, when
-    /// it did, the mutation succeeds with that detail. Otherwise a transport failure stands
-    /// and an unreadable answer becomes [`GithubError::Ambiguous`]. Any other failure to
-    /// send means nothing reached GitHub and is returned as is. A read-back that itself
-    /// fails counts as unconfirmed.
+    /// it did, the mutation succeeds with what the read-back says of it. Otherwise a
+    /// transport failure stands and an unreadable answer becomes [`GithubError::Ambiguous`].
+    /// Any other failure to send means nothing reached GitHub and is returned as is. A
+    /// read-back that itself fails counts as unconfirmed.
+    ///
+    /// `A` is what the caller makes of a write known to have landed without GitHub's
+    /// answer to read: the words for it, and whatever else the read-back has to say — a
+    /// merge found done names its commit. `T` is GitHub's answer when there is one.
     ///
     /// HTTP errors GitHub returns after the pull request was verified are flagged as coming
     /// from a known resource.
-    async fn verified_mutation<T: DeserializeOwned>(
+    async fn verified_mutation<T: DeserializeOwned, A>(
         &self,
         operation: Operation,
         target: &PrTarget,
-        already_applied: impl FnOnce(&GithubPull) -> Option<String>,
-        mutate: impl AsyncFnOnce() -> Result<Write, GithubError>,
-        confirm: impl AsyncFnOnce() -> Result<Option<String>, GithubError>,
-    ) -> Result<MutationOutcome<T>, GithubError> {
+        already_applied: impl FnOnce(&GithubPull) -> Option<A>,
+        mutate: impl AsyncFnOnce() -> Result<Write<A>, GithubError>,
+        confirm: impl AsyncFnOnce() -> Result<Option<A>, GithubError>,
+    ) -> Result<MutationOutcome<T, A>, GithubError> {
         let pull = self.fetch_target(target).await?;
-        if let Some(detail) = already_applied(&pull) {
-            return Ok(MutationOutcome::Applied(detail));
+        if let Some(applied) = already_applied(&pull) {
+            return Ok(MutationOutcome::Applied(applied));
         }
         if pull.state != "open" || pull.user.login != DEPENDABOT_LOGIN {
             return Err(not_found(
@@ -616,10 +620,10 @@ impl GithubClient {
         }
         let response = match mutate().await {
             Ok(Write::Sent(response)) => response,
-            Ok(Write::AlreadyApplied(detail)) => return Ok(MutationOutcome::Applied(detail)),
+            Ok(Write::AlreadyApplied(applied)) => return Ok(MutationOutcome::Applied(applied)),
             Err(lost @ GithubError::Transport(_)) => {
                 return match confirm().await {
-                    Ok(Some(detail)) => Ok(MutationOutcome::Applied(detail)),
+                    Ok(Some(applied)) => Ok(MutationOutcome::Applied(applied)),
                     Ok(None) | Err(_) => Err(lost),
                 };
             }
@@ -628,7 +632,7 @@ impl GithubClient {
         match parse_response(response).await.map_err(known_http) {
             Ok(answer) => Ok(MutationOutcome::Answered(answer)),
             Err(GithubError::Protocol(unreadable)) => match confirm().await {
-                Ok(Some(detail)) => Ok(MutationOutcome::Applied(detail)),
+                Ok(Some(applied)) => Ok(MutationOutcome::Applied(applied)),
                 Ok(None) | Err(_) => Err(GithubError::Ambiguous {
                     operation,
                     source: unreadable,
@@ -638,48 +642,58 @@ impl GithubClient {
         }
     }
 
-    /// The read-back for writes whose effect shows on the pull request itself: `Some(detail)`
-    /// when `landed` holds for what GitHub now shows.
-    async fn confirm_on_pull(
+    /// The read-back for writes whose effect shows on the pull request itself: what
+    /// `landed` makes of what GitHub now shows, `Some` once the write is seen to have
+    /// landed.
+    async fn confirm_on_pull<A>(
         &self,
         target: &PrTarget,
-        detail: &str,
-        landed: impl FnOnce(&GithubPull) -> bool,
-    ) -> Result<Option<String>, GithubError> {
+        landed: impl FnOnce(&GithubPull) -> Option<A>,
+    ) -> Result<Option<A>, GithubError> {
         let pull = self.fetch_target(target).await?;
-        Ok(landed(&pull).then(|| detail.to_owned()))
+        Ok(landed(&pull))
     }
 }
 
 /// What the mutate step of a verified mutation did.
-enum Write {
+enum Write<A> {
     /// The write went out; GitHub's raw answer.
     Sent(Response),
     /// An earlier attempt already did the work, so nothing was sent.
-    AlreadyApplied(String),
+    AlreadyApplied(A),
 }
 
 /// How a verified mutation ended.
-enum MutationOutcome<T> {
+enum MutationOutcome<T, A> {
     /// GitHub answered and the client read the answer.
     Answered(T),
     /// The work is known to have happened without a readable answer: an earlier attempt
     /// did it, or a read-back confirmed it after an ambiguous answer.
-    Applied(String),
+    Applied(A),
 }
 
-impl<T> MutationOutcome<T> {
-    /// The outcome's detail: the one already known, or the one `answered` reads out of
-    /// GitHub's answer.
-    fn into_detail(
+impl<T, A> MutationOutcome<T, A> {
+    /// What the mutation did: what was already known of it, or what `answered` reads
+    /// out of GitHub's answer.
+    fn into_applied(
         self,
-        answered: impl FnOnce(T) -> Result<String, GithubError>,
-    ) -> Result<String, GithubError> {
+        answered: impl FnOnce(T) -> Result<A, GithubError>,
+    ) -> Result<A, GithubError> {
         match self {
             MutationOutcome::Answered(answer) => answered(answer),
-            MutationOutcome::Applied(detail) => Ok(detail),
+            MutationOutcome::Applied(applied) => Ok(applied),
         }
     }
+}
+
+/// A merge that landed: the words for how the client knows — GitHub's answer, the pull
+/// request found merged already, or a read-back after an ambiguous answer — and the
+/// commit it made, as GitHub names it in the answer and on the merged pull request
+/// alike. `None` when GitHub named none, which its schema allows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Merged {
+    pub detail: String,
+    pub sha: Option<String>,
 }
 
 #[async_trait]
@@ -699,12 +713,12 @@ pub trait GithubApi: Send + Sync {
     ) -> Result<Vec<SyncRequest>, GithubError>;
     /// Merges the target with `merge_method`, the method its repository resolved
     /// at its last sync because it disallows the configured preference, or with
-    /// the preference when `None`.
+    /// the preference when `None`. Names the commit the merge made.
     async fn merge(
         &self,
         request: &MergeRequest,
         merge_method: Option<MergeMethod>,
-    ) -> Result<String, GithubError>;
+    ) -> Result<Merged, GithubError>;
     async fn post_command(&self, request: &CommandRequest) -> Result<String, GithubError>;
     async fn update_branch(&self, request: &UpdateBranchRequest) -> Result<String, GithubError>;
 }
@@ -892,7 +906,7 @@ impl GithubApi for GithubClient {
         &self,
         request: &MergeRequest,
         merge_method: Option<MergeMethod>,
-    ) -> Result<String, GithubError> {
+    ) -> Result<Merged, GithubError> {
         let target = &request.target;
         let path = format!(
             "/repos/{}/{}/pulls/{}/merge",
@@ -907,7 +921,7 @@ impl GithubApi for GithubClient {
         self.verified_mutation(
             Operation::Merge,
             target,
-            |pull| pull.merged.then(|| "already merged".to_owned()),
+            merged_as("already merged"),
             async || {
                 self.installation_request(
                     self.config.installation_id,
@@ -921,16 +935,18 @@ impl GithubApi for GithubClient {
             async || {
                 self.confirm_on_pull(
                     target,
-                    "merged (confirmed after an ambiguous response)",
-                    |pull| pull.merged,
+                    merged_as("merged (confirmed after an ambiguous response)"),
                 )
                 .await
             },
         )
         .await?
-        .into_detail(|answer: MergeResult| {
+        .into_applied(|answer: MergeResult| {
             if answer.merged {
-                Ok(answer.message)
+                Ok(Merged {
+                    detail: answer.message,
+                    sha: answer.sha,
+                })
             } else {
                 Err(GithubError::Http {
                     response: GithubErrorResponse {
@@ -988,7 +1004,7 @@ impl GithubApi for GithubClient {
             },
         )
         .await?
-        .into_detail(|comment: IssueComment| Ok(format!("GitHub accepted comment #{}", comment.id)))
+        .into_applied(|comment: IssueComment| Ok(format!("GitHub accepted comment #{}", comment.id)))
     }
 
     async fn update_branch(&self, request: &UpdateBranchRequest) -> Result<String, GithubError> {
@@ -1013,16 +1029,16 @@ impl GithubApi for GithubClient {
                 .map(Write::Sent)
             },
             async || {
-                self.confirm_on_pull(
-                    target,
-                    "branch updated (confirmed after an ambiguous response)",
-                    |pull| pull.head.sha != target.expected_sha,
-                )
+                self.confirm_on_pull(target, |pull| {
+                    (pull.head.sha != target.expected_sha).then(|| {
+                        "branch updated (confirmed after an ambiguous response)".to_owned()
+                    })
+                })
                 .await
             },
         )
         .await?
-        .into_detail(|answer: UpdateBranchResult| Ok(answer.message))
+        .into_applied(|answer: UpdateBranchResult| Ok(answer.message))
     }
 }
 
@@ -1061,6 +1077,18 @@ async fn parse_response<T: DeserializeOwned>(response: Response) -> Result<T, Gi
         response: http_error(response).await,
         known_resource: false,
     })
+}
+
+/// A merge seen on the pull request rather than in GitHub's answer to the merge — found
+/// done before anything was sent, or confirmed after an ambiguous answer — with `detail`
+/// as the words for it. It names the commit the pull request does.
+fn merged_as(detail: &'static str) -> impl FnOnce(&GithubPull) -> Option<Merged> {
+    move |pull| {
+        pull.merged.then(|| Merged {
+            detail: detail.to_owned(),
+            sha: pull.merge_commit_sha.clone(),
+        })
+    }
 }
 
 async fn http_error(response: Response) -> GithubErrorResponse {
@@ -1197,7 +1225,9 @@ struct GithubHead {
 }
 
 /// The REST view of a pull request, read to verify a mutation's target: snapshots come
-/// from GraphQL, so only the fields the verify and confirm steps look at are kept.
+/// from GraphQL, so only the fields the verify and confirm steps look at are kept. The
+/// merge commit is one: a merge found already done, or confirmed after an ambiguous
+/// answer, has no answer of GitHub's to read it from.
 #[derive(Debug, Deserialize)]
 struct GithubPull {
     state: String,
@@ -1205,6 +1235,8 @@ struct GithubPull {
     head: GithubHead,
     #[serde(default)]
     merged: bool,
+    #[serde(default)]
+    merge_commit_sha: Option<String>,
 }
 
 /// One page of `GET /installation/repositories`: the page's repositories beside how many
@@ -1270,11 +1302,15 @@ struct PullListItem {
     user: GithubUser,
 }
 
+/// GitHub's answer to `PUT /pulls/{n}/merge`: whether it merged, in words, and as what
+/// commit.
 #[derive(Debug, Deserialize)]
 struct MergeResult {
     merged: bool,
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    sha: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

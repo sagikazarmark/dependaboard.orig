@@ -740,6 +740,11 @@ pub struct BulkRequest {
     pub action: BulkActionKind,
     pub targets: Vec<PrTarget>,
     pub user_id: UserId,
+    /// The batch this one retries the rejected targets of, when it was queued from a
+    /// finished batch's **Retry rejected**: the id of that batch. Every target here was
+    /// rejected there, so the record of the one names the record of the other.
+    #[serde(default)]
+    pub retried_from: Option<String>,
 }
 
 impl BulkRequest {
@@ -747,19 +752,31 @@ impl BulkRequest {
     /// asking Restate, and the workflow checks it again on its way in, so a batch that
     /// reaches Restate by another route is held to the same rules.
     pub fn validate(&self, batch_id: &str) -> Result<(), InvalidBatch> {
-        validate_batch(batch_id, self.targets.iter().map(PrTarget::key))
+        validate_batch(
+            batch_id,
+            self.retried_from.as_deref(),
+            self.targets.iter().map(PrTarget::key),
+        )
     }
 }
 
-/// Whether pull requests `keys` may run as batch `batch_id`: the id is a UUIDv7, the
-/// count is within bounds, and no pull request is named twice. Takes the keys alone so
-/// the web API can hold a submission to the rules before it resolves a single target.
+/// Whether pull requests `keys` may run as batch `batch_id`, retrying `retried_from` if
+/// it names a batch: the id is a UUIDv7, so is the retried batch's when given, the count
+/// is within bounds, and no pull request is named twice. Takes the keys alone so the web
+/// API can hold a submission to the rules before it resolves a single target. The retried
+/// batch is not looked up: the link is the browser's word, as the targets are, and a
+/// record that names a batch the projection never kept is a dangling link, not a lost
+/// record.
 pub fn validate_batch(
     batch_id: &str,
+    retried_from: Option<&str>,
     keys: impl IntoIterator<Item = PrKey>,
 ) -> Result<(), InvalidBatch> {
     if !valid_batch_id(batch_id) {
         return Err(InvalidBatch::BatchId);
+    }
+    if retried_from.is_some_and(|retried| !valid_batch_id(retried)) {
+        return Err(InvalidBatch::RetriedFrom);
     }
     let keys: Vec<PrKey> = keys.into_iter().collect();
     if keys.is_empty() || keys.len() > MAX_BATCH_TARGETS {
@@ -777,6 +794,8 @@ pub fn validate_batch(
 pub enum InvalidBatch {
     #[error("batch id must be a UUIDv7")]
     BatchId,
+    #[error("the batch retried must be named by a UUIDv7")]
+    RetriedFrom,
     #[error("batch must contain between 1 and {MAX_BATCH_TARGETS} targets")]
     TargetCount,
     #[error("batch contains duplicate pull requests")]
@@ -815,11 +834,26 @@ impl fmt::Display for DependabotCommand {
     }
 }
 
+/// How one target's action ended once GitHub had its say: done, or refused for good.
+///
+/// A merge that landed carries the commit it made — GitHub's answer names it, and so
+/// does the pull request once merged — as `merge_sha`; for a squash or rebase merge the
+/// commit is not the head that was merged, so the record could not work it out later. A
+/// rebase comment and a branch update produce nothing to name here: the one is a
+/// request Dependabot carries out in its own time, the other an update GitHub only
+/// accepts and finishes after it has answered. `None` for those, and for a merge
+/// journaled before the commit was kept.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionOutcome {
-    Succeeded { detail: String },
-    Rejected { reason: RejectReason },
+    Succeeded {
+        detail: String,
+        #[serde(default)]
+        merge_sha: Option<String>,
+    },
+    Rejected {
+        reason: RejectReason,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -865,7 +899,9 @@ impl fmt::Display for RejectReason {
     }
 }
 
-fn short_sha(value: &str) -> &str {
+/// The first seven characters of `value`, how a commit is named in passing; `value` whole
+/// when it is shorter.
+pub fn short_sha(value: &str) -> &str {
     value.get(..7).unwrap_or(value)
 }
 
@@ -874,9 +910,18 @@ fn short_sha(value: &str) -> &str {
 pub enum TargetProgressState {
     Queued,
     Running,
-    Succeeded { detail: String },
-    Rejected { reason: RejectReason },
-    Failed { detail: String },
+    /// See [`ActionOutcome::Succeeded`] for `merge_sha`.
+    Succeeded {
+        detail: String,
+        #[serde(default)]
+        merge_sha: Option<String>,
+    },
+    Rejected {
+        reason: RejectReason,
+    },
+    Failed {
+        detail: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -934,7 +979,9 @@ impl BatchProgress {
     /// The target's action completed: GitHub did it, or said no for good.
     pub fn record(&mut self, key: &PrKey, outcome: ActionOutcome) {
         let state = match outcome {
-            ActionOutcome::Succeeded { detail } => TargetProgressState::Succeeded { detail },
+            ActionOutcome::Succeeded { detail, merge_sha } => {
+                TargetProgressState::Succeeded { detail, merge_sha }
+            }
             ActionOutcome::Rejected { reason } => TargetProgressState::Rejected { reason },
         };
         self.set_state(key, state);
@@ -988,13 +1035,15 @@ impl BatchProgress {
         self.completed = self.settled() == self.targets.len() as u64;
     }
 
-    /// This batch as the projection keeps it once it has run: who asked for it, when it
-    /// started and finished, the tally, and every target's verdict in batch order.
-    /// `None` while any target is still queued or running: there is no record to keep
-    /// of a batch that has not finished.
+    /// This batch as the projection keeps it once it has run: who asked for it, which
+    /// batch it retried if any, when it started and finished, the tally, and every
+    /// target's verdict in batch order with the head it was sent against. `None` while
+    /// any target is still queued or running: there is no record to keep of a batch that
+    /// has not finished.
     pub fn completed_record(
         &self,
         requested_by: UserId,
+        retried_from: Option<String>,
         started_at: u64,
         completed_at: u64,
     ) -> Option<BatchRecord> {
@@ -1009,6 +1058,7 @@ impl BatchProgress {
                     number: item.target.number,
                     title: item.target.title.clone(),
                     html_url: item.target.html_url.clone(),
+                    head_sha: Some(item.target.expected_sha.clone()),
                     outcome: item.state.outcome()?,
                 })
             })
@@ -1017,6 +1067,7 @@ impl BatchProgress {
             batch_id: self.batch_id.clone(),
             action: self.action,
             requested_by,
+            retried_from,
             started_at,
             completed_at,
             succeeded: self.succeeded,
@@ -1033,19 +1084,39 @@ impl BatchProgress {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetOutcome {
-    Succeeded { detail: String },
-    Rejected { reason: RejectReason },
-    Failed { detail: String },
+    /// See [`ActionOutcome::Succeeded`] for `merge_sha`.
+    Succeeded {
+        detail: String,
+        #[serde(default)]
+        merge_sha: Option<String>,
+    },
+    Rejected {
+        reason: RejectReason,
+    },
+    Failed {
+        detail: String,
+    },
 }
 
 impl TargetProgressState {
+    /// The commit the target's merge made, once it has: see
+    /// [`ActionOutcome::Succeeded`]. `None` in every other state, and for a merge whose
+    /// commit is unknown.
+    pub fn merge_sha(&self) -> Option<&str> {
+        match self {
+            Self::Succeeded { merge_sha, .. } => merge_sha.as_deref(),
+            Self::Queued | Self::Running | Self::Rejected { .. } | Self::Failed { .. } => None,
+        }
+    }
+
     /// The verdict this state is, if it is one; `None` while the target is queued or
     /// running.
     pub fn outcome(&self) -> Option<TargetOutcome> {
         match self {
             Self::Queued | Self::Running => None,
-            Self::Succeeded { detail } => Some(TargetOutcome::Succeeded {
+            Self::Succeeded { detail, merge_sha } => Some(TargetOutcome::Succeeded {
                 detail: detail.clone(),
+                merge_sha: merge_sha.clone(),
             }),
             Self::Rejected { reason } => Some(TargetOutcome::Rejected {
                 reason: reason.clone(),
@@ -1060,7 +1131,7 @@ impl TargetProgressState {
 impl From<TargetOutcome> for TargetProgressState {
     fn from(outcome: TargetOutcome) -> Self {
         match outcome {
-            TargetOutcome::Succeeded { detail } => Self::Succeeded { detail },
+            TargetOutcome::Succeeded { detail, merge_sha } => Self::Succeeded { detail, merge_sha },
             TargetOutcome::Rejected { reason } => Self::Rejected { reason },
             TargetOutcome::Failed { detail } => Self::Failed { detail },
         }
@@ -1078,6 +1149,13 @@ pub struct BatchTargetRecord {
     pub number: u64,
     pub title: String,
     pub html_url: String,
+    /// The head the target was sent against: the one the user saw, which the guard
+    /// checked the pull request still had before anything was done to it. Says what a
+    /// merge was a merge *of*, where the merge commit says what it made — for a squash or
+    /// rebase merge the two are different commits — and what a rejected or failed
+    /// attempt was over. `None` on a record from before the head was kept.
+    #[serde(default)]
+    pub head_sha: Option<String>,
     pub outcome: TargetOutcome,
 }
 
@@ -1089,6 +1167,12 @@ pub struct BatchRecord {
     pub batch_id: String,
     pub action: BulkActionKind,
     pub requested_by: UserId,
+    /// The batch this one was queued to retry the rejected targets of, by id, when it
+    /// was; see [`BulkRequest::retried_from`]. The audit view links the two entries
+    /// each way. `None` for a batch confirmed from the table, and on a record from
+    /// before the link was kept.
+    #[serde(default)]
+    pub retried_from: Option<String>,
     /// Unix seconds when the workflow started running the batch.
     pub started_at: u64,
     /// Unix seconds when the workflow found every target settled and finished the batch.
@@ -1102,10 +1186,10 @@ pub struct BatchRecord {
 
 /// The record as the progress it was written from — the inverse of
 /// [`BatchProgress::completed_record`]: every target settled by its verdict, the batch
-/// complete, the tally as recorded. So a dashboard that reads a finished batch from the
-/// projection shows it as it would have shown Restate's last word on it. The head each
-/// target was sent against is not kept in the record, so the targets carry none;
-/// nothing that reads a finished batch needs it.
+/// complete, the tally as recorded, each target at the head it was sent against. So a
+/// dashboard that reads a finished batch from the projection shows it as it would have
+/// shown Restate's last word on it. A record from before the heads were kept has none
+/// to give, and its targets carry an empty one.
 impl From<BatchRecord> for BatchProgress {
     fn from(record: BatchRecord) -> Self {
         Self {
@@ -1120,7 +1204,7 @@ impl From<BatchRecord> for BatchProgress {
                         owner: target.owner,
                         repo: target.repo,
                         number: target.number,
-                        expected_sha: String::new(),
+                        expected_sha: target.head_sha.unwrap_or_default(),
                         title: target.title,
                         html_url: target.html_url,
                     },
@@ -1146,6 +1230,10 @@ pub struct RunningBatch {
     pub batch_id: String,
     pub action: BulkActionKind,
     pub requested_by: UserId,
+    /// See [`BatchRecord::retried_from`]: the same link, from the moment the batch is
+    /// listed, so the batch it retries can say it is being retried while this one runs.
+    #[serde(default)]
+    pub retried_from: Option<String>,
     /// Unix seconds when the workflow started running the batch.
     pub started_at: u64,
     /// How many pull requests the batch was asked to act on.
@@ -1731,11 +1819,13 @@ mod tests {
             action: BulkActionKind::Merge,
             targets,
             user_id: UserId::new("alice"),
+            retried_from: None,
         }
     }
 
     /// The one check both the web API and the workflow run before taking a batch: the id
-    /// is a UUIDv7, the target count is within bounds, and no pull request is named twice.
+    /// is a UUIDv7, the target count is within bounds, no pull request is named twice, and
+    /// the batch it retries, if it names one, is a batch id too.
     #[test]
     fn a_batch_request_is_checked_for_its_id_its_size_and_repeated_targets() {
         let full = (1..=MAX_BATCH_TARGETS as u64).map(batch_target).collect();
@@ -1760,6 +1850,19 @@ mod tests {
                 .validate(&new_batch_id()),
             Err(InvalidBatch::DuplicateTargets)
         );
+        let retry = BulkRequest {
+            retried_from: Some(new_batch_id()),
+            ..bulk_request(vec![batch_target(1)])
+        };
+        assert_eq!(retry.validate(&new_batch_id()), Ok(()));
+        let retry_of_nothing = BulkRequest {
+            retried_from: Some("batch-a".to_owned()),
+            ..bulk_request(vec![batch_target(1)])
+        };
+        assert_eq!(
+            retry_of_nothing.validate(&new_batch_id()),
+            Err(InvalidBatch::RetriedFrom)
+        );
     }
 
     #[test]
@@ -1775,6 +1878,10 @@ mod tests {
         assert_eq!(
             InvalidBatch::DuplicateTargets.to_string(),
             "batch contains duplicate pull requests"
+        );
+        assert_eq!(
+            InvalidBatch::RetriedFrom.to_string(),
+            "the batch retried must be named by a UUIDv7"
         );
     }
 
@@ -1803,6 +1910,7 @@ mod tests {
             &targets[0].key(),
             ActionOutcome::Succeeded {
                 detail: "merged".to_owned(),
+                merge_sha: None,
             },
         );
         progress.record_failure(
@@ -1845,6 +1953,7 @@ mod tests {
             &targets[0].key(),
             ActionOutcome::Succeeded {
                 detail: "merged".to_owned(),
+                merge_sha: None,
             },
         );
 
@@ -1860,7 +1969,8 @@ mod tests {
         assert_eq!(
             progress.targets[0].state,
             TargetProgressState::Succeeded {
-                detail: "merged".to_owned()
+                detail: "merged".to_owned(),
+                merge_sha: None,
             }
         );
         assert_eq!(
@@ -1917,8 +2027,9 @@ mod tests {
     }
 
     /// The record the projection keeps is the finished batch: who asked, when it ran,
-    /// the tally, and each target's verdict in batch order. Until the last target has
-    /// settled there is no record to keep.
+    /// which batch it retried if any, the tally, and each target's verdict in batch order
+    /// with the head it was sent against — and, for a merge that landed, the commit it
+    /// made. Until the last target has settled there is no record to keep.
     #[test]
     fn a_finished_batch_becomes_a_record_with_every_targets_verdict_and_not_before() {
         let targets = [batch_target(1), batch_target(2), batch_target(3)];
@@ -1928,6 +2039,7 @@ mod tests {
             &targets[0].key(),
             ActionOutcome::Succeeded {
                 detail: "merged".to_owned(),
+                merge_sha: Some("9f8e7d6c5b4a".to_owned()),
             },
         );
         progress.record(
@@ -1937,7 +2049,7 @@ mod tests {
             },
         );
         assert_eq!(
-            progress.completed_record(requester.clone(), 100, 160),
+            progress.completed_record(requester.clone(), Some("batch-0".to_owned()), 100, 160),
             None,
             "one target is still queued"
         );
@@ -1945,11 +2057,12 @@ mod tests {
         progress.record_failure(&targets[2].key(), "boom");
 
         assert_eq!(
-            progress.completed_record(requester, 100, 160),
+            progress.completed_record(requester, Some("batch-0".to_owned()), 100, 160),
             Some(BatchRecord {
                 batch_id: "batch-1".to_owned(),
                 action: BulkActionKind::Merge,
                 requested_by: UserId::new("alice"),
+                retried_from: Some("batch-0".to_owned()),
                 started_at: 100,
                 completed_at: 160,
                 succeeded: 1,
@@ -1963,8 +2076,10 @@ mod tests {
                         number: 1,
                         title: "Bump dependency 1".to_owned(),
                         html_url: String::new(),
+                        head_sha: Some("abc123".to_owned()),
                         outcome: TargetOutcome::Succeeded {
-                            detail: "merged".to_owned()
+                            detail: "merged".to_owned(),
+                            merge_sha: Some("9f8e7d6c5b4a".to_owned()),
                         },
                     },
                     BatchTargetRecord {
@@ -1974,6 +2089,7 @@ mod tests {
                         number: 2,
                         title: "Bump dependency 2".to_owned(),
                         html_url: String::new(),
+                        head_sha: Some("abc123".to_owned()),
                         outcome: TargetOutcome::Rejected {
                             reason: RejectReason::Forbidden
                         },
@@ -1985,6 +2101,7 @@ mod tests {
                         number: 3,
                         title: "Bump dependency 3".to_owned(),
                         html_url: String::new(),
+                        head_sha: Some("abc123".to_owned()),
                         outcome: TargetOutcome::Failed {
                             detail: "boom".to_owned()
                         },
@@ -1992,6 +2109,122 @@ mod tests {
                 ],
             })
         );
+    }
+
+    /// A finished batch opened from its record shows as Restate's last word on it would
+    /// have: the record keeps the head each target was sent against and the commit each
+    /// merge made, so reading it back as progress loses neither. A record from before the
+    /// heads were kept reads back with none, as it was written.
+    #[test]
+    fn a_record_reads_back_as_the_progress_it_was_written_from_heads_and_merge_commits_included() {
+        let targets = [batch_target(1), batch_target(2)];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        progress.record(
+            &targets[0].key(),
+            ActionOutcome::Succeeded {
+                detail: "merged".to_owned(),
+                merge_sha: Some("9f8e7d6c5b4a".to_owned()),
+            },
+        );
+        progress.record(
+            &targets[1].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::NotMergeable,
+            },
+        );
+        let record = progress
+            .completed_record(UserId::new("alice"), None, 100, 160)
+            .unwrap();
+
+        assert_eq!(BatchProgress::from(record.clone()), progress);
+
+        let before_heads_were_kept = BatchRecord {
+            targets: record
+                .targets
+                .iter()
+                .cloned()
+                .map(|target| BatchTargetRecord {
+                    head_sha: None,
+                    ..target
+                })
+                .collect(),
+            ..record
+        };
+        let read_back = BatchProgress::from(before_heads_were_kept);
+        assert!(
+            read_back
+                .targets
+                .iter()
+                .all(|item| item.target.expected_sha.is_empty()),
+            "{read_back:?}"
+        );
+    }
+
+    /// Restate journals an action's outcome and keeps a batch's progress for seven days;
+    /// the store keeps every target's outcome for good. All of them were written before a
+    /// merge's commit was kept, and must still read, as a merge whose commit is unknown.
+    /// Likewise a request, a listing, or a record from before a batch named the one it
+    /// retried.
+    #[test]
+    fn outcomes_and_batches_from_before_the_merge_commit_and_retry_link_still_deserialize() {
+        let outcome: ActionOutcome =
+            serde_json::from_value(serde_json::json!({ "succeeded": { "detail": "merged" } }))
+                .unwrap();
+        assert_eq!(
+            outcome,
+            ActionOutcome::Succeeded {
+                detail: "merged".to_owned(),
+                merge_sha: None,
+            }
+        );
+        let outcome: TargetOutcome =
+            serde_json::from_value(serde_json::json!({ "succeeded": { "detail": "merged" } }))
+                .unwrap();
+        assert_eq!(
+            outcome,
+            TargetOutcome::Succeeded {
+                detail: "merged".to_owned(),
+                merge_sha: None,
+            }
+        );
+        let state: TargetProgressState =
+            serde_json::from_value(serde_json::json!({ "succeeded": { "detail": "merged" } }))
+                .unwrap();
+        assert_eq!(
+            state,
+            TargetProgressState::Succeeded {
+                detail: "merged".to_owned(),
+                merge_sha: None,
+            }
+        );
+
+        let request: BulkRequest = serde_json::from_value(serde_json::json!({
+            "action": "merge",
+            "targets": [],
+            "user_id": "alice"
+        }))
+        .unwrap();
+        assert_eq!(request.retried_from, None);
+        let running: RunningBatch = serde_json::from_value(serde_json::json!({
+            "batch_id": "batch-1",
+            "action": "merge",
+            "requested_by": "alice",
+            "started_at": 100,
+            "target_count": 2
+        }))
+        .unwrap();
+        assert_eq!(running.retried_from, None);
+        let target: BatchTargetRecord = serde_json::from_value(serde_json::json!({
+            "repository_id": 7,
+            "owner": "acme",
+            "repo": "api",
+            "number": 9,
+            "title": "Bump serde",
+            "html_url": "",
+            "outcome": { "failed": { "detail": "boom" } }
+        }))
+        .unwrap();
+        assert_eq!(target.head_sha, None);
     }
 
     /// The store keeps the kind in its display form, as it keeps every enum, so the

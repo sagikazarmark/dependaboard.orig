@@ -149,6 +149,7 @@ pub(crate) fn ActiveBatch(
 pub(crate) fn queue_batch(pending: PendingAction, mut host: BatchHost) {
     let action = pending.action;
     let targets = pending.targets();
+    let retried_from = pending.retried_from.clone();
     let batch_id = new_batch_id();
     let followed = Followed::queued(&batch_id, action, &targets, unix_seconds());
     host.take_over(followed.clone(), async move {
@@ -159,6 +160,7 @@ pub(crate) fn queue_batch(pending: PendingAction, mut host: BatchHost) {
             },
             action,
             targets,
+            retried_from,
         };
         let mut followed_signal = host.followed;
         let outcome = run_batch(
@@ -297,8 +299,9 @@ fn not_submitted_notice(fault: &Fault) -> String {
 /// Retries what `finished` rejected: each rejected target is synced again so
 /// the new batch carries its current head SHA, the ones there is no retrying
 /// are named in a toast, and the rest are queued as a new batch of the same
-/// kind, which replaces `finished` in the host and so in the drawer.
-/// `retrying` is held while the targets are being refreshed.
+/// kind that names `finished` as the batch it retries, which replaces
+/// `finished` in the host and so in the drawer. `retrying` is held while the
+/// targets are being refreshed.
 ///
 /// The refresh can take a while, and the user may confirm another batch in
 /// the meantime; a retry that finds the host following a batch other than
@@ -314,9 +317,9 @@ fn retry_rejected(finished: BatchProgress, mut retrying: Signal<bool>, host: Bat
         if let Some(notice) = refreshed.notice() {
             host.toast.warning(notice, sticky());
         }
-        if refreshed.rows.is_empty() {
+        let Some(retry) = refreshed.retry() else {
             return;
-        }
+        };
         if !host.follows(&finished.batch_id) {
             host.toast.info(
                 "The retry stood down: another batch was queued while its targets were being refreshed."
@@ -325,13 +328,7 @@ fn retry_rejected(finished: BatchProgress, mut retrying: Signal<bool>, host: Bat
             );
             return;
         }
-        queue_batch(
-            PendingAction {
-                action: finished.action,
-                rows: refreshed.rows,
-            },
-            host,
-        );
+        queue_batch(retry, host);
     });
 }
 
@@ -593,6 +590,7 @@ mod tests {
             &targets[0].key(),
             ActionOutcome::Succeeded {
                 detail: "merged".to_owned(),
+                merge_sha: None,
             },
         );
         progress.record(
@@ -619,6 +617,7 @@ mod tests {
         assert_eq!(
             completion_notice(&finished(ActionOutcome::Succeeded {
                 detail: "merged".to_owned(),
+                merge_sha: None,
             })),
             None
         );

@@ -134,6 +134,7 @@ pub(crate) fn half_done_merge() -> BatchProgress {
         &targets[0].key(),
         ActionOutcome::Succeeded {
             detail: "merged".to_owned(),
+            merge_sha: None,
         },
     );
     progress

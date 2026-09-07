@@ -228,7 +228,11 @@ mod tests {
         ) -> Element {
             rsx! {
                 ConfirmModal {
-                    pending: Some(PendingAction { action, rows }),
+                    pending: Some(PendingAction {
+                        action,
+                        rows,
+                        retried_from: None,
+                    }),
                     repositories,
                     oncancel: move |_| {},
                     onconfirm: move |_| {},

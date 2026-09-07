@@ -171,14 +171,16 @@ Workflow rather than object: a batch has a definite lifecycle and you want to qu
 progress from the UI.
 
 ```
-run(BulkRequest { action, targets: Vec<PrTarget>, user_id })
-  ├─ ctx.run: PrStore::start_batch(kind, requester, started at, target count)   // best effort
+run(BulkRequest { action, targets: Vec<PrTarget>, user_id, retried_from })
+  ├─ ctx.run: PrStore::start_batch(kind, requester, retried_from, started at, target count)
+  │                                                                          // best effort
   ├─ for each target (bounded concurrency; merges grouped per repo, see below):
   │     ctx.object_client::<PullRequest>(key).call(action)
   │       → ActionOutcome, or a TerminalError the callee gave up with
   │     write the outcome into workflow state AS IT COMPLETES
   ├─ terminal state: Completed { succeeded, rejected, failed }
-  └─ ctx.run: PrStore::record_batch(kind, requester, started/completed at, per-target verdicts)
+  └─ ctx.run: PrStore::record_batch(kind, requester, retried_from, started/completed at,
+                                     per-target verdicts with the head each was sent against)
                                      // …and stops listing the batch as running
 
 progress() -> BatchProgress    // shared handler, UI polls this
@@ -231,13 +233,13 @@ audit view, and it does not care how old a batch is. A merged pull request leave
 the truth about a running batch, but only a dashboard that knows the batch id can ask
 for it, and a dashboard that lost the id — the tab was closed, or it was never this
 tab's batch — is blind until the finished record lands. So the first step of `run`, once
-the start clock is journaled, lists the batch as running: kind, requester, started at,
-and how many targets, in a `running_batches` table of its own so `batches` stays
-append-only; `record_batch` takes the listing away in the transaction that writes the
-finished record. The listing is for finding the batch, not the batch itself, and it
-stands in the way of the work: its `ctx.run` step gets a retry budget of seconds, and a
-store that will not take it fails the step alone — the batch runs unlisted and the
-refusal is logged. The web edge does not write this row: a row written before a send
+the start clock is journaled, lists the batch as running: kind, requester, the batch it
+retries if any, started at, and how many targets, in a `running_batches` table of its own
+so `batches` stays append-only; `record_batch` takes the listing away in the transaction
+that writes the finished record. The listing is for finding the batch, not the batch
+itself, and it stands in the way of the work: its `ctx.run` step gets a retry budget of
+seconds, and a store that will not take it fails the step alone — the batch runs unlisted
+and the refusal is logged. The web edge does not write this row: a row written before a send
 that then fails is a phantom, and the projection is Restate's to write. A workflow that
 ends with no finished batch to record — cancelled, or failed past what a target's own
 verdict can carry — takes its listing away itself on the way out, under the ordinary
@@ -274,9 +276,9 @@ projection holds every finished batch for good and lists every running one; Rest
 a batch's progress for seven days. So a link's id goes to the projection first, through
 one server function that reads the record or the listing by id in one snapshot. A
 finished record opens the drawer at once as the completed progress it was written from —
-the record is the inverse of `completed_record`, less the head SHA each target was sent
-against, which nothing that reads a finished batch needs — and is not polled: there is
-nothing left to follow, and it reads as any finished batch does, retry offer included. A
+the record is the inverse of `completed_record`, the head each target was sent against
+included — and is not polled: there is nothing left to follow, and it reads as any
+finished batch does, retry offer included. A
 running listing opens the drawer on what the listing says and polls `progress` as a batch
 Restate is known to have: the workflow wrote the listing itself, after publishing its
 first progress, so the listing vouches for the batch as a submission receipt does, and the
@@ -285,6 +287,25 @@ to Restate under that give-up, since a batch just queued is not listed until its
 starts. A projection that could not be read is reported as a failing poll is, and Restate
 is asked as before. The drawer says which of the three the follow is on while it has no
 progress to show.
+
+**The record says what a merge was of, and what it made.** Every target of a finished
+batch keeps the head it was sent against — the one the user saw, which the guard checked
+— as `head_sha`, whatever its verdict: it is what a merge was a merge *of*, what a
+rejection or failure was over, and for a squash or rebase merge nothing later could work
+it out from the commit. A merge that landed keeps the commit it made too, as `merge_sha`
+inside its `succeeded` outcome rather than a column: it is part of what succeeding was, a
+rejected target cannot have one, and the outcome is already what flows from
+`PullRequest.merge` through the workflow's progress to the record, so the drawer that
+follows a running batch shows the commit the moment it lands. GitHub names the commit in
+its answer to the merge and on the merged pull request, and the client reads both, so a
+merge found already done on a replay, or confirmed after an ambiguous answer, names it as
+a clean merge does; only a pull request GitHub names no commit for, which its schema
+allows, is recorded as merged with the commit unknown. A branch update records no new
+head: GitHub answers `202 Accepted` and finishes the update after, so the new head is not
+in hand when the outcome is, and is learned by the sync the handler fires afterwards. The
+drawers show a merge's commit as its short SHA linked to the commit under the pull
+request's own page, from which the repository's is read: the dashboard knows GitHub's web
+host no other way.
 
 **A finished batch is announced by its tally, not by its failures alone.** The
 completion toast is a plain success only when every target succeeded. Any rejected or
@@ -301,7 +322,14 @@ batch has finished with a rejected target a fresh attempt can cure. The UI syncs
 such pull request
 through `DashboardIngress.sync_pull_request` — all at once, awaiting each completion id
 as the drawer's own **Sync** does — reads the rows back, and queues them as a new batch
-of the same kind under a fresh UUIDv7: the old id has run and cannot run again. Only
+of the same kind under a fresh UUIDv7: the old id has run and cannot run again. The new
+batch names the old one as `retried_from`, on the request, the running listing, and the
+finished record alike: every target in it was rejected there, so the link is the batch's,
+not each target's, and the audit view links the two entries each way. The web edge holds
+the link to the shape of a batch id and no further — it is the browser's word, as the
+targets are — and the store keeps it as a plain column rather than a foreign key: a
+record that names a batch the projection never kept is a dangling link, and refusing it
+would lose the record that names it. Only
 `StaleSha` and `NotMergeable` are worth the trip: the head is what moved, and GitHub
 judges mergeability anew on every attempt. `Forbidden` and `MergeMethodDisallowed` are
 over the configuration, the same whatever the head, and are left out unrefreshed with
@@ -959,14 +987,15 @@ pub trait PrStore {
     /// Forget every retirement up to and including `through`, the last one read; ids
     /// only grow, so anything queued since stays for the next drain.
     async fn acknowledge_retirements(&self, through: u64) -> Result<()>;
-    /// Keep a finished batch for audit, and stop listing it as running. A batch id
-    /// already recorded is left as it was, so the workflow's recording step is safe
-    /// to run again.
+    /// Keep a finished batch for audit — the batch it retried, each target's head and
+    /// verdict, a merge's commit inside the verdict — and stop listing it as running. A
+    /// batch id already recorded is left as it was, so the workflow's recording step is
+    /// safe to run again.
     async fn record_batch(&self, batch: &BatchRecord) -> Result<()>;
     /// The most recently finished batches, newest first, targets and verdicts included.
     async fn recent_batches(&self, limit: u32) -> Result<Vec<BatchRecord>>;
-    /// List a batch as running until it is recorded. A batch id already listed is left
-    /// as it was, for the same reason.
+    /// List a batch as running until it is recorded, the batch it retries included. A
+    /// batch id already listed is left as it was, for the same reason.
     async fn start_batch(&self, batch: &RunningBatch) -> Result<()>;
     /// Stop listing a batch as running without recording it, for a workflow that ended
     /// with no finished batch to keep. A batch not listed is left as it is.
@@ -1051,6 +1080,8 @@ CREATE TABLE batches (
   batch_id     TEXT PRIMARY KEY,   -- the workflow key, a UUIDv7
   action       TEXT NOT NULL,      -- merge | rebase | update branch
   requested_by TEXT NOT NULL,      -- the dashboard user who confirmed it
+  retried_from TEXT,               -- the batch whose rejected targets this one retries;
+                                   -- not a foreign key: a dangling link is not a lost record
   started_at   INTEGER NOT NULL,
   completed_at INTEGER NOT NULL,
   succeeded    INTEGER NOT NULL,
@@ -1068,8 +1099,21 @@ CREATE TABLE batch_targets (
   number        INTEGER NOT NULL,
   title         TEXT NOT NULL,
   html_url      TEXT NOT NULL,
-  outcome       TEXT NOT NULL,     -- JSON: succeeded { detail } | rejected { reason } | failed { detail }
+  head_sha      TEXT,              -- the head the target was sent against, which the guard checked
+  outcome       TEXT NOT NULL,     -- JSON: succeeded { detail, merge_sha? } | rejected { reason } | failed { detail }
   PRIMARY KEY (batch_id, position)
+);
+
+-- Bulk actions the workflow is running (§2): written as its first step, taken away by
+-- the finished record's write. Says only that the batch runs, what was asked, by whom,
+-- what it retries, since when, and over how many pull requests.
+CREATE TABLE running_batches (
+  batch_id     TEXT PRIMARY KEY,
+  action       TEXT NOT NULL,
+  requested_by TEXT NOT NULL,
+  retried_from TEXT,
+  started_at   INTEGER NOT NULL,
+  target_count INTEGER NOT NULL
 );
 
 -- The retirement outbox (§2 RepoSync): the pull requests a prune removed whose

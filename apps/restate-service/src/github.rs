@@ -7,7 +7,7 @@ use dependaboard_core::{
     ActionOutcome, Classification, GithubErrorResponse, Operation, RejectReason,
     classify_github_error, unix_seconds,
 };
-use dependaboard_github::{GithubApi, GithubError};
+use dependaboard_github::{GithubApi, GithubError, Merged};
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -247,9 +247,31 @@ pub(crate) fn read_result<T>(result: Settled<T>) -> HandlerResult<T> {
     }
 }
 
+/// The outcome of a comment or a branch update: the words GitHub had for it, and no
+/// commit to name — see [`ActionOutcome::Succeeded`].
 pub(crate) fn action_result(result: Settled<String>) -> HandlerResult<ActionOutcome> {
+    settled_outcome(result, |detail| ActionOutcome::Succeeded {
+        detail,
+        merge_sha: None,
+    })
+}
+
+/// The outcome of a merge: the words for it and the commit it made.
+pub(crate) fn merge_result(result: Settled<Merged>) -> HandlerResult<ActionOutcome> {
+    settled_outcome(result, |merged| ActionOutcome::Succeeded {
+        detail: merged.detail,
+        merge_sha: merged.sha,
+    })
+}
+
+/// A settled mutation as an outcome, `succeeded` making one of what GitHub did: a
+/// rejection is an outcome too, and only a fatal answer fails the handler.
+fn settled_outcome<T>(
+    result: Settled<T>,
+    succeeded: impl FnOnce(T) -> ActionOutcome,
+) -> HandlerResult<ActionOutcome> {
     match result {
-        Settled::Ok(detail) => Ok(ActionOutcome::Succeeded { detail }),
+        Settled::Ok(done) => Ok(succeeded(done)),
         Settled::StaleSha { expected, actual } => {
             Ok(rejected(RejectReason::StaleSha { expected, actual }))
         }
@@ -657,9 +679,36 @@ mod tests {
             }
         );
         assert_eq!(
-            action_result(Settled::Ok("merged".to_owned())).unwrap(),
+            action_result(Settled::Ok("branch updated".to_owned())).unwrap(),
             ActionOutcome::Succeeded {
-                detail: "merged".to_owned()
+                detail: "branch updated".to_owned(),
+                merge_sha: None,
+            },
+            "a comment or a branch update makes no commit to name"
+        );
+        assert_eq!(
+            merge_result(Settled::Ok(Merged {
+                detail: "merged".to_owned(),
+                sha: Some("9f8e7d6".to_owned()),
+            }))
+            .unwrap(),
+            ActionOutcome::Succeeded {
+                detail: "merged".to_owned(),
+                merge_sha: Some("9f8e7d6".to_owned()),
+            },
+            "a merge names the commit it made"
+        );
+        assert_eq!(
+            merge_result(Settled::StaleSha {
+                expected: "abc".to_owned(),
+                actual: "def".to_owned(),
+            })
+            .unwrap(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::StaleSha {
+                    expected: "abc".to_owned(),
+                    actual: "def".to_owned(),
+                }
             }
         );
 

@@ -48,10 +48,15 @@ use crate::ui::dashboard::Dashboard;
 /// dialog's cancel and confirm paths do not depend on each other's ordering.
 /// They are kept as rows rather than targets so the dialog can also say what
 /// state they are in.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PendingAction {
     pub(crate) action: BulkActionKind,
     pub(crate) rows: Vec<PrRecord>,
+    /// The batch whose rejected targets these rows are, by id, when the action
+    /// is a finished batch's **Retry rejected** rather than a request from the
+    /// table; the batch queued names it, so its record points at the one it
+    /// retries.
+    pub(crate) retried_from: Option<String>,
 }
 
 impl PendingAction {

@@ -105,23 +105,30 @@ pub(crate) async fn load_capabilities() -> Result<Capabilities, ServerFnError> {
 /// the same submission after a lost response and be told it was accepted
 /// rather than refused for the workflow already existing.
 ///
-/// The browser names each target by key and the head it saw; the rest of the
-/// target is resolved here from the projection. A target the projection no
-/// longer has — merged or closed between the selection and the click — is one
-/// pull request's business, not the batch's: it is left out, named by key in
-/// the receipt, and the batch runs over the rest. A target from another
-/// installation is no race but a client that should not exist, and refuses
-/// the batch whole; so does a submission that leaves nothing to run. The
-/// submission is held to the batch rules first, so one that could not run
-/// resolves nothing.
+/// The browser names each target by key and the head it saw, and the batch
+/// this one retries when it is a retry; the rest of each target is resolved
+/// here from the projection. A target the projection no longer has — merged or
+/// closed between the selection and the click — is one pull request's
+/// business, not the batch's: it is left out, named by key in the receipt, and
+/// the batch runs over the rest. A target from another installation is no race
+/// but a client that should not exist, and refuses the batch whole; so does a
+/// submission that leaves nothing to run. The submission is held to the batch
+/// rules first, so one that could not run resolves nothing. The batch retried
+/// is taken on the browser's word, as the targets are: held to the shape of a
+/// batch id, not looked up.
 #[server(state: Extension<ServerState>, user: Extension<UserId>)]
 pub(crate) async fn submit_batch(
     batch_id: String,
     action: BulkActionKind,
     targets: Vec<SubmittedTarget>,
+    retried_from: Option<String>,
 ) -> Result<BatchReceipt, ServerFnError> {
-    validate_batch(&batch_id, targets.iter().map(SubmittedTarget::key))
-        .map_err(|invalid| ServerFnError::new(invalid.to_string()))?;
+    validate_batch(
+        &batch_id,
+        retried_from.as_deref(),
+        targets.iter().map(SubmittedTarget::key),
+    )
+    .map_err(|invalid| ServerFnError::new(invalid.to_string()))?;
     let submitted = targets.len();
     let mut resolved = Vec::with_capacity(submitted);
     let mut left_out = Vec::new();
@@ -150,6 +157,7 @@ pub(crate) async fn submit_batch(
         action,
         targets: resolved,
         user_id: user.0,
+        retried_from,
     };
     state
         .ingress
@@ -394,6 +402,7 @@ mod tests {
             batch_id: OTHER_BATCH.to_owned(),
             action: BulkActionKind::Merge,
             requested_by: UserId::new(USERNAME),
+            retried_from: Some(BATCH.to_owned()),
             started_at: 2_000,
             target_count: 3,
         };
@@ -401,6 +410,7 @@ mod tests {
             batch_id: BATCH.to_owned(),
             action: BulkActionKind::Rebase,
             requested_by: UserId::new(USERNAME),
+            retried_from: None,
             started_at: 1_000,
             completed_at: 1_030,
             succeeded: 1,
@@ -413,8 +423,10 @@ mod tests {
                 number: 9,
                 title: GROUPED_ROW_TITLE.to_owned(),
                 html_url: "https://github.example/acme/api/pull/9".to_owned(),
+                head_sha: Some("abc123".to_owned()),
                 outcome: TargetOutcome::Succeeded {
                     detail: "@dependabot rebase posted".to_owned(),
+                    merge_sha: None,
                 },
             }],
         };
@@ -449,6 +461,7 @@ mod tests {
             batch_id: OTHER_BATCH.to_owned(),
             action: BulkActionKind::Merge,
             requested_by: UserId::new(USERNAME),
+            retried_from: Some(BATCH.to_owned()),
             started_at: 2_000,
             target_count: 3,
         };
@@ -456,6 +469,7 @@ mod tests {
             batch_id: BATCH.to_owned(),
             action: BulkActionKind::Rebase,
             requested_by: UserId::new(USERNAME),
+            retried_from: None,
             started_at: 1_000,
             completed_at: 1_030,
             succeeded: 1,
@@ -468,8 +482,10 @@ mod tests {
                 number: 9,
                 title: GROUPED_ROW_TITLE.to_owned(),
                 html_url: "https://github.example/acme/api/pull/9".to_owned(),
+                head_sha: Some("abc123".to_owned()),
                 outcome: TargetOutcome::Succeeded {
                     detail: "@dependabot rebase posted".to_owned(),
+                    merge_sha: None,
                 },
             }],
         };
@@ -561,27 +577,45 @@ mod tests {
         json!({ "repository_id": repository_id, "number": number, "expected_sha": expected_sha })
     }
 
-    /// Submits a merge batch of `targets` under `batch_id`.
+    /// Submits a merge batch of `targets` under `batch_id`, retrying no batch.
     async fn submit(
         dashboard: &Dashboard,
         batch_id: &str,
         targets: serde_json::Value,
     ) -> reqwest::Response {
+        submit_retrying(dashboard, batch_id, targets, None).await
+    }
+
+    /// Submits a merge batch of `targets` under `batch_id`, as a retry of
+    /// `retried_from` when one is named.
+    async fn submit_retrying(
+        dashboard: &Dashboard,
+        batch_id: &str,
+        targets: serde_json::Value,
+        retried_from: Option<&str>,
+    ) -> reqwest::Response {
         dashboard
             .call(
                 "submit_batch",
-                json!({ "batch_id": batch_id, "action": "merge", "targets": targets }),
+                json!({
+                    "batch_id": batch_id,
+                    "action": "merge",
+                    "targets": targets,
+                    "retried_from": retried_from,
+                }),
             )
             .send()
             .await
             .unwrap()
     }
 
-    /// A batch names its targets by key and the head the user saw; the rest
-    /// of what the workflow and the audit record say about a target is the
-    /// projection's word, whatever the browser sent along.
+    /// A batch names its targets by key and the head the user saw, and the
+    /// batch it retries when it is a retry; the rest of what the workflow and
+    /// the audit record say about a target is the projection's word, whatever
+    /// the browser sent along.
     #[tokio::test]
-    async fn a_batch_carries_the_projections_word_on_its_targets_and_the_browsers_on_the_head() {
+    async fn a_batch_carries_the_projections_word_on_its_targets_and_the_browsers_on_the_head_and_the_batch_retried()
+     {
         let dashboard = dashboard().await;
         dashboard.project(INSTALLATION_ID, &grouped_row()).await;
         let batch_id = new_batch_id();
@@ -589,7 +623,7 @@ mod tests {
         forged["title"] = json!("Click here");
         forged["html_url"] = json!("https://evil.example/");
 
-        let response = submit(&dashboard, &batch_id, json!([forged])).await;
+        let response = submit_retrying(&dashboard, &batch_id, json!([forged]), Some(BATCH)).await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let forward =
@@ -601,6 +635,7 @@ mod tests {
             json!({
                 "action": "merge",
                 "user_id": USERNAME,
+                "retried_from": BATCH,
                 "targets": [{
                     "repository_id": 7,
                     "owner": "acme",
@@ -725,10 +760,22 @@ mod tests {
             "batch must contain between 1 and 100 targets"
         );
 
-        let repeated = submit(&dashboard, &new_batch_id(), json!([own, unknown, own])).await;
+        let repeated = submit(
+            &dashboard,
+            &new_batch_id(),
+            json!([own.clone(), unknown, own]),
+        )
+        .await;
         assert_eq!(
             error_message(repeated).await,
             "batch contains duplicate pull requests"
+        );
+
+        let retry_of_nothing =
+            submit_retrying(&dashboard, &new_batch_id(), json!([own]), Some("batch-a")).await;
+        assert_eq!(
+            error_message(retry_of_nothing).await,
+            "the batch retried must be named by a UUIDv7"
         );
 
         assert!(dashboard.forwards().is_empty());

@@ -132,12 +132,13 @@ impl AttachGateway for ServerFollow {
 /// One batch to submit, driven through the server functions: a
 /// [`ServerFollow`] with what to submit. The targets are kept in full so the
 /// drawer can show them before the first progress arrives; the server is sent
-/// only what it takes the browser's word on, the key and the head the user
-/// saw.
+/// only what it takes the browser's word on — the key and the head the user
+/// saw of each target, and the batch this one retries, if it is a retry.
 pub(crate) struct ServerBatch {
     pub(crate) follow: ServerFollow,
     pub(crate) action: BulkActionKind,
     pub(crate) targets: Vec<PrTarget>,
+    pub(crate) retried_from: Option<String>,
 }
 
 impl BatchGateway for ServerBatch {
@@ -162,9 +163,14 @@ impl SubmitGateway for ServerBatch {
             return Err(Fault::SignedOut);
         }
         let targets = self.targets.iter().map(SubmittedTarget::from).collect();
-        submit_batch(self.follow.batch_id.clone(), self.action, targets)
-            .await
-            .map_err(|error| logged_fault(&error))
+        submit_batch(
+            self.follow.batch_id.clone(),
+            self.action,
+            targets,
+            self.retried_from.clone(),
+        )
+        .await
+        .map_err(|error| logged_fault(&error))
     }
 }
 
@@ -641,6 +647,7 @@ mod tests {
                 &target.key(),
                 ActionOutcome::Succeeded {
                     detail: "merged".to_owned(),
+                    merge_sha: None,
                 },
             );
         }
@@ -752,6 +759,7 @@ mod tests {
             &targets()[0].key(),
             ActionOutcome::Succeeded {
                 detail: "merged".to_owned(),
+                merge_sha: None,
             },
         );
         done
@@ -1068,24 +1076,15 @@ mod tests {
     /// finished: `alice` asked for it, it ran for thirty seconds.
     fn recorded() -> BatchRecord {
         after(2)
-            .completed_record(UserId::new("alice"), EPOCH - 30, EPOCH)
+            .completed_record(UserId::new("alice"), None, EPOCH - 30, EPOCH)
             .expect("every target has settled")
-    }
-
-    /// [`after`]`(2)` as it reads back from the record: the record does not
-    /// keep the head each target was sent against, so the targets carry none.
-    fn read_back() -> BatchProgress {
-        let mut progress = after(2);
-        for item in &mut progress.targets {
-            item.target.expected_sha.clear();
-        }
-        progress
     }
 
     /// A link eight days on names a batch Restate has long retired, and the
     /// projection has held the finished record the whole time. The record is
-    /// the batch as it stands, and the follow ends on it at once: Restate is
-    /// not asked, and nothing is waited for.
+    /// the batch as it stands — heads each target was sent against included —
+    /// and the follow ends on it at once: Restate is not asked, and nothing is
+    /// waited for.
     #[tokio::test]
     async fn a_batch_the_projection_has_finished_is_shown_from_the_record_without_asking_restate() {
         let mut gateway = Scripted::new([], [Ok(None)])
@@ -1093,7 +1092,7 @@ mod tests {
 
         let (outcome, reported) = attach(&mut gateway).await;
 
-        assert_eq!(outcome, BatchOutcome::Completed(read_back()));
+        assert_eq!(outcome, BatchOutcome::Completed(after(2)));
         assert_eq!(gateway.progress_calls, 0, "Restate is not asked");
         assert_eq!(gateway.ticks, 0, "and nothing is waited for");
         assert_eq!(
@@ -1101,7 +1100,7 @@ mod tests {
                 .iter()
                 .map(|followed| (followed.heard, followed.progress.clone(), followed.since))
                 .collect::<Vec<_>>(),
-            [(true, Some(read_back()), EPOCH)],
+            [(true, Some(after(2)), EPOCH)],
             "the record is reported once, as the word on the batch"
         );
     }
@@ -1112,6 +1111,7 @@ mod tests {
             batch_id: "batch-1".to_owned(),
             action: BulkActionKind::Merge,
             requested_by: UserId::new("alice"),
+            retried_from: None,
             started_at: EPOCH - 30,
             target_count: 2,
         }

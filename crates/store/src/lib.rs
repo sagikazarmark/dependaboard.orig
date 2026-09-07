@@ -483,14 +483,15 @@ impl PrStore for LibSqlPrStore {
         let inserted = transaction
             .execute(
                 r#"INSERT INTO batches (
-                    batch_id, action, requested_by, started_at, completed_at,
+                    batch_id, action, requested_by, retried_from, started_at, completed_at,
                     succeeded, rejected, failed
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ON CONFLICT(batch_id) DO NOTHING"#,
                 vec![
                     Value::Text(batch.batch_id.clone()),
                     Value::Text(batch.action.to_string()),
                     Value::Text(batch.requested_by.to_string()),
+                    option_text(batch.retried_from.clone()),
                     integer(batch.started_at)?,
                     integer(batch.completed_at)?,
                     integer(batch.succeeded)?,
@@ -508,8 +509,8 @@ impl PrStore for LibSqlPrStore {
                 .execute(
                     r#"INSERT INTO batch_targets (
                         batch_id, position, repository_id, owner, repo, number,
-                        title, html_url, outcome
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                        title, html_url, head_sha, outcome
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
                     vec![
                         Value::Text(batch.batch_id.clone()),
                         integer(position as u64)?,
@@ -519,6 +520,7 @@ impl PrStore for LibSqlPrStore {
                         integer(target.number)?,
                         Value::Text(target.title.clone()),
                         Value::Text(target.html_url.clone()),
+                        option_text(target.head_sha.clone()),
                         Value::Text(serde_json::to_string(&target.outcome)?),
                     ],
                 )
@@ -580,13 +582,14 @@ impl PrStore for LibSqlPrStore {
             .await
             .execute(
                 r#"INSERT INTO running_batches (
-                    batch_id, action, requested_by, started_at, target_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    batch_id, action, requested_by, retried_from, started_at, target_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 ON CONFLICT(batch_id) DO NOTHING"#,
                 vec![
                     Value::Text(batch.batch_id.clone()),
                     Value::Text(batch.action.to_string()),
                     Value::Text(batch.requested_by.to_string()),
+                    option_text(batch.retried_from.clone()),
                     integer(batch.started_at)?,
                     integer(batch.target_count)?,
                 ],
@@ -677,7 +680,7 @@ impl PrStore for LibSqlPrStore {
 
 /// The `batches` columns in the order [`batch_from_row`] reads them.
 fn select_batches_sql() -> &'static str {
-    r#"SELECT batch_id, action, requested_by, started_at, completed_at,
+    r#"SELECT batch_id, action, requested_by, retried_from, started_at, completed_at,
               succeeded, rejected, failed
        FROM batches"#
 }
@@ -685,13 +688,15 @@ fn select_batches_sql() -> &'static str {
 /// The `batch_targets` columns in the order [`batch_target_from_row`] reads
 /// them.
 fn select_batch_targets_sql() -> &'static str {
-    "SELECT batch_id, repository_id, owner, repo, number, title, html_url, outcome FROM batch_targets"
+    r#"SELECT batch_id, repository_id, owner, repo, number, title, html_url, head_sha, outcome
+       FROM batch_targets"#
 }
 
 /// The `running_batches` columns in the order [`running_batch_from_row`]
 /// reads them.
 fn select_running_batches_sql() -> &'static str {
-    "SELECT batch_id, action, requested_by, started_at, target_count FROM running_batches"
+    r#"SELECT batch_id, action, requested_by, retried_from, started_at, target_count
+       FROM running_batches"#
 }
 
 /// A `batches` row, without its targets.
@@ -700,11 +705,12 @@ fn batch_from_row(row: Row) -> Result<BatchRecord, StoreError> {
         batch_id: row.get(0)?,
         action: stored_enum(row.get(1)?)?,
         requested_by: UserId::new(row.get::<String>(2)?),
-        started_at: unsigned(row.get::<i64>(3)?)?,
-        completed_at: unsigned(row.get::<i64>(4)?)?,
-        succeeded: unsigned(row.get::<i64>(5)?)?,
-        rejected: unsigned(row.get::<i64>(6)?)?,
-        failed: unsigned(row.get::<i64>(7)?)?,
+        retried_from: row.get(3)?,
+        started_at: unsigned(row.get::<i64>(4)?)?,
+        completed_at: unsigned(row.get::<i64>(5)?)?,
+        succeeded: unsigned(row.get::<i64>(6)?)?,
+        rejected: unsigned(row.get::<i64>(7)?)?,
+        failed: unsigned(row.get::<i64>(8)?)?,
         targets: Vec::new(),
     })
 }
@@ -719,7 +725,8 @@ fn batch_target_from_row(row: Row) -> Result<BatchTargetRecord, StoreError> {
         number: unsigned(row.get::<i64>(4)?)?,
         title: row.get(5)?,
         html_url: row.get(6)?,
-        outcome: serde_json::from_str(&row.get::<String>(7)?)?,
+        head_sha: row.get(7)?,
+        outcome: serde_json::from_str(&row.get::<String>(8)?)?,
     })
 }
 
@@ -729,8 +736,9 @@ fn running_batch_from_row(row: Row) -> Result<RunningBatch, StoreError> {
         batch_id: row.get(0)?,
         action: stored_enum(row.get(1)?)?,
         requested_by: UserId::new(row.get::<String>(2)?),
-        started_at: unsigned(row.get::<i64>(3)?)?,
-        target_count: unsigned(row.get::<i64>(4)?)?,
+        retried_from: row.get(3)?,
+        started_at: unsigned(row.get::<i64>(4)?)?,
+        target_count: unsigned(row.get::<i64>(5)?)?,
     })
 }
 
@@ -2507,13 +2515,14 @@ mod tests {
         assert!(store.get_pr(&PrKey::new(2, 1)).await.unwrap().is_some());
     }
 
-    /// A finished merge of two pull requests in `acme/repo-1`, asked for by `alice`,
-    /// with the first merged and the second rejected.
+    /// A finished merge of two pull requests in `acme/repo-1`, asked for by `alice`
+    /// as a retry of `batch-0`, with the first merged and the second rejected.
     fn batch(batch_id: &str, completed_at: u64) -> BatchRecord {
         BatchRecord {
             batch_id: batch_id.to_owned(),
             action: BulkActionKind::Merge,
             requested_by: UserId::new("alice"),
+            retried_from: Some("batch-0".to_owned()),
             started_at: completed_at - 30,
             completed_at,
             succeeded: 1,
@@ -2527,8 +2536,10 @@ mod tests {
                     number: 1,
                     title: "Bump serde from 1.0.0 to 1.1.0".to_owned(),
                     html_url: "https://github.com/acme/repo-1/pull/1".to_owned(),
+                    head_sha: Some("abc123".to_owned()),
                     outcome: TargetOutcome::Succeeded {
                         detail: "merged".to_owned(),
+                        merge_sha: Some("9f8e7d6c5b4a".to_owned()),
                     },
                 },
                 BatchTargetRecord {
@@ -2538,6 +2549,7 @@ mod tests {
                     number: 2,
                     title: "Bump tokio from 1.40.0 to 1.41.0".to_owned(),
                     html_url: "https://github.com/acme/repo-1/pull/2".to_owned(),
+                    head_sha: Some("abc123".to_owned()),
                     outcome: TargetOutcome::Rejected {
                         reason: RejectReason::StaleSha {
                             expected: "abc123".to_owned(),
@@ -2556,6 +2568,7 @@ mod tests {
         let newer = BatchRecord {
             action: BulkActionKind::Rebase,
             requested_by: UserId::new("bob"),
+            retried_from: None,
             targets: vec![BatchTargetRecord {
                 number: 5,
                 html_url: "https://github.com/acme/repo-1/pull/5".to_owned(),
@@ -2575,7 +2588,9 @@ mod tests {
         assert_eq!(
             store.recent_batches(10).await.unwrap(),
             vec![newer.clone(), older],
-            "every column and every target comes back, targets in batch order"
+            "every column and every target comes back, targets in batch order: the batch \
+             retried, each head, and each merge's commit included, and a batch that retried \
+             nothing as such"
         );
         assert_eq!(store.recent_batches(1).await.unwrap(), vec![newer]);
         assert_eq!(
@@ -2604,13 +2619,14 @@ mod tests {
         assert_eq!(store.recent_batches(10).await.unwrap(), vec![first]);
     }
 
-    /// A merge of two pull requests `alice` asked for, as the workflow writes it
-    /// when it starts running the batch.
+    /// A merge of two pull requests `alice` asked for as a retry of `batch-0`, as
+    /// the workflow writes it when it starts running the batch.
     fn running(batch_id: &str, started_at: u64) -> RunningBatch {
         RunningBatch {
             batch_id: batch_id.to_owned(),
             action: BulkActionKind::Merge,
             requested_by: UserId::new("alice"),
+            retried_from: Some("batch-0".to_owned()),
             started_at,
             target_count: 2,
         }
@@ -2625,6 +2641,7 @@ mod tests {
         let newer = RunningBatch {
             action: BulkActionKind::Rebase,
             requested_by: UserId::new("bob"),
+            retried_from: None,
             target_count: 1,
             ..running("batch-newer", 2_000)
         };
@@ -2635,7 +2652,7 @@ mod tests {
         assert_eq!(
             store.running_batches().await.unwrap(),
             vec![newer, older],
-            "every column comes back, newest first"
+            "every column comes back, the batch retried included, newest first"
         );
     }
 
@@ -2750,6 +2767,89 @@ mod tests {
             Some(ProjectedBatch::Running(still_running))
         );
         assert_eq!(store.get_batch("batch-never-run").await.unwrap(), None);
+    }
+
+    /// The rows from before a batch named the batch it retried, a target kept the head
+    /// it was sent against, and a merge kept the commit it made are still here, and read
+    /// as batches that retried nothing anyone recorded, over heads nobody kept, with
+    /// merges as what commit nobody knows — not as rows the store cannot read.
+    #[tokio::test]
+    async fn batches_recorded_before_the_link_the_heads_and_the_merge_commits_read_as_unknown() {
+        let (_directory, store) = test_store().await;
+        let connection = store.connection().await;
+        connection
+            .execute(
+                r#"INSERT INTO batches (
+                    batch_id, action, requested_by, started_at, completed_at,
+                    succeeded, rejected, failed
+                ) VALUES ('batch-old', 'merge', 'alice', 970, 1000, 1, 0, 0)"#,
+                (),
+            )
+            .await
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO batch_targets (
+                    batch_id, position, repository_id, owner, repo, number, title, html_url, outcome
+                ) VALUES (
+                    'batch-old', 0, 1, 'acme', 'repo-1', 1, 'Bump serde',
+                    'https://github.com/acme/repo-1/pull/1', '{"succeeded":{"detail":"merged"}}'
+                )"#,
+                (),
+            )
+            .await
+            .unwrap();
+        connection
+            .execute(
+                r#"INSERT INTO running_batches (
+                    batch_id, action, requested_by, started_at, target_count
+                ) VALUES ('batch-old-running', 'merge', 'alice', 2000, 2)"#,
+                (),
+            )
+            .await
+            .unwrap();
+        drop(connection);
+
+        let old = BatchRecord {
+            batch_id: "batch-old".to_owned(),
+            action: BulkActionKind::Merge,
+            requested_by: UserId::new("alice"),
+            retried_from: None,
+            started_at: 970,
+            completed_at: 1000,
+            succeeded: 1,
+            rejected: 0,
+            failed: 0,
+            targets: vec![BatchTargetRecord {
+                repository_id: 1,
+                owner: "acme".to_owned(),
+                repo: "repo-1".to_owned(),
+                number: 1,
+                title: "Bump serde".to_owned(),
+                html_url: "https://github.com/acme/repo-1/pull/1".to_owned(),
+                head_sha: None,
+                outcome: TargetOutcome::Succeeded {
+                    detail: "merged".to_owned(),
+                    merge_sha: None,
+                },
+            }],
+        };
+        assert_eq!(store.recent_batches(10).await.unwrap(), vec![old.clone()]);
+        assert_eq!(
+            store.get_batch("batch-old").await.unwrap(),
+            Some(ProjectedBatch::Finished(old))
+        );
+        assert_eq!(
+            store.running_batches().await.unwrap(),
+            vec![RunningBatch {
+                batch_id: "batch-old-running".to_owned(),
+                action: BulkActionKind::Merge,
+                requested_by: UserId::new("alice"),
+                retried_from: None,
+                started_at: 2000,
+                target_count: 2,
+            }]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

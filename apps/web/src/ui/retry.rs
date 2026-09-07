@@ -13,12 +13,12 @@
 //! time the batch is submitted; both name the pull request with its
 //! repository, in one voice.
 
-use dependaboard_core::{BatchProgress, PrRecord, PrTarget, RejectReason};
+use dependaboard_core::{BatchProgress, BulkActionKind, PrRecord, PrTarget, RejectReason};
 use futures_util::future::join_all;
 
 use crate::api::request_pr_sync;
 use crate::ui::pr_sync::wait_for_pr_sync_completion;
-use crate::ui::user_facing;
+use crate::ui::{PendingAction, user_facing};
 
 /// The server as the retry sees it, so the flow can be driven by a script in
 /// tests. Errors are already in their user-facing form.
@@ -41,10 +41,14 @@ impl RefreshGateway for ServerRefresh {
     }
 }
 
-/// The rejected targets once they have been refreshed: the rows to submit,
-/// carrying their current head SHAs, and the targets left out, each with why.
+/// The rejected targets of a batch once they have been refreshed: which batch,
+/// and of what kind, the rows to submit, carrying their current head SHAs, and
+/// the targets left out, each with why.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Refreshed {
+    /// The batch whose rejected targets these are.
+    pub(crate) batch_id: String,
+    pub(crate) action: BulkActionKind,
     pub(crate) rows: Vec<PrRecord>,
     pub(crate) left_out: Vec<LeftOut>,
 }
@@ -53,6 +57,20 @@ impl Refreshed {
     /// What to tell the user about the targets left out; nothing if none were.
     pub(crate) fn notice(&self) -> Option<String> {
         left_out_notice("the retry", &self.left_out)
+    }
+
+    /// The batch to queue: one of the same kind over the refreshed rows, naming
+    /// the batch it retries so the record of the one points at the record of the
+    /// other. `None` when every target was left out: there is nothing to queue.
+    pub(crate) fn retry(&self) -> Option<PendingAction> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        Some(PendingAction {
+            action: self.action,
+            rows: self.rows.clone(),
+            retried_from: Some(self.batch_id.clone()),
+        })
     }
 }
 
@@ -176,7 +194,12 @@ pub(crate) async fn refresh_rejected<G: RefreshGateway>(
             }),
         }
     }
-    Refreshed { rows, left_out }
+    Refreshed {
+        batch_id: progress.batch_id.clone(),
+        action: progress.action,
+        rows,
+        left_out,
+    }
 }
 
 #[cfg(all(test, feature = "server"))]
@@ -186,8 +209,8 @@ mod tests {
     use dependaboard_core::{ActionOutcome, BulkActionKind, PrKey, RejectReason};
 
     use super::*;
-    use crate::ui::pr_target;
     use crate::ui::test_support::{grouped_row, off_page_row, serde_row};
+    use crate::ui::{PendingAction, pr_target};
 
     /// A server whose answer to each target's refresh is scripted by key. A
     /// target the script does not name fails its refresh, so a target that
@@ -243,6 +266,7 @@ mod tests {
             &targets[0].key(),
             ActionOutcome::Succeeded {
                 detail: "merged".to_owned(),
+                merge_sha: None,
             },
         );
         progress.record(
@@ -269,11 +293,39 @@ mod tests {
         assert_eq!(
             refreshed,
             Refreshed {
+                batch_id: "batch-1".to_owned(),
+                action: BulkActionKind::Merge,
                 rows: vec![moved_on(&serde_row())],
                 left_out: vec![],
             }
         );
         assert_eq!(refreshed.notice(), None);
+    }
+
+    /// What a retry queues is a batch of the same kind over the refreshed rows that
+    /// names the batch it retries, so the record of the one points at the record of
+    /// the other and the audit view can link them each way. A retry with nothing
+    /// left to send queues no batch.
+    #[tokio::test]
+    async fn the_retry_is_a_batch_of_the_same_kind_that_names_the_batch_it_retries() {
+        let gateway = Scripted::new([(serde_row(), Ok(Some(moved_on(&serde_row()))))]);
+
+        let refreshed = refresh_rejected(&gateway, &one_of_each()).await;
+
+        assert_eq!(
+            refreshed.retry(),
+            Some(PendingAction {
+                action: BulkActionKind::Merge,
+                rows: vec![moved_on(&serde_row())],
+                retried_from: Some("batch-1".to_owned()),
+            })
+        );
+
+        let nothing_left = Refreshed {
+            rows: Vec::new(),
+            ..refreshed
+        };
+        assert_eq!(nothing_left.retry(), None);
     }
 
     /// A batch rejected two targets: one for a moved head, one as not found.
@@ -303,6 +355,8 @@ mod tests {
         assert_eq!(
             refreshed,
             Refreshed {
+                batch_id: "batch-1".to_owned(),
+                action: BulkActionKind::Merge,
                 rows: vec![moved_on(&serde_row())],
                 left_out: vec![LeftOut {
                     target: pr_target(&off_page_row()),
@@ -365,6 +419,8 @@ mod tests {
         assert_eq!(
             refreshed,
             Refreshed {
+                batch_id: "batch-1".to_owned(),
+                action: BulkActionKind::Merge,
                 rows: vec![moved_on(&off_page_row())],
                 left_out: vec![LeftOut {
                     target: pr_target(&serde_row()),
@@ -414,6 +470,8 @@ mod tests {
         assert_eq!(
             refreshed,
             Refreshed {
+                batch_id: "batch-1".to_owned(),
+                action: BulkActionKind::Merge,
                 rows: vec![moved_on(&serde_row())],
                 left_out: vec![
                     LeftOut {
@@ -484,6 +542,7 @@ mod tests {
         let refreshed = refresh_rejected(&gateway, &progress).await;
 
         assert_eq!(refreshed.rows, vec![]);
+        assert_eq!(refreshed.retry(), None, "nothing is left to queue");
         assert_eq!(
             refreshed.notice().as_deref(),
             Some(

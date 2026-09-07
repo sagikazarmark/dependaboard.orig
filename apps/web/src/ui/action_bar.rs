@@ -40,6 +40,7 @@ pub(crate) fn ActionBar(onrequest: EventHandler<PendingAction>) -> Element {
         onrequest.call(PendingAction {
             action,
             rows: state.selected_rows(),
+            retried_from: None,
         });
     };
     rsx! {
