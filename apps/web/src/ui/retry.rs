@@ -14,32 +14,45 @@
 //! repository, in one voice.
 
 use dependaboard_core::{BatchProgress, BulkActionKind, PrRecord, PrTarget, RejectReason};
-use futures_util::future::join_all;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 
-use crate::api::request_pr_sync;
-use crate::ui::pr_sync::wait_for_pr_sync_completion;
-use crate::ui::{PendingAction, user_facing};
+use crate::ui::PendingAction;
+use crate::ui::dashboard_state::DashboardState;
+use crate::ui::pr_sync::{ServerSync, SyncFailure, sync_pr};
 
 /// The server as the retry sees it, so the flow can be driven by a script in
-/// tests. Errors are already in their user-facing form.
+/// tests. A refresh that failed says why, since a refusal of the credentials
+/// ends the retry where any other failure leaves the one target out.
 pub(crate) trait RefreshGateway {
     /// Syncs `target`'s pull request again and reads its row back; `None`
     /// once the pull request is no longer in the dashboard.
-    async fn refresh(&self, target: &PrTarget) -> Result<Option<PrRecord>, String>;
+    async fn refresh(&self, target: &PrTarget) -> Result<Option<PrRecord>, SyncFailure>;
 }
 
 /// The refresh as the drawer's per-PR **Sync** does it, through the server
-/// functions: queue the sync, wait for its completion id, read the row.
-pub(crate) struct ServerRefresh;
+/// functions, on the page whose line to the server `state` carries: queue
+/// the sync, wait for its completion id, read the row. Not asked from a page
+/// the server has already refused, as [`ServerSync`] is not.
+pub(crate) struct ServerRefresh {
+    pub(crate) state: DashboardState,
+}
 
 impl RefreshGateway for ServerRefresh {
-    async fn refresh(&self, target: &PrTarget) -> Result<Option<PrRecord>, String> {
-        let completion_id = request_pr_sync(target.repository_id, target.number)
-            .await
-            .map_err(|error| user_facing(&error))?;
-        wait_for_pr_sync_completion(target.repository_id, target.number, completion_id).await
+    async fn refresh(&self, target: &PrTarget) -> Result<Option<PrRecord>, SyncFailure> {
+        let mut sync = ServerSync {
+            key: target.key(),
+            state: self.state,
+        };
+        sync_pr(&mut sync, || {}).await
     }
 }
+
+/// The retry was given up before anything was queued: the server refused
+/// the credentials of one target's sync, or of a poll after it. Every other
+/// target's would be refused the same, and so would the batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SignedOut;
 
 /// The rejected targets of a batch once they have been refreshed: which batch,
 /// and of what kind, the rows to submit, carrying their current head SHAs, and
@@ -164,10 +177,16 @@ pub(crate) fn can_retry(progress: &BatchProgress) -> bool {
 /// not found is left out unrefreshed: its pull request is closed or merged
 /// and its row already gone. So is one rejected over the configuration: a
 /// refresh changes nothing GitHub would judge differently.
+///
+/// One failure is not a target's alone: the server refusing the credentials
+/// of any refresh. Every other target's sync and poll would be refused the
+/// same, each with a credential prompt, and so would the batch the retry
+/// queues; so the retry is given up at the first refusal, as [`SignedOut`],
+/// with the refreshes still in flight dropped before they ask again.
 pub(crate) async fn refresh_rejected<G: RefreshGateway>(
     gateway: &G,
     progress: &BatchProgress,
-) -> Refreshed {
+) -> Result<Refreshed, SignedOut> {
     let mut left_out = Vec::new();
     let mut to_refresh = Vec::new();
     for (target, reason) in progress.rejected_targets() {
@@ -182,60 +201,113 @@ pub(crate) async fn refresh_rejected<G: RefreshGateway>(
             to_refresh.push(target);
         }
     }
-    let refreshed = join_all(to_refresh.iter().map(|target| gateway.refresh(target))).await;
+    // The answers come in as they land; they are sorted back into the batch's
+    // order once all are in, so the retry lists its targets as the batch did.
+    let mut refreshing: FuturesUnordered<_> = to_refresh
+        .into_iter()
+        .enumerate()
+        .map(|(order, target)| async move { (order, target, gateway.refresh(target).await) })
+        .collect();
+    let mut answered = Vec::new();
+    while let Some((order, target, answer)) = refreshing.next().await {
+        if answer.as_ref().is_err_and(SyncFailure::signed_out) {
+            return Err(SignedOut);
+        }
+        answered.push((order, target, answer));
+    }
+    answered.sort_by_key(|(order, ..)| *order);
     let mut rows = Vec::new();
-    for (target, answer) in to_refresh.into_iter().zip(refreshed) {
+    for (_, target, answer) in answered {
         match answer {
             Ok(Some(row)) => rows.push(row),
             Ok(None) => left_out.push(LeftOut::no_longer_open(target)),
-            Err(error) => left_out.push(LeftOut {
+            Err(failure) => left_out.push(LeftOut {
                 target: target.clone(),
-                why: LeftOutReason::CouldNotRefresh(error),
+                why: LeftOutReason::CouldNotRefresh(failure.to_string()),
             }),
         }
     }
-    Refreshed {
+    Ok(Refreshed {
         batch_id: progress.batch_id.clone(),
         action: progress.action,
         rows,
         left_out,
-    }
+    })
 }
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
 
     use dependaboard_core::{ActionOutcome, BulkActionKind, PrKey, RejectReason};
 
     use super::*;
     use crate::ui::test_support::{grouped_row, off_page_row, serde_row};
-    use crate::ui::{PendingAction, pr_target};
+    use crate::ui::{Fault, PendingAction, pr_target};
 
-    /// A server whose answer to each target's refresh is scripted by key. A
-    /// target the script does not name fails its refresh, so a target that
-    /// should never have been refreshed shows up as left out with that error.
-    struct Scripted(BTreeMap<PrKey, Result<Option<PrRecord>, String>>);
+    /// A server whose answer to each target's refresh is scripted by key, and
+    /// which remembers which targets it was asked to refresh and which it
+    /// answered, each in order. A target the script does not name fails its
+    /// refresh, so a target that should never have been refreshed shows up as
+    /// left out with that error. An answer can be held back a number of
+    /// turns, so the answers come in an order of the test's choosing rather
+    /// than the targets' — or not at all, if the refresh is dropped first.
+    struct Scripted {
+        answers: BTreeMap<PrKey, Result<Option<PrRecord>, SyncFailure>>,
+        held_back: BTreeMap<PrKey, u32>,
+        asked: RefCell<Vec<PrKey>>,
+        answered: RefCell<Vec<PrKey>>,
+    }
 
     impl Scripted {
         fn new(
-            answers: impl IntoIterator<Item = (PrRecord, Result<Option<PrRecord>, String>)>,
+            answers: impl IntoIterator<Item = (PrRecord, Result<Option<PrRecord>, SyncFailure>)>,
         ) -> Self {
-            Self(
-                answers
+            Self {
+                answers: answers
                     .into_iter()
                     .map(|(row, answer)| (pr_target(&row).key(), answer))
                     .collect(),
-            )
+                held_back: BTreeMap::new(),
+                asked: RefCell::new(Vec::new()),
+                answered: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// With `row`'s answer held back `turns` turns of the executor.
+        fn holding_back(mut self, row: &PrRecord, turns: u32) -> Self {
+            self.held_back.insert(pr_target(row).key(), turns);
+            self
         }
     }
 
     impl RefreshGateway for Scripted {
-        async fn refresh(&self, target: &PrTarget) -> Result<Option<PrRecord>, String> {
-            self.0.get(&target.key()).cloned().unwrap_or_else(|| {
-                Err(format!("{} was not expected to be refreshed", target.key()))
+        async fn refresh(&self, target: &PrTarget) -> Result<Option<PrRecord>, SyncFailure> {
+            let key = target.key();
+            self.asked.borrow_mut().push(key.clone());
+            for _ in 0..self.held_back.get(&key).copied().unwrap_or(0) {
+                tokio::task::yield_now().await;
+            }
+            self.answered.borrow_mut().push(key.clone());
+            self.answers.get(&key).cloned().unwrap_or_else(|| {
+                Err(SyncFailure::Unconfirmed(Fault::Refused(format!(
+                    "{key} was not expected to be refreshed"
+                ))))
             })
         }
+    }
+
+    /// The refresh failing on the server's side: Restate away.
+    fn unavailable() -> SyncFailure {
+        SyncFailure::Unconfirmed(Fault::Refused("Restate is unavailable".to_owned()))
+    }
+
+    /// [`refresh_rejected`] on a page the server lets in.
+    async fn refresh(gateway: &Scripted, progress: &BatchProgress) -> Refreshed {
+        refresh_rejected(gateway, progress)
+            .await
+            .expect("no refresh was refused the credentials")
     }
 
     /// `row` as the store shows it after another push: a new head SHA.
@@ -288,7 +360,7 @@ mod tests {
             (off_page_row(), Ok(Some(moved_on(&off_page_row())))),
         ]);
 
-        let refreshed = refresh_rejected(&gateway, &one_of_each()).await;
+        let refreshed = refresh(&gateway, &one_of_each()).await;
 
         assert_eq!(
             refreshed,
@@ -310,7 +382,7 @@ mod tests {
     async fn the_retry_is_a_batch_of_the_same_kind_that_names_the_batch_it_retries() {
         let gateway = Scripted::new([(serde_row(), Ok(Some(moved_on(&serde_row()))))]);
 
-        let refreshed = refresh_rejected(&gateway, &one_of_each()).await;
+        let refreshed = refresh(&gateway, &one_of_each()).await;
 
         assert_eq!(
             refreshed.retry(),
@@ -350,7 +422,7 @@ mod tests {
         // Only the moved one is scripted: refreshing the other is an error.
         let gateway = Scripted::new([(serde_row(), Ok(Some(moved_on(&serde_row()))))]);
 
-        let refreshed = refresh_rejected(&gateway, &progress).await;
+        let refreshed = refresh(&gateway, &progress).await;
 
         assert_eq!(
             refreshed,
@@ -414,7 +486,7 @@ mod tests {
             (off_page_row(), Ok(Some(moved_on(&off_page_row())))),
         ]);
 
-        let refreshed = refresh_rejected(&gateway, &progress).await;
+        let refreshed = refresh(&gateway, &progress).await;
 
         assert_eq!(
             refreshed,
@@ -465,7 +537,7 @@ mod tests {
         // Only the moved one is scripted: refreshing either other is an error.
         let gateway = Scripted::new([(serde_row(), Ok(Some(moved_on(&serde_row()))))]);
 
-        let refreshed = refresh_rejected(&gateway, &progress).await;
+        let refreshed = refresh(&gateway, &progress).await;
 
         assert_eq!(
             refreshed,
@@ -539,7 +611,7 @@ mod tests {
         );
         let gateway = Scripted::new([]);
 
-        let refreshed = refresh_rejected(&gateway, &progress).await;
+        let refreshed = refresh(&gateway, &progress).await;
 
         assert_eq!(refreshed.rows, vec![]);
         assert_eq!(refreshed.retry(), None, "nothing is left to queue");
@@ -584,10 +656,10 @@ mod tests {
         );
         let gateway = Scripted::new([
             (grouped_row(), Ok(Some(moved_on(&grouped_row())))),
-            (serde_row(), Err("Restate is unavailable".to_owned())),
+            (serde_row(), Err(unavailable())),
         ]);
 
-        let refreshed = refresh_rejected(&gateway, &progress).await;
+        let refreshed = refresh(&gateway, &progress).await;
 
         assert_eq!(refreshed.rows, vec![moved_on(&grouped_row())]);
         assert_eq!(
@@ -609,6 +681,121 @@ mod tests {
                 "Left out of the retry: acme/web#13 is no longer open; \
                  acme/web#12 could not be refreshed (Restate is unavailable)."
             )
+        );
+    }
+
+    /// Every target of `batch-1` rejected as not mergeable: three refreshes
+    /// to run.
+    fn three_rejected() -> BatchProgress {
+        let targets = [
+            pr_target(&grouped_row()),
+            pr_target(&serde_row()),
+            pr_target(&off_page_row()),
+        ];
+        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        for target in &targets {
+            progress.record(
+                &target.key(),
+                ActionOutcome::Rejected {
+                    reason: RejectReason::NotMergeable,
+                },
+            );
+        }
+        progress
+    }
+
+    /// A refresh the server refused the credentials of is not a target to
+    /// leave out and go on without: every other target's sync and poll would
+    /// be refused the same, each with a credential prompt, and so would the
+    /// batch the retry queues. The retry is given up there and then, and
+    /// nothing is queued. On a page already signed out the first target's
+    /// request is refused without asking, before a poll of anything, and the
+    /// other targets are not started at all — whether the refusal is of the
+    /// request or of a poll after it.
+    #[tokio::test]
+    async fn a_retry_from_a_page_already_signed_out_is_given_up_with_nothing_more_started() {
+        for refusal in [
+            SyncFailure::NotQueued(Fault::SignedOut),
+            SyncFailure::Unconfirmed(Fault::SignedOut),
+        ] {
+            let gateway = Scripted::new([
+                (grouped_row(), Err(refusal.clone())),
+                (serde_row(), Ok(Some(moved_on(&serde_row())))),
+                (off_page_row(), Ok(Some(moved_on(&off_page_row())))),
+            ]);
+
+            let outcome = refresh_rejected(&gateway, &three_rejected()).await;
+
+            assert_eq!(outcome, Err(SignedOut), "{refusal:?}");
+            assert_eq!(
+                *gateway.asked.borrow(),
+                vec![pr_target(&grouped_row()).key()],
+                "nothing is asked after the refusal ({refusal:?})"
+            );
+        }
+    }
+
+    /// The password is rotated while the targets are being refreshed: every
+    /// refresh is out already, and the first poll refused ends them all. The
+    /// waits still in flight are dropped where they stand, so none of them
+    /// asks again, and none answers.
+    #[tokio::test]
+    async fn a_refusal_while_the_targets_are_being_refreshed_ends_every_wait_in_flight() {
+        let gateway = Scripted::new([
+            (grouped_row(), Ok(Some(moved_on(&grouped_row())))),
+            (serde_row(), Err(SyncFailure::Unconfirmed(Fault::SignedOut))),
+            (off_page_row(), Ok(Some(moved_on(&off_page_row())))),
+        ])
+        .holding_back(&grouped_row(), 3)
+        .holding_back(&serde_row(), 1)
+        .holding_back(&off_page_row(), 3);
+
+        let outcome = refresh_rejected(&gateway, &three_rejected()).await;
+
+        assert_eq!(outcome, Err(SignedOut));
+        assert_eq!(
+            gateway.asked.borrow().len(),
+            3,
+            "every refresh was under way when the refusal came"
+        );
+        assert_eq!(
+            *gateway.answered.borrow(),
+            vec![pr_target(&serde_row()).key()],
+            "the refused one is the only one to answer: the rest were dropped mid-wait"
+        );
+    }
+
+    /// The targets are refreshed all at once, and their syncs land in
+    /// whatever order GitHub answers; the retry still lists them as the batch
+    /// it retries did, so the drawer reads the same down both.
+    #[tokio::test]
+    async fn the_refreshed_rows_keep_the_batchs_order_whatever_order_the_answers_came_in() {
+        let gateway = Scripted::new([
+            (grouped_row(), Ok(Some(moved_on(&grouped_row())))),
+            (serde_row(), Ok(Some(moved_on(&serde_row())))),
+            (off_page_row(), Ok(Some(moved_on(&off_page_row())))),
+        ])
+        .holding_back(&grouped_row(), 2)
+        .holding_back(&serde_row(), 1);
+
+        let refreshed = refresh(&gateway, &three_rejected()).await;
+
+        assert_eq!(
+            refreshed.rows,
+            vec![
+                moved_on(&grouped_row()),
+                moved_on(&serde_row()),
+                moved_on(&off_page_row()),
+            ]
+        );
+        assert_eq!(
+            *gateway.answered.borrow(),
+            vec![
+                pr_target(&off_page_row()).key(),
+                pr_target(&serde_row()).key(),
+                pr_target(&grouped_row()).key(),
+            ],
+            "the answers did come in the other order"
         );
     }
 }

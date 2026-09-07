@@ -1,6 +1,8 @@
-//! Shared fixtures for the UI modules' SSR snapshot tests.
+//! Shared fixtures for the UI modules' tests: the rows and pages the SSR
+//! snapshots render, the dashboard to mount them under, and the script reader
+//! the scripted servers share.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use dependaboard_core::{
     ActionOutcome, BatchProgress, BulkActionKind, CheckStatus, DashboardPage, DashboardSummary,
@@ -256,4 +258,15 @@ pub(crate) fn render(app: fn() -> Element) -> String {
     let mut dom = VirtualDom::new(app);
     dom.rebuild_in_place();
     dioxus::ssr::render(&dom)
+}
+
+/// The next answer of a scripted server: each call pops the next, and the
+/// last one repeats once the script runs out, so a script can say "and then
+/// this, for as long as it is asked".
+pub(crate) fn next_or_repeat<T: Clone>(script: &mut VecDeque<T>) -> T {
+    if script.len() > 1 {
+        script.pop_front().unwrap()
+    } else {
+        script.front().cloned().expect("the script is not empty")
+    }
 }

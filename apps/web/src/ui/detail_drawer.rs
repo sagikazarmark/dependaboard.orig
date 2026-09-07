@@ -9,12 +9,12 @@ use dependaboard_core::{BulkActionKind, DashboardPage, PrKey, PrRecord, PrState}
 use dioxus::logger::tracing;
 use dioxus::prelude::*;
 
-use crate::api::{load_pr_projection, load_pr_status, request_pr_sync};
+use crate::api::{load_pr_projection, load_pr_status};
 use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
-use crate::ui::dashboard_state::use_dashboard;
+use crate::ui::dashboard_state::{Connection, use_dashboard};
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
-use crate::ui::pr_sync::wait_for_pr_sync_completion;
+use crate::ui::pr_sync::{ServerSync, SyncFailure, sync_pr};
 use crate::ui::side_panel::SidePanel;
 use crate::ui::{PendingAction, user_facing};
 
@@ -191,6 +191,17 @@ fn follow(open: &OpenPr, page: &DashboardPage) -> Followed {
     }
 }
 
+/// What the user reads when the drawer's **Sync** fell short of the row:
+/// whether Restate was asked at all, and why it ended there.
+fn sync_message(failure: &SyncFailure) -> String {
+    match failure {
+        SyncFailure::NotQueued(_) => format!("Could not queue sync: {failure}"),
+        SyncFailure::Unconfirmed(_) | SyncFailure::TimedOut => {
+            format!("Sync was queued, but completion could not be confirmed: {failure}")
+        }
+    }
+}
+
 /// The drawer for `row`. `gone` says the pull request has left the read
 /// model since the drawer opened: the drawer still shows the row, as the
 /// last the dashboard saw of it, but says so and withholds every action. The
@@ -198,6 +209,12 @@ fn follow(open: &OpenPr, page: &DashboardPage) -> Followed {
 /// starts from the row in the read model, which is no longer there.
 /// `rebase_withheld` is why a rebase alone is not on offer, if the service
 /// has said it is not; the rest of the actions run as the App and stand.
+///
+/// The drawer's **Sync** runs on the page's line to the server, which the
+/// dashboard state carries: it is not started from a page the server has
+/// already refused, and a refusal it meets is the page's word, told to the
+/// state so the banner goes up, as well as the sync's, reported through
+/// `onsync`.
 #[component]
 pub(crate) fn DetailDrawer(
     row: PrRecord,
@@ -209,6 +226,7 @@ pub(crate) fn DetailDrawer(
     onsync: EventHandler<Result<Option<PrRecord>, String>>,
 ) -> Element {
     let stale = row.is_stale(now);
+    let mut state = use_dashboard();
     let mut syncing = use_signal(|| false);
     let mut sync_queued = use_signal(|| false);
     let sync_repository_id = row.repository_id;
@@ -287,37 +305,26 @@ pub(crate) fn DetailDrawer(
                         onclick: move |_| {
                             syncing.set(true);
                             spawn(async move {
-                                match request_pr_sync(sync_repository_id, sync_number).await {
-                                    Ok(completion_id) => {
-                                        syncing.set(false);
-                                        sync_queued.set(true);
-                                        match wait_for_pr_sync_completion(
-                                            sync_repository_id,
-                                            sync_number,
-                                            completion_id,
-                                        ).await {
-                                            Ok(row) => {
-                                                sync_queued.set(false);
-                                                // The row the sync returns replaces the
-                                                // drawer's, which re-reads the durable state.
-                                                onsync.call(Ok(row));
-                                            }
-                                            Err(error) => {
-                                                sync_queued.set(false);
-                                                onsync.call(Err(format!(
-                                                    "Sync was queued, but completion could not be confirmed: {error}"
-                                                )));
-                                            }
-                                        }
-                                    }
-                                    Err(error) => {
-                                        syncing.set(false);
-                                        onsync.call(Err(format!(
-                                            "Could not queue sync: {}",
-                                            user_facing(&error)
-                                        )));
-                                    }
+                                let mut sync = ServerSync {
+                                    key: PrKey::new(sync_repository_id, sync_number),
+                                    state,
+                                };
+                                let outcome = sync_pr(&mut sync, || {
+                                    syncing.set(false);
+                                    sync_queued.set(true);
+                                })
+                                .await;
+                                syncing.set(false);
+                                sync_queued.set(false);
+                                // A refusal of the credentials is the page's
+                                // word, not the sync's: the banner goes up, and
+                                // the live refresh asks nothing more.
+                                if outcome.as_ref().is_err_and(SyncFailure::signed_out) {
+                                    state.poll_missed(Connection::SignedOut);
                                 }
+                                // The row the sync returns replaces the
+                                // drawer's, which re-reads the durable state.
+                                onsync.call(outcome.map_err(|failure| sync_message(&failure)));
                             });
                         },
                         if syncing() {
@@ -641,12 +648,14 @@ mod tests {
         // variant name, so the assertion below can tell Display from Debug.
         row.mergeable = Mergeable::HasHooks;
         rsx! {
-            DetailDrawer {
-                row,
-                now: FIXTURE_NOW,
-                onclose: move |_| {},
-                onaction: move |_| {},
-                onsync: move |_| {},
+            DashboardFixture {
+                DetailDrawer {
+                    row,
+                    now: FIXTURE_NOW,
+                    onclose: move |_| {},
+                    onaction: move |_| {},
+                    onsync: move |_| {},
+                }
             }
         }
     }

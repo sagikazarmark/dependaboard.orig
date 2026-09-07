@@ -550,7 +550,7 @@ mod tests {
 
     use super::*;
     use crate::ui::pr_target;
-    use crate::ui::test_support::grouped_row;
+    use crate::ui::test_support::{grouped_row, next_or_repeat};
 
     /// A server whose answers are scripted: each call pops the next answer,
     /// and the last one repeats once the script runs out. The projection's
@@ -587,14 +587,6 @@ mod tests {
         /// With `projected` as the projection's word on the batch.
         fn projecting(self, projected: Result<Option<ProjectedBatch>, Fault>) -> Self {
             Self { projected, ..self }
-        }
-    }
-
-    fn next_or_repeat<T: Clone>(script: &mut VecDeque<T>) -> T {
-        if script.len() > 1 {
-            script.pop_front().unwrap()
-        } else {
-            script.front().cloned().expect("the script is not empty")
         }
     }
 

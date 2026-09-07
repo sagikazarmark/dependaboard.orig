@@ -20,7 +20,7 @@ use crate::ui::dashboard_state::{Connection, DashboardState, use_dashboard};
 use crate::ui::format::{relative_time, verdict_tally};
 use crate::ui::progress_drawer::ProgressDrawer;
 use crate::ui::retry::{LeftOut, ServerRefresh, left_out_notice, refresh_rejected};
-use crate::ui::{Fault, PendingAction, sticky};
+use crate::ui::{Fault, PendingAction, SIGNED_OUT_MESSAGE, sticky};
 
 /// Where a followed batch lands: what is known of it, which the pill and
 /// drawer read, the task following it, whether the drawer is showing, the
@@ -306,14 +306,26 @@ fn not_submitted_notice(fault: &Fault) -> String {
 /// The refresh can take a while, and the user may confirm another batch in
 /// the meantime; a retry that finds the host following a batch other than
 /// `finished` stands down rather than take the drawer from the one running.
-fn retry_rejected(finished: BatchProgress, mut retrying: Signal<bool>, host: BatchHost) {
+/// A retry the server refused the credentials of is given up whole, saying
+/// so, and the page is told it is signed out, as it is when a follow is
+/// refused: the banner goes up at once and the live refresh asks nothing
+/// more either.
+fn retry_rejected(finished: BatchProgress, mut retrying: Signal<bool>, mut host: BatchHost) {
     if retrying() {
         return;
     }
     retrying.set(true);
     spawn(async move {
-        let refreshed = refresh_rejected(&ServerRefresh, &finished).await;
+        let refreshed = refresh_rejected(&ServerRefresh { state: host.state }, &finished).await;
         retrying.set(false);
+        let Ok(refreshed) = refreshed else {
+            host.toast.error(
+                format!("The retry was given up: {SIGNED_OUT_MESSAGE}"),
+                sticky(),
+            );
+            host.state.poll_missed(Connection::SignedOut);
+            return;
+        };
         if let Some(notice) = refreshed.notice() {
             host.toast.warning(notice, sticky());
         }
