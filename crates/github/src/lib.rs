@@ -11,21 +11,34 @@ use dependaboard_core::{
     Mergeable, Operation, PrKey, PrRecord, PrTarget, RepoRecord, SyncRequest, UpdateBranchRequest,
     UserId, highest_update_type, parse_dependabot_metadata, rollup_checks, unix_seconds,
 };
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use jsonwebtoken::EncodingKey;
 use reqwest::{Method, Response, StatusCode};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::graphql::{
-    CHECK_CONTEXTS_PAGE_QUERY, CHECK_SUITES_PAGE_QUERY, CheckContextsPage, CheckSuitesPage,
-    CommitData, GraphqlResponse, SnapshotData, check_context_signal, check_suite_signal,
-    head_commit_query, snapshot_query,
-};
-
+mod auth;
+mod error;
 mod graphql;
+mod rest;
+
+pub use auth::TokenProvider;
+pub use error::{GithubError, ProtocolError};
+
+use crate::{
+    auth::{CachedToken, StaticTokenProvider, no_user_token},
+    error::{known_http, not_found},
+    graphql::{
+        CHECK_CONTEXTS_PAGE_QUERY, CHECK_SUITES_PAGE_QUERY, CheckContextsPage, CheckSuitesPage,
+        CommitData, GraphqlResponse, SnapshotData, check_context_signal, check_suite_signal,
+        head_commit_query, snapshot_query,
+    },
+    rest::{
+        GithubPull, InstallationRepositories, IssueComment, MergeResult, PullListItem,
+        RateLimitHeaders, UpdateBranchResult, http_error, parse_response, parse_timestamp,
+    },
+};
 
 const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "dependaboard/0.1";
@@ -107,41 +120,6 @@ impl GithubConfig {
     }
 }
 
-#[async_trait]
-pub trait TokenProvider: Send + Sync {
-    async fn user_token(&self, user: &UserId) -> Result<SecretString, GithubError>;
-}
-
-/// The one user identity a deployment configures, with its PAT if the operator minted
-/// one. Without a PAT there is no token for anyone, and every command is refused with
-/// the variable to set.
-struct StaticTokenProvider {
-    user: UserId,
-    token: Option<SecretString>,
-}
-
-#[async_trait]
-impl TokenProvider for StaticTokenProvider {
-    async fn user_token(&self, user: &UserId) -> Result<SecretString, GithubError> {
-        let token = self.token.clone().ok_or_else(no_user_token)?;
-        if user == &self.user {
-            Ok(token)
-        } else {
-            Err(GithubError::Config(format!(
-                "no GitHub user token is configured for {user}"
-            )))
-        }
-    }
-}
-
-/// The refusal a command meets when the deployment has no user identity at all.
-fn no_user_token() -> GithubError {
-    GithubError::Config(
-        "no GitHub user token is configured; set GITHUB_USER_PAT to post @dependabot commands"
-            .to_owned(),
-    )
-}
-
 fn parse_u64_var(var: &impl Fn(&str) -> Option<String>, name: &str) -> Result<u64, GithubError> {
     var(name)
         .ok_or_else(|| GithubError::Config(format!("set {name}")))?
@@ -161,12 +139,6 @@ pub struct GithubClient {
     /// Whether `user_tokens` can answer for anyone: false for a deployment without a
     /// PAT, where every command is refused before GitHub is asked anything.
     user_commands: bool,
-}
-
-#[derive(Clone)]
-struct CachedToken {
-    value: SecretString,
-    expires_at: u64,
 }
 
 impl GithubClient {
@@ -215,66 +187,6 @@ impl GithubClient {
 
     pub fn installation_id(&self) -> u64 {
         self.config.installation_id
-    }
-
-    async fn installation_token(
-        &self,
-        installation_id: u64,
-        force_refresh: bool,
-    ) -> Result<SecretString, GithubError> {
-        let now = unix_seconds();
-        let mut tokens = self.tokens.lock().await;
-        if !force_refresh
-            && let Some(token) = tokens.get(&installation_id)
-            && token.expires_at > now + 60
-        {
-            return Ok(token.value.clone());
-        }
-        let jwt = self.app_jwt()?;
-        let response = self
-            .http
-            .post(format!(
-                "{}/app/installations/{installation_id}/access_tokens",
-                self.config.api_url
-            ))
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .bearer_auth(jwt)
-            .send()
-            .await
-            .map_err(GithubError::Transport)?;
-        let token: InstallationToken = parse_response(response).await?;
-        let expires_at = parse_timestamp(&token.expires_at)?;
-        let value = SecretString::from(token.token);
-        tokens.insert(
-            installation_id,
-            CachedToken {
-                value: value.clone(),
-                expires_at,
-            },
-        );
-        Ok(value)
-    }
-
-    fn app_jwt(&self) -> Result<String, GithubError> {
-        #[derive(Serialize)]
-        struct Claims {
-            iat: u64,
-            exp: u64,
-            iss: String,
-        }
-
-        let now = unix_seconds();
-        encode(
-            &Header::new(Algorithm::RS256),
-            &Claims {
-                iat: now.saturating_sub(60),
-                exp: now + 9 * 60,
-                iss: self.config.app_id.to_string(),
-            },
-            &self.app_key,
-        )
-        .map_err(|error| GithubError::Config(format!("cannot sign GitHub App JWT: {error}")))
     }
 
     async fn installation_request(
@@ -1042,43 +954,6 @@ impl GithubApi for GithubClient {
     }
 }
 
-fn not_found(message: &str) -> GithubError {
-    GithubError::Http {
-        response: GithubErrorResponse {
-            status: StatusCode::NOT_FOUND.as_u16(),
-            message: message.to_owned(),
-            ..Default::default()
-        },
-        known_resource: true,
-    }
-}
-
-/// Marks an HTTP error as coming from a resource the client has already read, so a 404
-/// downstream means the pull request went away rather than that it was never visible.
-fn known_http(error: GithubError) -> GithubError {
-    match error {
-        GithubError::Http { response, .. } => GithubError::Http {
-            response,
-            known_resource: true,
-        },
-        error => error,
-    }
-}
-
-async fn parse_response<T: DeserializeOwned>(response: Response) -> Result<T, GithubError> {
-    let status = response.status();
-    if status.is_success() {
-        return response
-            .json::<T>()
-            .await
-            .map_err(|error| GithubError::Protocol(ProtocolError::Body(error)));
-    }
-    Err(GithubError::Http {
-        response: http_error(response).await,
-        known_resource: false,
-    })
-}
-
 /// A merge seen on the pull request rather than in GitHub's answer to the merge — found
 /// done before anything was sent, or confirmed after an ambiguous answer — with `detail`
 /// as the words for it. It names the commit the pull request does.
@@ -1089,240 +964,6 @@ fn merged_as(detail: &'static str) -> impl FnOnce(&GithubPull) -> Option<Merged>
             sha: pull.merge_commit_sha.clone(),
         })
     }
-}
-
-async fn http_error(response: Response) -> GithubErrorResponse {
-    let status = response.status().as_u16();
-    let rate_limit = RateLimitHeaders::read(&response);
-    let body = response.json::<GithubErrorBody>().await.unwrap_or_default();
-    rate_limit.error(status, body.message, body.documentation_url)
-}
-
-/// The rate-limit headers GitHub attaches to every answer, REST or GraphQL, as unix
-/// seconds and counts.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RateLimitHeaders {
-    pub(crate) remaining: Option<u64>,
-    pub(crate) reset: Option<u64>,
-    pub(crate) retry_after: Option<u64>,
-}
-
-impl RateLimitHeaders {
-    fn read(response: &Response) -> Self {
-        Self {
-            remaining: header_u64(response, "x-ratelimit-remaining"),
-            reset: header_u64(response, "x-ratelimit-reset"),
-            retry_after: header_u64(response, "retry-after"),
-        }
-    }
-
-    /// A failed answer that carried these headers.
-    pub(crate) fn error(
-        self,
-        status: u16,
-        message: String,
-        documentation_url: Option<String>,
-    ) -> GithubErrorResponse {
-        GithubErrorResponse {
-            status,
-            message,
-            documentation_url,
-            rate_limit_remaining: self.remaining,
-            rate_limit_reset: self.reset,
-            retry_after_seconds: self.retry_after,
-        }
-    }
-}
-
-fn header_u64(response: &Response, name: &str) -> Option<u64> {
-    response.headers().get(name)?.to_str().ok()?.parse().ok()
-}
-
-fn parse_timestamp(value: &str) -> Result<u64, GithubError> {
-    let timestamp = chrono::DateTime::parse_from_rfc3339(value)
-        .map_err(|error| GithubError::Protocol(ProtocolError::Timestamp(error)))?
-        .timestamp();
-    u64::try_from(timestamp).map_err(|_| GithubError::Protocol(ProtocolError::TimestampBeforeEpoch))
-}
-
-#[derive(Debug, Error)]
-pub enum GithubError {
-    /// The request never completed: the client could not be built, the connection failed,
-    /// or the response was lost before it could be read.
-    #[error("GitHub transport failed: {0}")]
-    Transport(#[source] reqwest::Error),
-    /// GitHub answered with a non-success status.
-    ///
-    /// `known_resource` records whether the client had already proven the target exists
-    /// when this came back: a 404 on a pull request it just read means "gone", while a
-    /// 404 on the first read may be a permissions misconfiguration.
-    #[error("GitHub returned HTTP {}: {}", response.status, response.message)]
-    Http {
-        response: GithubErrorResponse,
-        known_resource: bool,
-    },
-    #[error("GitHub protocol error: {0}")]
-    Protocol(#[source] ProtocolError),
-    /// A mutation's answer from GitHub could not be read and reading back did not show the
-    /// mutation as applied, so whether it happened is unknown. Safe to retry: every attempt
-    /// re-verifies the pull request before acting.
-    #[error("ambiguous GitHub {operation} response: {source}")]
-    Ambiguous {
-        operation: Operation,
-        source: ProtocolError,
-    },
-    #[error("GitHub configuration error: {0}")]
-    Config(String),
-    #[error("pull request head changed from {expected} to {actual}")]
-    StaleSha { expected: String, actual: String },
-    /// A paged listing moved under its own pages: the total GitHub reports changed
-    /// between them, or the pages did not add up to it. Offset pagination cannot say
-    /// which item a boundary shift dropped, so the set fetched must not be treated as
-    /// authoritative. Safe to retry: a fresh listing starts over from the first page.
-    #[error("GitHub {listing} listing shifted while it was being paged: {detail}")]
-    Shifted {
-        listing: &'static str,
-        detail: String,
-    },
-}
-
-/// Why a successful GitHub answer could not be read.
-#[derive(Debug, Error)]
-pub enum ProtocolError {
-    #[error("invalid GitHub response: {0}")]
-    Body(#[source] reqwest::Error),
-    #[error("invalid GitHub timestamp: {0}")]
-    Timestamp(#[source] chrono::ParseError),
-    #[error("GitHub returned a timestamp before 1970")]
-    TimestampBeforeEpoch,
-    /// A well-formed GraphQL answer that reported no error yet lacks a part the query
-    /// asked for, such as a pull request with no head commit.
-    #[error("GitHub GraphQL answer is missing its {0}")]
-    Missing(&'static str),
-}
-
-#[derive(Debug, Deserialize)]
-struct InstallationToken {
-    token: String,
-    expires_at: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct GithubErrorBody {
-    #[serde(default)]
-    message: String,
-    documentation_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubUser {
-    login: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubHead {
-    sha: String,
-}
-
-/// The REST view of a pull request, read to verify a mutation's target: snapshots come
-/// from GraphQL, so only the fields the verify and confirm steps look at are kept. The
-/// merge commit is one: a merge found already done, or confirmed after an ambiguous
-/// answer, has no answer of GitHub's to read it from.
-#[derive(Debug, Deserialize)]
-struct GithubPull {
-    state: String,
-    user: GithubUser,
-    head: GithubHead,
-    #[serde(default)]
-    merged: bool,
-    #[serde(default)]
-    merge_commit_sha: Option<String>,
-}
-
-/// One page of `GET /installation/repositories`: the page's repositories beside how many
-/// the installation has in all, which is what lets a listing notice it moved under its
-/// own pages.
-#[derive(Debug, Deserialize)]
-struct InstallationRepositories {
-    total_count: usize,
-    repositories: Vec<GithubRepository>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GithubRepository {
-    id: u64,
-    name: String,
-    owner: GithubUser,
-    #[serde(flatten)]
-    merge_settings: MergeSettings,
-}
-
-/// Which merge methods a repository's settings permit. GitHub's schema marks
-/// each flag optional with a default of `true`, so an absent flag reads as
-/// allowed.
-#[derive(Debug, Deserialize)]
-struct MergeSettings {
-    #[serde(default = "allowed_by_default")]
-    allow_squash_merge: bool,
-    #[serde(default = "allowed_by_default")]
-    allow_merge_commit: bool,
-    #[serde(default = "allowed_by_default")]
-    allow_rebase_merge: bool,
-}
-
-fn allowed_by_default() -> bool {
-    true
-}
-
-impl MergeSettings {
-    fn allows(&self, method: MergeMethod) -> bool {
-        match method {
-            MergeMethod::Squash => self.allow_squash_merge,
-            MergeMethod::Merge => self.allow_merge_commit,
-            MergeMethod::Rebase => self.allow_rebase_merge,
-        }
-    }
-
-    /// The method to merge with instead of `preferred`, when these settings
-    /// disallow it: the first allowed of squash, merge, rebase. `None` when
-    /// `preferred` is allowed, or when nothing is (GitHub then decides).
-    fn method_instead_of(&self, preferred: MergeMethod) -> Option<MergeMethod> {
-        if self.allows(preferred) {
-            return None;
-        }
-        [MergeMethod::Squash, MergeMethod::Merge, MergeMethod::Rebase]
-            .into_iter()
-            .find(|method| self.allows(*method))
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct PullListItem {
-    number: u64,
-    user: GithubUser,
-}
-
-/// GitHub's answer to `PUT /pulls/{n}/merge`: whether it merged, in words, and as what
-/// commit.
-#[derive(Debug, Deserialize)]
-struct MergeResult {
-    merged: bool,
-    #[serde(default)]
-    message: String,
-    #[serde(default)]
-    sha: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct UpdateBranchResult {
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct IssueComment {
-    id: u64,
-    #[serde(default)]
-    body: String,
 }
 
 #[cfg(test)]
@@ -1443,26 +1084,6 @@ mod tests {
         assert_eq!(
             highest_update_type(&dependencies),
             dependaboard_core::UpdateType::Minor
-        );
-    }
-
-    #[tokio::test]
-    async fn static_token_provider_is_scoped_to_the_configured_user() {
-        let provider = StaticTokenProvider {
-            user: UserId::new("dependaboard"),
-            token: Some(SecretString::from("secret")),
-        };
-        assert!(
-            provider
-                .user_token(&UserId::new("dependaboard"))
-                .await
-                .is_ok()
-        );
-        assert!(
-            provider
-                .user_token(&UserId::new("someone-else"))
-                .await
-                .is_err()
         );
     }
 }

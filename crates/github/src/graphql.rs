@@ -12,7 +12,7 @@ use dependaboard_core::{
 };
 use serde::Deserialize;
 
-use crate::RateLimitHeaders;
+use crate::rest::RateLimitHeaders;
 
 /// What a snapshot reads off a commit: its message, and the first page each of its check
 /// contexts (check runs and commit statuses together, under `statusCheckRollup`) and its
