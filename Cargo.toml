@@ -50,3 +50,27 @@ web-time = "1.1.0"
 [profile.release]
 lto = "thin"
 strip = true
+
+# The dev profile compiles dependencies at -O0, and a few of them do the kind
+# of work the tests feel at that level: `rsa` and `num-bigint-dig` sign the
+# RS256 JWT behind every GitHub token exchange, one per client test, and
+# `libsql-ffi` is SQLite itself, under every store test and every server test
+# with a read model. `aws-lc-sys` and `ring` are the crypto under the two TLS
+# stacks (reqwest's rustls and libsql's); the tests speak plain HTTP to
+# loopback and hardly touch them, but they are the rest of the crypto tier
+# and go with it. None is code we debug, so optimising them costs one longer
+# build of each and nothing in the debuggability of our own crates.
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.libsql-ffi]
+opt-level = 3
+
+[profile.dev.package.aws-lc-sys]
+opt-level = 3
+
+[profile.dev.package.ring]
+opt-level = 3

@@ -2993,6 +2993,42 @@ mod tests {
         );
     }
 
+    /// Watches the store's connection, as [`watch_selects`] does, and says
+    /// when SQLite has compiled an `INSERT` into `table` on it. The hook runs
+    /// as the statement is compiled, so by the time the notice arrives the
+    /// insert is at the door of the write lock: its next step, on the same
+    /// thread and with no await between, is to try the lock. A test that
+    /// holds the lock from another connection can take the notice as the
+    /// moment to let go of it, instead of guessing at a sleep. The notice is
+    /// a permit, so it keeps if it is raised before anyone waits on it.
+    ///
+    /// The step is a few instructions after the notice; the other side's
+    /// commit is a cross-thread wake and a write to disk. Should the commit
+    /// still land in that gap, the insert passes without having met the lock
+    /// — the gap is what is left of the race, libsql exposing no hook on the
+    /// busy handler that would close it.
+    async fn watch_insert_into(
+        store: &LibSqlPrStore,
+        table: &'static str,
+    ) -> Arc<tokio::sync::Notify> {
+        let connection = store.connection().await.clone();
+        let compiled = Arc::new(tokio::sync::Notify::new());
+        let notice = Arc::clone(&compiled);
+        connection
+            .authorizer(Some(Arc::new(move |context: &libsql::AuthContext| {
+                if context.action == (libsql::AuthAction::Insert { table_name: table }) {
+                    notice.notify_one();
+                }
+                libsql::Authorization::Allow
+            })))
+            .unwrap();
+        compiled
+    }
+
+    /// The web and Restate processes share the file, so a write lands while
+    /// the other is mid-transaction. The busy timeout is what makes it wait
+    /// its turn instead of failing with SQLITE_BUSY; without it, the write
+    /// here comes back with the error the moment it meets the lock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writes_wait_for_a_writer_in_another_process() {
         let (directory, store) = test_store().await;
@@ -3002,35 +3038,40 @@ mod tests {
         let transaction = other_process.transaction().await.unwrap();
         upsert_repo_on(&transaction, &repo(2, 10)).await.unwrap();
 
+        // The insert runs on its own worker thread and blocks it inside
+        // SQLite for as long as the other writer holds the lock; the notice
+        // says when it is there.
+        let insert_compiled = watch_insert_into(&store, "pull_requests").await;
         let write = tokio::spawn(async move { store.upsert_pr(&pr(1, 1, 10)).await });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        insert_compiled.notified().await;
         transaction.commit().await.unwrap();
 
         write.await.unwrap().unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// A start-up that finds the schema current only reads the version. It
+    /// must not queue behind a writer in the other process, let alone fail
+    /// with SQLITE_BUSY: that is what would happen if it took the write lock
+    /// to look.
+    #[tokio::test]
     async fn connecting_to_a_current_database_does_not_wait_for_another_writer() {
         let (directory, _store) = test_store().await;
-        // The other process is mid-write for longer than the busy timeout.
-        // A start-up that only needs to read the schema version must not
-        // queue behind it, let alone fail with SQLITE_BUSY.
         let other_process = sidecar(&directory).await;
-        let _transaction = other_process
+        let transaction = other_process
             .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
             .await
             .unwrap();
 
-        let started = std::time::Instant::now();
-        LibSqlPrStore::connect(&StoreConfig::local(database_path(&directory)))
-            .await
-            .unwrap();
+        let connected =
+            LibSqlPrStore::connect(&StoreConfig::local(database_path(&directory))).await;
 
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "connect waited {:?} for the other writer",
-            started.elapsed()
-        );
+        // The other writer's lock was held from before `connect` until after
+        // it returned: a `connect` that waited on the lock could only have
+        // run out the busy timeout and failed with SQLITE_BUSY, and one that
+        // met the lock without a timeout would have failed with it at once.
+        // Coming back `Ok` is having done neither.
+        transaction.commit().await.unwrap();
+        connected.expect("connect neither waits on the other writer nor meets SQLITE_BUSY");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

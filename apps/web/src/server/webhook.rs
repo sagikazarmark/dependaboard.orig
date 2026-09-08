@@ -227,7 +227,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::server::test_support::{fake_restate_ingress, serve};
+    use crate::server::test_support::{client, fake_restate_ingress, serve};
 
     #[test]
     fn webhook_deliveries_are_authenticated_before_they_are_routed() {
@@ -357,7 +357,7 @@ mod tests {
         signature: &str,
         body: &'static [u8],
     ) -> reqwest::Response {
-        reqwest::Client::new()
+        client()
             .post(format!("http://{webhook}/api/webhooks/github"))
             .header("x-hub-signature-256", signature)
             .header("x-github-delivery", delivery_id)

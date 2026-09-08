@@ -523,16 +523,16 @@ For production, point both binaries at the same remote libSQL database, expose o
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace
-cargo test -p dependaboard-core --all-features
-cargo test -p dependaboard-web --features server --no-default-features
+cargo test --workspace --no-default-features --features dependaboard-web/server
 cargo check -p dependaboard-web --target wasm32-unknown-unknown
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --no-default-features --features dependaboard-web/server -- -D warnings
 cargo deny check
 npm run css:build
 docker compose config --quiet
 dx build --package dependaboard-web --platform web
 ```
+
+The test and clippy lines carry one feature set, so neither builds the dependency tree a second time for another. The web crate's default `web` feature is the browser bundle; its server, its API and most of its UI tests are compiled only under `server`, and `--no-default-features` changes nothing for the other members, none of which defines a default.
 
 Work is tracked in GitHub Issues, one issue per commit. The commit's subject reads as the behaviour it delivers, and its body carries `Closes #N`, naming the issue that asked for it, so a review can trace a change back to its ticket and the ticket closes when the commit lands. `docs/agents/issue-tracker.md` has the rest of the convention.
 

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::http::HeaderMap;
@@ -23,6 +24,19 @@ pub(crate) const USERNAME: &str = "dependaboard";
 pub(crate) const PASSWORD: &str = "secret";
 /// The webhook secret; the signed delivery in `router.rs` is made with it.
 pub(crate) const WEBHOOK_SECRET: &str = "secret";
+
+/// The HTTP client the server tests reach their loopback servers with. A
+/// request the server never answers fails the test in seconds rather than
+/// hanging it, and a proxy named in the environment (`HTTP_PROXY`,
+/// `ALL_PROXY`) is not put between the test and its own port, as
+/// `reqwest::Client::new()` would.
+pub(crate) fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
+}
 
 /// A client for a Restate ingress stand-in listening at `address`.
 pub(crate) fn ingress_at(address: SocketAddr) -> RestateIngress {
@@ -221,7 +235,7 @@ impl Dashboard {
         password: &str,
         arguments: serde_json::Value,
     ) -> reqwest::RequestBuilder {
-        reqwest::Client::new()
+        client()
             .post(self.server_fn(name))
             .basic_auth(USERNAME, Some(password))
             .header("sec-fetch-site", "same-origin")

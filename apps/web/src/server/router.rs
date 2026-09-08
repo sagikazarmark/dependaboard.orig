@@ -37,13 +37,13 @@ mod tests {
     use axum::http::header;
     use reqwest::StatusCode;
 
-    use crate::server::test_support::{PASSWORD, USERNAME, dashboard};
+    use crate::server::test_support::{PASSWORD, USERNAME, client, dashboard};
 
     #[tokio::test]
     async fn a_request_without_credentials_is_told_how_to_authenticate() {
         let dashboard = dashboard().await;
 
-        let response = reqwest::get(dashboard.url("/")).await.unwrap();
+        let response = client().get(dashboard.url("/")).send().await.unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
@@ -70,7 +70,7 @@ mod tests {
 
         let dashboard = dashboard().await;
         let deliver = |signature: &'static str| {
-            reqwest::Client::new()
+            client()
                 .post(dashboard.url("/api/webhooks/github"))
                 .header("x-hub-signature-256", signature)
                 .header("x-github-delivery", "72d3162e-cc78-11e3-81ab-4c9367dc0958")
@@ -97,7 +97,7 @@ mod tests {
     async fn a_state_change_another_site_asked_for_is_refused_despite_the_credentials() {
         let dashboard = dashboard().await;
 
-        let cross_site = reqwest::Client::new()
+        let cross_site = client()
             .post(dashboard.server_fn("request_sync"))
             .basic_auth(USERNAME, Some(PASSWORD))
             .header("sec-fetch-site", "cross-site")
