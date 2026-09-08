@@ -1513,6 +1513,36 @@ mod tests {
         );
     }
 
+    /// A check webhook names a commit, and the service asks the projection
+    /// which of the repository's pull requests have it as their head. The
+    /// answer is the repository's alone: another repository can hold a pull
+    /// request at the same commit, and it is not this one's to sync.
+    #[tokio::test]
+    async fn the_pull_requests_at_a_head_are_the_repositorys_own_and_only_those() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_repo(&repo(2, 10)).await.unwrap();
+        let at_head = |repository_id, number| PrRecord {
+            head_sha: "abc123".to_owned(),
+            ..pr(repository_id, number, 10)
+        };
+        // Two of repository 1's pull requests share the head, a third has one
+        // of its own, and repository 2 has a pull request at the shared head.
+        for record in [at_head(1, 1), at_head(1, 2), pr(1, 3, 10), at_head(2, 1)] {
+            store.upsert_pr(&record).await.unwrap();
+        }
+
+        let mut found = store.prs_for_sha(1, "abc123").await.unwrap();
+
+        found.sort_by_key(|record| record.number);
+        assert_eq!(found, vec![at_head(1, 1), at_head(1, 2)]);
+        assert_eq!(
+            store.prs_for_sha(1, "no-such-head").await.unwrap(),
+            Vec::new(),
+            "a commit no pull request of the repository is at has nothing to sync"
+        );
+    }
+
     #[tokio::test]
     async fn a_repository_keeps_the_merge_method_it_was_synced_with() {
         let (_directory, store) = test_store().await;
