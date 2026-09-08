@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use dependaboard_core::{Operation, RepoRecord, unix_seconds};
-use dependaboard_store::PrStore;
+use dependaboard_store::ProjectionWriter;
 use restate_sdk::prelude::*;
 
 use crate::{
@@ -23,7 +23,7 @@ const SCHEDULER_TICK_PENDING: &str = "scheduler_tick_pending";
 #[derive(Clone)]
 pub(crate) struct InstallationSync {
     pub(crate) github: GithubApiHandle,
-    pub(crate) store: Arc<dyn PrStore>,
+    pub(crate) store: Arc<dyn ProjectionWriter>,
     pub(crate) interval: Duration,
 }
 
@@ -285,7 +285,7 @@ trait SchedulerTickEffects {
 struct RestateTickEffects<'a, 'ctx> {
     ctx: &'a ObjectContext<'ctx>,
     github: &'a GithubApiHandle,
-    store: &'a Arc<dyn PrStore>,
+    store: &'a Arc<dyn ProjectionWriter>,
     interval: Duration,
 }
 
@@ -344,7 +344,7 @@ trait InstallationSyncEffects {
 struct RestateSyncEffects<'a, 'ctx> {
     ctx: &'a ObjectContext<'ctx>,
     github: &'a GithubApiHandle,
-    store: &'a Arc<dyn PrStore>,
+    store: &'a Arc<dyn ProjectionWriter>,
     reconcile_start: u64,
 }
 
@@ -418,7 +418,7 @@ async fn run_installation_sync<E: InstallationSyncEffects, R: RetirementEffects>
 async fn perform_installation_sync(
     ctx: &ObjectContext<'_>,
     github: &GithubApiHandle,
-    store: &Arc<dyn PrStore>,
+    store: &Arc<dyn ProjectionWriter>,
 ) -> HandlerResult<usize> {
     let reconcile_start = ctx
         .run(|| async { Ok(unix_seconds()) })
@@ -445,7 +445,7 @@ trait InstallationPurgeEffects {
 
 struct RestatePurgeEffects<'a, 'ctx> {
     ctx: &'a ObjectContext<'ctx>,
-    store: &'a Arc<dyn PrStore>,
+    store: &'a Arc<dyn ProjectionWriter>,
     installation_id: u64,
 }
 

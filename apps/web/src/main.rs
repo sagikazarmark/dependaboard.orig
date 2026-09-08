@@ -21,6 +21,7 @@ use {
     },
     dependaboard_store::{LibSqlPrStore, StoreConfig},
     dioxus::server::{DioxusRouterExt, ServeConfig},
+    std::sync::Arc,
 };
 
 #[cfg(feature = "server")]
@@ -41,7 +42,7 @@ async fn main() {
         .expect("read-model store should connect");
     let state = ServerState {
         ingress: ingress.clone(),
-        store,
+        store: Arc::new(store),
         installation_id: config.installation_id,
     };
     let app = axum::Router::new().serve_dioxus_application(ServeConfig::new(), ui::App);

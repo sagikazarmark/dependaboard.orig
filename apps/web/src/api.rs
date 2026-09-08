@@ -16,7 +16,7 @@ use {
     dependaboard_core::{
         BulkRequest, InvalidBatch, ManualSyncRequest, PrKey, PrTarget, new_batch_id, validate_batch,
     },
-    dependaboard_store::{PrStore, StoreError},
+    dependaboard_store::StoreError,
 };
 
 /// One page of rows for `filter`. Paging through a filter calls this alone;
@@ -373,6 +373,10 @@ mod tests {
     };
     use reqwest::StatusCode;
     use serde_json::json;
+
+    // The tests write to the projection as the Restate service would; the
+    // server functions under test only ever read it.
+    use dependaboard_store::ProjectionWriter;
 
     use super::*;
     use crate::server::test_support::{

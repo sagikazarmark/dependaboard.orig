@@ -18,7 +18,7 @@ use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 
 use dependaboard_core::Capabilities;
 use dependaboard_github::{GithubClient, GithubConfig};
-use dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig};
+use dependaboard_store::{LibSqlPrStore, ProjectionWriter, StoreConfig};
 use restate_sdk::{filter::ReplayAwareFilter, prelude::*};
 use tokio::{net::TcpListener, signal};
 use tracing::{info, warn};
@@ -49,7 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let store: Arc<dyn PrStore> = Arc::new(LibSqlPrStore::connect(&StoreConfig::from_env()).await?);
+    let store: Arc<dyn ProjectionWriter> =
+        Arc::new(LibSqlPrStore::connect(&StoreConfig::from_env()).await?);
     let github = GithubApiHandle::new(Arc::new(GithubClient::new(GithubConfig::from_env()?)?));
     let debounce = Duration::from_secs(env_seconds(
         "SYNC_DEBOUNCE_SECONDS",

@@ -8,7 +8,7 @@ use dependaboard_core::{
     DependabotCommand, MergeRequest, PrTarget, RunningBatch, UpdateBranchRequest, UserId,
     unix_seconds,
 };
-use dependaboard_store::PrStore;
+use dependaboard_store::ProjectionWriter;
 use restate_sdk::prelude::*;
 use tracing::warn;
 
@@ -30,7 +30,7 @@ const COMMENT_SPACING: Duration = Duration::from_millis(350);
 
 #[derive(Clone)]
 pub(crate) struct BulkAction {
-    pub(crate) store: Arc<dyn PrStore>,
+    pub(crate) store: Arc<dyn ProjectionWriter>,
     /// The one installation this service serves, stamped on every batch it lists and
     /// records so the projection can hold its batch reads to the installation.
     pub(crate) installation_id: u64,
@@ -111,7 +111,7 @@ trait BulkActionEffects {
 
 struct RestateBulkAction<'a, 'ctx> {
     ctx: &'a WorkflowContext<'ctx>,
-    store: &'a Arc<dyn PrStore>,
+    store: &'a Arc<dyn ProjectionWriter>,
     user_id: UserId,
 }
 

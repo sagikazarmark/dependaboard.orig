@@ -8,7 +8,7 @@ use dependaboard_core::{
     ActionLog, ActionOutcome, CommandRequest, MergeMethod, MergeRequest, Operation, PrKey,
     PrRecord, PrState, PrTarget, RejectReason, SyncRequest, UpdateBranchRequest, unix_seconds,
 };
-use dependaboard_store::{PrStore, StoreError};
+use dependaboard_store::{ProjectionWriter, StoreError};
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +26,7 @@ const PR_STATE: &str = "pr_state";
 #[derive(Clone)]
 pub(crate) struct PullRequest {
     pub(crate) github: GithubApiHandle,
-    pub(crate) store: Arc<dyn PrStore>,
+    pub(crate) store: Arc<dyn ProjectionWriter>,
     pub(crate) debounce: Duration,
 }
 
@@ -460,7 +460,7 @@ fn closed_retires(state: Option<&PrState>, request: ClosedRequest) -> bool {
 /// preference. A missing row (the repository was purged mid-batch) or a row from before
 /// the column reads as no override, and the client falls back to the preference.
 async fn repository_merge_method(
-    store: &dyn PrStore,
+    store: &dyn ProjectionWriter,
     repository_id: u64,
 ) -> Result<Option<MergeMethod>, StoreError> {
     Ok(store

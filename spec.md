@@ -23,7 +23,7 @@ the same commit; a change to what the user sees edits the README. The split is
 | **Web app** (Dioxus fullstack) | Worker *or* Axum | UI + server functions. Reads the read model, submits batches. |
 | **Webhook handler** | Separate Worker (or an Axum route) | Verify HMAC, forward to `WebhookIngress.dispatch`, return 200. No routing logic. |
 | **Restate services** | **Separate binary** | `PullRequest` object, `BulkAction` workflow, `WebhookIngress` service, `InstallationSync` / `RepoSync` objects. |
-| **Read model** | libSQL (see below) | Queryable projection of PR state, behind a `PrStore` trait. |
+| **Read model** | libSQL (see below) | Queryable projection of PR state, behind two traits: `ProjectionWriter`, which the Restate service holds, and `ProjectionReader`, which the web app holds (§4). |
 | **Restate server** | Restate Cloud (prod) / Docker (local) | Durable execution, keyed concurrency, retries. |
 
 Splitting the Restate service into its own binary is the right call — it gets a full
@@ -34,7 +34,7 @@ coupled to the Workers lifecycle. It does have one knock-on effect, below.
 
 Restate object state is keyed — you can read one PR's state, not `WHERE update_type =
 'patch' AND check_status = 'failure' ORDER BY updated_at`. The table needs cross-key
-querying, so object handlers write through to `PrStore` after every state change.
+querying, so object handlers write through to `ProjectionWriter` after every state change.
 Restate holds *in-flight action* truth; the store holds *queryable* truth.
 
 ---
@@ -106,7 +106,7 @@ refresh. It also makes the webhook Worker trivially boring, which is the point.
 
 | Handler | Kind | Behaviour |
 |---|---|---|
-| `sync(SyncRequest)` | exclusive | Debounce, then fetch canonical state from GitHub, update state, write through to `PrStore`. Idempotent. |
+| `sync(SyncRequest)` | exclusive | Debounce, then fetch canonical state from GitHub, update state, write through to `ProjectionWriter`. Idempotent. |
 | `closed(synced_before?)` | exclusive | PR merged or closed: clear the object's state keys, `delete_pr()` from the read model. A sweep's drain passes the fence the prune recorded — the instant its listing started; the object stands down if it has synced since (reopened behind the sweep). Webhooks and purges pass nothing: unconditional. |
 | `merge(MergeRequest)` | exclusive | Guard `expected_sha == snapshot.sha`; `PUT /pulls/{n}/merge` with an explicit `merge_method`; on success `delete_pr()`. |
 | `command(DependabotCommand)` | exclusive | Post `@dependabot <cmd>` + attribution footer. **Needs the optional user token** — see §6; without one the handler answers `Rejected(NoUserToken)` before the target is guarded or GitHub is asked. Fire-and-forget. |
@@ -183,17 +183,17 @@ progress from the UI.
 
 ```
 run(BulkRequest { action, targets: Vec<PrTarget>, user_id, retried_from })
-  ├─ ctx.run: PrStore::start_batch(installation, kind, requester, retried_from, started at,
-  │                                 target count)                            // best effort
+  ├─ ctx.run: ProjectionWriter::start_batch(installation, kind, requester, retried_from,
+  │                                          started at, target count)       // best effort
   ├─ for each target (bounded concurrency; merges grouped per repo, see below):
   │     ctx.object_client::<PullRequest>(key).call(action)
   │       → ActionOutcome, or a TerminalError the callee gave up with
   │     write the outcome into workflow state AS IT COMPLETES
   ├─ terminal state: Completed { succeeded, rejected, failed }
-  └─ ctx.run: PrStore::record_batch(installation, kind, requester, retried_from,
-                                     started/completed at, per-target verdicts with the
-                                     head each was sent against)
-                                     // …and stops listing the batch as running
+  └─ ctx.run: ProjectionWriter::record_batch(installation, kind, requester, retried_from,
+                                              started/completed at, per-target verdicts
+                                              with the head each was sent against)
+                                              // …and stops listing the batch as running
 
 progress() -> BatchProgress    // shared handler, UI polls this
 ```
@@ -672,10 +672,10 @@ exists will fail the insert. Sequence `sync_now` explicitly:
 ```
 capture reconcile_start
 enumerate ALL repos (complete, successful pagination; see below)
-  → in one transaction: upsert every live RepoRecord
-                        + retain_repos(live_ids, synced_before: reconcile_start)
-                          → queues the PR keys the cascade removed for retirement,
-                            fenced by reconcile_start
+  → replace_installation_repos(live repos, synced_before: reconcile_start), in one
+    transaction: upsert every live RepoRecord, then drop the installation's other
+    repositories synced before reconcile_start, pull requests and all
+      → queues the PR keys the cascade removed for retirement, fenced by reconcile_start
   → drain the retirement outbox: send PullRequest.closed(fence) to each, acknowledge
   → then fan out RepoSync.reconcile for the live set
 ```
@@ -709,8 +709,8 @@ survive forever, invisible to every reconcile. `RepoSync` can't fix this; it onl
 sees repos it was told about. `InstallationSync` has to diff the live repo set and
 cascade-delete the rest. Same completeness and timestamp rules as below: only after a
 fully successful enumeration, and only rows synced before the enumeration started. And
-the same object-state rule as `RepoSync.reconcile` below: `retain_repos` queues the PR
-keys the cascade removed, and `sync_now` drains the queue and sends `PullRequest.closed`
+the same object-state rule as `RepoSync.reconcile` below: `replace_installation_repos`
+queues the PR keys its cascade removed, and `sync_now` drains the queue and sends `PullRequest.closed`
 to each, fenced by `reconcile_start`, so no object keeps serving a snapshot for a
 repository the App no longer sees — and one re-synced since the sweep began, because
 the repository was re-added behind its back, keeps its state.
@@ -747,8 +747,8 @@ be subscribed to.
   delete; one that lands between the delete and the `closed` invocation would still be
   wiped, so the sweep's `closed` carries `reconcile_start` and the object stands down
   when its `last_synced_at >= reconcile_start` — the same boundary, applied on the
-  object side. `sync_now` does the same over everything `retain_repos` cascaded when a
-  repository left the installation, under the same fence: the App receives no webhooks
+  object side. `sync_now` does the same over everything `replace_installation_repos`
+  cascaded when a repository left the installation, under the same fence: the App receives no webhooks
   for a repository it no longer sees, but the repository can be re-added and its pull
   requests re-synced before the close lands, and a listing that dropped it by mistake
   (the pagination shift above) must not cost them their history. `purge()` alone is
@@ -758,7 +758,7 @@ be subscribed to.
   process die before the journal takes the returned keys, and the re-run then finds
   nothing left to delete. Driving `closed` from that return value would leave the
   objects that just lost their rows serving a snapshot nobody else has, indefinitely. So
-  every prune — `retain_prs`, `retain_repos`, `purge_installation` — writes the keys it
+  every prune — `retain_prs`, `replace_installation_repos`, `purge_installation` — writes the keys it
   removed to `pull_request_retirements`, in the delete's own transaction, with the fence
   it ran under (`NULL` for a purge). The handler then drains the outbox in steps that are
   each safe to run again: read what is pending, send `closed` to each with the fence its
@@ -806,15 +806,15 @@ enumeration that finds live PRs is exactly the set you diff against.
 ## 3. Call flow
 
 ```
-Table render      UI → server fn → PrStore::list_prs(filter, page)
+Table render      UI → server fn → ProjectionReader::list_prs(filter, page)
                        one page and the total, from one snapshot
 
-Facets            UI → server fn → PrStore::dashboard_summary(filter)
+Facets            UI → server fn → ProjectionReader::dashboard_summary(filter)
                        the sidebar's counts, each scoped to the filter minus its own
                        dimension, and the read model's freshness; asked per filter, not
                        per page
 
-Live refresh      UI polls → server fn → PrStore::projection_revision()
+Live refresh      UI polls → server fn → ProjectionReader::projection_revision()
                        two counters the schema's triggers move; the UI reloads rows and
                        facets when the first moves and stops the Sync glyph when the
                        second does. Cadence, the disconnected banner, and the 401 rule
@@ -824,7 +824,7 @@ Capabilities      UI → server fn → POST /restate/call/DashboardIngress/capab
                        once per page; what the deployment can do, so an action the
                        service would reject is withheld rather than offered (§6)
 
-Select all        UI → server fn → PrStore::list_prs(filter, page of MAX_BATCH_TARGETS)
+Select all        UI → server fn → ProjectionReader::list_prs(filter, page of MAX_BATCH_TARGETS)
 matching               the selection is resolved server side, newest update first,
                        and capped at one batch's worth; the total comes back with the
                        rows so the UI can say when the filter matched more than it took
@@ -832,15 +832,15 @@ matching               the selection is resolved server side, newest update firs
 Bulk action       UI → server fn → Restate ingress
                        the UI names each target by key and the head SHA it saw; the
                        server fn resolves the rest — repository, title, link — from
-                       PrStore::get_pr, refuses a target of another installation whole,
+                       ProjectionReader::get_pr, refuses a target of another installation whole,
                        and leaves out one the projection no longer has: the batch runs
                        over the rest, and the receipt names the keys left out
                        POST /restate/send/BulkAction/{batch_id}/run
-                     → workflow lists the batch as running: PrStore::start_batch,
+                     → workflow lists the batch as running: ProjectionWriter::start_batch,
                        stamped with the installation the service serves
                      → workflow fans out to PullRequest objects
-                     → objects call GitHub API, write through to PrStore
-                     → workflow writes the finished batch: PrStore::record_batch,
+                     → objects call GitHub API, write through to ProjectionWriter
+                     → workflow writes the finished batch: ProjectionWriter::record_batch,
                        stamped the same, which also stops listing it as running
 
 Progress          UI polls → server fn →
@@ -850,7 +850,7 @@ Progress          UI polls → server fn →
                        of another's workflow and a batch just queued is polled before
                        it is listed
 
-Batch by id       UI → server fn → PrStore::get_batch(installation, batch_id)
+Batch by id       UI → server fn → ProjectionReader::get_batch(installation, batch_id)
                        what the projection holds of a batch followed by id alone, asked
                        before Restate is: the finished record, which opens the drawer
                        at once and is not polled; the running listing, which is polled
@@ -859,7 +859,7 @@ Batch by id       UI → server fn → PrStore::get_batch(installation, batch_id
                        heard of and for another installation's batch alike, so a
                        foreign link is given up as a stale one is
 
-Drawer            UI → server fn → PrStore::get_pr
+Drawer            UI → server fn → ProjectionReader::get_pr
                        the drawer names a pull request by key: the row it opens on
                        and reads back after a sync, and the durable state it polls,
                        POST /restate/call/PullRequest/{repository_id}%23{number}/status
@@ -870,7 +870,7 @@ Drawer            UI → server fn → PrStore::get_pr
                        for is answered with nothing, which the drawer reads as no
                        longer open
 
-Recent batches    UI → server fn → PrStore::running_batches(installation)
+Recent batches    UI → server fn → ProjectionReader::running_batches(installation)
                                    + recent_batches(installation, limit)
                        the running batches, then the finished ones, newest first, from
                        the projection rather than Restate, so a finished batch outlives
@@ -1066,18 +1066,31 @@ operator's copy of this one; change them together.
 
 > **Resolved: `Send`.** An earlier draft had `#[async_trait(?Send)]` for a single-threaded
 > Workers runtime. The Restate binary is a normal multi-threaded tokio process and the
-> web app runs on Axum, so the trait is plain `#[async_trait]` with `Send + Sync`
+> web app runs on Axum, so the traits are plain `#[async_trait]` with `Send + Sync`
 > supertraits and one production implementation, `LibSqlPrStore`, shared by both binaries
-> (the Restate service's tests carry an in-memory one). A Workers port would need its own
-> impl or a second trait; nothing today asks for it.
+> (the Restate service's tests carry an in-memory writer). A Workers port would need its
+> own impl or a second trait; nothing today asks for it.
 
-The excerpt below is the trait's method set at HEAD, with the doc comments shortened and
-`Result<T, StoreError>` written `Result<T>`; the crate's comments are the contract.
+> **Resolved: two traits, one per process (#71).** The store's contract is split along
+> the line the two binaries already drew. `ProjectionWriter` is what the Restate service
+> holds — `Arc<dyn ProjectionWriter>` in every handler — and `ProjectionReader` is what
+> the web app's server holds — `Arc<dyn ProjectionReader>` in its `ServerState`. Each
+> process names only its half, so a server function has nothing to write with and a
+> handler nothing to list with; `LibSqlPrStore` implements both. `get_pr` is on both, the
+> one method they share: the service reads a row back after writing, and every server
+> function that takes a key from the browser resolves the key through the row.
+> `retain_repos` is no longer on the surface: its only caller was
+> `replace_installation_repos`, which runs the same step inside its own transaction.
+
+The excerpts below are the traits' method sets at HEAD, with the doc comments shortened
+and `Result<T, StoreError>` written `Result<T>`; the crate's comments are the contract.
 
 ```rust
+/// What the Restate service writes, and the lookups it makes on the way.
 #[async_trait]
-pub trait PrStore: Send + Sync {
+pub trait ProjectionWriter: Send + Sync {
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<()>;
+    /// Shared with ProjectionReader; see above.
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>>;
     async fn delete_pr(&self, key: &PrKey) -> Result<()>;
     /// Reconciliation: drop rows for this repo not in `live` AND synced before the
@@ -1087,6 +1100,43 @@ pub trait PrStore: Send + Sync {
     /// `synced_before` in the delete's own transaction, so the caller need not trust
     /// this call's return value to reach them.
     async fn retain_prs(&self, repository_id: u64, live: &[u64], synced_before: u64) -> Result<Vec<PrKey>>;
+    /// The webhook SHA lookup (§3): open pull requests of this repo at this head.
+    async fn prs_for_sha(&self, repository_id: u64, sha: &str) -> Result<Vec<PrRecord>>;
+    async fn upsert_repo(&self, repo: &RepoRecord) -> Result<()>;
+    async fn get_repo(&self, repository_id: u64) -> Result<Option<RepoRecord>>;
+    /// What `sync_now` calls: upsert every listed repo, then drop the installation's
+    /// other repos (and cascade their PRs) synced before the listing started, in one
+    /// transaction, so a new repo's row is in place before its PRs arrive. The same
+    /// `synced_before` guard as retain_prs, for the same race. Returns the cascaded PR
+    /// keys, queued for retirement under `synced_before`.
+    async fn replace_installation_repos(&self, installation_id: u64, repos: &[RepoRecord], synced_before: u64) -> Result<Vec<PrKey>>;
+    /// Drop every repo of a deleted installation and its PRs; returns the PR keys,
+    /// queued for retirement with no fence: nothing can reopen them.
+    async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>>;
+    /// Every pull request a prune removed and no drain has acknowledged, oldest first.
+    async fn pending_retirements(&self) -> Result<Vec<Retirement>>;
+    /// Forget every retirement up to and including `through`, the last one read; ids
+    /// only grow, so anything queued since stays for the next drain.
+    async fn acknowledge_retirements(&self, through: u64) -> Result<()>;
+    /// List a batch as running until it is recorded, the installation and the batch it
+    /// retries included. A batch id already listed is left as it was, for the same
+    /// reason a recorded one is.
+    async fn start_batch(&self, batch: &RunningBatch) -> Result<()>;
+    /// Stop listing a batch as running without recording it, for a workflow that ended
+    /// with no finished batch to keep. A batch not listed is left as it is.
+    async fn unlist_batch(&self, batch_id: &str) -> Result<()>;
+    /// Keep a finished batch for audit — the installation it ran for, the batch it
+    /// retried, each target's head and verdict, a merge's commit inside the verdict — and
+    /// stop listing it as running. A batch id already recorded is left as it was, so the
+    /// workflow's recording step is safe to run again.
+    async fn record_batch(&self, batch: &BatchRecord) -> Result<()>;
+}
+
+/// What the dashboard reads, through the web app's server functions.
+#[async_trait]
+pub trait ProjectionReader: Send + Sync {
+    /// Shared with ProjectionWriter; see above.
+    async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>>;
     /// One keyset page of the pull requests `filter` matches, newest update first,
     /// plus how many match in all, from one snapshot (count and page in one
     /// transaction).
@@ -1100,39 +1150,9 @@ pub trait PrStore: Send + Sync {
     /// to read, so a dashboard can ask often and act only when an answer differs from
     /// the one it last saw. How the dashboard uses them is the README's *Live refresh*.
     async fn projection_revision(&self) -> Result<ProjectionRevision>;
-    /// The webhook SHA lookup (§3): open pull requests of this repo at this head.
-    async fn prs_for_sha(&self, repository_id: u64, sha: &str) -> Result<Vec<PrRecord>>;
-    async fn upsert_repo(&self, repo: &RepoRecord) -> Result<()>;
-    async fn get_repo(&self, repository_id: u64) -> Result<Option<RepoRecord>>;
-    /// Drop repos (and cascade their PRs) no longer in the installation.
-    /// Same `synced_before` guard as retain_prs, for the same race. Returns the
-    /// cascaded PR keys, queued for retirement under `synced_before`.
-    async fn retain_repos(&self, installation_id: u64, live: &[u64], synced_before: u64) -> Result<Vec<PrKey>>;
-    /// What `sync_now` calls: upsert every listed repo, then retain_repos over their
-    /// ids, in one transaction, so a new repo's row is in place before its PRs arrive.
-    async fn replace_installation_repos(&self, installation_id: u64, repos: &[RepoRecord], synced_before: u64) -> Result<Vec<PrKey>>;
-    /// Drop every repo of a deleted installation and its PRs; returns the PR keys,
-    /// queued for retirement with no fence: nothing can reopen them.
-    async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>>;
-    /// Every pull request a prune removed and no drain has acknowledged, oldest first.
-    async fn pending_retirements(&self) -> Result<Vec<Retirement>>;
-    /// Forget every retirement up to and including `through`, the last one read; ids
-    /// only grow, so anything queued since stays for the next drain.
-    async fn acknowledge_retirements(&self, through: u64) -> Result<()>;
-    /// Keep a finished batch for audit — the installation it ran for, the batch it
-    /// retried, each target's head and verdict, a merge's commit inside the verdict — and
-    /// stop listing it as running. A batch id already recorded is left as it was, so the
-    /// workflow's recording step is safe to run again.
-    async fn record_batch(&self, batch: &BatchRecord) -> Result<()>;
     /// The installation's most recently finished batches, newest first, targets and
     /// verdicts included; the limit counts its batches, not everyone's.
     async fn recent_batches(&self, installation_id: u64, limit: u32) -> Result<Vec<BatchRecord>>;
-    /// List a batch as running until it is recorded, the installation and the batch it
-    /// retries included. A batch id already listed is left as it was, for the same reason.
-    async fn start_batch(&self, batch: &RunningBatch) -> Result<()>;
-    /// Stop listing a batch as running without recording it, for a workflow that ended
-    /// with no finished batch to keep. A batch not listed is left as it is.
-    async fn unlist_batch(&self, batch_id: &str) -> Result<()>;
     /// Every batch of the installation started and not yet recorded or given up, newest first.
     async fn running_batches(&self, installation_id: u64) -> Result<Vec<RunningBatch>>;
     /// One batch by id within the installation: its finished record or its running
@@ -1175,8 +1195,8 @@ need to write the read model, pick a database both can reach directly.
 **libSQL/Turso is the natural fit.** Same SQLite dialect, so the "SQLite locally,
 something else in prod" constraint becomes a connection-string change rather than a
 second SQL implementation: a local file for dev, a remote endpoint for prod, reachable
-from a native binary *and* a Worker. Keep the `PrStore` trait regardless — it costs
-nothing and preserves the exit.
+from a native binary *and* a Worker. Keep the store traits regardless — they cost
+nothing and preserve the exit.
 
 Fallback if you'd rather not add a dependency on Turso: plain Postgres. Loses the
 local-file story, gains ubiquity.
@@ -1230,7 +1250,7 @@ CREATE INDEX idx_pr_sha        ON pull_requests(repository_id, head_sha);  -- we
 CREATE INDEX idx_pr_order      ON pull_requests(updated_at DESC, id DESC); -- stable paging
 CREATE INDEX idx_pr_dependency ON pull_requests(dependency);               -- the dependency filter
 
--- Two counters the dashboard polls instead of comparing rows (PrStore::projection_revision;
+-- Two counters the dashboard polls instead of comparing rows (ProjectionReader::projection_revision;
 -- README "Live refresh"). Triggers keep them, so no writer can forget to: a repository
 -- delete that cascades to its pull requests moves them as surely as an upsert. `revision`
 -- moves on any row of either table; `pull_requests` only when a pull request row does, so
@@ -1319,7 +1339,7 @@ exactly the sort of thing that silently hides PRs from a triage view. Decided: t
 matches *any* dependency in a group — `dependency = ?` on the scalar, or, where the scalar
 is NULL, a `json_each` over the list — case-insensitively either way.
 
-**`retain_repos` cascades.** With the FK above, deleting a repository row removes its PRs
+**`replace_installation_repos` cascades.** With the FK above, deleting a repository row removes its PRs
 in one statement — which is what makes the §2 installation-level reconciliation actually
 enforceable rather than aspirational. The cascade is silent, though: a `DELETE FROM
 repositories` cannot `RETURNING` the PR rows it takes with it. To report them, delete the

@@ -88,16 +88,39 @@ impl LibSqlPrStore {
         Ok(())
     }
 
+    /// The pull request `key` names, or `None` when the projection has no row
+    /// for it. The one method on both halves of the store's contract, so it
+    /// lives here once and each trait's `get_pr` is this one; the store's own
+    /// tests, which hold the concrete type with both traits in scope, resolve
+    /// to it rather than being asked which trait they mean.
+    async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError> {
+        let connection = self.connection().await;
+        let mut rows = connection
+            .query(
+                &format!("{} WHERE p.id = ?1", select_pr_sql()),
+                vec![Value::Text(key.to_string())],
+            )
+            .await?;
+        rows.next().await?.map(pr_from_row).transpose()
+    }
+
     /// Holds the connection for the duration of one store operation. The
-    /// lock is not re-entrant, so never call another `PrStore` method (or
+    /// lock is not re-entrant, so never call another store method (or
     /// `migrate`) while a guard is alive.
     async fn connection(&self) -> MutexGuard<'_, libsql::Connection> {
         self.connection.lock().await
     }
 }
 
+/// The half of the store's contract the Restate service holds: what its
+/// handlers write after every state change, the lookups they make on the way —
+/// a repository's row, the pull requests at a head, the retirement outbox — and
+/// `get_pr`, the one method it shares with [`ProjectionReader`], so a writer
+/// can read a row back without holding the reader. The dashboard's reads are
+/// not here: a process that only writes need not implement them, and the
+/// service's in-memory store does not.
 #[async_trait]
-pub trait PrStore: Send + Sync {
+pub trait ProjectionWriter: Send + Sync {
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<(), StoreError>;
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError>;
     async fn delete_pr(&self, key: &PrKey) -> Result<(), StoreError>;
@@ -105,14 +128,70 @@ pub trait PrStore: Send + Sync {
     /// were synced before the listing started, and reports which ones went.
     /// The `synced_before` guard keeps rows written by concurrent webhook
     /// syncs alive. The same keys are queued for retirement (see
-    /// [`PrStore::pending_retirements`]) in the delete's own transaction, so
-    /// the caller need not trust this call's return value to reach it.
+    /// [`ProjectionWriter::pending_retirements`]) in the delete's own
+    /// transaction, so the caller need not trust this call's return value to
+    /// reach it.
     async fn retain_prs(
         &self,
         repository_id: u64,
         live: &[u64],
         synced_before: u64,
     ) -> Result<Vec<PrKey>, StoreError>;
+    async fn prs_for_sha(&self, repository_id: u64, sha: &str)
+    -> Result<Vec<PrRecord>, StoreError>;
+    async fn upsert_repo(&self, repo: &RepoRecord) -> Result<(), StoreError>;
+    async fn get_repo(&self, repository_id: u64) -> Result<Option<RepoRecord>, StoreError>;
+    /// Installation reconciliation, in one transaction: upserts every repository in
+    /// `repos`, then drops the installation's other repositories that were synced
+    /// before the listing started, pull requests and all. Reports the pull requests
+    /// that went with them; the same keys are queued for retirement under
+    /// `synced_before` as their fence. The guard keeps repositories added by
+    /// concurrent syncs alive.
+    async fn replace_installation_repos(
+        &self,
+        installation_id: u64,
+        repos: &[RepoRecord],
+        synced_before: u64,
+    ) -> Result<Vec<PrKey>, StoreError>;
+    /// Drops the installation's repositories and their pull requests, and
+    /// reports which pull requests went; the same keys are queued for
+    /// retirement with no fence, since the App has lost the installation and
+    /// nothing can reopen them.
+    async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>, StoreError>;
+    /// Every pull request a prune has removed and not yet acknowledged, oldest
+    /// first. Reading is a step of its own in the sweep, so a prune whose
+    /// result was lost is made good the next time anything drains.
+    async fn pending_retirements(&self) -> Result<Vec<Retirement>, StoreError>;
+    /// Forgets every retirement up to and including `through`, which a
+    /// [`ProjectionWriter::pending_retirements`] read returned last. Ids only
+    /// grow, so anything queued since that read stays for the next drain;
+    /// acknowledging again is a no-op.
+    async fn acknowledge_retirements(&self, through: u64) -> Result<(), StoreError>;
+    /// Lists a bulk action as running until [`ProjectionWriter::record_batch`]
+    /// keeps it as finished, or [`ProjectionWriter::unlist_batch`] gives it
+    /// up. A batch already listed is left as it was, for the same reason a
+    /// recorded one is.
+    async fn start_batch(&self, batch: &RunningBatch) -> Result<(), StoreError>;
+    /// Stops listing a bulk action as running without recording it: the
+    /// workflow ended without a finished batch to keep, as a cancelled one
+    /// does. A batch not listed is left as it is.
+    async fn unlist_batch(&self, batch_id: &str) -> Result<(), StoreError>;
+    /// Keeps a finished bulk action for the audit view, targets and all, and
+    /// stops listing it as running. A batch already recorded is left as it
+    /// was: Restate may run the recording step again when the first attempt's
+    /// result was lost, and the first word is the one that stands.
+    async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError>;
+}
+
+/// The half of the store's contract the web app's server holds: what the
+/// dashboard reads — the rows and the facets around them, the revision it
+/// polls, the batches it lists for audit — and `get_pr`, through which every
+/// server function that takes a key from the browser resolves the key. Nothing
+/// here writes, so a process holding this half alone cannot reach the write
+/// half however it tries.
+#[async_trait]
+pub trait ProjectionReader: Send + Sync {
+    async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError>;
     /// One keyset page of the pull requests `filter` matches, newest update
     /// first, plus how many match in all.
     async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage, StoreError>;
@@ -126,50 +205,6 @@ pub trait PrStore: Send + Sync {
     /// does. Cheap to read, so a dashboard can ask often and act only when
     /// an answer differs from the one it last saw.
     async fn projection_revision(&self) -> Result<ProjectionRevision, StoreError>;
-    async fn prs_for_sha(&self, repository_id: u64, sha: &str)
-    -> Result<Vec<PrRecord>, StoreError>;
-    async fn upsert_repo(&self, repo: &RepoRecord) -> Result<(), StoreError>;
-    async fn get_repo(&self, repository_id: u64) -> Result<Option<RepoRecord>, StoreError>;
-    /// Installation reconciliation, in one transaction: upserts every repository in
-    /// `repos`, then drops the installation's other repositories that were synced
-    /// before the listing started, pull requests and all. Reports the pull requests
-    /// that went with them; the same keys are queued for retirement under
-    /// `synced_before` as their fence.
-    async fn replace_installation_repos(
-        &self,
-        installation_id: u64,
-        repos: &[RepoRecord],
-        synced_before: u64,
-    ) -> Result<Vec<PrKey>, StoreError>;
-    /// Drops the installation's repositories that are not in `live` and were synced
-    /// before the listing started, pull requests and all, and reports which pull
-    /// requests went; the same keys are queued for retirement under `synced_before`
-    /// as their fence. The guard keeps repositories added by concurrent syncs alive.
-    async fn retain_repos(
-        &self,
-        installation_id: u64,
-        live: &[u64],
-        synced_before: u64,
-    ) -> Result<Vec<PrKey>, StoreError>;
-    /// Drops the installation's repositories and their pull requests, and
-    /// reports which pull requests went; the same keys are queued for
-    /// retirement with no fence, since the App has lost the installation and
-    /// nothing can reopen them.
-    async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>, StoreError>;
-    /// Every pull request a prune has removed and not yet acknowledged, oldest
-    /// first. Reading is a step of its own in the sweep, so a prune whose
-    /// result was lost is made good the next time anything drains.
-    async fn pending_retirements(&self) -> Result<Vec<Retirement>, StoreError>;
-    /// Forgets every retirement up to and including `through`, which a
-    /// [`PrStore::pending_retirements`] read returned last. Ids only grow, so
-    /// anything queued since that read stays for the next drain; acknowledging
-    /// again is a no-op.
-    async fn acknowledge_retirements(&self, through: u64) -> Result<(), StoreError>;
-    /// Keeps a finished bulk action for the audit view, targets and all, and
-    /// stops listing it as running. A batch already recorded is left as it
-    /// was: Restate may run the recording step again when the first attempt's
-    /// result was lost, and the first word is the one that stands.
-    async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError>;
     /// The `limit` most recently finished batches of `installation_id`, newest
     /// first, each with every target's verdict in batch order. Another
     /// installation's batches are not counted against the limit, and a batch
@@ -179,15 +214,6 @@ pub trait PrStore: Send + Sync {
         installation_id: u64,
         limit: u32,
     ) -> Result<Vec<BatchRecord>, StoreError>;
-    /// Lists a bulk action as running until [`PrStore::record_batch`] keeps
-    /// it as finished, or [`PrStore::unlist_batch`] gives it up. A batch
-    /// already listed is left as it was, for the same reason a recorded one
-    /// is.
-    async fn start_batch(&self, batch: &RunningBatch) -> Result<(), StoreError>;
-    /// Stops listing a bulk action as running without recording it: the
-    /// workflow ended without a finished batch to keep, as a cancelled one
-    /// does. A batch not listed is left as it is.
-    async fn unlist_batch(&self, batch_id: &str) -> Result<(), StoreError>;
     /// Every batch of `installation_id` started and not yet recorded or given
     /// up, newest first.
     async fn running_batches(&self, installation_id: u64) -> Result<Vec<RunningBatch>, StoreError>;
@@ -206,7 +232,7 @@ pub trait PrStore: Send + Sync {
 }
 
 #[async_trait]
-impl PrStore for LibSqlPrStore {
+impl ProjectionWriter for LibSqlPrStore {
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<(), StoreError> {
         let connection = self.connection().await;
         let dependencies = serde_json::to_string(&pr.dependencies)?;
@@ -266,14 +292,7 @@ impl PrStore for LibSqlPrStore {
     }
 
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError> {
-        let connection = self.connection().await;
-        let mut rows = connection
-            .query(
-                &format!("{} WHERE p.id = ?1", select_pr_sql()),
-                vec![Value::Text(key.to_string())],
-            )
-            .await?;
-        rows.next().await?.map(pr_from_row).transpose()
+        LibSqlPrStore::get_pr(self, key).await
     }
 
     async fn delete_pr(&self, key: &PrKey) -> Result<(), StoreError> {
@@ -298,6 +317,207 @@ impl PrStore for LibSqlPrStore {
         let pruned = retain_prs_on(&transaction, repository_id, live, synced_before).await?;
         transaction.commit().await?;
         Ok(pruned)
+    }
+
+    async fn prs_for_sha(
+        &self,
+        repository_id: u64,
+        sha: &str,
+    ) -> Result<Vec<PrRecord>, StoreError> {
+        let connection = self.connection().await;
+        let rows = connection
+            .query(
+                &format!(
+                    "{} WHERE p.repository_id = ?1 AND p.head_sha = ?2",
+                    select_pr_sql()
+                ),
+                vec![integer(repository_id)?, Value::Text(sha.to_owned())],
+            )
+            .await?;
+        collect_prs(rows).await
+    }
+
+    async fn upsert_repo(&self, repo: &RepoRecord) -> Result<(), StoreError> {
+        let connection = self.connection().await;
+        upsert_repo_on(&connection, repo).await
+    }
+
+    async fn get_repo(&self, repository_id: u64) -> Result<Option<RepoRecord>, StoreError> {
+        let connection = self.connection().await;
+        let mut rows = connection
+            .query(
+                &format!("{} WHERE repository_id = ?1", select_repo_sql()),
+                vec![integer(repository_id)?],
+            )
+            .await?;
+        rows.next().await?.map(repo_from_row).transpose()
+    }
+
+    async fn replace_installation_repos(
+        &self,
+        installation_id: u64,
+        repos: &[RepoRecord],
+        synced_before: u64,
+    ) -> Result<Vec<PrKey>, StoreError> {
+        let connection = self.connection().await;
+        let transaction = connection.transaction().await?;
+        for repo in repos {
+            upsert_repo_on(&transaction, repo).await?;
+        }
+        let live = repos
+            .iter()
+            .map(|repo| repo.repository_id)
+            .collect::<Vec<_>>();
+        let cascaded = retain_repos_on(&transaction, installation_id, &live, synced_before).await?;
+        transaction.commit().await?;
+        Ok(cascaded)
+    }
+
+    async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>, StoreError> {
+        let connection = self.connection().await;
+        let transaction = connection.transaction().await?;
+        let purged = delete_repositories_where(
+            &transaction,
+            "installation_id = ?1",
+            vec![integer(installation_id)?],
+            None,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(purged)
+    }
+
+    async fn pending_retirements(&self) -> Result<Vec<Retirement>, StoreError> {
+        let connection = self.connection().await;
+        let mut rows = connection
+            .query(
+                "SELECT id, repository_id, number, synced_before
+                 FROM pull_request_retirements ORDER BY id",
+                (),
+            )
+            .await?;
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next().await? {
+            pending.push(Retirement {
+                id: unsigned(row.get::<i64>(0)?)?,
+                key: PrKey::new(unsigned(row.get::<i64>(1)?)?, unsigned(row.get::<i64>(2)?)?),
+                synced_before: row.get::<Option<i64>>(3)?.map(unsigned).transpose()?,
+            });
+        }
+        Ok(pending)
+    }
+
+    async fn acknowledge_retirements(&self, through: u64) -> Result<(), StoreError> {
+        self.connection()
+            .await
+            .execute(
+                "DELETE FROM pull_request_retirements WHERE id <= ?1",
+                vec![integer(through)?],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn start_batch(&self, batch: &RunningBatch) -> Result<(), StoreError> {
+        self.connection()
+            .await
+            .execute(
+                r#"INSERT INTO running_batches (
+                    batch_id, installation_id, action, requested_by, retried_from, started_at,
+                    target_count
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(batch_id) DO NOTHING"#,
+                vec![
+                    Value::Text(batch.batch_id.clone()),
+                    integer(batch.installation_id)?,
+                    Value::Text(batch.action.to_string()),
+                    Value::Text(batch.requested_by.to_string()),
+                    option_text(batch.retried_from.clone()),
+                    integer(batch.started_at)?,
+                    integer(batch.target_count)?,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn unlist_batch(&self, batch_id: &str) -> Result<(), StoreError> {
+        self.connection()
+            .await
+            .execute(
+                "DELETE FROM running_batches WHERE batch_id = ?1",
+                vec![Value::Text(batch_id.to_owned())],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError> {
+        let connection = self.connection().await;
+        let transaction = connection.transaction().await?;
+        // Whether or not this is the record that stands, the batch has run.
+        transaction
+            .execute(
+                "DELETE FROM running_batches WHERE batch_id = ?1",
+                vec![Value::Text(batch.batch_id.clone())],
+            )
+            .await?;
+        let inserted = transaction
+            .execute(
+                r#"INSERT INTO batches (
+                    batch_id, installation_id, action, requested_by, retried_from, started_at,
+                    completed_at, succeeded, rejected, failed
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(batch_id) DO NOTHING"#,
+                vec![
+                    Value::Text(batch.batch_id.clone()),
+                    integer(batch.installation_id)?,
+                    Value::Text(batch.action.to_string()),
+                    Value::Text(batch.requested_by.to_string()),
+                    option_text(batch.retried_from.clone()),
+                    integer(batch.started_at)?,
+                    integer(batch.completed_at)?,
+                    integer(batch.succeeded)?,
+                    integer(batch.rejected)?,
+                    integer(batch.failed)?,
+                ],
+            )
+            .await?;
+        if inserted == 0 {
+            transaction.commit().await?;
+            return Ok(());
+        }
+        for (position, target) in batch.targets.iter().enumerate() {
+            transaction
+                .execute(
+                    r#"INSERT INTO batch_targets (
+                        batch_id, position, repository_id, owner, repo, number,
+                        title, html_url, head_sha, outcome
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+                    vec![
+                        Value::Text(batch.batch_id.clone()),
+                        integer(position as u64)?,
+                        integer(target.repository_id)?,
+                        Value::Text(target.owner.clone()),
+                        Value::Text(target.repo.clone()),
+                        integer(target.number)?,
+                        Value::Text(target.title.clone()),
+                        Value::Text(target.html_url.clone()),
+                        option_text(target.head_sha.clone()),
+                        Value::Text(serde_json::to_string(&target.outcome)?),
+                    ],
+                )
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProjectionReader for LibSqlPrStore {
+    async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError> {
+        LibSqlPrStore::get_pr(self, key).await
     }
 
     async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage, StoreError> {
@@ -372,179 +592,6 @@ impl PrStore for LibSqlPrStore {
         })
     }
 
-    async fn prs_for_sha(
-        &self,
-        repository_id: u64,
-        sha: &str,
-    ) -> Result<Vec<PrRecord>, StoreError> {
-        let connection = self.connection().await;
-        let rows = connection
-            .query(
-                &format!(
-                    "{} WHERE p.repository_id = ?1 AND p.head_sha = ?2",
-                    select_pr_sql()
-                ),
-                vec![integer(repository_id)?, Value::Text(sha.to_owned())],
-            )
-            .await?;
-        collect_prs(rows).await
-    }
-
-    async fn upsert_repo(&self, repo: &RepoRecord) -> Result<(), StoreError> {
-        let connection = self.connection().await;
-        upsert_repo_on(&connection, repo).await
-    }
-
-    async fn get_repo(&self, repository_id: u64) -> Result<Option<RepoRecord>, StoreError> {
-        let connection = self.connection().await;
-        let mut rows = connection
-            .query(
-                &format!("{} WHERE repository_id = ?1", select_repo_sql()),
-                vec![integer(repository_id)?],
-            )
-            .await?;
-        rows.next().await?.map(repo_from_row).transpose()
-    }
-
-    async fn replace_installation_repos(
-        &self,
-        installation_id: u64,
-        repos: &[RepoRecord],
-        synced_before: u64,
-    ) -> Result<Vec<PrKey>, StoreError> {
-        let connection = self.connection().await;
-        let transaction = connection.transaction().await?;
-        for repo in repos {
-            upsert_repo_on(&transaction, repo).await?;
-        }
-        let live = repos
-            .iter()
-            .map(|repo| repo.repository_id)
-            .collect::<Vec<_>>();
-        let cascaded = retain_repos_on(&transaction, installation_id, &live, synced_before).await?;
-        transaction.commit().await?;
-        Ok(cascaded)
-    }
-
-    async fn retain_repos(
-        &self,
-        installation_id: u64,
-        live: &[u64],
-        synced_before: u64,
-    ) -> Result<Vec<PrKey>, StoreError> {
-        let connection = self.connection().await;
-        let transaction = connection.transaction().await?;
-        let cascaded = retain_repos_on(&transaction, installation_id, live, synced_before).await?;
-        transaction.commit().await?;
-        Ok(cascaded)
-    }
-
-    async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>, StoreError> {
-        let connection = self.connection().await;
-        let transaction = connection.transaction().await?;
-        let purged = delete_repositories_where(
-            &transaction,
-            "installation_id = ?1",
-            vec![integer(installation_id)?],
-            None,
-        )
-        .await?;
-        transaction.commit().await?;
-        Ok(purged)
-    }
-
-    async fn pending_retirements(&self) -> Result<Vec<Retirement>, StoreError> {
-        let connection = self.connection().await;
-        let mut rows = connection
-            .query(
-                "SELECT id, repository_id, number, synced_before
-                 FROM pull_request_retirements ORDER BY id",
-                (),
-            )
-            .await?;
-        let mut pending = Vec::new();
-        while let Some(row) = rows.next().await? {
-            pending.push(Retirement {
-                id: unsigned(row.get::<i64>(0)?)?,
-                key: PrKey::new(unsigned(row.get::<i64>(1)?)?, unsigned(row.get::<i64>(2)?)?),
-                synced_before: row.get::<Option<i64>>(3)?.map(unsigned).transpose()?,
-            });
-        }
-        Ok(pending)
-    }
-
-    async fn acknowledge_retirements(&self, through: u64) -> Result<(), StoreError> {
-        self.connection()
-            .await
-            .execute(
-                "DELETE FROM pull_request_retirements WHERE id <= ?1",
-                vec![integer(through)?],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError> {
-        let connection = self.connection().await;
-        let transaction = connection.transaction().await?;
-        // Whether or not this is the record that stands, the batch has run.
-        transaction
-            .execute(
-                "DELETE FROM running_batches WHERE batch_id = ?1",
-                vec![Value::Text(batch.batch_id.clone())],
-            )
-            .await?;
-        let inserted = transaction
-            .execute(
-                r#"INSERT INTO batches (
-                    batch_id, installation_id, action, requested_by, retried_from, started_at,
-                    completed_at, succeeded, rejected, failed
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                ON CONFLICT(batch_id) DO NOTHING"#,
-                vec![
-                    Value::Text(batch.batch_id.clone()),
-                    integer(batch.installation_id)?,
-                    Value::Text(batch.action.to_string()),
-                    Value::Text(batch.requested_by.to_string()),
-                    option_text(batch.retried_from.clone()),
-                    integer(batch.started_at)?,
-                    integer(batch.completed_at)?,
-                    integer(batch.succeeded)?,
-                    integer(batch.rejected)?,
-                    integer(batch.failed)?,
-                ],
-            )
-            .await?;
-        if inserted == 0 {
-            transaction.commit().await?;
-            return Ok(());
-        }
-        for (position, target) in batch.targets.iter().enumerate() {
-            transaction
-                .execute(
-                    r#"INSERT INTO batch_targets (
-                        batch_id, position, repository_id, owner, repo, number,
-                        title, html_url, head_sha, outcome
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
-                    vec![
-                        Value::Text(batch.batch_id.clone()),
-                        integer(position as u64)?,
-                        integer(target.repository_id)?,
-                        Value::Text(target.owner.clone()),
-                        Value::Text(target.repo.clone()),
-                        integer(target.number)?,
-                        Value::Text(target.title.clone()),
-                        Value::Text(target.html_url.clone()),
-                        option_text(target.head_sha.clone()),
-                        Value::Text(serde_json::to_string(&target.outcome)?),
-                    ],
-                )
-                .await?;
-        }
-        transaction.commit().await?;
-        Ok(())
-    }
-
     async fn recent_batches(
         &self,
         installation_id: u64,
@@ -594,40 +641,6 @@ impl PrStore for LibSqlPrStore {
             batch.targets = by_batch.remove(&batch.batch_id).unwrap_or_default();
         }
         Ok(batches)
-    }
-
-    async fn start_batch(&self, batch: &RunningBatch) -> Result<(), StoreError> {
-        self.connection()
-            .await
-            .execute(
-                r#"INSERT INTO running_batches (
-                    batch_id, installation_id, action, requested_by, retried_from, started_at,
-                    target_count
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ON CONFLICT(batch_id) DO NOTHING"#,
-                vec![
-                    Value::Text(batch.batch_id.clone()),
-                    integer(batch.installation_id)?,
-                    Value::Text(batch.action.to_string()),
-                    Value::Text(batch.requested_by.to_string()),
-                    option_text(batch.retried_from.clone()),
-                    integer(batch.started_at)?,
-                    integer(batch.target_count)?,
-                ],
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn unlist_batch(&self, batch_id: &str) -> Result<(), StoreError> {
-        self.connection()
-            .await
-            .execute(
-                "DELETE FROM running_batches WHERE batch_id = ?1",
-                vec![Value::Text(batch_id.to_owned())],
-            )
-            .await?;
-        Ok(())
     }
 
     async fn running_batches(&self, installation_id: u64) -> Result<Vec<RunningBatch>, StoreError> {
@@ -2550,14 +2563,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retaining_repos_spares_rows_synced_since_the_listing_started() {
+    async fn replacing_installation_repos_spares_rows_synced_since_the_listing_started() {
         let (_directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
         store.upsert_repo(&repo(2, 30)).await.unwrap();
         store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
         store.upsert_pr(&pr(2, 1, 10)).await.unwrap();
 
-        let cascaded = store.retain_repos(9, &[], 20).await.unwrap();
+        // A listing that found no repositories at all: everything synced
+        // before it started goes, and only that.
+        let cascaded = store.replace_installation_repos(9, &[], 20).await.unwrap();
 
         assert_eq!(cascaded, vec![PrKey::new(1, 1)]);
         assert!(store.get_repo(1).await.unwrap().is_none());

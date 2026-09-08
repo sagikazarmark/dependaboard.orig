@@ -1,19 +1,15 @@
-//! An in-memory [`PrStore`] that keeps the libSQL schema's constraints, so handler logic
-//! that takes the trait can run against a projection without a database.
+//! An in-memory [`ProjectionWriter`] that keeps the libSQL schema's constraints, so
+//! handler logic that takes the trait can run against a projection without a database.
 //!
-//! It implements the writes and the lookups the Restate service makes, and only those:
-//! the dashboard's reads (`list_prs`, `dashboard_summary`, `projection_revision`,
-//! `recent_batches`, `running_batches`, `get_batch`) are `unimplemented!`, so this is not
-//! a drop-in store for a test of the web app, which reads the projection through those.
+//! It implements the half of the store the Restate service holds, and only that: the
+//! dashboard's reads are `ProjectionReader`'s, which the service never names, so this is
+//! not a store for a test of the web app, which reads the projection through that half.
 
 use std::{collections::BTreeMap, sync::Mutex};
 
 use async_trait::async_trait;
-use dependaboard_core::{
-    BatchRecord, DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord, ProjectedBatch,
-    ProjectionRevision, RepoRecord, Retirement, RunningBatch,
-};
-use dependaboard_store::{PrStore, StoreError};
+use dependaboard_core::{BatchRecord, PrKey, PrRecord, RepoRecord, Retirement, RunningBatch};
+use dependaboard_store::{ProjectionWriter, StoreError};
 
 /// Rows keyed the way the schema keys them: pull requests by `(repository_id, number)`
 /// (the `id` column is derived from that pair), repositories by id, batches by batch id,
@@ -25,9 +21,6 @@ use dependaboard_store::{PrStore, StoreError};
 /// with its repository's `installation_id`, as the store's `JOIN` gives it, a batch
 /// recorded twice keeps its first record, recording a batch stops listing it as
 /// running, and every prune queues the keys it removed for retirement under its fence.
-/// What the service never asks of the store, the dashboard listing, its summary, the
-/// revision counters, and the recent and running batches and a batch by id, is not
-/// implemented and panics if called.
 #[derive(Default)]
 pub(crate) struct MemoryPrStore {
     tables: Mutex<Tables>,
@@ -117,7 +110,7 @@ impl Tables {
 }
 
 #[async_trait]
-impl PrStore for MemoryPrStore {
+impl ProjectionWriter for MemoryPrStore {
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<(), StoreError> {
         let mut tables = self.tables.lock().unwrap();
         assert!(
@@ -178,24 +171,6 @@ impl PrStore for MemoryPrStore {
         Ok(stale)
     }
 
-    async fn list_prs(&self, _filter: &PrFilter, _page: Page) -> Result<DashboardPage, StoreError> {
-        unimplemented!(
-            "the Restate service never lists the projection; the dashboard reads it through the web app"
-        )
-    }
-
-    async fn dashboard_summary(&self, _filter: &PrFilter) -> Result<DashboardSummary, StoreError> {
-        unimplemented!(
-            "the Restate service never summarises the projection; the dashboard reads it through the web app"
-        )
-    }
-
-    async fn projection_revision(&self) -> Result<ProjectionRevision, StoreError> {
-        unimplemented!(
-            "the Restate service never asks whether the projection moved; the dashboard polls it through the web app"
-        )
-    }
-
     async fn prs_for_sha(
         &self,
         repository_id: u64,
@@ -246,19 +221,6 @@ impl PrStore for MemoryPrStore {
         Ok(tables.retain_repos(installation_id, &live, synced_before))
     }
 
-    async fn retain_repos(
-        &self,
-        installation_id: u64,
-        live: &[u64],
-        synced_before: u64,
-    ) -> Result<Vec<PrKey>, StoreError> {
-        Ok(self
-            .tables
-            .lock()
-            .unwrap()
-            .retain_repos(installation_id, live, synced_before))
-    }
-
     async fn purge_installation(&self, installation_id: u64) -> Result<Vec<PrKey>, StoreError> {
         let mut tables = self.tables.lock().unwrap();
         let repositories = tables
@@ -304,16 +266,6 @@ impl PrStore for MemoryPrStore {
         Ok(())
     }
 
-    async fn recent_batches(
-        &self,
-        _installation_id: u64,
-        _limit: u32,
-    ) -> Result<Vec<BatchRecord>, StoreError> {
-        unimplemented!(
-            "the Restate service never lists the recorded batches; the dashboard reads them through the web app"
-        )
-    }
-
     async fn start_batch(&self, batch: &RunningBatch) -> Result<(), StoreError> {
         self.tables
             .lock()
@@ -327,25 +279,6 @@ impl PrStore for MemoryPrStore {
     async fn unlist_batch(&self, batch_id: &str) -> Result<(), StoreError> {
         self.tables.lock().unwrap().running_batches.remove(batch_id);
         Ok(())
-    }
-
-    async fn running_batches(
-        &self,
-        _installation_id: u64,
-    ) -> Result<Vec<RunningBatch>, StoreError> {
-        unimplemented!(
-            "the Restate service never lists the running batches; the dashboard reads them through the web app"
-        )
-    }
-
-    async fn get_batch(
-        &self,
-        _installation_id: u64,
-        _batch_id: &str,
-    ) -> Result<Option<ProjectedBatch>, StoreError> {
-        unimplemented!(
-            "the Restate service never reads a batch back; the dashboard reads it through the web app"
-        )
     }
 }
 

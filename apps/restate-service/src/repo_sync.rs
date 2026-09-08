@@ -4,7 +4,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use dependaboard_core::{Operation, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds};
-use dependaboard_store::PrStore;
+use dependaboard_store::ProjectionWriter;
 use restate_sdk::prelude::*;
 use tracing::warn;
 
@@ -41,7 +41,7 @@ trait RepoReconcileEffects {
 struct RestateReconcileEffects<'a, 'ctx> {
     ctx: &'a ObjectContext<'ctx>,
     github: &'a GithubApiHandle,
-    store: &'a Arc<dyn PrStore>,
+    store: &'a Arc<dyn ProjectionWriter>,
     repository: RepoRecord,
     reconcile_start: u64,
 }
@@ -158,7 +158,7 @@ async fn run_repo_reconcile<E: RepoReconcileEffects, R: RetirementEffects>(
 #[derive(Clone)]
 pub(crate) struct RepoSync {
     pub(crate) github: GithubApiHandle,
-    pub(crate) store: Arc<dyn PrStore>,
+    pub(crate) store: Arc<dyn ProjectionWriter>,
 }
 
 #[restate_sdk::object(ingress_private)]

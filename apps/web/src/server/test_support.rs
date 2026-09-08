@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::http::HeaderMap;
 use dependaboard_core::{PrRecord, RepoRecord};
-use dependaboard_store::{LibSqlPrStore, PrStore, StoreConfig};
+use dependaboard_store::{LibSqlPrStore, ProjectionWriter, StoreConfig};
 use dioxus::server::{DioxusRouterExt, ServeConfig};
 use secrecy::SecretString;
 
@@ -125,6 +125,9 @@ pub(crate) async fn fake_restate_ingress() -> (RestateIngress, Arc<Mutex<Vec<For
 /// and answers what it is asked with what the test put there.
 pub(crate) struct Dashboard {
     address: SocketAddr,
+    /// The same store the server reads, held whole so a test can write to it:
+    /// the server holds only the reader half, and the test stands in for the
+    /// Restate service, which does the writing.
     store: LibSqlPrStore,
     restate: FakeRestate,
 }
@@ -136,7 +139,7 @@ pub(crate) async fn dashboard() -> Dashboard {
         .unwrap();
     let state = ServerState {
         ingress: ingress.clone(),
-        store: store.clone(),
+        store: Arc::new(store.clone()),
         installation_id: INSTALLATION_ID,
     };
     let credentials = Credentials {
@@ -183,7 +186,8 @@ impl Dashboard {
     }
 
     /// The read model behind the server, for putting there what the Restate
-    /// service would have written.
+    /// service would have written; a test writes to it through
+    /// [`ProjectionWriter`], as the service does.
     pub(crate) fn store(&self) -> &LibSqlPrStore {
         &self.store
     }

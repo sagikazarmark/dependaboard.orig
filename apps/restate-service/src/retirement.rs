@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use dependaboard_core::{PrKey, Retirement};
-use dependaboard_store::PrStore;
+use dependaboard_store::ProjectionWriter;
 use restate_sdk::prelude::*;
 
 use crate::{
@@ -42,7 +42,7 @@ pub(crate) trait RetirementEffects {
 /// The Restate-bound outbox: each read and acknowledgement is a journaled store step.
 pub(crate) struct RestateRetirements<'a, 'ctx> {
     pub(crate) ctx: &'a ObjectContext<'ctx>,
-    pub(crate) store: &'a Arc<dyn PrStore>,
+    pub(crate) store: &'a Arc<dyn ProjectionWriter>,
 }
 
 impl RetirementEffects for RestateRetirements<'_, '_> {
