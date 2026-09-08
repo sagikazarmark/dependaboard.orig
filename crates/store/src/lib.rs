@@ -1518,7 +1518,7 @@ mod tests {
     /// answer is the repository's alone: another repository can hold a pull
     /// request at the same commit, and it is not this one's to sync.
     #[tokio::test]
-    async fn the_pull_requests_at_a_head_are_the_repositorys_own_and_only_those() {
+    async fn the_pull_requests_at_a_head_are_those_of_the_repository_named_and_no_other() {
         let (_directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
         store.upsert_repo(&repo(2, 10)).await.unwrap();

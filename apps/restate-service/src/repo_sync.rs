@@ -4,7 +4,7 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use dependaboard_core::{
-    Operation, PrRecord, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds,
+    Operation, PrKey, PrRecord, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds,
 };
 use dependaboard_store::ProjectionWriter;
 use restate_sdk::prelude::*;
@@ -47,9 +47,10 @@ trait RepoReconcileEffects {
         &mut self,
         sha: &str,
     ) -> impl Future<Output = HandlerResult<Vec<PrRecord>>> + Send;
-    /// Sends `request` one-way to the pull request it names, to sync as soon as the
-    /// object is free. A send cannot fail; how the sync fares is the callee's to tell.
-    fn send_sync(&mut self, request: SyncRequest);
+    /// Sends `request` one-way to the pull request object `key` names, to sync as soon as
+    /// it is free. A send cannot fail; how the sync fares is the callee's to tell. The
+    /// key is passed rather than derived here so a test sees where the send went.
+    fn send_sync(&mut self, key: &PrKey, request: SyncRequest);
 }
 
 struct RestateReconcileEffects<'a, 'ctx> {
@@ -144,9 +145,9 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
         Ok(matches.into_inner())
     }
 
-    fn send_sync(&mut self, request: SyncRequest) {
+    fn send_sync(&mut self, key: &PrKey, request: SyncRequest) {
         self.ctx
-            .object_client::<PullRequestClient>(request_key(&request).to_string())
+            .object_client::<PullRequestClient>(key.to_string())
             .sync(Json::from(request))
             .send();
     }
@@ -221,14 +222,16 @@ async fn run_sync_sha<E: RepoReconcileEffects>(
     numbers.extend(at_head.into_iter().map(|pull| pull.number));
     let told = numbers.len();
     for number in numbers {
-        restate.send_sync(SyncRequest {
+        let sync = SyncRequest {
             repository_id: request.repository_id,
             owner: request.owner.clone(),
             repo: request.repo.clone(),
             number,
             bypass_debounce: false,
             completion_id: None,
-        });
+        };
+        // Keyed by the request, as every sender keys a sync, so it is the same object.
+        restate.send_sync(&request_key(&sync), sync);
     }
     Ok(told)
 }
@@ -304,8 +307,6 @@ impl RepoSync {
 mod tests {
     use std::collections::BTreeMap;
 
-    use dependaboard_core::PrKey;
-
     use super::*;
     use crate::{
         pull_request::ClosedRequest,
@@ -359,8 +360,8 @@ mod tests {
         at_head: Vec<PrRecord>,
         /// The heads `pull_requests_at` was asked about.
         resolved: Vec<String>,
-        /// Every sync sent one-way, in order.
-        sent: Vec<SyncRequest>,
+        /// Every sync sent one-way, in order: the key it went to and what it carried.
+        sent: Vec<(PrKey, SyncRequest)>,
     }
 
     impl RepoReconcileEffects for RecordedRepoSync {
@@ -398,8 +399,8 @@ mod tests {
             Ok(self.at_head.clone())
         }
 
-        fn send_sync(&mut self, request: SyncRequest) {
-            self.sent.push(request);
+        fn send_sync(&mut self, key: &PrKey, request: SyncRequest) {
+            self.sent.push((key.clone(), request));
         }
     }
 
@@ -422,12 +423,12 @@ mod tests {
         assert_eq!(
             restate.sent,
             vec![
-                dependabot_pull(12),
-                dependabot_pull(19),
-                dependabot_pull(23)
+                (PrKey::new(7, 12), dependabot_pull(12)),
+                (PrKey::new(7, 19), dependabot_pull(19)),
+                (PrKey::new(7, 23), dependabot_pull(23)),
             ],
             "the ones GitHub named and the ones the projection has at that head, 19 once, \
-             each a plain sync that honours the debounce"
+             each sent to its own object as a plain sync that honours the debounce"
         );
     }
 
