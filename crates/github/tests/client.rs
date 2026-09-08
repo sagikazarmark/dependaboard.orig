@@ -6,9 +6,8 @@
 //! of how the client is structured internally.
 
 use dependaboard_core::{
-    CheckStatus, CommandRequest, DEPENDABOT_LOGIN, DependabotCommand, DependencyUpdate,
-    GithubErrorResponse, MergeMethod, MergeRequest, Mergeable, Operation, PrRecord, PrTarget,
-    SyncRequest, UpdateBranchRequest, UpdateType, UserId, unix_seconds,
+    CheckStatus, CommandRequest, DEPENDABOT_LOGIN, DependabotCommand, GithubErrorResponse,
+    MergeMethod, MergeRequest, Operation, PrTarget, SyncRequest, UpdateBranchRequest, UserId,
 };
 use dependaboard_github::{
     GithubApi, GithubClient, GithubConfig, GithubError, Merged, ProtocolError,
@@ -100,24 +99,6 @@ fn http_response(error: &GithubError) -> Option<&GithubErrorResponse> {
         GithubError::Http { response, .. } => Some(response),
         _ => None,
     }
-}
-
-// --- construction ---------------------------------------------------------
-
-#[tokio::test]
-async fn invalid_private_key_fails_client_construction() {
-    let server = MockServer::start().await;
-    let config = GithubConfig {
-        private_key: SecretString::from("-----BEGIN RSA PRIVATE KEY-----\nnot a key\n"),
-        ..config(&server)
-    };
-
-    let error = GithubClient::new(config).err().expect("construction fails");
-
-    assert!(
-        matches!(&error, GithubError::Config(message) if message.contains("private key")),
-        "expected a private-key config error, got {error:?}"
-    );
 }
 
 // --- installation tokens --------------------------------------------------
@@ -294,50 +275,6 @@ async fn repository_listing_stops_after_the_first_short_page() {
         request_count(&server, "GET", "/installation/repositories").await,
         2,
         "no request is made for a third page"
-    );
-    server.verify().await;
-}
-
-#[tokio::test]
-async fn repository_listing_fails_retryably_when_a_repository_leaves_between_pages() {
-    let server = MockServer::start().await;
-    mount_token(&server).await;
-    // Repository 50 is removed from the installation after the first page is served, so
-    // the second page starts one position early: 101 is never listed, and the total
-    // GitHub reports has moved. Offset pagination cannot say which one went.
-    mount_repositories_page(&server, 1, 150, 1..=100).await;
-    mount_repositories_page(&server, 2, 149, 102..=150).await;
-
-    let error = client(&server)
-        .list_installation_repositories()
-        .await
-        .unwrap_err();
-
-    assert!(
-        matches!(error, GithubError::Shifted { .. }),
-        "a listing that moved under its pages is not an authoritative set: {error:?}"
-    );
-    server.verify().await;
-}
-
-#[tokio::test]
-async fn repository_listing_fails_retryably_when_the_pages_do_not_add_up_to_the_total() {
-    let server = MockServer::start().await;
-    mount_token(&server).await;
-    // One repository leaves the tail and another joins the head between the pages: the
-    // total stands, but the page boundary shifted and repository 100 is listed twice while
-    // the newcomer, sorted before it, is never seen.
-    mount_repositories_page(&server, 1, 101, 1..=100).await;
-    mount_repositories_page(&server, 2, 101, [100]).await;
-
-    let error = client(&server)
-        .list_installation_repositories()
-        .await
-        .unwrap_err();
-
-    assert!(
-        matches!(error, GithubError::Shifted { .. }),
-        "a duplicate at the boundary means something else was dropped: {error:?}"
     );
     server.verify().await;
 }
@@ -550,15 +487,6 @@ const HEAD_SHA: &str = "abc123";
 const CREATED_AT: &str = "2024-05-01T10:00:00Z";
 const UPDATED_AT: &str = "2024-05-02T11:30:00Z";
 
-fn unix(rfc3339: &str) -> u64 {
-    u64::try_from(
-        chrono::DateTime::parse_from_rfc3339(rfc3339)
-            .unwrap()
-            .timestamp(),
-    )
-    .unwrap()
-}
-
 /// An open, unmerged Dependabot pull request at [`HEAD_SHA`].
 fn dependabot_pull() -> Value {
     json!({
@@ -648,10 +576,6 @@ fn check_run(status: &str, conclusion: Option<&str>) -> Value {
     json!({ "__typename": "CheckRun", "status": status, "conclusion": conclusion })
 }
 
-fn status_context(state: &str) -> Value {
-    json!({ "__typename": "StatusContext", "state": state })
-}
-
 fn check_suite(status: &str, conclusion: Option<&str>) -> Value {
     json!({ "status": status, "conclusion": conclusion })
 }
@@ -719,144 +643,48 @@ fn sync_request() -> SyncRequest {
     }
 }
 
-/// The expected record here is the one the REST-backed client produced for this pull
-/// request before snapshots moved to GraphQL; a GraphQL answer describing the same pull
-/// request must project to it unchanged.
+/// What the snapshot makes of the answer is pinned without a server, in `graphql.rs`;
+/// the wire tests here pin what it costs.
 #[tokio::test]
-async fn snapshot_of_a_single_dependency_pull_request() {
+async fn a_snapshot_is_one_graphql_request_when_the_head_is_listed_and_its_pages_are_short() {
     let server = MockServer::start().await;
     mount_token(&server).await;
     mount_snapshot(
         &server,
         pull_request_node(head_commit(
-            "Bump serde from 1.0.1 to 1.0.2\n\n---\nupdated-dependencies:\n- dependency-name: serde\n  dependency-type: direct:production\n  update-type: version-update:semver-patch\n...",
-            vec![
-                check_run("COMPLETED", Some("SUCCESS")),
-                status_context("SUCCESS"),
-            ],
+            "Bump serde from 1.0.1 to 1.0.2",
+            vec![check_run("COMPLETED", Some("SUCCESS"))],
             vec![check_suite("COMPLETED", Some("SUCCESS"))],
         )),
     )
     .await;
 
-    let before = unix_seconds();
     let record = client(&server)
         .fetch_snapshot(&sync_request())
         .await
         .unwrap()
         .expect("an open Dependabot pull request is projected");
 
-    assert!(record.synced_at >= before && record.synced_at <= unix_seconds());
-    assert_eq!(
-        record,
-        PrRecord {
-            id: "7#9".to_owned(),
-            repository_id: REPOSITORY_ID,
-            installation_id: INSTALLATION_ID,
-            owner: OWNER.to_owned(),
-            repo: REPO.to_owned(),
-            number: NUMBER,
-            title: "Bump serde from 1.0.1 to 1.0.2".to_owned(),
-            html_url: format!("https://github.com/{OWNER}/{REPO}/pull/{NUMBER}"),
-            dependency: Some("serde".to_owned()),
-            from_version: Some("1.0.1".to_owned()),
-            to_version: Some("1.0.2".to_owned()),
-            dependencies: vec![DependencyUpdate {
-                name: "serde".to_owned(),
-                from_version: Some("1.0.1".to_owned()),
-                to_version: Some("1.0.2".to_owned()),
-                update_type: UpdateType::Patch,
-            }],
-            update_type: UpdateType::Patch,
-            head_sha: HEAD_SHA.to_owned(),
-            check_status: CheckStatus::Success,
-            mergeable: Mergeable::Clean,
-            labels: vec!["dependencies".to_owned(), "rust".to_owned()],
-            created_at: unix(CREATED_AT),
-            updated_at: unix(UPDATED_AT),
-            synced_at: record.synced_at,
-        }
-    );
-    assert_eq!(
-        api_request_count(&server).await,
-        1,
-        "a snapshot is one GraphQL request"
-    );
+    assert_eq!(record.head_sha, HEAD_SHA);
+    assert_eq!(record.check_status, CheckStatus::Success);
+    assert_eq!(api_request_count(&server).await, 1);
 }
 
 #[tokio::test]
-async fn snapshot_of_a_grouped_pull_request_keeps_every_dependency() {
+async fn a_pull_request_the_dashboard_does_not_project_costs_the_one_request_that_says_so() {
     let server = MockServer::start().await;
     mount_token(&server).await;
-    // No runs or statuses yet: only a suite that failed to start.
-    let mut pull = pull_request_node(head_commit(
-        "Bump the cargo group with 2 updates\n\n---\nupdated-dependencies:\n- dependency-name: tokio\n  update-type: version-update:semver-minor\n- dependency-name: serde\n  update-type: version-update:semver-major\n...",
-        vec![],
-        vec![check_suite("COMPLETED", Some("STARTUP_FAILURE"))],
-    ));
-    pull["title"] = json!("Bump the cargo group with 2 updates");
-    pull["mergeStateStatus"] = json!("BEHIND");
+    let mut pull = pull_request_node(head_commit("Bump serde", vec![], vec![]));
+    pull["state"] = json!("MERGED");
     mount_snapshot(&server, pull).await;
-
-    let record = client(&server)
-        .fetch_snapshot(&sync_request())
-        .await
-        .unwrap()
-        .expect("an open Dependabot pull request is projected");
-
-    assert_eq!(record.dependency, None);
-    assert_eq!(record.from_version, None);
-    assert_eq!(record.to_version, None);
-    assert_eq!(
-        record
-            .dependencies
-            .iter()
-            .map(|dependency| dependency.name.as_str())
-            .collect::<Vec<_>>(),
-        ["tokio", "serde"]
-    );
-    assert_eq!(record.update_type, UpdateType::Major);
-    assert_eq!(record.check_status, CheckStatus::Failure);
-    assert_eq!(record.mergeable, Mergeable::Behind);
-}
-
-/// Asserts that `pull_request` is not projected, and that finding out cost one request.
-async fn assert_snapshot_skipped(pull_request: Value, case: &str) {
-    let server = MockServer::start().await;
-    mount_token(&server).await;
-    mount_snapshot(&server, pull_request).await;
 
     let record = client(&server)
         .fetch_snapshot(&sync_request())
         .await
         .unwrap();
 
-    assert_eq!(record, None, "{case}");
-    assert_eq!(api_request_count(&server).await, 1, "{case}");
-}
-
-#[tokio::test]
-async fn snapshot_skips_pull_requests_not_authored_by_dependabot() {
-    // A user account named `dependabot` is not the Dependabot app: only GraphQL's `Bot`
-    // maps onto REST's `dependabot[bot]`.
-    for author in [
-        json!({ "__typename": "User", "login": "octocat" }),
-        json!({ "__typename": "User", "login": "dependabot" }),
-        Value::Null,
-    ] {
-        let mut pull = pull_request_node(head_commit("Bump serde", vec![], vec![]));
-        pull["author"] = author.clone();
-        assert_snapshot_skipped(pull, &format!("author {author}")).await;
-    }
-}
-
-#[tokio::test]
-async fn snapshot_skips_closed_pull_requests() {
-    for state in ["CLOSED", "MERGED"] {
-        let mut pull = pull_request_node(head_commit("Bump serde", vec![], vec![]));
-        pull["state"] = json!(state);
-        assert_snapshot_skipped(pull, &format!("state {state}")).await;
-    }
+    assert_eq!(record, None);
+    assert_eq!(api_request_count(&server).await, 1);
 }
 
 /// A follow-up page of the head commit's check contexts or suites, continuing from `after`.

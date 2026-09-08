@@ -1,15 +1,10 @@
-use std::{
-    collections::{HashMap, HashSet},
-    env, fs,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, env, fs, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use dependaboard_core::{
     CheckSignal, CommandRequest, DEPENDABOT_LOGIN, GithubErrorResponse, MergeMethod, MergeRequest,
-    Mergeable, Operation, PrKey, PrRecord, PrTarget, RepoRecord, SyncRequest, UpdateBranchRequest,
-    UserId, highest_update_type, parse_dependabot_metadata, rollup_checks, unix_seconds,
+    Operation, PrRecord, PrTarget, RepoRecord, SyncRequest, UpdateBranchRequest, UserId,
+    unix_seconds,
 };
 use jsonwebtoken::EncodingKey;
 use reqwest::{Method, Response, StatusCode};
@@ -31,12 +26,12 @@ use crate::{
     error::{known_http, not_found},
     graphql::{
         CHECK_CONTEXTS_PAGE_QUERY, CHECK_SUITES_PAGE_QUERY, CheckContextsPage, CheckSuitesPage,
-        CommitData, GraphqlResponse, SnapshotData, check_context_signal, check_suite_signal,
-        head_commit_query, snapshot_query,
+        CommitData, Connection, GraphqlResponse, SnapshotData, check_context_signal,
+        check_suite_signal, head_commit_query, project_snapshot, snapshot_query,
     },
     rest::{
         GithubPull, InstallationRepositories, IssueComment, MergeResult, PullListItem,
-        RateLimitHeaders, UpdateBranchResult, http_error, parse_response, parse_timestamp,
+        RateLimitHeaders, UpdateBranchResult, fold_repository_pages, http_error, parse_response,
     },
 };
 
@@ -361,15 +356,14 @@ impl GithubClient {
     async fn fetch_head_commit(
         &self,
         request: &SyncRequest,
-        pull: graphql::PullRequestNode,
+        pull: &graphql::PullRequestNode,
     ) -> Result<graphql::Commit, GithubError> {
-        let head_sha = pull.head_ref_oid.clone();
         if let Some(listed) = pull.last_listed_commit()
-            && listed.oid == head_sha
+            && listed.oid == pull.head_ref_oid
         {
-            return Ok(listed);
+            return Ok(listed.clone());
         }
-        self.commit_by_sha(&head_commit_query(), request, &head_sha, None)
+        self.commit_by_sha(&head_commit_query(), request, &pull.head_ref_oid, None)
             .await?
             .ok_or(GithubError::Protocol(ProtocolError::Missing("head commit")))
     }
@@ -402,40 +396,42 @@ impl GithubClient {
     async fn check_signals(
         &self,
         request: &SyncRequest,
-        commit: graphql::Commit,
+        commit: &graphql::Commit,
     ) -> Result<Vec<CheckSignal>, GithubError> {
         let sha = &commit.oid;
         let mut signals = Vec::new();
-        let mut contexts = commit.status_check_rollup.map(|rollup| rollup.contexts);
-        while let Some(page) = contexts.take() {
-            signals.extend(page.nodes.iter().filter_map(check_context_signal));
-            if let Some(after) = page.next_cursor() {
-                contexts = self
-                    .commit_by_sha::<CheckContextsPage>(
-                        CHECK_CONTEXTS_PAGE_QUERY,
-                        request,
-                        sha,
-                        Some(after),
-                    )
-                    .await?
-                    .and_then(|commit| commit.status_check_rollup)
-                    .map(|rollup| rollup.contexts);
-            }
+        if let Some(rollup) = &commit.status_check_rollup {
+            signals.extend(
+                signals_across_pages(&rollup.contexts, check_context_signal, |after| async move {
+                    Ok(self
+                        .commit_by_sha::<CheckContextsPage>(
+                            CHECK_CONTEXTS_PAGE_QUERY,
+                            request,
+                            sha,
+                            Some(&after),
+                        )
+                        .await?
+                        .and_then(|commit| commit.status_check_rollup)
+                        .map(|rollup| rollup.contexts))
+                })
+                .await?,
+            );
         }
-        let mut suites = commit.check_suites;
-        while let Some(page) = suites.take() {
-            signals.extend(page.nodes.iter().filter_map(check_suite_signal));
-            if let Some(after) = page.next_cursor() {
-                suites = self
-                    .commit_by_sha::<CheckSuitesPage>(
-                        CHECK_SUITES_PAGE_QUERY,
-                        request,
-                        sha,
-                        Some(after),
-                    )
-                    .await?
-                    .and_then(|commit| commit.check_suites);
-            }
+        if let Some(suites) = &commit.check_suites {
+            signals.extend(
+                signals_across_pages(suites, check_suite_signal, |after| async move {
+                    Ok(self
+                        .commit_by_sha::<CheckSuitesPage>(
+                            CHECK_SUITES_PAGE_QUERY,
+                            request,
+                            sha,
+                            Some(&after),
+                        )
+                        .await?
+                        .and_then(|commit| commit.check_suites))
+                })
+                .await?,
+            );
         }
         Ok(signals)
     }
@@ -648,129 +644,61 @@ impl GithubApi for GithubClient {
     /// One GraphQL request in the common case, where the REST reads it replaced cost at
     /// least five (pull request, head commit, check runs, check suites, combined status),
     /// more with pagination. Only a commit with over a hundred check contexts or suites
-    /// costs a further request per extra page.
+    /// costs a further request per extra page — and a pull request the dashboard does not
+    /// project costs the one request that says so.
     async fn fetch_snapshot(&self, request: &SyncRequest) -> Result<Option<PrRecord>, GithubError> {
-        let installation_id = self.config.installation_id;
         let pull = self.fetch_pull_request_node(request).await?;
         if !pull.is_open_dependabot_pull() {
             return Ok(None);
         }
-        let title = pull.title.clone();
-        let url = pull.url.clone();
-        let mergeable = pull.mergeable_state().map_or(Mergeable::Unknown, |state| {
-            Mergeable::from_github_state(&state)
-        });
-        let labels = pull
-            .labels
-            .as_ref()
-            .map(|labels| {
-                labels
-                    .nodes
-                    .iter()
-                    .map(|label| label.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let created_at = parse_timestamp(&pull.created_at)?;
-        let updated_at = parse_timestamp(&pull.updated_at)?;
-        let head = self.fetch_head_commit(request, pull).await?;
-        let dependencies = parse_dependabot_metadata(&head.message, &title);
-        let (dependency, from_version, to_version) = if dependencies.len() == 1 {
-            let dependency = &dependencies[0];
-            (
-                Some(dependency.name.clone()),
-                dependency.from_version.clone(),
-                dependency.to_version.clone(),
-            )
-        } else {
-            (None, None, None)
-        };
-        let head_sha = head.oid.clone();
-        let check_status = rollup_checks(self.check_signals(request, head).await?);
-        let synced_at = unix_seconds();
-        Ok(Some(PrRecord {
-            id: PrKey::new(request.repository_id, request.number).to_string(),
-            repository_id: request.repository_id,
-            installation_id,
-            owner: request.owner.clone(),
-            repo: request.repo.clone(),
-            number: request.number,
-            title,
-            html_url: url,
-            dependency,
-            from_version,
-            to_version,
-            update_type: highest_update_type(&dependencies),
-            dependencies,
-            head_sha,
-            check_status,
-            mergeable,
-            labels,
-            created_at,
-            updated_at,
-            synced_at,
-        }))
+        let head = self.fetch_head_commit(request, &pull).await?;
+        let signals = self.check_signals(request, &head).await?;
+        project_snapshot(
+            request,
+            self.config.installation_id,
+            &pull,
+            &head,
+            signals,
+            unix_seconds(),
+        )
+        .map(Some)
     }
 
+    /// Reads every page of the installation's repositories — until one is short, or the
+    /// pages reach the total the first reported — and folds them, refusing a listing that
+    /// shifted under its pages (see `fold_repository_pages`).
     async fn list_installation_repositories(&self) -> Result<Vec<RepoRecord>, GithubError> {
-        let mut page = 1;
-        let mut repositories = Vec::new();
-        let mut total_count = None;
         let synced_at = unix_seconds();
-        let total = loop {
-            let response: InstallationRepositories = self
+        let mut pages: Vec<InstallationRepositories> = Vec::new();
+        let mut listed = 0;
+        loop {
+            let page: InstallationRepositories = self
                 .installation_json(
                     self.config.installation_id,
                     Method::GET,
-                    &format!("/installation/repositories?per_page={LISTING_PAGE_SIZE}&page={page}"),
+                    &format!(
+                        "/installation/repositories?per_page={LISTING_PAGE_SIZE}&page={}",
+                        pages.len() + 1
+                    ),
                     None,
                 )
                 .await?;
-            // Every page reports the installation's total as of that page. One that
-            // disagrees with the first means a repository joined or left in between, and
-            // offset pagination cannot say which item the boundary shift dropped.
-            let total = *total_count.get_or_insert(response.total_count);
-            if response.total_count != total {
-                return Err(GithubError::Shifted {
-                    listing: "installation repositories",
-                    detail: format!(
-                        "the total moved from {total} to {} between pages",
-                        response.total_count
-                    ),
-                });
+            listed += page.repositories.len();
+            let total = pages
+                .first()
+                .map_or(page.total_count, |first| first.total_count);
+            let last = page.repositories.len() < LISTING_PAGE_SIZE || listed >= total;
+            pages.push(page);
+            if last {
+                break;
             }
-            let count = response.repositories.len();
-            repositories.extend(response.repositories.into_iter().map(|repo| {
-                RepoRecord {
-                    repository_id: repo.id,
-                    installation_id: self.config.installation_id,
-                    owner: repo.owner.login,
-                    repo: repo.name,
-                    merge_method: repo
-                        .merge_settings
-                        .method_instead_of(self.config.merge_method),
-                    synced_at,
-                }
-            }));
-            if count < LISTING_PAGE_SIZE || repositories.len() >= total {
-                break total;
-            }
-            page += 1;
-        };
-        // A boundary that shifted without moving the total shows as a repository listed
-        // twice where another was never listed: the distinct ids fall short of the total.
-        let mut seen = HashSet::new();
-        repositories.retain(|repository| seen.insert(repository.repository_id));
-        if repositories.len() != total {
-            return Err(GithubError::Shifted {
-                listing: "installation repositories",
-                detail: format!(
-                    "{} distinct repositories were listed against a total of {total}",
-                    repositories.len()
-                ),
-            });
         }
-        Ok(repositories)
+        fold_repository_pages(
+            pages,
+            self.config.installation_id,
+            self.config.merge_method,
+            synced_at,
+        )
     }
 
     async fn list_dependabot_prs(
@@ -954,6 +882,28 @@ impl GithubApi for GithubClient {
     }
 }
 
+/// What `signal` makes of every node of a paged connection: those of `first`, the page
+/// that came with the commit, then of each page `next_page` reads for the cursor the
+/// page before it ended on.
+async fn signals_across_pages<T, Fut>(
+    first: &Connection<T>,
+    signal: impl Fn(&T) -> Option<CheckSignal>,
+    mut next_page: impl FnMut(String) -> Fut,
+) -> Result<Vec<CheckSignal>, GithubError>
+where
+    Fut: Future<Output = Result<Option<Connection<T>>, GithubError>>,
+{
+    let mut signals: Vec<CheckSignal> = first.nodes.iter().filter_map(&signal).collect();
+    let mut cursor = first.next_cursor().map(str::to_owned);
+    while let Some(after) = cursor.take() {
+        if let Some(page) = next_page(after).await? {
+            signals.extend(page.nodes.iter().filter_map(&signal));
+            cursor = page.next_cursor().map(str::to_owned);
+        }
+    }
+    Ok(signals)
+}
+
 /// A merge seen on the pull request rather than in GitHub's answer to the merge — found
 /// done before anything was sent, or confirmed after an ambiguous answer — with `detail`
 /// as the words for it. It names the commit the pull request does.
@@ -969,7 +919,6 @@ fn merged_as(detail: &'static str) -> impl FnOnce(&GithubPull) -> Option<Merged>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dependaboard_core::DependencyUpdate;
 
     /// A throwaway RSA key generated for the test suite.
     const APP_KEY: &str = include_str!("../testdata/app-key.pem");
@@ -1000,6 +949,22 @@ mod tests {
 
         assert_eq!(config.private_key.expose_secret(), APP_KEY.trim_end());
         assert!(GithubClient::new(config).is_ok());
+    }
+
+    /// A malformed key is refused when the client is built, before any API call.
+    #[test]
+    fn an_invalid_private_key_fails_client_construction() {
+        let config = GithubConfig::from_lookup(lookup(&required_env(
+            "-----BEGIN RSA PRIVATE KEY-----\nnot a key\n",
+        )))
+        .expect("the key is not read until the client is built");
+
+        let error = GithubClient::new(config).err().expect("construction fails");
+
+        assert!(
+            matches!(&error, GithubError::Config(message) if message.contains("private key")),
+            "expected a private-key config error, got {error:?}"
+        );
     }
 
     #[test]
@@ -1063,27 +1028,5 @@ mod tests {
             GithubConfig::from_lookup(lookup(&vars)),
             Err(GithubError::Config(message)) if message.contains("GITHUB_APP_ID")
         ));
-    }
-
-    #[test]
-    fn grouped_update_scalar_columns_remain_empty() {
-        let dependencies = [
-            DependencyUpdate {
-                name: "a".to_owned(),
-                from_version: None,
-                to_version: None,
-                update_type: dependaboard_core::UpdateType::Patch,
-            },
-            DependencyUpdate {
-                name: "b".to_owned(),
-                from_version: None,
-                to_version: None,
-                update_type: dependaboard_core::UpdateType::Minor,
-            },
-        ];
-        assert_eq!(
-            highest_update_type(&dependencies),
-            dependaboard_core::UpdateType::Minor
-        );
     }
 }
