@@ -8,11 +8,15 @@
 //! twice.
 
 use dependaboard_core::{
-    CheckSignal, DEPENDABOT_LOGIN, GithubErrorResponse, check_signal, status_signal,
+    CheckSignal, DEPENDABOT_LOGIN, GithubErrorResponse, Mergeable, PrKey, PrRecord, SyncRequest,
+    check_signal, highest_update_type, parse_dependabot_metadata, rollup_checks, status_signal,
 };
 use serde::Deserialize;
 
-use crate::rest::RateLimitHeaders;
+use crate::{
+    GithubError,
+    rest::{RateLimitHeaders, parse_timestamp},
+};
 
 /// What a snapshot reads off a commit: its message, and the first page each of its check
 /// contexts (check runs and commit statuses together, under `statusCheckRollup`) and its
@@ -184,7 +188,7 @@ pub(crate) fn error_response(
 }
 
 /// One page of a GraphQL connection.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Connection<T> {
     #[serde(default)]
@@ -205,7 +209,7 @@ impl<T> Connection<T> {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PageInfo {
     #[serde(default)]
@@ -271,12 +275,8 @@ impl PullRequestNode {
 
     /// The last commit GitHub lists for the pull request, which is its head unless the
     /// listing's date order says otherwise; see [`snapshot_query`].
-    pub(crate) fn last_listed_commit(self) -> Option<Commit> {
-        self.commits
-            .nodes
-            .into_iter()
-            .next()
-            .map(|listed| listed.commit)
+    pub(crate) fn last_listed_commit(&self) -> Option<&Commit> {
+        self.commits.nodes.first().map(|listed| &listed.commit)
     }
 }
 
@@ -310,7 +310,7 @@ pub(crate) struct PullRequestCommit {
     pub(crate) commit: Commit,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Commit {
     pub(crate) oid: String,
@@ -320,7 +320,7 @@ pub(crate) struct Commit {
     pub(crate) check_suites: Option<Connection<CheckSuite>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct StatusCheckRollup {
     pub(crate) contexts: Connection<CheckContext>,
 }
@@ -356,7 +356,7 @@ pub(crate) struct CheckSuitesPage {
 }
 
 /// A member of `statusCheckRollup.contexts`: a check run or a legacy commit status.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "__typename")]
 pub(crate) enum CheckContext {
     CheckRun {
@@ -368,7 +368,7 @@ pub(crate) enum CheckContext {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CheckSuite {
     pub(crate) status: Option<String>,
     pub(crate) conclusion: Option<String>,
@@ -405,9 +405,79 @@ fn lowercase(value: Option<&str>) -> Option<String> {
     value.map(str::to_ascii_lowercase)
 }
 
+/// The record the dashboard keeps of `request`'s pull request, projected from what
+/// GitHub answered: `pull` as the snapshot query read it, `head` the commit at its
+/// `headRefOid`, and `signals` everything the head's check runs, statuses and suites
+/// contributed across every page. The caller has already found `pull` to be an open
+/// Dependabot pull request (see [`PullRequestNode::is_open_dependabot_pull`]); a closed
+/// one is never projected, and is not read this far.
+///
+/// The Dependabot metadata is parsed from the head commit's message with the title as
+/// the fallback; a grouped update leaves the scalar dependency columns empty and keeps
+/// every dependency in `dependencies`. Fails only on a timestamp that cannot be read.
+pub(crate) fn project_snapshot(
+    request: &SyncRequest,
+    installation_id: u64,
+    pull: &PullRequestNode,
+    head: &Commit,
+    signals: impl IntoIterator<Item = CheckSignal>,
+    synced_at: u64,
+) -> Result<PrRecord, GithubError> {
+    let mergeable = pull.mergeable_state().map_or(Mergeable::Unknown, |state| {
+        Mergeable::from_github_state(&state)
+    });
+    let labels = pull
+        .labels
+        .as_ref()
+        .map(|labels| {
+            labels
+                .nodes
+                .iter()
+                .map(|label| label.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let dependencies = parse_dependabot_metadata(&head.message, &pull.title);
+    let (dependency, from_version, to_version) = if dependencies.len() == 1 {
+        let dependency = &dependencies[0];
+        (
+            Some(dependency.name.clone()),
+            dependency.from_version.clone(),
+            dependency.to_version.clone(),
+        )
+    } else {
+        (None, None, None)
+    };
+    Ok(PrRecord {
+        id: PrKey::new(request.repository_id, request.number).to_string(),
+        repository_id: request.repository_id,
+        installation_id,
+        owner: request.owner.clone(),
+        repo: request.repo.clone(),
+        number: request.number,
+        title: pull.title.clone(),
+        html_url: pull.url.clone(),
+        dependency,
+        from_version,
+        to_version,
+        update_type: highest_update_type(&dependencies),
+        dependencies,
+        head_sha: head.oid.clone(),
+        check_status: rollup_checks(signals),
+        mergeable,
+        labels,
+        created_at: parse_timestamp(&pull.created_at)?,
+        updated_at: parse_timestamp(&pull.updated_at)?,
+        synced_at,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use dependaboard_core::{CheckStatus, rollup_checks};
+    use dependaboard_core::{
+        CheckStatus, DependencyUpdate, Mergeable, PrRecord, SyncRequest, UpdateType, rollup_checks,
+    };
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -604,5 +674,183 @@ mod tests {
                 retry_after_seconds: None,
             }
         );
+    }
+
+    // --- the snapshot projection ------------------------------------------
+
+    const INSTALLATION_ID: u64 = 42;
+    const REPOSITORY_ID: u64 = 7;
+    const OWNER: &str = "acme";
+    const REPO: &str = "api";
+    const NUMBER: u64 = 9;
+    const HEAD_SHA: &str = "abc123";
+    const CREATED_AT: &str = "2024-05-01T10:00:00Z";
+    const UPDATED_AT: &str = "2024-05-02T11:30:00Z";
+    const SYNCED_AT: u64 = 1_700_000_000;
+
+    fn sync_request() -> SyncRequest {
+        SyncRequest {
+            repository_id: REPOSITORY_ID,
+            owner: OWNER.to_owned(),
+            repo: REPO.to_owned(),
+            number: NUMBER,
+            bypass_debounce: false,
+            completion_id: None,
+        }
+    }
+
+    fn unix(rfc3339: &str) -> u64 {
+        u64::try_from(
+            chrono::DateTime::parse_from_rfc3339(rfc3339)
+                .unwrap()
+                .timestamp(),
+        )
+        .unwrap()
+    }
+
+    /// The head commit as GraphQL reports it, at [`HEAD_SHA`] with `message`; its check
+    /// pages are the client's to read, so the projection never looks at them.
+    fn head_commit(message: &str) -> Commit {
+        serde_json::from_value(json!({
+            "oid": HEAD_SHA,
+            "message": message,
+            "statusCheckRollup": null,
+            "checkSuites": null,
+        }))
+        .expect("a commit as the snapshot query answers with it")
+    }
+
+    /// GraphQL's view of an open pull request authored by the Dependabot app (which
+    /// GraphQL reports as the `Bot` named `dependabot`, where REST says
+    /// `dependabot[bot]`), at [`HEAD_SHA`].
+    fn pull_request_node() -> Value {
+        json!({
+            "title": "Bump serde from 1.0.1 to 1.0.2",
+            "url": format!("https://github.com/{OWNER}/{REPO}/pull/{NUMBER}"),
+            "state": "OPEN",
+            "author": { "__typename": "Bot", "login": "dependabot" },
+            "createdAt": CREATED_AT,
+            "updatedAt": UPDATED_AT,
+            "mergeStateStatus": "CLEAN",
+            "headRefOid": HEAD_SHA,
+            "labels": { "nodes": [{ "name": "dependencies" }, { "name": "rust" }] },
+            "commits": { "nodes": [{ "commit": { "oid": HEAD_SHA, "message": "Bump serde from 1.0.1 to 1.0.2" } }] },
+        })
+    }
+
+    fn pull(node: Value) -> PullRequestNode {
+        serde_json::from_value(node).expect("a pull request as the snapshot query answers with it")
+    }
+
+    /// The expected record is the one the REST-backed client produced for this pull
+    /// request before snapshots moved to GraphQL; the pull request as GraphQL describes
+    /// it, with what its checks signalled, must project to it unchanged.
+    #[test]
+    fn a_single_dependency_pull_request_projects_to_its_record() {
+        let pull = pull(pull_request_node());
+        let head = head_commit(
+            "Bump serde from 1.0.1 to 1.0.2\n\n---\nupdated-dependencies:\n- dependency-name: serde\n  dependency-type: direct:production\n  update-type: version-update:semver-patch\n...",
+        );
+
+        let record = project_snapshot(
+            &sync_request(),
+            INSTALLATION_ID,
+            &pull,
+            &head,
+            [CheckSignal::Pass, CheckSignal::Pass],
+            SYNCED_AT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            record,
+            PrRecord {
+                id: "7#9".to_owned(),
+                repository_id: REPOSITORY_ID,
+                installation_id: INSTALLATION_ID,
+                owner: OWNER.to_owned(),
+                repo: REPO.to_owned(),
+                number: NUMBER,
+                title: "Bump serde from 1.0.1 to 1.0.2".to_owned(),
+                html_url: format!("https://github.com/{OWNER}/{REPO}/pull/{NUMBER}"),
+                dependency: Some("serde".to_owned()),
+                from_version: Some("1.0.1".to_owned()),
+                to_version: Some("1.0.2".to_owned()),
+                dependencies: vec![DependencyUpdate {
+                    name: "serde".to_owned(),
+                    from_version: Some("1.0.1".to_owned()),
+                    to_version: Some("1.0.2".to_owned()),
+                    update_type: UpdateType::Patch,
+                }],
+                update_type: UpdateType::Patch,
+                head_sha: HEAD_SHA.to_owned(),
+                check_status: CheckStatus::Success,
+                mergeable: Mergeable::Clean,
+                labels: vec!["dependencies".to_owned(), "rust".to_owned()],
+                created_at: unix(CREATED_AT),
+                updated_at: unix(UPDATED_AT),
+                synced_at: SYNCED_AT,
+            }
+        );
+    }
+
+    #[test]
+    fn a_grouped_pull_request_keeps_every_dependency_and_leaves_the_scalar_columns_empty() {
+        let mut node = pull_request_node();
+        node["title"] = json!("Bump the cargo group with 2 updates");
+        node["mergeStateStatus"] = json!("BEHIND");
+        let pull = pull(node);
+        let head = head_commit(
+            "Bump the cargo group with 2 updates\n\n---\nupdated-dependencies:\n- dependency-name: tokio\n  update-type: version-update:semver-minor\n- dependency-name: serde\n  update-type: version-update:semver-major\n...",
+        );
+
+        // The head's one signal is a suite that failed to start, with no run to show for it.
+        let record = project_snapshot(
+            &sync_request(),
+            INSTALLATION_ID,
+            &pull,
+            &head,
+            [CheckSignal::Fail],
+            SYNCED_AT,
+        )
+        .unwrap();
+
+        assert_eq!(record.dependency, None);
+        assert_eq!(record.from_version, None);
+        assert_eq!(record.to_version, None);
+        assert_eq!(
+            record
+                .dependencies
+                .iter()
+                .map(|dependency| dependency.name.as_str())
+                .collect::<Vec<_>>(),
+            ["tokio", "serde"]
+        );
+        assert_eq!(record.update_type, UpdateType::Major);
+        assert_eq!(record.check_status, CheckStatus::Failure);
+        assert_eq!(record.mergeable, Mergeable::Behind);
+    }
+
+    /// Only an open pull request of the Dependabot app is one the dashboard projects. A
+    /// user account named `dependabot` is not the app: only GraphQL's `Bot` maps onto
+    /// REST's `dependabot[bot]`. A pull request whose author no longer exists has none.
+    #[test]
+    fn only_an_open_pull_request_of_the_dependabot_app_is_one_to_project() {
+        assert!(pull(pull_request_node()).is_open_dependabot_pull());
+
+        for author in [
+            json!({ "__typename": "User", "login": "octocat" }),
+            json!({ "__typename": "User", "login": "dependabot" }),
+            Value::Null,
+        ] {
+            let mut node = pull_request_node();
+            node["author"] = author.clone();
+            assert!(!pull(node).is_open_dependabot_pull(), "author {author}");
+        }
+        for state in ["CLOSED", "MERGED"] {
+            let mut node = pull_request_node();
+            node["state"] = json!(state);
+            assert!(!pull(node).is_open_dependabot_pull(), "state {state}");
+        }
     }
 }
