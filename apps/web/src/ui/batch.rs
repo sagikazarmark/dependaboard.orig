@@ -26,7 +26,7 @@ use dependaboard_core::{
 
 use crate::api::{load_batch_progress, load_batch_projection, submit_batch};
 use crate::ui::dashboard_state::DashboardState;
-use crate::ui::{Fault, POLL_INTERVAL, logged_fault, sleep};
+use crate::ui::{Fault, POLL_INTERVAL, sleep};
 
 /// How many times a submission is tried, one poll interval apart, before the
 /// batch is reported as not submitted — unless the server refuses the
@@ -87,24 +87,20 @@ pub(crate) trait AttachGateway: BatchGateway {
 }
 
 /// A batch known by id alone, followed through the server functions, on the
-/// page whose line to the server `state` carries.
+/// page whose line to the server `state` carries. A page the server has
+/// already refused — the live refresh's poll got the 401 — is not asked on
+/// behalf of: each call goes through [`DashboardState::guarded`], which
+/// hands it the refusal as if it had asked.
 pub(crate) struct ServerFollow {
     pub(crate) batch_id: String,
     pub(crate) state: DashboardState,
 }
 
 impl BatchGateway for ServerFollow {
-    /// A page the server has already refused — the live refresh's poll got
-    /// the 401 — is not asked on behalf of: the answer would be the same
-    /// refusal, with a credential prompt for it, so the follow is handed the
-    /// refusal as if it had asked.
     async fn progress(&mut self) -> Result<Option<BatchProgress>, Fault> {
-        if self.state.signed_out() {
-            return Err(Fault::SignedOut);
-        }
-        load_batch_progress(self.batch_id.clone())
+        self.state
+            .guarded(|| load_batch_progress(self.batch_id.clone()))
             .await
-            .map_err(|error| logged_fault(&error))
     }
 
     async fn tick(&mut self) {
@@ -117,15 +113,10 @@ impl BatchGateway for ServerFollow {
 }
 
 impl AttachGateway for ServerFollow {
-    /// Not asked from a page the server has already refused, as
-    /// [`ServerFollow::progress`] does not ask from one.
     async fn projected(&mut self) -> Result<Option<ProjectedBatch>, Fault> {
-        if self.state.signed_out() {
-            return Err(Fault::SignedOut);
-        }
-        load_batch_projection(self.batch_id.clone())
+        self.state
+            .guarded(|| load_batch_projection(self.batch_id.clone()))
             .await
-            .map_err(|error| logged_fault(&error))
     }
 }
 
@@ -157,20 +148,19 @@ impl BatchGateway for ServerBatch {
 
 impl SubmitGateway for ServerBatch {
     /// Not submitted from a page the server has already refused, as
-    /// [`ServerFollow::progress`] does not ask from one.
+    /// [`ServerFollow`] does not ask from one.
     async fn submit(&mut self) -> Result<BatchReceipt, Fault> {
-        if self.follow.state.signed_out() {
-            return Err(Fault::SignedOut);
-        }
-        let targets = self.targets.iter().map(SubmittedTarget::from).collect();
-        submit_batch(
-            self.follow.batch_id.clone(),
-            self.action,
-            targets,
-            self.retried_from.clone(),
-        )
-        .await
-        .map_err(|error| logged_fault(&error))
+        self.follow
+            .state
+            .guarded(|| {
+                submit_batch(
+                    self.follow.batch_id.clone(),
+                    self.action,
+                    self.targets.iter().map(SubmittedTarget::from).collect(),
+                    self.retried_from.clone(),
+                )
+            })
+            .await
     }
 }
 

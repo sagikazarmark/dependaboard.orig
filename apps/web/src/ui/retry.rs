@@ -243,7 +243,7 @@ mod tests {
     use dependaboard_core::{ActionOutcome, BulkActionKind, PrKey, RejectReason};
 
     use super::*;
-    use crate::ui::test_support::{grouped_row, off_page_row, serde_row};
+    use crate::ui::test_support::{grouped_row, half_done_merge, off_page_row, serde_row};
     use crate::ui::{Fault, PendingAction, pr_target};
 
     /// A server whose answer to each target's refresh is scripted by key, and
@@ -572,7 +572,10 @@ mod tests {
     /// The offer follows the same rule as the refresh: a finished batch with
     /// a rejection a fresh attempt can cure has one; a batch whose rejections
     /// are all over the configuration, or all of pull requests no longer
-    /// open, has none.
+    /// open, has none. Nor has a batch still running, whatever it has
+    /// rejected so far, or one that finished with a target failed and none
+    /// rejected: a failure was the round trip's, not the request's, and is
+    /// not what the retry is for.
     #[test]
     fn a_retry_is_offered_only_for_rejections_a_fresh_attempt_can_cure() {
         fn finished_with(reason: RejectReason) -> BatchProgress {
@@ -593,6 +596,32 @@ mod tests {
         assert!(
             !can_retry(&finished_with(RejectReason::NoUserToken)),
             "a rebase without a user token is refused the same way every time"
+        );
+
+        let targets = [pr_target(&serde_row()), pr_target(&off_page_row())];
+        let mut running = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
+        running.record(
+            &targets[0].key(),
+            ActionOutcome::Rejected {
+                reason: RejectReason::NotMergeable,
+            },
+        );
+        assert!(!running.completed);
+        assert!(
+            !can_retry(&running),
+            "a batch still running is not offered a retry yet"
+        );
+
+        let mut failed = half_done_merge();
+        failed.record_failure(
+            &pr_target(&serde_row()).key(),
+            "GitHub mutation failed with HTTP 500",
+        );
+        assert!(failed.completed);
+        assert!(
+            !can_retry(&failed),
+            "a failed target is not a rejected one, and a batch with nothing rejected has \
+             nothing to retry"
         );
     }
 

@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use dependaboard_core::{Capabilities, DashboardPage, DashboardSummary, PrFilter, PrRecord};
 use dioxus::prelude::*;
 
-use crate::ui::{repository_count, user_facing};
+use crate::ui::{Fault, logged_fault, repository_count, user_facing};
 
 /// What the dashboard has heard from the read model in answer to one
 /// question.
@@ -250,9 +250,28 @@ impl DashboardState {
     /// Whether the server has refused the credentials the page holds, as any
     /// poll found. Nothing that would ask the server is done on a page that
     /// is: the answer would be the same refusal, and a credential prompt for
-    /// it, until the page is reloaded.
+    /// it, until the page is reloaded. [`guarded`](Self::guarded) is how a
+    /// call keeps to that.
     pub(crate) fn signed_out(&self) -> bool {
         self.connection() == Connection::SignedOut
+    }
+
+    /// Makes `call` to the server on the page's behalf, unless the page is
+    /// [`signed_out`](Self::signed_out): then the call is not made, and is
+    /// handed the refusal it would have met as if it had been. What a made
+    /// call comes back with is passed on, a failure read for what it says
+    /// about the line to the server and put on the log in full, as
+    /// [`logged_fault`] does. The gateways that follow a batch, submit one,
+    /// or sync a pull request from a page all go through here, so the rule
+    /// about a signed-out page is written once for them.
+    pub(crate) async fn guarded<T, Fut>(self, call: impl FnOnce() -> Fut) -> Result<T, Fault>
+    where
+        Fut: Future<Output = Result<T, ServerFnError>>,
+    {
+        if self.signed_out() {
+            return Err(Fault::SignedOut);
+        }
+        call().await.map_err(|error| logged_fault(&error))
     }
 
     /// When a poll was last answered, in Unix seconds; `None` before the
@@ -520,8 +539,11 @@ pub(crate) fn use_dashboard() -> DashboardState {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
+    use std::cell::Cell;
+
     use dependaboard_core::CheckStatus;
     use dioxus::core::consume_context_from_scope;
+    use futures_util::FutureExt;
 
     use super::*;
     use crate::ui::test_support::{
@@ -626,6 +648,51 @@ mod tests {
             state.poll_answered(FIXTURE_NOW + 60);
             assert_eq!(state.connection(), Connection::Online);
             assert_eq!(state.refreshed_at(), Some(FIXTURE_NOW + 60));
+        });
+    }
+
+    /// A page the server has refused is not asked on behalf of: a call made
+    /// through the state is handed the refusal without being made, since
+    /// making it would be refused the same, with a credential prompt for
+    /// it. Once a poll is answered the call is made, and what it comes back
+    /// with — the answer, or the fault a failed call reads as — is passed on.
+    #[test]
+    fn a_signed_out_page_refuses_a_server_call_without_making_it() {
+        let (dom, mut state) = mount();
+
+        dom.in_runtime(|| {
+            let calls = Cell::new(0);
+            let call = || {
+                calls.set(calls.get() + 1);
+                async { Ok::<_, ServerFnError>("answered") }
+            };
+
+            state.poll_missed(Connection::SignedOut);
+            let refused = state.guarded(&call).now_or_never();
+            assert_eq!(refused, Some(Err(Fault::SignedOut)));
+            assert_eq!(calls.get(), 0, "the call is not made");
+
+            state.poll_answered(FIXTURE_NOW);
+            let answered = state.guarded(&call).now_or_never();
+            assert_eq!(answered, Some(Ok("answered")));
+            assert_eq!(calls.get(), 1, "the call is made once the line is back");
+
+            let failed = state
+                .guarded(|| async {
+                    Err::<&str, _>(ServerFnError::ServerError {
+                        message: "The read model is unavailable".to_owned(),
+                        code: 500,
+                        details: None,
+                    })
+                })
+                .now_or_never();
+            assert_eq!(
+                failed,
+                Some(Err(Fault::Refused(
+                    "The read model is unavailable".to_owned()
+                ))),
+                "a call that fails is read for what it says about the line"
+            );
         });
     }
 

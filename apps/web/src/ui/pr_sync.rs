@@ -18,7 +18,7 @@ use dependaboard_core::{PrKey, PrRecord, PrState};
 
 use crate::api::{load_pr_projection, load_pr_status, request_pr_sync};
 use crate::ui::dashboard_state::DashboardState;
-use crate::ui::{Fault, POLL_INTERVAL, logged_fault, sleep};
+use crate::ui::{Fault, POLL_INTERVAL, sleep};
 
 /// How long a manual sync is waited for before it is given up on.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -44,9 +44,9 @@ pub(crate) trait SyncGateway {
 
 /// The sync of the pull request `key` names through the server functions,
 /// on the page whose line to the server `state` carries. A page the server
-/// has already refused — a poll got the 401 — is not asked on behalf of: the
-/// answer would be the same refusal, with a credential prompt for it, so
-/// each call is handed the refusal as if it had asked.
+/// has already refused — a poll got the 401 — is not asked on behalf of:
+/// each call goes through [`DashboardState::guarded`], which hands it the
+/// refusal as if it had asked.
 pub(crate) struct ServerSync {
     pub(crate) key: PrKey,
     pub(crate) state: DashboardState,
@@ -54,30 +54,21 @@ pub(crate) struct ServerSync {
 
 impl SyncGateway for ServerSync {
     async fn request(&mut self) -> Result<String, Fault> {
-        if self.state.signed_out() {
-            return Err(Fault::SignedOut);
-        }
-        request_pr_sync(self.key.repository_id, self.key.number)
+        self.state
+            .guarded(|| request_pr_sync(self.key.repository_id, self.key.number))
             .await
-            .map_err(|error| logged_fault(&error))
     }
 
     async fn status(&mut self) -> Result<Option<PrState>, Fault> {
-        if self.state.signed_out() {
-            return Err(Fault::SignedOut);
-        }
-        load_pr_status(self.key.repository_id, self.key.number)
+        self.state
+            .guarded(|| load_pr_status(self.key.repository_id, self.key.number))
             .await
-            .map_err(|error| logged_fault(&error))
     }
 
     async fn projection(&mut self) -> Result<Option<PrRecord>, Fault> {
-        if self.state.signed_out() {
-            return Err(Fault::SignedOut);
-        }
-        load_pr_projection(self.key.repository_id, self.key.number)
+        self.state
+            .guarded(|| load_pr_projection(self.key.repository_id, self.key.number))
             .await
-            .map_err(|error| logged_fault(&error))
     }
 
     async fn tick(&mut self) {
