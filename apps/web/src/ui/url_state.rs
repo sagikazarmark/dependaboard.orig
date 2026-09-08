@@ -1,7 +1,10 @@
 //! The dashboard state the URL carries: the filter in force, the page cursor,
 //! the open pull request, and the batch being followed. A URL names a state,
 //! and a state has one URL, so a view can be shared and survives a refresh —
-//! and so does following a batch, which is what the batch is there for.
+//! and so does following a batch, which is what the batch is there for. A
+//! state also says what reaching it does to the browser history: whether it
+//! is an entry of its own, takes the current one's place, or is where the
+//! browser already is.
 
 use std::str::FromStr;
 
@@ -16,6 +19,17 @@ pub(crate) struct UrlState {
     /// The id of the batch the dashboard follows, so a reload follows it
     /// again and a link to it can be shared.
     pub(crate) batch: Option<String>,
+}
+
+/// How a state the dashboard has reached goes into the browser history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HistoryMove {
+    /// The browser is already at this state's address.
+    Stay,
+    /// The state takes the current entry's place.
+    Replace,
+    /// The state is an entry of its own, with the current one behind it.
+    Push,
 }
 
 // The query parameters, in the order the route lists them.
@@ -111,12 +125,38 @@ impl UrlState {
         }
     }
 
+    /// What reaching this state does to the browser history, given the
+    /// address the browser is at and whether the drawer has just given up
+    /// reading the pull request it was opened on.
+    ///
+    /// A state the address already names is where the browser is; an address
+    /// that carried values the dashboard dropped, or in another order, is
+    /// tidied in place. A pull request that could not be read, a search text
+    /// refined, or a batch followed or given up takes the current entry's
+    /// place: an entry back would fail the same way, step through what was
+    /// typed, or put a running batch down. Any other change is a move of its
+    /// own.
+    pub(crate) fn history_move(&self, current_route: &str, gave_up: bool) -> HistoryMove {
+        let previous = Self::from_route(current_route);
+        if *self == previous {
+            if self.to_route() == current_route {
+                HistoryMove::Stay
+            } else {
+                HistoryMove::Replace
+            }
+        } else if gave_up || self.refines_search_of(&previous) || self.same_view_as(&previous) {
+            HistoryMove::Replace
+        } else {
+            HistoryMove::Push
+        }
+    }
+
     /// Whether this state should take the place of `previous` in the browser
     /// history rather than follow it. Refining the search text does: it
     /// arrives a debounced word at a time, and back should return to before
     /// the search, not step through it. Starting or clearing the search, and
     /// any other change, is a move of its own.
-    pub(crate) fn refines_search_of(&self, previous: &Self) -> bool {
+    fn refines_search_of(&self, previous: &Self) -> bool {
         if self.filter.query.is_none() || previous.filter.query.is_none() {
             return false;
         }
@@ -135,7 +175,7 @@ impl UrlState {
     /// dashboard follows rides along with the view rather than being a move
     /// of its own: the pill is over every page, and back should not put a
     /// running batch down.
-    pub(crate) fn same_view_as(&self, other: &Self) -> bool {
+    fn same_view_as(&self, other: &Self) -> bool {
         Self {
             batch: other.batch.clone(),
             ..self.clone()
@@ -302,6 +342,126 @@ mod tests {
                 ..PrFilter::default()
             },
             ..UrlState::default()
+        }
+    }
+
+    fn failing_checks() -> UrlState {
+        UrlState {
+            filter: PrFilter {
+                check_statuses: vec![CheckStatus::Failure],
+                ..PrFilter::default()
+            },
+            ..UrlState::default()
+        }
+    }
+
+    /// Whether a state the dashboard has reached is a new history entry,
+    /// takes the last one's place, or is where the browser already is. Each
+    /// row is the address the browser is at, the state the dashboard is in
+    /// now, and whether the drawer has just given a pull request up.
+    #[test]
+    fn a_history_move_is_decided_from_the_address_and_the_state() {
+        let failing = failing_checks();
+        let following = UrlState {
+            batch: Some(BATCH.to_owned()),
+            ..failing.clone()
+        };
+        let followed_address = format!("/?check=failure&batch={BATCH}");
+        let tidied = UrlState {
+            filter: PrFilter {
+                update_types: vec![UpdateType::Major],
+                check_statuses: vec![CheckStatus::Failure],
+                ..PrFilter::default()
+            },
+            ..UrlState::default()
+        };
+
+        let table = [
+            (
+                "the address already names the state",
+                "/?check=failure",
+                failing.clone(),
+                false,
+                HistoryMove::Stay,
+            ),
+            (
+                "back from a search, once the dashboard has followed",
+                "/",
+                UrlState::default(),
+                false,
+                HistoryMove::Stay,
+            ),
+            (
+                "a link with stray values is tidied",
+                "/?utm_source=slack&type=huge&check=failure&type=major",
+                tidied,
+                false,
+                HistoryMove::Replace,
+            ),
+            (
+                "a facet is a move of its own",
+                "/",
+                failing.clone(),
+                false,
+                HistoryMove::Push,
+            ),
+            (
+                "starting a search",
+                "/",
+                searching("ser"),
+                false,
+                HistoryMove::Push,
+            ),
+            (
+                "refining a search",
+                "/?q=ser",
+                searching("serde"),
+                false,
+                HistoryMove::Replace,
+            ),
+            (
+                "clearing a search",
+                "/?q=serde",
+                UrlState::default(),
+                false,
+                HistoryMove::Push,
+            ),
+            (
+                "closing a drawer that opened",
+                "/?check=failure&pr=7%239",
+                failing.clone(),
+                false,
+                HistoryMove::Push,
+            ),
+            (
+                "a pull request that could not be read",
+                "/?check=failure&pr=7%239",
+                failing.clone(),
+                true,
+                HistoryMove::Replace,
+            ),
+            (
+                "following a batch",
+                "/?check=failure",
+                following,
+                false,
+                HistoryMove::Replace,
+            ),
+            (
+                "giving a batch up",
+                followed_address.as_str(),
+                failing,
+                false,
+                HistoryMove::Replace,
+            ),
+        ];
+
+        for (case, current_route, next, gave_up, expected) in table {
+            assert_eq!(
+                next.history_move(current_route, gave_up),
+                expected,
+                "{case}"
+            );
         }
     }
 

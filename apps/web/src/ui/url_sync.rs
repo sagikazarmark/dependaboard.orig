@@ -17,7 +17,7 @@ use dioxus::prelude::*;
 use crate::ui::batch::Followed;
 use crate::ui::dashboard_state::DashboardState;
 use crate::ui::detail_drawer::OpenPr;
-use crate::ui::url_state::UrlState;
+use crate::ui::url_state::{HistoryMove, UrlState};
 
 /// The state the URL named when the dashboard opened. Read once, so the
 /// signals can start from it and the first render asks the read model for
@@ -90,7 +90,8 @@ pub(crate) fn use_url_sync(
 
     // The browser follows the dashboard. Whether the open pull request was
     // still being read the last time round is remembered, because a drawer
-    // that never opened leaves no entry to go back to.
+    // that never opened leaves no entry to go back to. Which kind of move a
+    // state is, is the state's to say; this effect only makes it.
     let mut was_loading = use_hook(|| CopyValue::new(false));
     use_effect(move || {
         let open = detail.read();
@@ -103,23 +104,10 @@ pub(crate) fn use_url_sync(
         };
         drop(open);
         let gave_up = was_loading.replace(loading) && next.pr.is_none();
-        let current = history.current_route();
-        let previous = UrlState::from_route(&current);
-        let route = next.to_route();
-        if next == previous {
-            // The browser is already here. A link that carried values the
-            // dashboard dropped, or in another order, is tidied in place.
-            if route != current {
-                history.replace(route);
-            }
-        } else if gave_up || next.refines_search_of(&previous) || next.same_view_as(&previous) {
-            // The linked pull request could not be read, the search text was
-            // refined, or only the followed batch differs: an entry back would
-            // fail the same way, step through what was typed, or put a running
-            // batch down, so this state takes the last one's place.
-            history.replace(route);
-        } else {
-            history.push(route);
+        match next.history_move(&history.current_route(), gave_up) {
+            HistoryMove::Stay => {}
+            HistoryMove::Replace => history.replace(next.to_route()),
+            HistoryMove::Push => history.push(next.to_route()),
         }
     });
 }
@@ -147,12 +135,14 @@ mod tests {
     #[derive(Clone, Copy)]
     struct Adopted(Signal<Vec<String>>);
 
-    /// A browser history: in memory, and firing `popstate` — the callback
-    /// given to [`History::updater`] — when it goes back or forward, as the
-    /// browser does and [`MemoryHistory`] alone does not.
+    /// A browser history: in memory, firing `popstate` — the callback given
+    /// to [`History::updater`] — when it goes back or forward, as the browser
+    /// does and [`MemoryHistory`] alone does not, and keeping the moves the
+    /// dashboard made on it.
     struct TestHistory {
         memory: MemoryHistory,
         on_pop: RefCell<Option<Arc<dyn Fn() + Send + Sync>>>,
+        moves: RefCell<Vec<(HistoryMove, String)>>,
     }
 
     impl TestHistory {
@@ -160,6 +150,7 @@ mod tests {
             Rc::new(Self {
                 memory: MemoryHistory::with_initial_path(route),
                 on_pop: RefCell::new(None),
+                moves: RefCell::new(Vec::new()),
             })
         }
 
@@ -167,6 +158,11 @@ mod tests {
             if let Some(on_pop) = &*self.on_pop.borrow() {
                 on_pop();
             }
+        }
+
+        /// The pushes and replacements made on the history, in order.
+        fn moves(&self) -> Vec<(HistoryMove, String)> {
+            self.moves.borrow().clone()
         }
     }
 
@@ -194,10 +190,16 @@ mod tests {
         }
 
         fn push(&self, route: String) {
+            self.moves
+                .borrow_mut()
+                .push((HistoryMove::Push, route.clone()));
             self.memory.push(route);
         }
 
         fn replace(&self, route: String) {
+            self.moves
+                .borrow_mut()
+                .push((HistoryMove::Replace, route.clone()));
             self.memory.replace(route);
         }
 
@@ -358,53 +360,44 @@ mod tests {
         assert!(!mounted.history.can_go_back());
     }
 
-    /// A link may carry values the dashboard drops, or list them in another
-    /// order. The dashboard opens on what is left, and tidies the address bar
-    /// to say the same, without an entry to go back to.
+    /// Each kind of move reaches the browser: a state the address already
+    /// names leaves the history alone, one that takes the current entry's
+    /// place is replaced, and a move of the dashboard's own is pushed. The
+    /// one input the effect works out itself — that the drawer has just given
+    /// up the pull request it was opened on — is worked out across two runs.
     #[test]
-    fn a_link_with_stray_values_is_tidied_in_place() {
-        let mounted = Mounted::at("/?utm_source=slack&type=huge&check=failure&type=major");
-
-        assert_eq!(
-            mounted.filter(),
-            PrFilter {
-                update_types: vec![UpdateType::Major],
-                check_statuses: vec![CheckStatus::Failure],
-                ..PrFilter::default()
-            }
-        );
-        assert_eq!(mounted.route(), "/?type=major&check=failure");
-        assert!(!mounted.history.can_go_back());
-    }
-
-    /// Each move the dashboard makes — a facet, the next page, a drawer —
-    /// takes the browser to the matching address, with the last one behind it.
-    #[test]
-    fn the_dashboards_moves_reach_the_address_bar() {
-        let mut mounted = Mounted::at("/");
-
-        mounted.act(|state, _| {
-            state.toggle_filter(|filter| &mut filter.check_statuses, CheckStatus::Failure)
-        });
-        assert_eq!(mounted.route(), "/?check=failure");
-        assert!(mounted.history.can_go_back());
-
-        mounted.act(|state, _| state.load_next(cursor()));
-        assert_eq!(
-            mounted.route(),
-            format!("/?check=failure&after={}", cursor())
-        );
-
-        mounted.act(|_, detail| detail.set(Some(OpenPr::from(grouped_row()))));
-        assert_eq!(
-            mounted.route(),
-            format!("/?check=failure&after={}&pr=7%239", cursor())
+    fn each_history_move_reaches_the_browser() {
+        let mut mounted = Mounted::at("/?check=failure&pr=7%239");
+        assert!(
+            mounted.history.moves().is_empty(),
+            "the address already names the state"
         );
 
         mounted.act(|_, detail| detail.set(None));
         assert_eq!(
+            mounted.history.moves(),
+            [(HistoryMove::Replace, "/?check=failure".to_owned())],
+            "the pull request could not be read"
+        );
+
+        mounted.act(|state, _| {
+            state.toggle_filter(|filter| &mut filter.update_types, UpdateType::Major)
+        });
+        mounted.follow(Some(BATCH));
+        assert_eq!(
+            mounted.history.moves(),
+            [
+                (HistoryMove::Replace, "/?check=failure".to_owned()),
+                (HistoryMove::Push, "/?type=major&check=failure".to_owned()),
+                (
+                    HistoryMove::Replace,
+                    format!("/?type=major&check=failure&batch={BATCH}")
+                ),
+            ]
+        );
+        assert_eq!(
             mounted.route(),
-            format!("/?check=failure&after={}", cursor())
+            format!("/?type=major&check=failure&batch={BATCH}")
         );
     }
 
@@ -469,35 +462,6 @@ mod tests {
         assert_eq!(mounted.route(), "/?pr=7%239");
     }
 
-    /// Typing reaches the filter a debounced word at a time. Back from a
-    /// search returns to before it, not to what was typed along the way.
-    #[test]
-    fn back_from_a_search_returns_to_before_it() {
-        let mut mounted = Mounted::at("/");
-        mounted.act(|state, _| state.update_filter(|filter| filter.query = Some("ser".to_owned())));
-        mounted
-            .act(|state, _| state.update_filter(|filter| filter.query = Some("serde".to_owned())));
-        assert_eq!(mounted.route(), "/?q=serde");
-
-        mounted.history.go_back();
-        mounted.settle();
-
-        assert_eq!(mounted.route(), "/");
-        assert_eq!(mounted.filter().query, None);
-    }
-
-    /// A link may name a pull request that has since gone, or cannot be read.
-    /// The drawer gives it up before it ever opened, and the address is set
-    /// right in place: an entry back would only fail the same way again.
-    #[test]
-    fn a_link_to_a_pull_request_that_cannot_be_read_leaves_no_entry_behind() {
-        let mut mounted = Mounted::at("/?check=failure&pr=7%239");
-
-        mounted.act(|_, detail| detail.set(None));
-
-        assert_eq!(mounted.route(), "/?check=failure");
-        assert!(!mounted.history.can_go_back());
-    }
     /// A reload keeps the batch: the dashboard opens following the batch its
     /// URL names, by id, before Restate has said a word about it.
     #[test]
@@ -509,23 +473,6 @@ mod tests {
         assert_eq!(mounted.filter().check_statuses, vec![CheckStatus::Failure]);
         assert_eq!(mounted.route(), format!("/?check=failure&batch={BATCH}"));
         assert!(!mounted.history.can_go_back());
-    }
-
-    /// Queuing a batch puts it in the address bar, so a reload finds it, but
-    /// leaves no entry behind: the pill is over the page, not a page of its
-    /// own, and back should not put a running batch down.
-    #[test]
-    fn following_a_batch_reaches_the_address_bar_without_an_entry() {
-        let mut mounted = Mounted::at("/?check=failure");
-
-        mounted.follow(Some(BATCH));
-
-        assert_eq!(mounted.route(), format!("/?check=failure&batch={BATCH}"));
-        assert!(!mounted.history.can_go_back());
-        assert!(
-            mounted.adopted().is_empty(),
-            "the dashboard's own batch is not told back to it"
-        );
     }
 
     /// The batch a dashboard follows rides along through its history: back
@@ -570,18 +517,6 @@ mod tests {
             [BATCH],
             "adopted once, when the page opened"
         );
-    }
-
-    /// A batch given up — Restate had no progress for it — leaves the address
-    /// bar in place: an entry back would only find nothing again.
-    #[test]
-    fn giving_a_batch_up_leaves_no_entry_behind() {
-        let mut mounted = Mounted::at(&format!("/?check=failure&batch={BATCH}"));
-
-        mounted.follow(None);
-
-        assert_eq!(mounted.route(), "/?check=failure");
-        assert!(!mounted.history.can_go_back());
     }
 
     /// An address from before a batch was given up still names it. Back to
