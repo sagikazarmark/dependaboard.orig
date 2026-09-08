@@ -1,12 +1,77 @@
-//! Maps projection-store effects onto Restate: how a store write retries and how its
-//! failures read.
+//! Maps projection-store effects onto Restate: how a store step is journaled, how it
+//! retries and how its failures read.
 
 use std::time::Duration;
 
 use dependaboard_store::{StoreError, StoreErrorClass};
 use restate_sdk::prelude::*;
+// Restate's own serde traits, which `ctx.run` journals its result through; not the
+// `serde` crate's, which a journaled value reaches by going through `Json`.
+use restate_sdk::serde::{Deserialize, Serialize};
 
 use crate::handler::RetryableServiceError;
+
+/// A Restate context a store step can be journaled on: the object and workflow contexts,
+/// which are the ones that write the projection.
+///
+/// Every store call a handler makes goes through [`Self::run_store_step`], so none is
+/// journaled without a name to find it by in Restate's UI or a retry policy chosen on
+/// purpose — a bare `ctx.run` would retry under the server's default, indefinitely.
+///
+/// A trait with an impl per context rather than one function over `ContextSideEffects`:
+/// the SDK does not promise its `run` future is `Send`, and a function generic over the
+/// context cannot see through to the future that is, so each impl names its context and
+/// lets the compiler look.
+pub(crate) trait StoreStepContext<'ctx> {
+    /// Journals one store step under `name`, retried under `policy`.
+    ///
+    /// The caller picks the policy by name: [`store_retry_policy`] for a write something
+    /// later would redo, [`brief_store_retry_policy`] for a convenience that stands in
+    /// the way of the work, and [`persistent_store_retry_policy`] for the one write
+    /// nothing would redo. `step` says how its own failures read, with [`store_failure`]
+    /// or [`batch_record_failure`]; what it resolves to is journaled, so a value goes
+    /// through [`Json`]. Resolves to what the step did, or the terminal failure Restate
+    /// ends it with once the policy's budget is spent.
+    fn run_store_step<F, T>(
+        &self,
+        name: &'static str,
+        policy: RunRetryPolicy,
+        step: impl FnOnce() -> F + Send + 'ctx,
+    ) -> impl Future<Output = Result<T, TerminalError>> + Send
+    where
+        F: Future<Output = HandlerResult<T>> + Send + 'ctx,
+        T: Serialize + Deserialize + 'static;
+}
+
+impl<'ctx> StoreStepContext<'ctx> for ObjectContext<'ctx> {
+    fn run_store_step<F, T>(
+        &self,
+        name: &'static str,
+        policy: RunRetryPolicy,
+        step: impl FnOnce() -> F + Send + 'ctx,
+    ) -> impl Future<Output = Result<T, TerminalError>> + Send
+    where
+        F: Future<Output = HandlerResult<T>> + Send + 'ctx,
+        T: Serialize + Deserialize + 'static,
+    {
+        self.run(step).retry_policy(policy).name(name)
+    }
+}
+
+impl<'ctx> StoreStepContext<'ctx> for WorkflowContext<'ctx> {
+    fn run_store_step<F, T>(
+        &self,
+        name: &'static str,
+        policy: RunRetryPolicy,
+        step: impl FnOnce() -> F + Send + 'ctx,
+    ) -> impl Future<Output = Result<T, TerminalError>> + Send
+    where
+        F: Future<Output = HandlerResult<T>> + Send + 'ctx,
+        T: Serialize + Deserialize + 'static,
+    {
+        self.run(step).retry_policy(policy).name(name)
+    }
+}
 
 /// Bounded backoff for projection-store writes: SQLite contention, the FK race between a
 /// fresh repository's first webhook and its enumeration, and a remote store's blip — a

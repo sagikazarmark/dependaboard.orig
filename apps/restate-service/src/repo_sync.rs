@@ -13,7 +13,7 @@ use crate::{
     handler::traced,
     pull_request::{PullRequestClient, request_key, short_sha},
     retirement::{RestateRetirements, RetirementEffects, retire_pending},
-    store::{store_failure, store_retry_policy},
+    store::{StoreStepContext, store_failure, store_retry_policy},
 };
 
 /// Side effects a repository reconcile asks of Restate, GitHub and the store, abstracted
@@ -90,15 +90,17 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
         let reconcile_start = self.reconcile_start;
         let live = live.to_vec();
         self.ctx
-            .run(move || async move {
-                store
-                    .retain_prs(repository_id, &live, reconcile_start)
-                    .await
-                    .map_err(store_failure)?;
-                Ok(())
-            })
-            .retry_policy(store_retry_policy())
-            .name("retain-live-pull-requests")
+            .run_store_step(
+                "retain-live-pull-requests",
+                store_retry_policy(),
+                move || async move {
+                    store
+                        .retain_prs(repository_id, &live, reconcile_start)
+                        .await
+                        .map(drop)
+                        .map_err(store_failure)
+                },
+            )
             .await?;
         Ok(())
     }
@@ -203,16 +205,17 @@ impl RepoSync {
             let repository_id = request.repository_id;
             let sha = request.sha.clone();
             let matches = ctx
-                .run(move || async move {
-                    Ok(Json::from(
+                .run_store_step(
+                    "resolve-prs-for-sha",
+                    store_retry_policy(),
+                    move || async move {
                         store
                             .prs_for_sha(repository_id, &sha)
                             .await
-                            .map_err(store_failure)?,
-                    ))
-                })
-                .retry_policy(store_retry_policy())
-                .name("resolve-prs-for-sha")
+                            .map(Json::from)
+                            .map_err(store_failure)
+                    },
+                )
                 .await?;
             let mut numbers = request
                 .pull_requests

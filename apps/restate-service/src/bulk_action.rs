@@ -16,8 +16,8 @@ use crate::{
     handler::{HandlerOutcome, handler_cause, traced, traced_read},
     pull_request::PullRequestClient,
     store::{
-        batch_record_failure, brief_store_retry_policy, persistent_store_retry_policy,
-        store_failure, store_retry_policy,
+        StoreStepContext, batch_record_failure, brief_store_retry_policy,
+        persistent_store_retry_policy, store_failure, store_retry_policy,
     },
 };
 
@@ -204,12 +204,11 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
         let store = self.store.clone();
         let batch = batch.clone();
         self.ctx
-            .run(move || async move {
-                store.start_batch(&batch).await.map_err(store_failure)?;
-                Ok(())
-            })
-            .retry_policy(brief_store_retry_policy())
-            .name("start-batch")
+            .run_store_step(
+                "start-batch",
+                brief_store_retry_policy(),
+                move || async move { store.start_batch(&batch).await.map_err(store_failure) },
+            )
             .await?;
         Ok(())
     }
@@ -218,12 +217,9 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
         let store = self.store.clone();
         let batch_id = self.ctx.key().to_owned();
         self.ctx
-            .run(move || async move {
-                store.unlist_batch(&batch_id).await.map_err(store_failure)?;
-                Ok(())
+            .run_store_step("unlist-batch", store_retry_policy(), move || async move {
+                store.unlist_batch(&batch_id).await.map_err(store_failure)
             })
-            .retry_policy(store_retry_policy())
-            .name("unlist-batch")
             .await?;
         Ok(())
     }
@@ -232,16 +228,17 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
         let store = self.store.clone();
         let record = record.clone();
         self.ctx
-            .run(move || async move {
-                store.record_batch(&record).await.map_err(|error| {
-                    let failure = batch_record_failure(error);
-                    warn_if_record_stuck(&record, unix_seconds(), &handler_cause(&failure));
-                    failure
-                })?;
-                Ok(())
-            })
-            .retry_policy(persistent_store_retry_policy())
-            .name("record-batch")
+            .run_store_step(
+                "record-batch",
+                persistent_store_retry_policy(),
+                move || async move {
+                    store.record_batch(&record).await.map_err(|error| {
+                        let failure = batch_record_failure(error);
+                        warn_if_record_stuck(&record, unix_seconds(), &handler_cause(&failure));
+                        failure
+                    })
+                },
+            )
             .await?;
         Ok(())
     }

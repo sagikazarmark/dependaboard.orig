@@ -13,7 +13,7 @@ use crate::{
     handler::{HandlerOutcome, traced},
     repo_sync::RepoSyncClient,
     retirement::{RestateRetirements, RetirementEffects, retire_pending},
-    store::{store_failure, store_retry_policy},
+    store::{StoreStepContext, store_failure, store_retry_policy},
 };
 
 const SCHEDULER_STARTED: &str = "scheduler_started";
@@ -371,15 +371,17 @@ impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
         let reconcile_start = self.reconcile_start;
         let repositories = repositories.to_vec();
         self.ctx
-            .run(move || async move {
-                store
-                    .replace_installation_repos(installation_id, &repositories, reconcile_start)
-                    .await
-                    .map_err(store_failure)?;
-                Ok(())
-            })
-            .retry_policy(store_retry_policy())
-            .name("replace-installation-repositories")
+            .run_store_step(
+                "replace-installation-repositories",
+                store_retry_policy(),
+                move || async move {
+                    store
+                        .replace_installation_repos(installation_id, &repositories, reconcile_start)
+                        .await
+                        .map(drop)
+                        .map_err(store_failure)
+                },
+            )
             .await?;
         Ok(())
     }
@@ -452,15 +454,17 @@ impl InstallationPurgeEffects for RestatePurgeEffects<'_, '_> {
         let store = self.store.clone();
         let installation_id = self.installation_id;
         self.ctx
-            .run(move || async move {
-                store
-                    .purge_installation(installation_id)
-                    .await
-                    .map_err(store_failure)?;
-                Ok(())
-            })
-            .retry_policy(store_retry_policy())
-            .name("purge-installation")
+            .run_store_step(
+                "purge-installation",
+                store_retry_policy(),
+                move || async move {
+                    store
+                        .purge_installation(installation_id)
+                        .await
+                        .map(drop)
+                        .map_err(store_failure)
+                },
+            )
             .await?;
         Ok(())
     }

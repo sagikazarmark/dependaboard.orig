@@ -19,7 +19,7 @@ use restate_sdk::prelude::*;
 
 use crate::{
     pull_request::{ClosedRequest, close_pull_request},
-    store::{store_failure, store_retry_policy},
+    store::{StoreStepContext, store_failure, store_retry_policy},
 };
 
 /// Side effects draining the outbox asks of Restate and the store, abstracted so
@@ -50,13 +50,17 @@ impl RetirementEffects for RestateRetirements<'_, '_> {
         let store = self.store.clone();
         let pending = self
             .ctx
-            .run(move || async move {
-                Ok(Json::from(
-                    store.pending_retirements().await.map_err(store_failure)?,
-                ))
-            })
-            .retry_policy(store_retry_policy())
-            .name("read-pending-retirements")
+            .run_store_step(
+                "read-pending-retirements",
+                store_retry_policy(),
+                move || async move {
+                    store
+                        .pending_retirements()
+                        .await
+                        .map(Json::from)
+                        .map_err(store_failure)
+                },
+            )
             .await?;
         Ok(pending.into_inner())
     }
@@ -68,15 +72,16 @@ impl RetirementEffects for RestateRetirements<'_, '_> {
     async fn acknowledge_retirements(&mut self, through: u64) -> HandlerResult<()> {
         let store = self.store.clone();
         self.ctx
-            .run(move || async move {
-                store
-                    .acknowledge_retirements(through)
-                    .await
-                    .map_err(store_failure)?;
-                Ok(())
-            })
-            .retry_policy(store_retry_policy())
-            .name("acknowledge-retirements")
+            .run_store_step(
+                "acknowledge-retirements",
+                store_retry_policy(),
+                move || async move {
+                    store
+                        .acknowledge_retirements(through)
+                        .await
+                        .map_err(store_failure)
+                },
+            )
             .await?;
         Ok(())
     }

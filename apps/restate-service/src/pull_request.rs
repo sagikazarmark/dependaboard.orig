@@ -18,7 +18,7 @@ use crate::{
         rejected, run_github_step,
     },
     handler::{HandlerOutcome, traced, traced_read},
-    store::{store_failure, store_retry_policy},
+    store::{StoreStepContext, store_failure, store_retry_policy},
 };
 
 const PR_STATE: &str = "pr_state";
@@ -171,24 +171,22 @@ impl PullRequest {
             let Some(snapshot) = snapshot else {
                 let store = self.store.clone();
                 let key = request_key(&request);
-                ctx.run(move || async move {
-                    store.delete_pr(&key).await.map_err(store_failure)?;
-                    Ok(())
-                })
-                .retry_policy(store_retry_policy())
-                .name("delete-ineligible-pr-projection")
+                ctx.run_store_step(
+                    "delete-ineligible-pr-projection",
+                    store_retry_policy(),
+                    move || async move { store.delete_pr(&key).await.map_err(store_failure) },
+                )
                 .await?;
                 ctx.clear_all();
                 return Ok(SyncOutcome::Deleted);
             };
             let store = self.store.clone();
             let projected = snapshot.clone();
-            ctx.run(move || async move {
-                store.upsert_pr(&projected).await.map_err(store_failure)?;
-                Ok(())
-            })
-            .retry_policy(store_retry_policy())
-            .name("upsert-pr-projection")
+            ctx.run_store_step(
+                "upsert-pr-projection",
+                store_retry_policy(),
+                move || async move { store.upsert_pr(&projected).await.map_err(store_failure) },
+            )
             .await?;
             state.snapshot = Some(snapshot.clone());
             state.last_synced_at = Some(snapshot.synced_at);
@@ -224,12 +222,11 @@ impl PullRequest {
                 return Ok(ClosedOutcome::Kept);
             }
             let store = self.store.clone();
-            ctx.run(move || async move {
-                store.delete_pr(&key).await.map_err(store_failure)?;
-                Ok(())
-            })
-            .retry_policy(store_retry_policy())
-            .name("delete-closed-pr-projection")
+            ctx.run_store_step(
+                "delete-closed-pr-projection",
+                store_retry_policy(),
+                move || async move { store.delete_pr(&key).await.map_err(store_failure) },
+            )
             .await?;
             ctx.clear_all();
             Ok(ClosedOutcome::Retired)
@@ -258,14 +255,16 @@ impl PullRequest {
             let store = self.store.clone();
             let repository_id = request.target.repository_id;
             let merge_method = ctx
-                .run(move || async move {
-                    repository_merge_method(store.as_ref(), repository_id)
-                        .await
-                        .map(Json::from)
-                        .map_err(store_failure)
-                })
-                .retry_policy(store_retry_policy())
-                .name("read-repository-merge-method")
+                .run_store_step(
+                    "read-repository-merge-method",
+                    store_retry_policy(),
+                    move || async move {
+                        repository_merge_method(store.as_ref(), repository_id)
+                            .await
+                            .map(Json::from)
+                            .map_err(store_failure)
+                    },
+                )
                 .await?
                 .into_inner();
             let github = self.github.clone();
@@ -286,12 +285,11 @@ impl PullRequest {
             if matches!(outcome, ActionOutcome::Succeeded { .. }) {
                 let store = self.store.clone();
                 let key = request.target.key();
-                ctx.run(move || async move {
-                    store.delete_pr(&key).await.map_err(store_failure)?;
-                    Ok(())
-                })
-                .retry_policy(store_retry_policy())
-                .name("delete-merged-pr-projection")
+                ctx.run_store_step(
+                    "delete-merged-pr-projection",
+                    store_retry_policy(),
+                    move || async move { store.delete_pr(&key).await.map_err(store_failure) },
+                )
                 .await?;
                 state.snapshot = None;
             }
