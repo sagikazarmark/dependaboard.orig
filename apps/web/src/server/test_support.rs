@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +19,8 @@ use crate::server::router::router;
 use crate::server::state::ServerState;
 use crate::server::webhook::WebhookState;
 
-/// The installation the test dashboard is bound to.
+/// The installation the test backend, and the dashboard served over it, is
+/// bound to.
 pub(crate) const INSTALLATION_ID: u64 = 42;
 pub(crate) const USERNAME: &str = "dependaboard";
 pub(crate) const PASSWORD: &str = "secret";
@@ -119,46 +121,45 @@ pub(crate) async fn fake_restate_ingress() -> (RestateIngress, Arc<Mutex<Vec<For
     (ingress, fake.forwarded)
 }
 
-/// The whole server as a test reaches it over HTTP: the routes as `main`
-/// mounts them, minus the static assets, on loopback; behind them an empty
-/// in-memory read model and a Restate stand-in that records what it is sent
-/// and answers what it is asked with what the test put there.
-pub(crate) struct Dashboard {
-    address: SocketAddr,
-    /// The same store the server reads, held whole so a test can write to it:
-    /// the server holds only the reader half, and the test stands in for the
-    /// Restate service, which does the writing.
+/// What the server functions run against, as a test holds it without a
+/// server: a [`ServerState`] over an empty in-memory read model and a
+/// Restate stand-in that records what it is sent and answers what it is
+/// asked with what the test put there. A server function's body is called
+/// on [`Self::state`] directly; [`Dashboard`] is this served over HTTP.
+pub(crate) struct Backend {
+    state: ServerState,
+    /// The same store the state reads, held whole so a test can write to
+    /// it: the state holds only the reader half, and the test stands in for
+    /// the Restate service, which does the writing.
     store: LibSqlPrStore,
     restate: FakeRestate,
 }
 
-pub(crate) async fn dashboard() -> Dashboard {
+/// A [`Backend`] over a fresh `:memory:` store and a fresh Restate stand-in,
+/// for a test that calls a server function's body and looks at what it read
+/// and sent.
+pub(crate) async fn backend() -> Backend {
     let (ingress, restate) = fake_restate().await;
     let store = LibSqlPrStore::connect(&StoreConfig::local(":memory:"))
         .await
         .unwrap();
     let state = ServerState {
-        ingress: ingress.clone(),
+        ingress,
         store: Arc::new(store.clone()),
         installation_id: INSTALLATION_ID,
     };
-    let credentials = Credentials {
-        username: USERNAME.to_owned(),
-        password: SecretString::from(PASSWORD),
-    };
-    let webhooks = WebhookState::new(&SecretString::from(WEBHOOK_SECRET), ingress);
-    let app = axum::Router::new().serve_api_application(ServeConfig::new(), crate::ui::App);
-    let address = serve(router(app, credentials, state, webhooks)).await;
-    Dashboard {
-        address,
+    Backend {
+        state,
         store,
         restate,
     }
 }
 
-impl Dashboard {
-    pub(crate) fn url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.address)
+impl Backend {
+    /// What a server function's body takes: the state bound to
+    /// [`INSTALLATION_ID`], reading the store and sending to the stand-in.
+    pub(crate) fn state(&self) -> &ServerState {
+        &self.state
     }
 
     /// Every request Restate was sent so far, in order.
@@ -185,7 +186,7 @@ impl Dashboard {
             .insert(format!("{RESTATE_CALL}{path}"), output);
     }
 
-    /// The read model behind the server, for putting there what the Restate
+    /// The read model behind the state, for putting there what the Restate
     /// service would have written; a test writes to it through
     /// [`ProjectionWriter`], as the service does.
     pub(crate) fn store(&self) -> &LibSqlPrStore {
@@ -208,6 +209,46 @@ impl Dashboard {
             .await
             .unwrap();
         self.store.upsert_pr(row).await.unwrap();
+    }
+}
+
+/// The whole server as a test reaches it over HTTP: the routes as `main`
+/// mounts them, minus the static assets, on loopback, over a [`Backend`],
+/// which it derefs to for seeding the store and reading what reached
+/// Restate.
+pub(crate) struct Dashboard {
+    address: SocketAddr,
+    backend: Backend,
+}
+
+/// A [`Dashboard`] over a fresh [`Backend`], for a test that needs the wire:
+/// the auth edge, the origin policy, the route by name, the error envelope.
+pub(crate) async fn dashboard() -> Dashboard {
+    let backend = backend().await;
+    let credentials = Credentials {
+        username: USERNAME.to_owned(),
+        password: SecretString::from(PASSWORD),
+    };
+    let webhooks = WebhookState::new(
+        &SecretString::from(WEBHOOK_SECRET),
+        backend.state.ingress.clone(),
+    );
+    let app = axum::Router::new().serve_api_application(ServeConfig::new(), crate::ui::App);
+    let address = serve(router(app, credentials, backend.state.clone(), webhooks)).await;
+    Dashboard { address, backend }
+}
+
+impl Deref for Dashboard {
+    type Target = Backend;
+
+    fn deref(&self) -> &Backend {
+        &self.backend
+    }
+}
+
+impl Dashboard {
+    pub(crate) fn url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.address)
     }
 
     /// The URL a server function is mounted at. Dioxus suffixes the name with

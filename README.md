@@ -544,7 +544,7 @@ The suite is named by module, so a filterset (`-E`, see `cargo nextest help filt
 | Store | SQLite on a temporary directory | `package(dependaboard-store)` |
 | HTTP mock | A wiremock server on loopback, in the GitHub client's integration tests | `package(dependaboard-github) & kind(test)` |
 | VirtualDom | Dioxus' VirtualDom, in the web UI | `package(dependaboard-web) & test(/^ui::/)` |
-| Sockets | The web server and its API on loopback | `package(dependaboard-web) & (test(/^api::/) + test(/^server::/))` |
+| Sockets | The web server, and the Restate stand-in behind its API, on loopback | `package(dependaboard-web) & (test(/^api::/) + test(/^server::/))` |
 
 The five are a partition: together they are the whole suite, and no test is in two.
 

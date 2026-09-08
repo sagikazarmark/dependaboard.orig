@@ -1,6 +1,13 @@
 //! The server functions the dashboard calls. Compiled on both targets: the
 //! wasm build gets the client stubs, the server build the bodies, which reach
 //! the store and Restate through [`crate::server::state::ServerState`].
+//!
+//! Each `#[server]` function with a body is a one-line adapter over a `*_in`
+//! body that takes the state — and, where it matters, the user — as
+//! arguments, so the body is called in a test without a server, a signed-in
+//! request or the wire's error envelope between the test and what it
+//! asserts. The one exception, [`load_signed_in_user`], has no body: it
+//! answers with what the auth edge extracted.
 
 use dependaboard_core::{
     BatchList, BatchProgress, BatchReceipt, BulkActionKind, Capabilities, DashboardPage,
@@ -26,9 +33,19 @@ pub(crate) async fn load_dashboard(
     filter: PrFilter,
     page: Page,
 ) -> Result<DashboardPage, ServerFnError> {
+    load_dashboard_in(&state, &filter, page).await
+}
+
+/// The body of [`load_dashboard`].
+#[cfg(feature = "server")]
+pub(crate) async fn load_dashboard_in(
+    state: &ServerState,
+    filter: &PrFilter,
+    page: Page,
+) -> Result<DashboardPage, ServerFnError> {
     state
         .store
-        .list_prs(&filter, page)
+        .list_prs(filter, page)
         .await
         .map_err(store_failure)
 }
@@ -36,9 +53,18 @@ pub(crate) async fn load_dashboard(
 /// The facet counts scoped to `filter` and the read model's freshness.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_summary(filter: PrFilter) -> Result<DashboardSummary, ServerFnError> {
+    load_summary_in(&state, &filter).await
+}
+
+/// The body of [`load_summary`].
+#[cfg(feature = "server")]
+pub(crate) async fn load_summary_in(
+    state: &ServerState,
+    filter: &PrFilter,
+) -> Result<DashboardSummary, ServerFnError> {
     state
         .store
-        .dashboard_summary(&filter)
+        .dashboard_summary(filter)
         .await
         .map_err(store_failure)
 }
@@ -52,6 +78,15 @@ pub(crate) async fn load_summary(filter: PrFilter) -> Result<DashboardSummary, S
 /// [`MAX_BATCH_TARGETS`]: dependaboard_core::MAX_BATCH_TARGETS
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_matching(filter: PrFilter) -> Result<DashboardPage, ServerFnError> {
+    load_matching_in(&state, &filter).await
+}
+
+/// The body of [`load_matching`].
+#[cfg(feature = "server")]
+pub(crate) async fn load_matching_in(
+    state: &ServerState,
+    filter: &PrFilter,
+) -> Result<DashboardPage, ServerFnError> {
     let batch = Page {
         limit: u32::try_from(dependaboard_core::MAX_BATCH_TARGETS)
             .expect("the batch limit fits in a page"),
@@ -59,7 +94,7 @@ pub(crate) async fn load_matching(filter: PrFilter) -> Result<DashboardPage, Ser
     };
     state
         .store
-        .list_prs(&filter, batch)
+        .list_prs(filter, batch)
         .await
         .map_err(store_failure)
 }
@@ -71,6 +106,14 @@ pub(crate) async fn load_matching(filter: PrFilter) -> Result<DashboardPage, Ser
 /// its pull requests landing.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_projection_revision() -> Result<ProjectionRevision, ServerFnError> {
+    load_projection_revision_in(&state).await
+}
+
+/// The body of [`load_projection_revision`].
+#[cfg(feature = "server")]
+pub(crate) async fn load_projection_revision_in(
+    state: &ServerState,
+) -> Result<ProjectionRevision, ServerFnError> {
     state
         .store
         .projection_revision()
@@ -81,7 +124,9 @@ pub(crate) async fn load_projection_revision() -> Result<ProjectionRevision, Ser
 /// Who the auth edge let this request through as. The browser holds the
 /// credentials but cannot read them, so this is how the dashboard learns
 /// whose name to show; the answer is the identity a batch will be recorded
-/// under.
+/// under. There is no body to call without a server: the answer is what the
+/// edge extracted, and the test of it is the 401 the edge answers a stale
+/// credential with.
 #[server(user: Extension<UserId>)]
 pub(crate) async fn load_signed_in_user() -> Result<UserId, ServerFnError> {
     Ok(user.0)
@@ -93,6 +138,14 @@ pub(crate) async fn load_signed_in_user() -> Result<UserId, ServerFnError> {
 /// credentials the answer turns on.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_capabilities() -> Result<Capabilities, ServerFnError> {
+    load_capabilities_in(&state).await
+}
+
+/// The body of [`load_capabilities`].
+#[cfg(feature = "server")]
+pub(crate) async fn load_capabilities_in(
+    state: &ServerState,
+) -> Result<Capabilities, ServerFnError> {
     state
         .ingress
         .call("DashboardIngress/capabilities")
@@ -123,8 +176,22 @@ pub(crate) async fn submit_batch(
     targets: Vec<SubmittedTarget>,
     retried_from: Option<String>,
 ) -> Result<BatchReceipt, ServerFnError> {
+    submit_batch_in(&state, user.0, &batch_id, action, targets, retried_from).await
+}
+
+/// The body of [`submit_batch`], for `user`, the identity the auth edge let
+/// the request through as.
+#[cfg(feature = "server")]
+pub(crate) async fn submit_batch_in(
+    state: &ServerState,
+    user: UserId,
+    batch_id: &str,
+    action: BulkActionKind,
+    targets: Vec<SubmittedTarget>,
+    retried_from: Option<String>,
+) -> Result<BatchReceipt, ServerFnError> {
     validate_batch(
-        &batch_id,
+        batch_id,
         retried_from.as_deref(),
         targets.iter().map(SubmittedTarget::key),
     )
@@ -134,7 +201,7 @@ pub(crate) async fn submit_batch(
     let mut left_out = Vec::new();
     for target in targets {
         let key = target.key();
-        let Some(row) = projected_pr(&state, &key).await? else {
+        let Some(row) = projected_pr(state, &key).await? else {
             left_out.push(key);
             continue;
         };
@@ -156,7 +223,7 @@ pub(crate) async fn submit_batch(
     let request = BulkRequest {
         action,
         targets: resolved,
-        user_id: user.0,
+        user_id: user,
         retried_from,
     };
     state
@@ -164,7 +231,7 @@ pub(crate) async fn submit_batch(
         .send(
             &format!("BulkAction/{batch_id}/run"),
             &request,
-            Some(&batch_id),
+            Some(batch_id),
         )
         .await
         .map_err(restate_unavailable)?;
@@ -181,7 +248,16 @@ pub(crate) async fn submit_batch(
 pub(crate) async fn load_batch_progress(
     batch_id: String,
 ) -> Result<Option<BatchProgress>, ServerFnError> {
-    if !dependaboard_core::valid_batch_id(&batch_id) {
+    load_batch_progress_in(&state, &batch_id).await
+}
+
+/// The body of [`load_batch_progress`].
+#[cfg(feature = "server")]
+pub(crate) async fn load_batch_progress_in(
+    state: &ServerState,
+    batch_id: &str,
+) -> Result<Option<BatchProgress>, ServerFnError> {
+    if !dependaboard_core::valid_batch_id(batch_id) {
         return Err(ServerFnError::new(InvalidBatch::BatchId.to_string()));
     }
     state
@@ -201,6 +277,15 @@ pub(crate) async fn load_batch_progress(
 /// [`MAX_RECENT_BATCHES`](dependaboard_core::MAX_RECENT_BATCHES).
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_recent_batches(limit: u32) -> Result<BatchList, ServerFnError> {
+    load_recent_batches_in(&state, limit).await
+}
+
+/// The body of [`load_recent_batches`].
+#[cfg(feature = "server")]
+pub(crate) async fn load_recent_batches_in(
+    state: &ServerState,
+    limit: u32,
+) -> Result<BatchList, ServerFnError> {
     let running = state
         .store
         .running_batches(state.installation_id)
@@ -231,12 +316,21 @@ pub(crate) async fn load_recent_batches(limit: u32) -> Result<BatchList, ServerF
 pub(crate) async fn load_batch_projection(
     batch_id: String,
 ) -> Result<Option<ProjectedBatch>, ServerFnError> {
-    if !dependaboard_core::valid_batch_id(&batch_id) {
+    load_batch_projection_in(&state, &batch_id).await
+}
+
+/// The body of [`load_batch_projection`].
+#[cfg(feature = "server")]
+pub(crate) async fn load_batch_projection_in(
+    state: &ServerState,
+    batch_id: &str,
+) -> Result<Option<ProjectedBatch>, ServerFnError> {
+    if !dependaboard_core::valid_batch_id(batch_id) {
         return Err(ServerFnError::new(InvalidBatch::BatchId.to_string()));
     }
     state
         .store
-        .get_batch(state.installation_id, &batch_id)
+        .get_batch(state.installation_id, batch_id)
         .await
         .map_err(store_failure)
 }
@@ -251,8 +345,16 @@ pub(crate) async fn load_pr_status(
     repository_id: u64,
     number: u64,
 ) -> Result<Option<PrState>, ServerFnError> {
-    let key = PrKey::new(repository_id, number);
-    if projected_pr(&state, &key).await?.is_none() {
+    load_pr_status_in(&state, PrKey::new(repository_id, number)).await
+}
+
+/// The body of [`load_pr_status`].
+#[cfg(feature = "server")]
+pub(crate) async fn load_pr_status_in(
+    state: &ServerState,
+    key: PrKey,
+) -> Result<Option<PrState>, ServerFnError> {
+    if projected_pr(state, &key).await?.is_none() {
         return Ok(None);
     }
     state
@@ -271,11 +373,31 @@ pub(crate) async fn load_pr_projection(
     repository_id: u64,
     number: u64,
 ) -> Result<Option<PrRecord>, ServerFnError> {
-    projected_pr(&state, &PrKey::new(repository_id, number)).await
+    load_pr_projection_in(&state, PrKey::new(repository_id, number)).await
 }
 
+/// The body of [`load_pr_projection`]: [`projected_pr`] for the key the
+/// browser named, and nothing else, which makes it where that resolution is
+/// tested.
+#[cfg(feature = "server")]
+pub(crate) async fn load_pr_projection_in(
+    state: &ServerState,
+    key: PrKey,
+) -> Result<Option<PrRecord>, ServerFnError> {
+    projected_pr(state, &key).await
+}
+
+/// Asks Restate to reconcile the whole installation now, without waiting for
+/// the scheduler's next sweep: what the **Sync** control queues. One-way:
+/// Restate takes it, and the dashboard's live refresh sees the sweep land.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn request_sync() -> Result<(), ServerFnError> {
+    request_sync_in(&state).await
+}
+
+/// The body of [`request_sync`].
+#[cfg(feature = "server")]
+pub(crate) async fn request_sync_in(state: &ServerState) -> Result<(), ServerFnError> {
     state
         .ingress
         .send_empty("DashboardIngress/sync_installation")
@@ -283,13 +405,27 @@ pub(crate) async fn request_sync() -> Result<(), ServerFnError> {
         .map_err(restate_unavailable)
 }
 
+/// Asks Restate to refresh one pull request, and answers with the completion
+/// id the refresh will be recorded under, which is how the drawer tells this
+/// refresh from the webhook syncs around it. The browser names the pull
+/// request by key; the projection's row says which repository it is in, and
+/// a key the projection has no row for is refused, since a sync of it has
+/// nothing to refresh.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn request_pr_sync(
     repository_id: u64,
     number: u64,
 ) -> Result<String, ServerFnError> {
-    let key = PrKey::new(repository_id, number);
-    let row = projected_pr(&state, &key)
+    request_pr_sync_in(&state, PrKey::new(repository_id, number)).await
+}
+
+/// The body of [`request_pr_sync`].
+#[cfg(feature = "server")]
+pub(crate) async fn request_pr_sync_in(
+    state: &ServerState,
+    key: PrKey,
+) -> Result<String, ServerFnError> {
+    let row = projected_pr(state, &key)
         .await?
         .ok_or_else(|| no_longer_in_the_dashboard(&key))?;
     let completion_id = new_batch_id();
@@ -380,18 +516,12 @@ mod tests {
 
     use super::*;
     use crate::server::test_support::{
-        Dashboard, INSTALLATION_ID, USERNAME, dashboard, error_message,
+        Backend, Dashboard, INSTALLATION_ID, USERNAME, backend, dashboard, error_message,
     };
     use crate::ui::test_support::{BATCH, GROUPED_ROW_TITLE, OTHER_BATCH, grouped_row, serde_row};
 
     /// A well-formed id no batch has ever had.
     const UNKNOWN_BATCH: &str = "01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1c";
-    /// A batch of another installation, as the workflow of a deployment sharing this
-    /// store would list it running.
-    const FOREIGN_RUNNING_BATCH: &str = "01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1e";
-    /// A batch of another installation, as the workflow of a deployment sharing this
-    /// store would record it finished.
-    const FOREIGN_FINISHED_BATCH: &str = "01926e3a-7c1e-7b7d-9f8b-2b4c6d8e0f1f";
 
     /// A running merge of three pull requests as the workflow serving
     /// `installation_id` lists it.
@@ -437,6 +567,20 @@ mod tests {
         }
     }
 
+    /// The message `error` reaches the browser as: what a failed server
+    /// function's envelope carries, and the user is shown.
+    fn reported(error: ServerFnError) -> String {
+        match error {
+            ServerFnError::ServerError { message, .. } => message,
+            other => panic!("a server-side failure: {other}"),
+        }
+    }
+
+    /// The message a body refused with; the one the browser would be shown.
+    fn refusal<T: std::fmt::Debug>(result: Result<T, ServerFnError>) -> String {
+        reported(result.expect_err("a refusal"))
+    }
+
     #[test]
     fn infrastructure_failures_reach_the_browser_without_their_detail() {
         let detail = "libsql://db.internal: connection refused (token=abc)";
@@ -444,9 +588,7 @@ mod tests {
         let restate = restate_unavailable(format!("Restate returned 502: {detail}"));
 
         for error in [store, restate] {
-            let ServerFnError::ServerError { message, .. } = error else {
-                panic!("a server-side failure: {error}");
-            };
+            let message = reported(error);
             assert!(!message.contains(detail), "{message}");
             assert!(!message.contains("libsql"), "{message}");
             assert!(!message.is_empty());
@@ -457,13 +599,10 @@ mod tests {
     /// saying so is what lets the user start over.
     #[test]
     fn a_bad_page_cursor_is_reported_as_such() {
-        let ServerFnError::ServerError { message, .. } =
-            store_failure(StoreError::Cursor(CursorError::Invalid))
-        else {
-            panic!("a server-side failure");
-        };
-
-        assert_eq!(message, "invalid page cursor");
+        assert_eq!(
+            reported(store_failure(StoreError::Cursor(CursorError::Invalid))),
+            "invalid page cursor"
+        );
     }
 
     /// The audit view lists what is running beside what has run: a batch the
@@ -471,24 +610,19 @@ mod tests {
     /// tab that lost a batch, or never followed it, can find it there.
     #[tokio::test]
     async fn recent_batches_list_the_running_ones_beside_the_finished_ones() {
-        let dashboard = dashboard().await;
+        let backend = backend().await;
         let running = RunningBatch {
             retried_from: Some(BATCH.to_owned()),
             ..listed(INSTALLATION_ID, OTHER_BATCH)
         };
         let finished = recorded(INSTALLATION_ID, BATCH);
-        dashboard.store().start_batch(&running).await.unwrap();
-        dashboard.store().record_batch(&finished).await.unwrap();
+        backend.store().start_batch(&running).await.unwrap();
+        backend.store().record_batch(&finished).await.unwrap();
 
-        let response = dashboard
-            .call("load_recent_batches", json!({ "limit": 20 }))
-            .send()
-            .await
-            .unwrap();
+        let batches = load_recent_batches_in(backend.state(), 20).await.unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.json::<BatchList>().await.unwrap(),
+            batches,
             BatchList {
                 running: vec![running],
                 finished: vec![finished],
@@ -503,57 +637,39 @@ mod tests {
     /// is refused, as the progress read refuses it.
     #[tokio::test]
     async fn one_batch_is_read_from_the_projection_as_finished_running_or_unknown() {
-        let dashboard = dashboard().await;
+        let backend = backend().await;
         let running = RunningBatch {
             retried_from: Some(BATCH.to_owned()),
             ..listed(INSTALLATION_ID, OTHER_BATCH)
         };
         let finished = recorded(INSTALLATION_ID, BATCH);
-        dashboard.store().start_batch(&running).await.unwrap();
-        dashboard.store().record_batch(&finished).await.unwrap();
+        backend.store().start_batch(&running).await.unwrap();
+        backend.store().record_batch(&finished).await.unwrap();
+        let read = |batch_id: &'static str| load_batch_projection_in(backend.state(), batch_id);
 
-        let read = |batch_id: &str| {
-            dashboard
-                .call("load_batch_projection", json!({ "batch_id": batch_id }))
-                .send()
-        };
-        let recorded = read(BATCH).await.unwrap();
-        assert_eq!(recorded.status(), StatusCode::OK);
         assert_eq!(
-            recorded.json::<Option<ProjectedBatch>>().await.unwrap(),
+            read(BATCH).await.unwrap(),
             Some(ProjectedBatch::Finished(finished))
         );
-        let listed = read(OTHER_BATCH).await.unwrap();
-        assert_eq!(listed.status(), StatusCode::OK);
         assert_eq!(
-            listed.json::<Option<ProjectedBatch>>().await.unwrap(),
+            read(OTHER_BATCH).await.unwrap(),
             Some(ProjectedBatch::Running(running))
         );
-        let never_heard_of = read(UNKNOWN_BATCH).await.unwrap();
-        assert_eq!(never_heard_of.status(), StatusCode::OK);
-        assert_eq!(
-            never_heard_of
-                .json::<Option<ProjectedBatch>>()
-                .await
-                .unwrap(),
-            None
-        );
+        assert_eq!(read(UNKNOWN_BATCH).await.unwrap(), None);
         assert!(
-            dashboard.forwards().is_empty(),
+            backend.forwards().is_empty(),
             "the projection answers; Restate is not asked"
         );
 
-        let refused = read("batch-1").await.unwrap();
-        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
-            error_message(refused).await,
+            refusal(read("batch-1").await),
             InvalidBatch::BatchId.to_string()
         );
     }
 
     /// The body of the one request Restate was sent, which went to `path`.
-    fn the_one_request(dashboard: &Dashboard, path: &str) -> serde_json::Value {
-        serde_json::from_slice(&dashboard.the_one_forward(path).body).unwrap()
+    fn the_one_request(backend: &Backend, path: &str) -> serde_json::Value {
+        serde_json::from_slice(&backend.the_one_forward(path).body).unwrap()
     }
 
     /// The dashboard says who is signed in by asking the server, which
@@ -593,22 +709,46 @@ mod tests {
     }
 
     /// A batch target as the browser submits it.
-    fn target(repository_id: u64, number: u64, expected_sha: &str) -> serde_json::Value {
-        json!({ "repository_id": repository_id, "number": number, "expected_sha": expected_sha })
+    fn submitted(repository_id: u64, number: u64, expected_sha: &str) -> SubmittedTarget {
+        SubmittedTarget {
+            repository_id,
+            number,
+            expected_sha: expected_sha.to_owned(),
+        }
     }
 
-    /// Submits a merge batch of `targets` under `batch_id`, retrying no batch.
+    /// Submits a merge batch of `targets` under `batch_id`, retrying no
+    /// batch, as [`USERNAME`].
     async fn submit(
-        dashboard: &Dashboard,
+        backend: &Backend,
         batch_id: &str,
-        targets: serde_json::Value,
-    ) -> reqwest::Response {
-        submit_retrying(dashboard, batch_id, targets, None).await
+        targets: Vec<SubmittedTarget>,
+    ) -> Result<BatchReceipt, ServerFnError> {
+        submit_retrying(backend, batch_id, targets, None).await
     }
 
     /// Submits a merge batch of `targets` under `batch_id`, as a retry of
-    /// `retried_from` when one is named.
+    /// `retried_from` when one is named, as [`USERNAME`].
     async fn submit_retrying(
+        backend: &Backend,
+        batch_id: &str,
+        targets: Vec<SubmittedTarget>,
+        retried_from: Option<&str>,
+    ) -> Result<BatchReceipt, ServerFnError> {
+        submit_batch_in(
+            backend.state(),
+            UserId::new(USERNAME),
+            batch_id,
+            BulkActionKind::Merge,
+            targets,
+            retried_from.map(str::to_owned),
+        )
+        .await
+    }
+
+    /// Posts a merge batch of `targets` under `batch_id` over HTTP, as the
+    /// browser does: `targets` is the JSON it sends, whatever shape that is.
+    async fn post_batch(
         dashboard: &Dashboard,
         batch_id: &str,
         targets: serde_json::Value,
@@ -632,18 +772,20 @@ mod tests {
     /// A batch names its targets by key and the head the user saw, and the
     /// batch it retries when it is a retry; the rest of what the workflow and
     /// the audit record say about a target is the projection's word, whatever
-    /// the browser sent along.
+    /// the browser sent along. Over the wire, since what the browser sends
+    /// along is the point: a target carrying fields the server does not know
+    /// is decoded to the ones it does.
     #[tokio::test]
     async fn a_batch_carries_the_projections_word_on_its_targets_and_the_browsers_on_the_head_and_the_batch_retried()
      {
         let dashboard = dashboard().await;
         dashboard.project(INSTALLATION_ID, &grouped_row()).await;
         let batch_id = new_batch_id();
-        let mut forged = target(7, 9, "before-the-push");
+        let mut forged = json!(submitted(7, 9, "before-the-push"));
         forged["title"] = json!("Click here");
         forged["html_url"] = json!("https://evil.example/");
 
-        let response = submit_retrying(&dashboard, &batch_id, json!([forged]), Some(BATCH)).await;
+        let response = post_batch(&dashboard, &batch_id, json!([forged]), Some(BATCH)).await;
 
         assert_eq!(response.status(), StatusCode::OK);
         let forward =
@@ -675,26 +817,26 @@ mod tests {
     /// so the browser can account for it, and the batch runs over the rest.
     #[tokio::test]
     async fn a_target_gone_from_the_projection_is_left_out_and_the_rest_run() {
-        let dashboard = dashboard().await;
-        dashboard.project(INSTALLATION_ID, &grouped_row()).await;
+        let backend = backend().await;
+        backend.project(INSTALLATION_ID, &grouped_row()).await;
         let batch_id = new_batch_id();
 
-        let response = submit(
-            &dashboard,
+        let receipt = submit(
+            &backend,
             &batch_id,
-            json!([target(7, 9, "abc123"), target(7, 10, "abc124")]),
+            vec![submitted(7, 9, "abc123"), submitted(7, 10, "abc124")],
         )
-        .await;
+        .await
+        .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
-            response.json::<BatchReceipt>().await.unwrap(),
+            receipt,
             BatchReceipt {
                 left_out: vec![PrKey::new(7, 10)],
             }
         );
         let request = the_one_request(
-            &dashboard,
+            &backend,
             &format!("/restate/send/BulkAction/{batch_id}/run"),
         );
         assert_eq!(
@@ -713,38 +855,40 @@ mod tests {
     /// run: it is refused as a whole, before Restate hears of it.
     #[tokio::test]
     async fn a_submission_with_no_resolvable_target_is_refused_whole() {
-        let dashboard = dashboard().await;
-        dashboard.project(INSTALLATION_ID, &grouped_row()).await;
+        let backend = backend().await;
+        backend.project(INSTALLATION_ID, &grouped_row()).await;
 
-        let response = submit(
-            &dashboard,
+        let refused = submit(
+            &backend,
             &new_batch_id(),
-            json!([target(7, 10, "abc124"), target(7, 11, "abc125")]),
+            vec![submitted(7, 10, "abc124"), submitted(7, 11, "abc125")],
         )
         .await;
 
-        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
-            error_message(response).await,
+            refusal(refused),
             "none of the 2 pull requests submitted are still in the dashboard"
         );
-        assert!(dashboard.forwards().is_empty());
+        assert!(backend.forwards().is_empty());
     }
 
     /// A pull request from another installation is not a race the dashboard
     /// can lose: the projection never showed it, so a submission naming one
     /// comes from a client that should not exist. It refuses the whole batch,
-    /// and nothing reaches Restate.
+    /// and nothing reaches Restate. Over the wire, as the one test of the
+    /// error envelope: a refusal out of a body reaches the browser as a 500
+    /// whose `ServerError.message` is the refusal.
     #[tokio::test]
     async fn a_batch_with_a_target_from_another_installation_is_refused_whole() {
         let dashboard = dashboard().await;
         dashboard.project(INSTALLATION_ID, &grouped_row()).await;
         dashboard.project(INSTALLATION_ID + 1, &serde_row()).await;
 
-        let response = submit(
+        let response = post_batch(
             &dashboard,
             &new_batch_id(),
-            json!([target(7, 9, "abc123"), target(8, 12, "def456")]),
+            json!([submitted(7, 9, "abc123"), submitted(8, 12, "def456")]),
+            None,
         )
         .await;
 
@@ -761,44 +905,41 @@ mod tests {
     /// unknown target in it goes unmentioned.
     #[tokio::test]
     async fn a_submission_is_held_to_the_batch_rules_before_its_targets_are_resolved() {
-        let dashboard = dashboard().await;
-        dashboard.project(INSTALLATION_ID, &grouped_row()).await;
-        let own = target(7, 9, "abc123");
-        let unknown = target(7, 10, "abc124");
+        let backend = backend().await;
+        backend.project(INSTALLATION_ID, &grouped_row()).await;
+        let own = submitted(7, 9, "abc123");
+        let unknown = submitted(7, 10, "abc124");
 
         let bad_id = submit(
-            &dashboard,
+            &backend,
             "550e8400-e29b-41d4-a716-446655440000",
-            json!([unknown]),
+            vec![unknown.clone()],
         )
         .await;
-        assert_eq!(error_message(bad_id).await, "batch id must be a UUIDv7");
+        assert_eq!(refusal(bad_id), "batch id must be a UUIDv7");
 
-        let empty = submit(&dashboard, &new_batch_id(), json!([])).await;
+        let empty = submit(&backend, &new_batch_id(), vec![]).await;
         assert_eq!(
-            error_message(empty).await,
+            refusal(empty),
             "batch must contain between 1 and 100 targets"
         );
 
         let repeated = submit(
-            &dashboard,
+            &backend,
             &new_batch_id(),
-            json!([own.clone(), unknown, own]),
+            vec![own.clone(), unknown, own.clone()],
         )
         .await;
-        assert_eq!(
-            error_message(repeated).await,
-            "batch contains duplicate pull requests"
-        );
+        assert_eq!(refusal(repeated), "batch contains duplicate pull requests");
 
         let retry_of_nothing =
-            submit_retrying(&dashboard, &new_batch_id(), json!([own]), Some("batch-a")).await;
+            submit_retrying(&backend, &new_batch_id(), vec![own], Some("batch-a")).await;
         assert_eq!(
-            error_message(retry_of_nothing).await,
+            refusal(retry_of_nothing),
             "the batch retried must be named by a UUIDv7"
         );
 
-        assert!(dashboard.forwards().is_empty());
+        assert!(backend.forwards().is_empty());
     }
 
     /// The browser names a pull request by key; the projection says which
@@ -808,45 +949,30 @@ mod tests {
     /// projection has it.
     #[tokio::test]
     async fn a_pull_request_sync_is_resolved_from_the_projection_and_held_to_the_installation() {
-        let dashboard = dashboard().await;
-        dashboard.project(INSTALLATION_ID, &grouped_row()).await;
-        dashboard.project(INSTALLATION_ID + 1, &serde_row()).await;
-        let sync = |row: PrRecord| {
-            dashboard
-                .call(
-                    "request_pr_sync",
-                    json!({ "repository_id": row.repository_id, "number": row.number }),
-                )
-                .send()
-        };
+        let backend = backend().await;
+        backend.project(INSTALLATION_ID, &grouped_row()).await;
+        backend.project(INSTALLATION_ID + 1, &serde_row()).await;
+        let sync = |row: PrRecord| request_pr_sync_in(backend.state(), row.key());
 
         let unknown = sync(PrRecord {
             number: 99,
             ..grouped_row()
         })
-        .await
-        .unwrap();
-        assert_eq!(unknown.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        .await;
         assert_eq!(
-            error_message(unknown).await,
+            refusal(unknown),
             "pull request #99 is no longer in the dashboard"
         );
 
-        let foreign = sync(serde_row()).await.unwrap();
-        assert_eq!(foreign.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let foreign = sync(serde_row()).await;
         assert_eq!(
-            error_message(foreign).await,
+            refusal(foreign),
             "pull request #12 does not belong to the configured installation"
         );
-        assert!(dashboard.forwards().is_empty());
+        assert!(backend.forwards().is_empty());
 
-        let own = sync(grouped_row()).await.unwrap();
-        assert_eq!(own.status(), StatusCode::OK);
-        let completion_id: String = own.json().await.unwrap();
-        let request = the_one_request(
-            &dashboard,
-            "/restate/send/DashboardIngress/sync_pull_request",
-        );
+        let completion_id = sync(grouped_row()).await.unwrap();
+        let request = the_one_request(&backend, "/restate/send/DashboardIngress/sync_pull_request");
         assert_eq!(
             request,
             json!({
@@ -859,34 +985,24 @@ mod tests {
         );
     }
 
-    /// Calls `name` for `row` the way the drawer names a pull request: by key.
-    async fn read_by_key(dashboard: &Dashboard, name: &str, row: PrRecord) -> reqwest::Response {
-        dashboard
-            .call(
-                name,
-                json!({ "repository_id": row.repository_id, "number": row.number }),
-            )
-            .send()
-            .await
-            .unwrap()
-    }
-
-    /// The drawer reads a row by the key the browser holds, and the key is
-    /// held to the installation the same way a sync or a batch target is: a
-    /// row of another installation is refused, not shown, while a key the
-    /// projection has no row for is answered with nothing, which is how the
-    /// drawer learns a pull request is no longer open.
+    /// Every key the browser names — for the drawer's row, its durable
+    /// state, a sync, a batch target — is resolved through [`projected_pr`],
+    /// which holds the key to the installation in this one place; the
+    /// drawer's read of the row is that resolution and nothing else, so it
+    /// is where the resolution is tested. A row of another installation is
+    /// refused, not shown; a key the projection has no row for is answered
+    /// with nothing, which is how the drawer learns a pull request is no
+    /// longer open; and a key of this installation is answered with its row.
     #[tokio::test]
     async fn a_pull_request_row_is_read_only_within_the_installation() {
-        let dashboard = dashboard().await;
-        dashboard.project(INSTALLATION_ID, &grouped_row()).await;
-        dashboard.project(INSTALLATION_ID + 1, &serde_row()).await;
-        let read = |row: PrRecord| read_by_key(&dashboard, "load_pr_projection", row);
+        let backend = backend().await;
+        backend.project(INSTALLATION_ID, &grouped_row()).await;
+        backend.project(INSTALLATION_ID + 1, &serde_row()).await;
+        let read = |row: PrRecord| load_pr_projection_in(backend.state(), row.key());
 
         let foreign = read(serde_row()).await;
-        assert_eq!(foreign.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(
-            error_message(foreign).await,
+            refusal(foreign),
             "pull request #12 does not belong to the configured installation"
         );
 
@@ -895,13 +1011,11 @@ mod tests {
             ..grouped_row()
         })
         .await;
-        assert_eq!(unknown.status(), StatusCode::OK);
-        assert_eq!(unknown.json::<Option<PrRecord>>().await.unwrap(), None);
+        assert_eq!(unknown.unwrap(), None);
 
         let own = read(grouped_row()).await;
-        assert_eq!(own.status(), StatusCode::OK);
         assert_eq!(
-            own.json::<Option<PrRecord>>().await.unwrap(),
+            own.unwrap(),
             Some(PrRecord {
                 installation_id: INSTALLATION_ID,
                 ..grouped_row()
@@ -911,35 +1025,37 @@ mod tests {
 
     /// The durable state lives in Restate, whose `PullRequest` objects know
     /// nothing of installations: whatever key is asked for is answered. So
-    /// the key is held to the projection first. A key whose row is another
-    /// installation's is refused before Restate is asked, whatever Restate
-    /// holds for it; a key with no row is answered with no state without
-    /// asking either, the answer the drawer reads as "no longer open"; and
-    /// a key of this installation is answered with what Restate holds.
+    /// the key is held to the projection first, as every key is
+    /// ([`a_pull_request_row_is_read_only_within_the_installation`]): a key
+    /// with no row is answered with no state without asking Restate, the
+    /// answer the drawer reads as "no longer open", and a key of this
+    /// installation is answered with what Restate holds. Over the wire, as
+    /// the one test that Restate is asked at the path the object key
+    /// encodes to.
     #[tokio::test]
-    async fn a_pull_request_status_is_read_only_within_the_installation() {
+    async fn a_pull_request_status_is_asked_of_restate_only_for_a_key_the_projection_has() {
         let dashboard = dashboard().await;
         dashboard.project(INSTALLATION_ID, &grouped_row()).await;
-        dashboard.project(INSTALLATION_ID + 1, &serde_row()).await;
         let mut synced = PrState::default();
         synced.complete_sync("sync-1".to_owned());
-        for (repository_id, number) in [(7, 9), (7, 99), (8, 12)] {
+        for (repository_id, number) in [(7, 9), (7, 99)] {
             dashboard.restate_answers(&pr_status_path(repository_id, number), json!(synced));
         }
-        let read = |row: PrRecord| read_by_key(&dashboard, "load_pr_status", row);
-
-        let foreign = read(serde_row()).await;
-        assert_eq!(foreign.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(
-            error_message(foreign).await,
-            "pull request #12 does not belong to the configured installation"
-        );
+        let read = |row: PrRecord| {
+            dashboard
+                .call(
+                    "load_pr_status",
+                    json!({ "repository_id": row.repository_id, "number": row.number }),
+                )
+                .send()
+        };
 
         let unknown = read(PrRecord {
             number: 99,
             ..grouped_row()
         })
-        .await;
+        .await
+        .unwrap();
         assert_eq!(unknown.status(), StatusCode::OK);
         assert_eq!(unknown.json::<Option<PrState>>().await.unwrap(), None);
         assert!(
@@ -947,98 +1063,9 @@ mod tests {
             "a key the projection does not vouch for is not asked of Restate"
         );
 
-        let own = read(grouped_row()).await;
+        let own = read(grouped_row()).await.unwrap();
         assert_eq!(own.status(), StatusCode::OK);
         assert_eq!(own.json::<Option<PrState>>().await.unwrap(), Some(synced));
         dashboard.the_one_forward("/restate/call/PullRequest/7%239/status");
-    }
-
-    /// Two deployments on one store each see their own **Batches**: the audit
-    /// view lists the batches the configured installation's workflow listed
-    /// and recorded, and none of another's — not their repositories, not
-    /// their pull requests' titles, not who asked.
-    #[tokio::test]
-    async fn recent_batches_are_listed_only_within_the_installation() {
-        let dashboard = dashboard().await;
-        let store = dashboard.store();
-        store
-            .start_batch(&listed(INSTALLATION_ID, OTHER_BATCH))
-            .await
-            .unwrap();
-        store
-            .record_batch(&recorded(INSTALLATION_ID, BATCH))
-            .await
-            .unwrap();
-        store
-            .start_batch(&listed(INSTALLATION_ID + 1, FOREIGN_RUNNING_BATCH))
-            .await
-            .unwrap();
-        store
-            .record_batch(&recorded(INSTALLATION_ID + 1, FOREIGN_FINISHED_BATCH))
-            .await
-            .unwrap();
-
-        let response = dashboard
-            .call("load_recent_batches", json!({ "limit": 20 }))
-            .send()
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.json::<BatchList>().await.unwrap(),
-            BatchList {
-                running: vec![listed(INSTALLATION_ID, OTHER_BATCH)],
-                finished: vec![recorded(INSTALLATION_ID, BATCH)],
-            }
-        );
-    }
-
-    /// A link to another installation's batch is answered as a link to a batch
-    /// the projection has never heard of — not refused, since a stale or
-    /// foreign link is given up the same way after the attach polls — while
-    /// a link to this installation's batch opens from the record.
-    #[tokio::test]
-    async fn a_batch_is_read_by_id_only_within_the_installation() {
-        let dashboard = dashboard().await;
-        let store = dashboard.store();
-        store
-            .record_batch(&recorded(INSTALLATION_ID, BATCH))
-            .await
-            .unwrap();
-        store
-            .start_batch(&listed(INSTALLATION_ID + 1, FOREIGN_RUNNING_BATCH))
-            .await
-            .unwrap();
-        store
-            .record_batch(&recorded(INSTALLATION_ID + 1, FOREIGN_FINISHED_BATCH))
-            .await
-            .unwrap();
-        let read = |batch_id: &str| {
-            dashboard
-                .call("load_batch_projection", json!({ "batch_id": batch_id }))
-                .send()
-        };
-
-        for foreign in [FOREIGN_RUNNING_BATCH, FOREIGN_FINISHED_BATCH] {
-            let response = read(foreign).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                response.json::<Option<ProjectedBatch>>().await.unwrap(),
-                None,
-                "{foreign} is another installation's, and told apart from no batch at all by nothing"
-            );
-        }
-        assert!(
-            dashboard.forwards().is_empty(),
-            "the projection answers; Restate is not asked"
-        );
-
-        let own = read(BATCH).await.unwrap();
-        assert_eq!(own.status(), StatusCode::OK);
-        assert_eq!(
-            own.json::<Option<ProjectedBatch>>().await.unwrap(),
-            Some(ProjectedBatch::Finished(recorded(INSTALLATION_ID, BATCH)))
-        );
     }
 }
