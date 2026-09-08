@@ -500,6 +500,13 @@ Restate shows (`persistent_store_retry_policy`, `batch_record_failure`; see `Bul
 The unlisting a failed or cancelled workflow does on its way out uses the ordinary budget:
 nothing waits behind it, and a lost unlist is a stale row, not a lost record.
 
+**The web edge's Restate ingress client fails in three classes** —
+`RestateIngressError::{Transport, Status { code, body }, Decode}`: no answer, a refusal
+with its status, an answer that could not be read — and the server functions consult the
+status, since a 404 on `BulkAction/{id}/progress` is a workflow this Restate never had,
+which is the `None` the by-id follow gives up on, where every other class is "Restate is
+unavailable" and is waited out.
+
 **One 405 is special-cased, and it's the one bulk merging hits most.**
 `PUT /pulls/{n}/merge` returns 405 `"Base branch was modified. Review and try the merge
 again."` transiently when merges land in quick succession on the same base branch — which

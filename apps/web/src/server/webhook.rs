@@ -13,6 +13,7 @@ use dependaboard_core::WebhookEvent;
 use octoevents::{Envelope, EventKind, ResponseStatus, Secret, Verifier};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, de::DeserializeOwned};
+use thiserror::Error;
 
 use crate::server::restate::RestateIngress;
 
@@ -90,6 +91,23 @@ enum Disposition {
     Acknowledge,
 }
 
+/// Why a verified delivery cannot be forwarded: it lacks what
+/// `WebhookIngress::dispatch` addresses an installation, a repository or a
+/// pull request by. Logged beside the event kind and answered to GitHub as a
+/// 400; a redelivery of the same payload would lack the same fields.
+#[derive(Debug, Error)]
+enum RoutingError {
+    /// An installation delivery that names no installation.
+    #[error("GitHub installation webhook is missing an installation id")]
+    MissingInstallation,
+    /// A repository delivery that names no repository.
+    #[error("GitHub repository webhook is missing its repository")]
+    MissingRepository,
+    /// The payload is not the shape the event's routing fields are read from.
+    #[error("GitHub webhook payload is missing routing fields: {0}")]
+    Payload(#[source] serde_json::Error),
+}
+
 /// Decides what the edge does with a verified delivery: forward it, reduced
 /// to the routing fields `WebhookIngress` dispatches on, or acknowledge it.
 ///
@@ -100,11 +118,11 @@ enum Disposition {
 /// The envelope already carries the installation and repository probe, so only
 /// the per-event fields — PR number, head SHA, and the PRs a check belongs to —
 /// need parsing out of the payload.
-fn route_delivery(envelope: &Envelope) -> Result<Disposition, String> {
+fn route_delivery(envelope: &Envelope) -> Result<Disposition, RoutingError> {
     let (number, sha, pull_requests) = match envelope.kind {
         EventKind::Installation | EventKind::InstallationRepositories => {
             if envelope.common.installation_id.is_none() {
-                return Err("GitHub installation webhook is missing an installation id".to_owned());
+                return Err(RoutingError::MissingInstallation);
             }
             (None, None, Vec::new())
         }
@@ -141,7 +159,7 @@ fn route_delivery(envelope: &Envelope) -> Result<Disposition, String> {
                 .common
                 .repository
                 .as_ref()
-                .ok_or("GitHub repository webhook is missing routing fields")?,
+                .ok_or(RoutingError::MissingRepository)?,
         ),
         _ => envelope.common.repository.as_ref(),
     };
@@ -161,8 +179,8 @@ fn route_delivery(envelope: &Envelope) -> Result<Disposition, String> {
     })))
 }
 
-fn parse_payload<T: DeserializeOwned>(envelope: &Envelope) -> Result<T, String> {
-    envelope.parse::<T>().map_err(|error| error.to_string())
+fn parse_payload<T: DeserializeOwned>(envelope: &Envelope) -> Result<T, RoutingError> {
+    envelope.parse::<T>().map_err(RoutingError::Payload)
 }
 
 #[derive(Deserialize)]
@@ -450,15 +468,21 @@ mod tests {
     fn envelope_missing_routing_fields_is_rejected() {
         // Authenticated but unroutable: the payload verified, yet nothing
         // downstream can address a pull request or repository with it.
+        let rejected = |envelope: &Envelope| {
+            route_delivery(envelope).expect_err("an unroutable delivery is rejected")
+        };
+
+        let no_pull_request = rejected(&envelope(
+            "pull_request",
+            Some("opened"),
+            true,
+            &serde_json::json!({ "action": "opened" }),
+        ));
         assert!(
-            route_delivery(&envelope(
-                "pull_request",
-                Some("opened"),
-                true,
-                &serde_json::json!({ "action": "opened" })
-            ))
-            .is_err()
+            matches!(no_pull_request, RoutingError::Payload(_)),
+            "{no_pull_request:?}"
         );
+
         let mut anonymous = envelope(
             "installation",
             Some("created"),
@@ -466,38 +490,42 @@ mod tests {
             &serde_json::json!({ "action": "created" }),
         );
         anonymous.common.installation_id = None;
-        assert!(route_delivery(&anonymous).is_err());
+        assert!(matches!(
+            rejected(&anonymous),
+            RoutingError::MissingInstallation
+        ));
 
         let mut check_run = serde_json::json!({
             "action": "completed",
             "check_run": { "head_sha": "abc123", "pull_requests": [{}] }
         });
+        let unnumbered = rejected(&envelope("check_run", Some("completed"), true, &check_run));
         assert!(
-            route_delivery(&envelope("check_run", Some("completed"), true, &check_run)).is_err()
+            matches!(unnumbered, RoutingError::Payload(_)),
+            "{unnumbered:?}"
         );
         check_run["check_run"]["pull_requests"] = serde_json::json!([]);
         check_run["check_run"]
             .as_object_mut()
             .unwrap()
             .remove("head_sha");
-        assert!(
-            route_delivery(&envelope("check_run", Some("completed"), true, &check_run)).is_err()
-        );
+        let headless = rejected(&envelope("check_run", Some("completed"), true, &check_run));
+        assert!(matches!(headless, RoutingError::Payload(_)), "{headless:?}");
 
         let pull_request = serde_json::json!({
             "action": "opened",
             "number": 9,
             "pull_request": { "number": 9, "head": { "sha": "abc123" } }
         });
-        assert!(
-            route_delivery(&envelope(
+        assert!(matches!(
+            rejected(&envelope(
                 "pull_request",
                 Some("opened"),
                 false,
                 &pull_request
-            ))
-            .is_err()
-        );
+            )),
+            RoutingError::MissingRepository
+        ));
     }
 
     #[test]

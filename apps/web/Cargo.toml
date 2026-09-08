@@ -34,6 +34,9 @@ serde_json.workspace = true
 # Already in the server build through octoevents and rustls; compares the
 # dashboard's credentials in constant time.
 subtle.workspace = true
+# Already in the server build through the store and core crates; derives the
+# server modules' error enums.
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
