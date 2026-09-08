@@ -18,12 +18,16 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use {
-    crate::server::{restate::pr_status_path, state::ServerState},
+    crate::server::{
+        restate::{RestateIngressError, pr_status_path},
+        state::ServerState,
+    },
     axum::extract::Extension,
     dependaboard_core::{
         BulkRequest, InvalidBatch, ManualSyncRequest, PrKey, PrTarget, new_batch_id, validate_batch,
     },
     dependaboard_store::StoreError,
+    reqwest::StatusCode,
 };
 
 /// One page of rows for `filter`. Paging through a filter calls this alone;
@@ -251,7 +255,11 @@ pub(crate) async fn load_batch_progress(
     load_batch_progress_in(&state, &batch_id).await
 }
 
-/// The body of [`load_batch_progress`].
+/// The body of [`load_batch_progress`]. Restate answers a shared handler of a
+/// workflow it never had with a 404, and that is the `None`: the one refusal
+/// that says something about the batch rather than about Restate, and the
+/// one the follow gives up on. Every other failure is Restate not answering
+/// for the batch, and is reported as such, so the follow waits it out.
 #[cfg(feature = "server")]
 pub(crate) async fn load_batch_progress_in(
     state: &ServerState,
@@ -260,11 +268,18 @@ pub(crate) async fn load_batch_progress_in(
     if !dependaboard_core::valid_batch_id(batch_id) {
         return Err(ServerFnError::new(InvalidBatch::BatchId.to_string()));
     }
-    state
+    match state
         .ingress
         .call(&format!("BulkAction/{batch_id}/progress"))
         .await
-        .map_err(restate_unavailable)
+    {
+        Ok(progress) => Ok(progress),
+        Err(RestateIngressError::Status {
+            code: StatusCode::NOT_FOUND,
+            ..
+        }) => Ok(None),
+        Err(error) => Err(restate_unavailable(error)),
+    }
 }
 
 /// The batches the audit view lists: every batch running, and the `limit`
@@ -497,8 +512,8 @@ fn store_failure(error: StoreError) -> ServerFnError {
 /// Logs a Restate failure in full; the browser learns only that Restate did
 /// not take the request.
 #[cfg(feature = "server")]
-fn restate_unavailable(error: String) -> ServerFnError {
-    tracing::error!(error, "Restate request failed");
+fn restate_unavailable(error: RestateIngressError) -> ServerFnError {
+    tracing::error!(%error, "Restate request failed");
     ServerFnError::new("Restate is unavailable")
 }
 
@@ -507,7 +522,6 @@ mod tests {
     use dependaboard_core::{
         BatchRecord, BatchTargetRecord, CursorError, ProjectedBatch, RunningBatch, TargetOutcome,
     };
-    use reqwest::StatusCode;
     use serde_json::json;
 
     // The tests write to the projection as the Restate service would; the
@@ -585,7 +599,10 @@ mod tests {
     fn infrastructure_failures_reach_the_browser_without_their_detail() {
         let detail = "libsql://db.internal: connection refused (token=abc)";
         let store = store_failure(StoreError::CorruptEnum(detail.to_owned()));
-        let restate = restate_unavailable(format!("Restate returned 502: {detail}"));
+        let restate = restate_unavailable(RestateIngressError::Status {
+            code: StatusCode::BAD_GATEWAY,
+            body: detail.to_owned(),
+        });
 
         for error in [store, restate] {
             let message = reported(error);
@@ -665,6 +682,29 @@ mod tests {
             refusal(read("batch-1").await),
             InvalidBatch::BatchId.to_string()
         );
+    }
+
+    /// Where a batch stands is Restate's word, and Restate has two ways of
+    /// not giving it: a 404 for a workflow it never had — a stale or foreign
+    /// link — which is the `None` the follow gives up on after its thirty
+    /// polls, and no answer at all, which is Restate being unavailable, and
+    /// is waited out. The two must not be confused: the first read as the
+    /// second polls a dead link for ever, the second read as the first gives
+    /// up on a batch that is running.
+    #[tokio::test]
+    async fn progress_of_a_batch_restate_never_had_is_none_and_of_one_it_cannot_answer_for_is_a_fault()
+     {
+        let mut backend = backend().await;
+        let progress = format!("BulkAction/{UNKNOWN_BATCH}/progress");
+        backend.restate_refuses(&progress, StatusCode::NOT_FOUND);
+
+        let unknown = load_batch_progress_in(backend.state(), UNKNOWN_BATCH).await;
+        assert_eq!(unknown.unwrap(), None);
+        backend.the_one_forward(&format!("/restate/call/{progress}"));
+
+        backend.restate_goes_away();
+        let unanswered = load_batch_progress_in(backend.state(), UNKNOWN_BATCH).await;
+        assert_eq!(refusal(unanswered), "Restate is unavailable");
     }
 
     /// The body of the one request Restate was sent, which went to `path`.

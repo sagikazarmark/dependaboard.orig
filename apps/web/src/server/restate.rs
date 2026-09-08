@@ -3,11 +3,34 @@
 
 use std::time::Duration;
 
+use reqwest::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use thiserror::Error;
 
 use crate::server::config::RestateConfig;
+
+/// What a request to the Restate ingress can fail with, in the classes a caller
+/// consults: no answer, an answer that refused, and an answer that could not be
+/// read. A refusal carries its status, since the code is what tells a workflow
+/// Restate never had (404) from a refused key (401) or a handler that is
+/// down (5xx), where the message alone would say only that Restate said no.
+#[derive(Debug, Error)]
+pub(crate) enum RestateIngressError {
+    /// The request never completed: the client could not be built, the
+    /// connection failed or timed out, or the response was lost before it
+    /// could be read.
+    #[error("Restate transport failed: {0}")]
+    Transport(#[source] reqwest::Error),
+    /// Restate answered with a non-success status; `body` is what it said.
+    #[error("Restate returned {code}: {body}")]
+    Status { code: StatusCode, body: String },
+    /// A successful answer whose body could not be read as the handler's
+    /// output.
+    #[error("Restate returned an invalid response: {0}")]
+    Decode(#[source] serde_json::Error),
+}
 
 /// The Restate ingress this deployment enqueues work on.
 ///
@@ -22,12 +45,12 @@ pub(crate) struct RestateIngress {
 }
 
 impl RestateIngress {
-    pub(crate) fn new(config: RestateConfig) -> Result<Self, String> {
+    pub(crate) fn new(config: RestateConfig) -> Result<Self, RestateIngressError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(15))
             .build()
-            .map_err(|error| error.to_string())?;
+            .map_err(RestateIngressError::Transport)?;
         Ok(Self {
             client,
             base: config.base,
@@ -45,7 +68,7 @@ impl RestateIngress {
         path: &str,
         input: &T,
         idempotency_key: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RestateIngressError> {
         let mut request = self.post("send", path).json(input);
         if let Some(key) = idempotency_key {
             request = request.header("idempotency-key", key);
@@ -57,7 +80,7 @@ impl RestateIngress {
     ///
     /// Restate rejects any body for such a handler, even an empty JSON one, so
     /// the request carries neither a body nor a content type.
-    pub(crate) async fn send_empty(&self, path: &str) -> Result<(), String> {
+    pub(crate) async fn send_empty(&self, path: &str) -> Result<(), RestateIngressError> {
         self.accept(self.post("send", path)).await
     }
 
@@ -74,17 +97,28 @@ impl RestateIngress {
     }
 
     /// Sends a one-way invocation and reads Restate's answer as accepted or not.
-    async fn accept(&self, request: reqwest::RequestBuilder) -> Result<(), String> {
-        let response = request.send().await.map_err(|error| error.to_string())?;
+    async fn accept(&self, request: reqwest::RequestBuilder) -> Result<(), RestateIngressError> {
+        let response = request
+            .send()
+            .await
+            .map_err(RestateIngressError::Transport)?;
         if response.status().is_success() {
             return Ok(());
         }
-        let status = response.status();
-        let detail = response.text().await.unwrap_or_default();
-        Err(format!("Restate returned {status}: {detail}"))
+        Err(Self::refusal(response).await)
     }
 
-    pub(crate) async fn call<R>(&self, path: &str) -> Result<R, String>
+    /// What Restate refused with: its status, and the body it said so in. A
+    /// body that could not be read is left empty; the status is the answer.
+    async fn refusal(response: reqwest::Response) -> RestateIngressError {
+        let code = response.status();
+        let body = response.text().await.unwrap_or_default();
+        RestateIngressError::Status { code, body }
+    }
+
+    /// Makes a request/response call and reads the handler's output out of
+    /// Restate's answer.
+    pub(crate) async fn call<R>(&self, path: &str) -> Result<R, RestateIngressError>
     where
         R: DeserializeOwned,
     {
@@ -92,17 +126,17 @@ impl RestateIngress {
             .post("call", path)
             .send()
             .await
-            .map_err(|error| error.to_string())?;
-        let status = response.status();
-        let value = response
-            .json::<Value>()
-            .await
-            .map_err(|error| format!("Restate returned an invalid response: {error}"))?;
-        if !status.is_success() {
-            return Err(format!("Restate returned {status}: {value}"));
+            .map_err(RestateIngressError::Transport)?;
+        if !response.status().is_success() {
+            return Err(Self::refusal(response).await);
         }
+        let body = response
+            .text()
+            .await
+            .map_err(RestateIngressError::Transport)?;
+        let value: Value = serde_json::from_str(&body).map_err(RestateIngressError::Decode)?;
         let output = value.get("output").cloned().unwrap_or(value);
-        serde_json::from_value(output).map_err(|error| error.to_string())
+        serde_json::from_value(output).map_err(RestateIngressError::Decode)
     }
 }
 
@@ -118,10 +152,10 @@ mod tests {
         response::IntoResponse,
         routing::post,
     };
-    use dependaboard_core::PrState;
+    use dependaboard_core::{BatchProgress, PrState};
 
     use super::*;
-    use crate::server::test_support::{ingress_at, serve};
+    use crate::server::test_support::{closed_port, ingress_at, serve};
 
     #[tokio::test]
     async fn empty_input_restate_call_has_no_body_or_content_type() {
@@ -187,12 +221,86 @@ mod tests {
             .send_empty("DashboardIngress/sync_installation")
             .await;
 
-        assert_eq!(result, Ok(()));
+        result.unwrap();
     }
 
     #[test]
     fn pull_request_status_path_encodes_the_object_key_separator() {
         assert_eq!(pr_status_path(7, 9), "PullRequest/7%239/status");
+    }
+
+    /// A workflow this Restate never had answers its shared handler with a 404, and the
+    /// caller must be able to tell that from every other refusal: it is what lets a
+    /// progress read say "no such batch" rather than "Restate is down".
+    #[tokio::test]
+    async fn a_not_found_from_restate_is_a_status_error_carrying_the_code() {
+        async fn restate_ingress() -> impl IntoResponse {
+            (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({
+                    "code": 404,
+                    "message": "Not found",
+                    "source": "ingress"
+                })),
+            )
+        }
+
+        let address = serve(axum::Router::new().route(
+            "/restate/call/BulkAction/batch-1/progress",
+            post(restate_ingress),
+        ))
+        .await;
+
+        let error = ingress_at(address)
+            .call::<Option<BatchProgress>>("BulkAction/batch-1/progress")
+            .await
+            .expect_err("a 404 is not an answer");
+
+        assert!(
+            matches!(
+                &error,
+                RestateIngressError::Status { code: StatusCode::NOT_FOUND, body }
+                    if body.contains("Not found")
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// No answer at all — nothing listening where Restate should be — is its own class,
+    /// so a caller can say "unavailable" for this and nothing else.
+    #[tokio::test]
+    async fn no_answer_from_restate_is_a_transport_error() {
+        let error = ingress_at(closed_port())
+            .call::<Option<BatchProgress>>("BulkAction/batch-1/progress")
+            .await
+            .expect_err("nobody answers on a closed port");
+
+        assert!(
+            matches!(error, RestateIngressError::Transport(_)),
+            "{error:?}"
+        );
+    }
+
+    /// A success whose body is not the handler's output — a proxy's maintenance page in
+    /// front of Restate, say — is neither Restate refusing nor Restate away.
+    #[tokio::test]
+    async fn an_unreadable_answer_from_restate_is_a_decode_error() {
+        async fn restate_ingress() -> impl IntoResponse {
+            (StatusCode::OK, "<html>Back soon</html>")
+        }
+
+        let address = serve(axum::Router::new().route(
+            "/restate/call/BulkAction/batch-1/progress",
+            post(restate_ingress),
+        ))
+        .await;
+
+        let error = ingress_at(address)
+            .call::<Option<BatchProgress>>("BulkAction/batch-1/progress")
+            .await
+            .expect_err("a page is not progress");
+
+        assert!(matches!(error, RestateIngressError::Decode(_)), "{error:?}");
     }
 
     /// A batch is submitted under its id as the idempotency key, so a repeat of the same
@@ -226,7 +334,13 @@ mod tests {
             .await;
 
         let error = result.expect_err("a conflict is not an acceptance");
-        assert!(error.contains("409"), "{error}");
-        assert!(error.contains("previously accepted"), "{error}");
+        assert!(
+            matches!(
+                &error,
+                RestateIngressError::Status { code: StatusCode::CONFLICT, body }
+                    if body.contains("previously accepted")
+            ),
+            "{error:?}"
+        );
     }
 }

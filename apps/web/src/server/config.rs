@@ -5,6 +5,20 @@
 //! `main`.
 
 use secrecy::SecretString;
+use thiserror::Error;
+
+/// Why the environment does not configure the process. Each names the
+/// variable, since setting it is the operator's fix; `main` panics with the
+/// message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub(crate) enum ConfigError {
+    /// A required variable is unset or blank.
+    #[error("{0} must be configured")]
+    Missing(&'static str),
+    /// A variable is set to something other than the integer it must be.
+    #[error("{0} must be an integer")]
+    NotAnInteger(&'static str),
+}
 
 pub(crate) struct Config {
     pub(crate) credentials: Credentials,
@@ -31,16 +45,15 @@ pub(crate) struct RestateConfig {
 }
 
 impl Config {
-    pub(crate) fn from_env() -> Result<Self, String> {
+    pub(crate) fn from_env() -> Result<Self, ConfigError> {
         Self::parse(|name| std::env::var(name).ok())
     }
 
     /// Resolves the settings from `lookup`, an environment variable reader.
     /// A blank value counts as unset.
-    fn parse(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+    fn parse(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let present = |name: &str| lookup(name).filter(|value| !value.trim().is_empty());
-        let required =
-            |name: &str| present(name).ok_or_else(|| format!("{name} must be configured"));
+        let required = |name: &'static str| present(name).ok_or(ConfigError::Missing(name));
         let credentials = Credentials {
             username: present("DASHBOARD_USERNAME").unwrap_or_else(|| "dependaboard".to_owned()),
             password: SecretString::from(required("DASHBOARD_PASSWORD")?),
@@ -48,7 +61,7 @@ impl Config {
         let webhook_secret = SecretString::from(required("GITHUB_WEBHOOK_SECRET")?);
         let installation_id = required("GITHUB_INSTALLATION_ID")?
             .parse::<u64>()
-            .map_err(|_| "GITHUB_INSTALLATION_ID must be an integer".to_owned())?;
+            .map_err(|_| ConfigError::NotAnInteger("GITHUB_INSTALLATION_ID"))?;
         let restate = RestateConfig {
             base: present("RESTATE_INGRESS_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned())
@@ -131,12 +144,13 @@ mod tests {
             "GITHUB_INSTALLATION_ID",
         ] {
             let error = Config::parse(env(&without(name))).err().unwrap();
-            assert!(error.contains(name), "{name}: {error}");
+            assert_eq!(error, ConfigError::Missing(name));
+            assert!(error.to_string().contains(name), "{name}: {error}");
 
             let mut blank = without(name);
             blank.push((name, "  "));
             let error = Config::parse(env(&blank)).err().unwrap();
-            assert!(error.contains(name), "blank {name}: {error}");
+            assert_eq!(error, ConfigError::Missing(name), "blank {name}");
         }
     }
 
@@ -162,7 +176,11 @@ mod tests {
 
         let error = Config::parse(env(&pairs)).err().unwrap();
 
-        assert!(error.contains("GITHUB_INSTALLATION_ID"), "{error}");
+        assert_eq!(error, ConfigError::NotAnInteger("GITHUB_INSTALLATION_ID"));
+        assert!(
+            error.to_string().contains("GITHUB_INSTALLATION_ID"),
+            "{error}"
+        );
     }
 
     #[test]

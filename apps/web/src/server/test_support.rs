@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use dependaboard_core::{PrRecord, RepoRecord};
 use dependaboard_store::{LibSqlPrStore, ProjectionWriter, StoreConfig};
 use dioxus::server::{DioxusRouterExt, ServeConfig};
@@ -49,6 +49,14 @@ pub(crate) fn ingress_at(address: SocketAddr) -> RestateIngress {
     .unwrap()
 }
 
+/// A loopback port nobody listens on: what a stopped Restate looks like from
+/// the web process. Bound and released, so it was free a moment ago; nothing
+/// in the suite binds a port it did not just get from the kernel.
+pub(crate) fn closed_port() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+}
+
 /// Serves `router` on a loopback port for the rest of the test; the task
 /// is dropped with the test runtime.
 pub(crate) async fn serve(router: axum::Router) -> SocketAddr {
@@ -72,18 +80,21 @@ pub(crate) struct ForwardedRequest {
 /// Where the ingress takes a request/response call, under the handler's path.
 const RESTATE_CALL: &str = "/restate/call/";
 
-/// The stand-in Restate ingress as a test sees it: what it was sent, and
-/// what it answers a call with, by the call's path.
+/// The stand-in Restate ingress as a test sees it: what it was sent, what it
+/// answers a call with, by the call's path, and which calls it refuses.
 #[derive(Clone, Default)]
 pub(crate) struct FakeRestate {
     forwarded: Arc<Mutex<Vec<ForwardedRequest>>>,
     answers: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    refusals: Arc<Mutex<HashMap<String, StatusCode>>>,
 }
 
 /// Serves a stand-in for the Restate ingress that accepts every send,
 /// recording what it was asked to enqueue, and answers a call with the output
 /// held for its path, or with nothing, as a virtual object with no state
-/// would.
+/// would — unless the path is one it has been told to refuse, which it
+/// answers with the status held for it, in the shape Restate's ingress
+/// refuses in.
 pub(crate) async fn fake_restate() -> (RestateIngress, FakeRestate) {
     let fake = FakeRestate::default();
     let restate = fake.clone();
@@ -100,14 +111,30 @@ pub(crate) async fn fake_restate() -> (RestateIngress, FakeRestate) {
                         .map(str::to_owned),
                     body,
                 });
+                if let Some(status) = restate.refusals.lock().unwrap().get(&path).copied() {
+                    return (
+                        status,
+                        axum::Json(serde_json::json!({
+                            "code": status.as_u16(),
+                            "message": status.canonical_reason().unwrap_or_default(),
+                            "source": "ingress"
+                        })),
+                    );
+                }
                 if path.starts_with(RESTATE_CALL) {
                     let output = restate.answers.lock().unwrap().get(&path).cloned();
-                    return axum::Json(serde_json::json!({ "output": output }));
+                    return (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({ "output": output })),
+                    );
                 }
-                axum::Json(serde_json::json!({
-                    "invocationId": "inv_1aiqX0vFEFNH1Umgre58JiCLgHfTtztYK5",
-                    "status": "Accepted"
-                }))
+                (
+                    StatusCode::ACCEPTED,
+                    axum::Json(serde_json::json!({
+                        "invocationId": "inv_1aiqX0vFEFNH1Umgre58JiCLgHfTtztYK5",
+                        "status": "Accepted"
+                    })),
+                )
             }
         },
     );
@@ -184,6 +211,23 @@ impl Backend {
             .lock()
             .unwrap()
             .insert(format!("{RESTATE_CALL}{path}"), output);
+    }
+
+    /// Has Restate refuse a call to `path` with `status`, as its ingress
+    /// refuses: a 404 for a workflow it never had, a 401 for a key it does not
+    /// accept.
+    pub(crate) fn restate_refuses(&self, path: &str, status: StatusCode) {
+        self.restate
+            .refusals
+            .lock()
+            .unwrap()
+            .insert(format!("{RESTATE_CALL}{path}"), status);
+    }
+
+    /// Takes Restate away: from here on the state's ingress reaches a port
+    /// nobody listens on. The stand-in keeps what it recorded.
+    pub(crate) fn restate_goes_away(&mut self) {
+        self.state.ingress = ingress_at(closed_port());
     }
 
     /// The read model behind the state, for putting there what the Restate
