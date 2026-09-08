@@ -40,9 +40,9 @@ impl HandlerOutcome for String {
     }
 }
 
-impl HandlerOutcome for Json<ActionOutcome> {
+impl HandlerOutcome for ActionOutcome {
     fn outcome(&self) -> String {
-        match &self.0 {
+        match self {
             ActionOutcome::Succeeded { .. } => "succeeded".to_owned(),
             ActionOutcome::Rejected { reason } => format!("rejected: {reason}"),
         }
@@ -140,18 +140,15 @@ mod tests {
         let sink = LogSink::default();
 
         let outcome = traced("PullRequest/merge", "7#9", async {
-            Ok(Json::from(ActionOutcome::Rejected {
+            Ok(ActionOutcome::Rejected {
                 reason: RejectReason::NotMergeable,
-            }))
+            })
         })
         .with_subscriber(sink.subscriber())
         .await
         .unwrap();
 
-        assert!(matches!(
-            outcome.into_inner(),
-            ActionOutcome::Rejected { .. }
-        ));
+        assert!(matches!(outcome, ActionOutcome::Rejected { .. }));
         let logs = sink.contents();
         assert!(logs.contains("INFO"), "{logs}");
         assert!(logs.contains(r#"handler="PullRequest/merge""#), "{logs}");
