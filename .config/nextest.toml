@@ -1,0 +1,33 @@
+# Nextest runs every test in a process of its own, so a hang, a leaked
+# global or a racing `env::set_var` is one test's failure, with a name,
+# instead of the run's. `cargo test` over the same flags must keep
+# passing: it is the fallback, and what runs the doctests should any appear.
+
+[profile.default]
+# A test that is still running after 30s is reported slow; one still running
+# after a second period is terminated and fails. Nothing in the suite takes a
+# second on its own, so the limit is generous, and a server function that
+# never returns becomes a failure with a test name instead of a hung run.
+slow-timeout = { period = "30s", terminate-after = 2 }
+
+# The one test that meets a real SQLite file lock from a second connection:
+# it holds the store's write lock through a sidecar, spawns a write, lets the
+# lock go when the write is compiled, and expects the write to have waited
+# its turn under the store's 5s busy timeout. The moment of release is
+# exact; what is left to the machine is the commit landing, a cross-thread
+# wake and a write to disk, before the busy timeout runs out. Under load, on
+# a box running the rest of the suite in parallel, it can miss that window
+# and come back SQLITE_BUSY through no fault of the store. One retry covers
+# the window; a real regression (the busy timeout removed fails 5/5, per
+# #69) fails both tries and still fails the run.
+[[profile.default.overrides]]
+filter = 'package(=dependaboard-store) & kind(=lib) & test(=tests::writes_wait_for_a_writer_in_another_process)'
+retries = 1
+
+# CI reports every failure of a run, not the first, and leaves a JUnit report
+# at target/nextest/ci/junit.xml for the runner to pick up.
+[profile.ci]
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"

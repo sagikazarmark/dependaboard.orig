@@ -11,6 +11,7 @@
     cargo-audit
     cargo-deny
     cargo-dist
+    cargo-nextest
     cargo-release
     cargo-watch
 

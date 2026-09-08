@@ -491,7 +491,7 @@ To add a migration:
    },
    ```
 
-3. Run `cargo test -p dependaboard-store`. A test fails if the files in `migrations/` and the registry disagree or versions are not contiguous, and the runner tests apply the whole registry to a fresh database and to one that predates versioning.
+3. Run `cargo nextest run -p dependaboard-store`. A test fails if the files in `migrations/` and the registry disagree or versions are not contiguous, and the runner tests apply the whole registry to a fresh database and to one that predates versioning.
 
 Never edit a migration that has shipped; add a new one instead. `0001_initial.sql` alone must stay idempotent, because databases created before versioning already contain its tables and adopt it as a no-op on their first start.
 
@@ -523,7 +523,7 @@ For production, point both binaries at the same remote libSQL database, expose o
 
 ```sh
 cargo fmt --all -- --check
-cargo test --workspace --no-default-features --features dependaboard-web/server
+cargo nextest run --workspace --no-default-features --features dependaboard-web/server
 cargo check -p dependaboard-web --target wasm32-unknown-unknown
 cargo clippy --workspace --all-targets --no-default-features --features dependaboard-web/server -- -D warnings
 cargo deny check
@@ -534,7 +534,21 @@ dx build --package dependaboard-web --platform web
 
 The test and clippy lines carry one feature set, so neither builds the dependency tree a second time for another. The web crate's default `web` feature is the browser bundle; its server, its API and most of its UI tests are compiled only under `server`, and `--no-default-features` changes nothing for the other members, none of which defines a default.
 
-CI runs the same lines through Dagger, from `.dagger/modules/ci`: a module of this repository that calls the Rust module's checks — and, for clippy, its container — with the arguments above, so `dagger check` at a checkout is what CI runs on a pull request. A pull request, and a push to `main`, run `dagger check`: `ci:fmt` (the first line), `ci:test` (the second — every test, in one build), `ci:clippy` (the fourth), `ci:doc` (`cargo doc --no-deps` over the same feature set, with rustdoc denying warnings) and `ci:audit` (`cargo audit` of `Cargo.lock` against the RustSec database). A push to any other branch runs the fast path, `dagger api call ci quick`: `cargo test -p dependaboard-core -p dependaboard-store -p dependaboard-github -p dependaboard-restate`, the tests of the four members that do not pull in dioxus — most of what the full build compiles is dioxus and what sits under it. In both, cargo-chef compiles the dependencies from the manifests alone — one layer for the tests' build, one in check mode that clippy and rustdoc share — so a source edit recompiles the workspace crates only. The wasm check, `cargo deny`, the stylesheet, the Compose file and the `dx` build are not yet run by CI.
+The tests run under [cargo-nextest](https://nexte.st), which `devenv shell` provides (elsewhere, `cargo install cargo-nextest --locked`, or a pre-built binary from the same site). Each test runs in a process of its own, so a leaked global or a racing `env::set_var` fails one named test instead of racing the rest silently. `.config/nextest.toml` adds a slow-test limit — a test still running after 30s is reported, and terminated after a second period, so a hang is a failure with a name rather than a hung run — and one retry, scoped to the single store test that meets a real SQLite file lock from a second connection; the file names the test and says why, and nothing else is retried. `cargo test` over the same flags is the fallback: it must also pass, it is what CI runs today, and it is the only runner for doctests, of which there are none. `-P ci` selects the CI profile, which turns fail-fast off and writes a JUnit report to `target/nextest/ci/junit.xml`.
+
+The suite is named by module, so a filterset (`-E`, see `cargo nextest help filterset`) selects a group of tests by what it touches, without renaming anything:
+
+| Group | Touches | Filterset |
+| --- | --- | --- |
+| Pure | Nothing: core, the GitHub client's own logic, the Restate service against in-memory fixtures | `package(dependaboard-core) + (package(dependaboard-github) & kind(lib)) + package(dependaboard-restate)` |
+| Store | SQLite on a temporary directory | `package(dependaboard-store)` |
+| HTTP mock | A wiremock server on loopback, in the GitHub client's integration tests | `package(dependaboard-github) & kind(test)` |
+| VirtualDom | Dioxus' VirtualDom, in the web UI | `package(dependaboard-web) & test(/^ui::/)` |
+| Sockets | The web server and its API on loopback | `package(dependaboard-web) & (test(/^api::/) + test(/^server::/))` |
+
+The five are a partition: together they are the whole suite, and no test is in two.
+
+CI runs these checks through Dagger, from `.dagger/modules/ci`: a module of this repository that calls the Rust module's checks — and, for clippy, its container — with the arguments above, so `dagger check` at a checkout is what CI runs on a pull request. A pull request, and a push to `main`, run `dagger check`: `ci:fmt` (the first line), `ci:test` (the second line's flags, run by `cargo test` — every test, in one build), `ci:clippy` (the fourth), `ci:doc` (`cargo doc --no-deps` over the same feature set, with rustdoc denying warnings) and `ci:audit` (`cargo audit` of `Cargo.lock` against the RustSec database). A push to any other branch runs the fast path, `dagger api call ci quick`: `cargo test -p dependaboard-core -p dependaboard-store -p dependaboard-github -p dependaboard-restate`, the tests of the four members that do not pull in dioxus — most of what the full build compiles is dioxus and what sits under it. In both, cargo-chef compiles the dependencies from the manifests alone — one layer for the tests' build, one in check mode that clippy and rustdoc share — so a source edit recompiles the workspace crates only. The wasm check, `cargo deny`, the stylesheet, the Compose file and the `dx` build are not yet run by CI; nor is nextest, whose `ci` profile is there for the day the Dagger module runs it.
 
 Work is tracked in GitHub Issues, one issue per commit. The commit's subject reads as the behaviour it delivers, and its body carries `Closes #N`, naming the issue that asked for it, so a review can trace a change back to its ticket and the ticket closes when the commit lands. `docs/agents/issue-tracker.md` has the rest of the convention.
 
