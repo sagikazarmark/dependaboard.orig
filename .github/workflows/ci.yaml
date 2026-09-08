@@ -2,18 +2,22 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
 
 permissions:
   contents: read
 
 env:
-  DAGGER_VERSION: 86d1d2f5791bcf3213d56903cfa81a3ba0abe54a
+  # The release devenv.nix runs (DAGGER_X_RELEASE), so CI runs the Dagger the dev environment runs.
+  DAGGER_VERSION: v1.0.0-beta.10
 
 jobs:
+  # A pull request, and a push to main, run every check: the tests in one build over the
+  # workspace's server side, clippy denying warnings, rustdoc, the advisory audit, rustfmt.
   checks:
     name: Checks
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
     steps:
@@ -24,5 +28,22 @@ jobs:
         uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
         with:
           verb: check
-          # version: ${{ env.DAGGER_VERSION }}
-          commit: ${{ env.DAGGER_VERSION }}
+          version: ${{ env.DAGGER_VERSION }}
+
+  # A push to any other branch runs the fast path: the tests of the members that do not
+  # pull in dioxus, cooked from their manifests alone.
+  quick:
+    name: Quick tests
+    if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Test
+        uses: dagger/dagger-for-github@27b130bf0f79a7f6fbbbe0fbca6760dc9bb40a77 # v8.4.1
+        with:
+          verb: api
+          args: call ci quick
+          version: ${{ env.DAGGER_VERSION }}

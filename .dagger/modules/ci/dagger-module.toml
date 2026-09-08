@@ -1,0 +1,7 @@
+name = "ci"
+engineVersion = "v1.0.0"
+runtime.source = "dang"
+
+[[dependencies]]
+name = "rust"
+source = "github.com/sagikazarmark/daggerverse-beta/rust"

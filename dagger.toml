@@ -1,6 +1,7 @@
 ignore = [".devenv", "target"]
 
-[modules.rust]
-source = "github.com/sagikazarmark/daggerverse-beta/rust"
-
-settings.noCache = "true"
+# The Rust module is a dependency of this one, not installed on its own: `ci` calls its
+# checks with the arguments the README's Development Verification runs, over dependency
+# layers cargo-chef cooks from the manifests, and leaves out `build`.
+[modules.ci]
+source = ".dagger/modules/ci"

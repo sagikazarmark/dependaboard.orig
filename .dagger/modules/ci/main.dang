@@ -1,0 +1,101 @@
+"""
+Dependaboard's CI: the Rust module's checks, called with the arguments the README's
+Development Verification runs by hand, over dependency layers cargo-chef cooks from the
+manifests — one for the tests' build, one in check mode that clippy and rustdoc share.
+"""
+
+"""
+The web crate's server side. Its default `web` feature is the browser bundle; its server,
+its API and most of its UI tests compile only under this one. No other member defines a
+default, so `--no-default-features` changes nothing for them.
+"""
+let serverFeature: String! = "dependaboard-web/server"
+
+"""
+What every full check compiles: the whole workspace, on the server side.
+"""
+let workspaceFlags: [String!]! = ["--workspace", "--no-default-features", "--features", serverFeature]
+
+"""
+The members that do not pull in dioxus: everything but the web app. Their tests are the
+fast path a push to a branch runs.
+"""
+let dioxusFreePackages: [String!]! = [
+  "dependaboard-core",
+  "dependaboard-store",
+  "dependaboard-github",
+  "dependaboard-restate",
+]
+
+type Ci {
+  """
+  Cooks a cargo command's dependencies as that command needs them, in build mode: `test`
+  and `quick` compile the dependencies proper. `audit` and `fmt` compile nothing and run on
+  it uncooked.
+  """
+  let rust: Rust!
+
+  """
+  Cooks one check-mode layer — the whole workspace, every target, through clippy — that
+  `clippy` and `doc` share: both need the dependencies' metadata only, and cargo does not
+  reuse build-mode artifacts for it.
+  """
+  let checkMode: Rust!
+
+  new(ws: Workspace!) {
+    self.rust = Dagger.rust(ws: ws, chef: true)
+    self.checkMode = Dagger.rust(ws: ws, chef: true, chefArgs: workspaceFlags + ["--all-targets", "--clippy"])
+
+    self
+  }
+
+  """
+  Every test in one build: cargo test --workspace --no-default-features --features dependaboard-web/server.
+  """
+  pub test: String! @check {
+    self.rust.test(all: true, noDefaultFeatures: true, feature: [serverFeature])
+  }
+
+  """
+  The fast path for a push to a branch: the tests of the members that do not pull in dioxus —
+  core, store, github and the Restate service — over dependencies cooked from their manifests
+  alone. Not a check: `dagger check` is the pull request's set, and this is a subset of `test`.
+  """
+  pub quick: String! {
+    self.rust.test(package: dioxusFreePackages)
+  }
+
+  """
+  cargo clippy --workspace --all-targets --no-default-features --features dependaboard-web/server -- -D warnings.
+  Run on the module's container by hand: its own clippy takes lint levels and `--no-deps`,
+  not a package, target or feature selection.
+  """
+  pub clippy: String! @check {
+    self
+      .checkMode
+      .container
+      .withExec(["cargo", "clippy"] + workspaceFlags + ["--all-targets", "--", "-D", "warnings"])
+      .stdout
+  }
+
+  """
+  cargo doc --no-deps over the workspace on the server side, with rustdoc denying warnings.
+  """
+  pub doc: String! @check {
+    self.checkMode.doc(all: true, noDefaultFeatures: true, feature: [serverFeature])
+  }
+
+  """
+  Audit Cargo.lock against the RustSec advisory database.
+  """
+  pub audit: String! @check {
+    self.rust.audit
+  }
+
+  """
+  Format the codebase using rustfmt.
+  """
+  pub fmt: Changeset! @generate {
+    self.rust.fmt
+  }
+}
