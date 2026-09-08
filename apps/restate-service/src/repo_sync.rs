@@ -3,7 +3,9 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use dependaboard_core::{Operation, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds};
+use dependaboard_core::{
+    Operation, PrKey, PrRecord, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds,
+};
 use dependaboard_store::ProjectionWriter;
 use restate_sdk::prelude::*;
 use tracing::warn;
@@ -16,8 +18,10 @@ use crate::{
     store::{StoreStepContext, store_failure, store_retry_policy},
 };
 
-/// Side effects a repository reconcile asks of Restate, GitHub and the store, abstracted
-/// so `run_repo_reconcile` can be exercised against a recording fake without a runtime.
+/// Side effects the repository's handlers ask of Restate, GitHub and the store — the
+/// sweep's listing, calls and retention, and the commit-status fan-out's lookup and
+/// sends — abstracted so `run_repo_reconcile` and `run_sync_sha` can be exercised
+/// against a recording fake without a runtime.
 trait RepoReconcileEffects {
     fn repository_id(&self) -> u64;
     fn list_pull_requests(
@@ -29,33 +33,45 @@ trait RepoReconcileEffects {
         &mut self,
         request: &SyncRequest,
     ) -> impl Future<Output = Result<(), TerminalError>> + Send;
-    /// Prunes the projection down to `live`. The keys it removes are queued for
-    /// retirement by the store, fenced by the sweep's start; the drain that follows tells
-    /// them, so nothing here depends on what this step returns.
+    /// Prunes the projection down to `live`, sparing rows synced since `synced_before`.
+    /// The keys it removes are queued for retirement by the store under the same fence;
+    /// the drain that follows tells them, so nothing here depends on what this step
+    /// returns.
     fn retain_pull_requests(
         &mut self,
         live: &[u64],
+        synced_before: u64,
     ) -> impl Future<Output = HandlerResult<()>> + Send;
+    /// The repository's pull requests whose head is `sha`, as the projection has them.
+    fn pull_requests_at(
+        &mut self,
+        sha: &str,
+    ) -> impl Future<Output = HandlerResult<Vec<PrRecord>>> + Send;
+    /// Sends `request` one-way to the pull request object `key` names, to sync as soon as
+    /// it is free. A send cannot fail; how the sync fares is the callee's to tell. The
+    /// key is passed rather than derived here so a test sees where the send went.
+    fn send_sync(&mut self, key: &PrKey, request: SyncRequest);
 }
 
 struct RestateReconcileEffects<'a, 'ctx> {
     ctx: &'a ObjectContext<'ctx>,
     github: &'a GithubApiHandle,
     store: &'a Arc<dyn ProjectionWriter>,
-    repository: RepoRecord,
-    reconcile_start: u64,
+    repository_id: u64,
+    owner: String,
+    repo: String,
 }
 
 impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
     fn repository_id(&self) -> u64 {
-        self.repository.repository_id
+        self.repository_id
     }
 
     async fn list_pull_requests(&mut self) -> HandlerResult<Vec<SyncRequest>> {
         let github = self.github.clone();
-        let owner = self.repository.owner.clone();
-        let repo = self.repository.repo.clone();
-        let repository_id = self.repository_id();
+        let owner = self.owner.clone();
+        let repo = self.repo.clone();
+        let repository_id = self.repository_id;
         let pulls = run_github_step(&mut RestateGithubStep {
             ctx: self.ctx,
             name: "list-open-dependabot-prs",
@@ -84,10 +100,13 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
             .await
     }
 
-    async fn retain_pull_requests(&mut self, live: &[u64]) -> HandlerResult<()> {
+    async fn retain_pull_requests(
+        &mut self,
+        live: &[u64],
+        synced_before: u64,
+    ) -> HandlerResult<()> {
         let store = self.store.clone();
-        let repository_id = self.repository_id();
-        let reconcile_start = self.reconcile_start;
+        let repository_id = self.repository_id;
         let live = live.to_vec();
         self.ctx
             .run_store_step(
@@ -95,7 +114,7 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
                 store_retry_policy(),
                 move || async move {
                     store
-                        .retain_prs(repository_id, &live, reconcile_start)
+                        .retain_prs(repository_id, &live, synced_before)
                         .await
                         .map(drop)
                         .map_err(store_failure)
@@ -104,11 +123,40 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
             .await?;
         Ok(())
     }
+
+    async fn pull_requests_at(&mut self, sha: &str) -> HandlerResult<Vec<PrRecord>> {
+        let store = self.store.clone();
+        let repository_id = self.repository_id;
+        let sha = sha.to_owned();
+        let matches = self
+            .ctx
+            .run_store_step(
+                "resolve-prs-for-sha",
+                store_retry_policy(),
+                move || async move {
+                    store
+                        .prs_for_sha(repository_id, &sha)
+                        .await
+                        .map(Json::from)
+                        .map_err(store_failure)
+                },
+            )
+            .await?;
+        Ok(matches.into_inner())
+    }
+
+    fn send_sync(&mut self, key: &PrKey, request: SyncRequest) {
+        self.ctx
+            .object_client::<PullRequestClient>(key.to_string())
+            .sync(Json::from(request))
+            .send();
+    }
 }
 
-/// Sweeps every listed pull request, prunes the projection down to the listing, then
-/// retires the durable state of every pull request the outbox holds — those pruning
-/// removed just now, and any an earlier prune removed without getting to tell.
+/// Sweeps every listed pull request, prunes the projection down to the listing under
+/// `reconcile_start` as the fence, then retires the durable state of every pull request
+/// the outbox holds — those pruning removed just now, and any an earlier prune removed
+/// without getting to tell.
 ///
 /// A pull request that fails terminally is logged and remembered rather than propagated,
 /// so one unsyncable pull request can neither starve the rest of the repository nor skip
@@ -117,6 +165,7 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
 async fn run_repo_reconcile<E: RepoReconcileEffects, R: RetirementEffects>(
     restate: &mut E,
     retirements: &mut R,
+    reconcile_start: u64,
 ) -> HandlerResult<usize> {
     let pulls = restate.list_pull_requests().await?;
     let mut failed = Vec::new();
@@ -136,7 +185,7 @@ async fn run_repo_reconcile<E: RepoReconcileEffects, R: RetirementEffects>(
         .iter()
         .map(|request| request.number)
         .collect::<Vec<_>>();
-    restate.retain_pull_requests(&live).await?;
+    restate.retain_pull_requests(&live, reconcile_start).await?;
     retire_pending(retirements).await?;
     if failed.is_empty() {
         return Ok(pulls.len());
@@ -153,6 +202,38 @@ async fn run_repo_reconcile<E: RepoReconcileEffects, R: RetirementEffects>(
         restate.repository_id(),
     ))
     .into())
+}
+
+/// Fans a commit's status change out to the pull requests at that commit: the ones
+/// GitHub named in the delivery — none for a fork's, several for a shared head — and
+/// the ones the projection has at that head, each sent one sync. No match means nothing
+/// is sent: a commit no pull request is at is not this repository's to reconcile.
+/// Resolves to how many pull requests were told.
+async fn run_sync_sha<E: RepoReconcileEffects>(
+    restate: &mut E,
+    request: &SyncShaRequest,
+) -> HandlerResult<usize> {
+    let at_head = restate.pull_requests_at(&request.sha).await?;
+    let mut numbers = request
+        .pull_requests
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    numbers.extend(at_head.into_iter().map(|pull| pull.number));
+    let told = numbers.len();
+    for number in numbers {
+        let sync = SyncRequest {
+            repository_id: request.repository_id,
+            owner: request.owner.clone(),
+            repo: request.repo.clone(),
+            number,
+            bypass_debounce: false,
+            completion_id: None,
+        };
+        // Keyed by the request, as every sender keys a sync, so it is the same object.
+        restate.send_sync(&request_key(&sync), sync);
+    }
+    Ok(told)
 }
 
 #[derive(Clone)]
@@ -179,14 +260,16 @@ impl RepoSync {
                 ctx: &ctx,
                 github: &self.github,
                 store: &self.store,
-                repository,
-                reconcile_start,
+                repository_id: repository.repository_id,
+                owner: repository.owner,
+                repo: repository.repo,
             };
             let mut retirements = RestateRetirements {
                 ctx: &ctx,
                 store: &self.store,
             };
-            let pull_requests = run_repo_reconcile(&mut restate, &mut retirements).await?;
+            let pull_requests =
+                run_repo_reconcile(&mut restate, &mut retirements, reconcile_start).await?;
             Ok(format!("synced {pull_requests} pull requests"))
         })
         .await
@@ -201,44 +284,17 @@ impl RepoSync {
     ) -> HandlerResult<()> {
         traced("RepoSync/sync_sha", ctx.key(), async {
             let request = request.into_inner();
-            let store = self.store.clone();
-            let repository_id = request.repository_id;
-            let sha = request.sha.clone();
-            let matches = ctx
-                .run_store_step(
-                    "resolve-prs-for-sha",
-                    store_retry_policy(),
-                    move || async move {
-                        store
-                            .prs_for_sha(repository_id, &sha)
-                            .await
-                            .map(Json::from)
-                            .map_err(store_failure)
-                    },
-                )
-                .await?;
-            let mut numbers = request
-                .pull_requests
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>();
-            numbers.extend(matches.into_inner().into_iter().map(|pull| pull.number));
-            let count = numbers.len();
-            for number in numbers {
-                let sync = SyncRequest {
-                    repository_id: request.repository_id,
-                    owner: request.owner.clone(),
-                    repo: request.repo.clone(),
-                    number,
-                    bypass_debounce: false,
-                    completion_id: None,
-                };
-                ctx.object_client::<PullRequestClient>(request_key(&sync).to_string())
-                    .sync(Json::from(sync))
-                    .send();
-            }
+            let mut restate = RestateReconcileEffects {
+                ctx: &ctx,
+                github: &self.github,
+                store: &self.store,
+                repository_id: request.repository_id,
+                owner: request.owner.clone(),
+                repo: request.repo.clone(),
+            };
+            let told = run_sync_sha(&mut restate, &request).await?;
             Ok(format!(
-                "fanned out to {count} pull requests at {}",
+                "fanned out to {told} pull requests at {}",
                 short_sha(&request.sha)
             ))
         })
@@ -251,10 +307,11 @@ impl RepoSync {
 mod tests {
     use std::collections::BTreeMap;
 
-    use dependaboard_core::PrKey;
-
     use super::*;
-    use crate::{pull_request::ClosedRequest, test_support::RecordedRetirements};
+    use crate::{
+        pull_request::ClosedRequest,
+        test_support::{RecordedRetirements, snapshot},
+    };
 
     fn dependabot_pull(number: u64) -> SyncRequest {
         SyncRequest {
@@ -267,8 +324,29 @@ mod tests {
         }
     }
 
-    /// Stands in for Restate, GitHub and the store during a repository reconcile and
-    /// records what the sweep asked of them.
+    /// A row of the projection: pull request `number` of `acme/api`, at `abc123`.
+    fn row_at_head(number: u64) -> PrRecord {
+        PrRecord {
+            id: PrKey::new(7, number).to_string(),
+            number,
+            ..snapshot()
+        }
+    }
+
+    /// What the ingress routes a check delivery for `abc123` in `acme/api` to, with the
+    /// pull requests GitHub named in it.
+    fn commit_status(pull_requests: &[u64]) -> SyncShaRequest {
+        SyncShaRequest {
+            repository_id: 7,
+            owner: "acme".to_owned(),
+            repo: "api".to_owned(),
+            sha: "abc123".to_owned(),
+            pull_requests: pull_requests.to_vec(),
+        }
+    }
+
+    /// Stands in for Restate, GitHub and the store during a repository reconcile or a
+    /// commit-status fan-out and records what each asked of them.
     #[derive(Default)]
     struct RecordedRepoSync {
         pulls: Vec<SyncRequest>,
@@ -276,6 +354,14 @@ mod tests {
         sync_failures: BTreeMap<u64, TerminalError>,
         synced: Vec<u64>,
         retained: Option<Vec<u64>>,
+        /// The fence the retain was asked to prune under.
+        retained_under: Option<u64>,
+        /// What the projection has at the head `pull_requests_at` is asked about.
+        at_head: Vec<PrRecord>,
+        /// The heads `pull_requests_at` was asked about.
+        resolved: Vec<String>,
+        /// Every sync sent one-way, in order: the key it went to and what it carried.
+        sent: Vec<(PrKey, SyncRequest)>,
     }
 
     impl RepoReconcileEffects for RecordedRepoSync {
@@ -298,10 +384,75 @@ mod tests {
             }
         }
 
-        async fn retain_pull_requests(&mut self, live: &[u64]) -> HandlerResult<()> {
+        async fn retain_pull_requests(
+            &mut self,
+            live: &[u64],
+            synced_before: u64,
+        ) -> HandlerResult<()> {
             self.retained = Some(live.to_vec());
+            self.retained_under = Some(synced_before);
             Ok(())
         }
+
+        async fn pull_requests_at(&mut self, sha: &str) -> HandlerResult<Vec<PrRecord>> {
+            self.resolved.push(sha.to_owned());
+            Ok(self.at_head.clone())
+        }
+
+        fn send_sync(&mut self, key: &PrKey, request: SyncRequest) {
+            self.sent.push((key.clone(), request));
+        }
+    }
+
+    /// A check delivery names a commit. GitHub names the pull requests it knows at that
+    /// commit — none for a fork's, several for a shared head — and the projection may
+    /// know others, so the fan-out is the union, each pull request told once.
+    #[tokio::test]
+    async fn a_commit_status_reaches_every_pull_request_at_that_head_once() {
+        let mut restate = RecordedRepoSync {
+            at_head: vec![row_at_head(12), row_at_head(19)],
+            ..Default::default()
+        };
+
+        let told = run_sync_sha(&mut restate, &commit_status(&[19, 23]))
+            .await
+            .unwrap();
+
+        assert_eq!(restate.resolved, vec!["abc123"]);
+        assert_eq!(told, 3);
+        assert_eq!(
+            restate.sent,
+            vec![
+                (PrKey::new(7, 12), dependabot_pull(12)),
+                (PrKey::new(7, 19), dependabot_pull(19)),
+                (PrKey::new(7, 23), dependabot_pull(23)),
+            ],
+            "the ones GitHub named and the ones the projection has at that head, 19 once, \
+             each sent to its own object as a plain sync that honours the debounce"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_no_pull_request_is_at_syncs_nothing() {
+        let mut restate = RecordedRepoSync::default();
+
+        let told = run_sync_sha(&mut restate, &commit_status(&[]))
+            .await
+            .unwrap();
+
+        assert_eq!(told, 0);
+        assert!(
+            restate.sent.is_empty(),
+            "a commit no pull request is at is not this repository's to sync"
+        );
+        assert!(
+            restate.synced.is_empty(),
+            "no match means ignore, not reconcile: no pull request is swept"
+        );
+        assert_eq!(
+            restate.retained, None,
+            "no match means ignore, not reconcile: nothing is pruned"
+        );
     }
 
     #[tokio::test]
@@ -315,11 +466,16 @@ mod tests {
         let mut retirements =
             RecordedRetirements::queued(&[PrKey::new(7, 3), PrKey::new(7, 9)], Some(900));
 
-        run_repo_reconcile(&mut restate, &mut retirements)
+        run_repo_reconcile(&mut restate, &mut retirements, 900)
             .await
             .unwrap();
 
         assert_eq!(restate.retained, Some(vec![12]));
+        assert_eq!(
+            restate.retained_under,
+            Some(900),
+            "the projection prunes under the sweep's start, the fence the retirements carry"
+        );
         assert_eq!(
             retirements.closed,
             vec![
@@ -358,7 +514,7 @@ mod tests {
         };
         let mut retirements = RecordedRetirements::queued(&[PrKey::new(7, 5)], Some(900));
 
-        let outcome = run_repo_reconcile(&mut restate, &mut retirements).await;
+        let outcome = run_repo_reconcile(&mut restate, &mut retirements, 900).await;
 
         assert_eq!(restate.synced, vec![12, 19, 23]);
         assert_eq!(
@@ -385,7 +541,7 @@ mod tests {
         };
         let mut retirements = RecordedRetirements::queued(&[PrKey::new(7, 3)], Some(900));
 
-        let outcome = run_repo_reconcile(&mut restate, &mut retirements).await;
+        let outcome = run_repo_reconcile(&mut restate, &mut retirements, 900).await;
 
         assert!(outcome.is_err());
         assert!(restate.synced.is_empty());
@@ -420,7 +576,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = run_repo_reconcile(&mut restate, &mut RecordedRetirements::default())
+        let error = run_repo_reconcile(&mut restate, &mut RecordedRetirements::default(), 900)
             .await
             .unwrap_err();
 
@@ -438,7 +594,7 @@ mod tests {
             ..Default::default()
         };
 
-        let synced = run_repo_reconcile(&mut restate, &mut RecordedRetirements::default())
+        let synced = run_repo_reconcile(&mut restate, &mut RecordedRetirements::default(), 900)
             .await
             .unwrap();
 
@@ -451,7 +607,7 @@ mod tests {
     async fn an_empty_listing_still_prunes_the_projection() {
         let mut restate = RecordedRepoSync::default();
 
-        run_repo_reconcile(&mut restate, &mut RecordedRetirements::default())
+        run_repo_reconcile(&mut restate, &mut RecordedRetirements::default(), 900)
             .await
             .unwrap();
 
