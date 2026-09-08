@@ -333,6 +333,11 @@ mod tests {
 
     const RETRY_BUTTON: &str = "retry-rejected-button";
 
+    /// A poll failing on the server's side: Restate away.
+    fn unavailable() -> Fault {
+        Fault::Refused("Restate is unavailable".to_owned())
+    }
+
     /// A merge that has landed names the commit it made the moment Restate
     /// reports it, as a short sha linked to the commit on the pull request's
     /// GitHub, beside the words for it; one reported without a commit —
@@ -394,6 +399,8 @@ mod tests {
         );
     }
 
+    /// Whether a retry is offered is [`can_retry`]'s rule, tested with it;
+    /// here, that a batch it holds for has the button, and can press it.
     #[test]
     fn a_finished_batch_with_a_rejected_target_offers_to_retry_the_rejected_ones() {
         let html = render_drawer(finished_with_rejection(RejectReason::NotMergeable), false);
@@ -417,292 +424,249 @@ mod tests {
         );
     }
 
+    /// The listing the projection holds of `batch-1` while it runs: a merge
+    /// of twelve, asked for by `alice`, started three minutes before
+    /// [`FIXTURE_NOW`].
+    fn listed_as_running() -> Listing {
+        Listing::Running(RunningBatch {
+            batch_id: "batch-1".to_owned(),
+            installation_id: 1,
+            action: BulkActionKind::Merge,
+            requested_by: UserId::new("alice"),
+            retried_from: None,
+            started_at: FIXTURE_NOW - 3 * 60,
+            target_count: 12,
+        })
+    }
+
+    /// Which of the ways of finding a batch the follow is on, in order. Until
+    /// the projection has answered, the batch is being looked up — not asked
+    /// of Restate, which is the second word, not the first. Listed as running,
+    /// what the listing knows is passed on — what was asked, over how many,
+    /// by whom, since when — with Restate asked for the rest. An id the
+    /// projection has never heard of is said to be, with why that need not be
+    /// the end of it. A projection that could not be read is said to be, and
+    /// Restate asked as it always was; the fault itself is the trouble note's.
     #[test]
-    fn a_batch_still_running_does_not_offer_a_retry_yet() {
-        // One target rejected already, but the other is still queued.
-        let targets = [pr_target(&grouped_row()), pr_target(&serde_row())];
-        let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
-        progress.record(
-            &targets[0].key(),
-            ActionOutcome::Rejected {
-                reason: RejectReason::Forbidden,
-            },
+    fn the_finding_note_says_which_way_of_finding_the_batch_the_follow_is_on() {
+        let attaching = Followed::attaching("batch-1", FIXTURE_NOW);
+        let with = |listing| Followed {
+            listing,
+            ..attaching.clone()
+        };
+
+        assert_eq!(
+            finding_note(&attaching, FIXTURE_NOW),
+            "Looking the batch up..."
         );
-        assert!(!progress.completed);
-
-        let html = render_drawer(progress, false);
-
-        assert!(!html.contains(RETRY_BUTTON), "{html}");
-    }
-
-    /// A failed target is not a rejected one: its problem was not the request
-    /// but the round trip, and it is not what the retry is for.
-    #[test]
-    fn a_finished_batch_with_nothing_rejected_offers_no_retry() {
-        let mut progress = half_done_merge();
-        progress.record_failure(
-            &pr_target(&serde_row()).key(),
-            "GitHub mutation failed with HTTP 500: Internal Server Error",
+        assert_eq!(
+            finding_note(&with(listed_as_running()), FIXTURE_NOW),
+            "Listed as running: merge over 12 pull requests, by alice, started 3m ago. Asking \
+             Restate where it stands..."
         );
-
-        let html = render_drawer(progress, false);
-
-        assert!(!html.contains(RETRY_BUTTON), "{html}");
-    }
-
-    /// A pull request rejected as not found is closed or merged; there is
-    /// nothing to retry it against, and the row already says so.
-    #[test]
-    fn a_batch_whose_only_rejections_are_not_found_offers_no_retry() {
-        let html = render_drawer(finished_with_rejection(RejectReason::NotFound), false);
-
-        assert!(!html.contains(RETRY_BUTTON), "{html}");
-    }
-
-    /// A rejection over the configuration — the identity GitHub refused, the
-    /// merge method the repository disallows, the user token the deployment
-    /// lacks — meets the same answer on the next attempt; a batch with only
-    /// those has nothing a retry can cure.
-    #[test]
-    fn a_batch_whose_only_rejections_are_over_the_configuration_offers_no_retry() {
-        for reason in [
-            RejectReason::Forbidden,
-            RejectReason::MergeMethodDisallowed,
-            RejectReason::NoUserToken,
-        ] {
-            let html = render_drawer(finished_with_rejection(reason.clone()), false);
-
-            assert!(!html.contains(RETRY_BUTTON), "{reason:?}: {html}");
-        }
-    }
-
-    /// The opening of the drawer's note about a batch that is not moving.
-    const NOTE: &str = r#"<p class="progress-note">"#;
-
-    /// A batch that moved within the minute is a batch at work; the drawer
-    /// shows its rows and says nothing more.
-    #[test]
-    fn a_batch_that_changed_within_the_minute_gets_no_waiting_note() {
-        let html = render_followed(
-            followed(half_done_merge()),
-            FIXTURE_NOW + WAITING_NOTICE_AFTER.as_secs() - 1,
-            false,
+        assert_eq!(
+            finding_note(&with(Listing::Unlisted), FIXTURE_NOW),
+            "The projection has no batch by this id, running or finished; one just queued may \
+             not be listed yet. Asking Restate where it stands..."
         );
-
-        assert!(!html.contains(NOTE), "{html}");
-    }
-
-    /// Nothing moved for longer than a healthy call takes. The batch is not
-    /// lost, and the drawer does not say so; nor does it say the wait is on
-    /// GitHub, which it cannot know — progress is published only as verdicts
-    /// land, so a call being retried and a service that has died look the
-    /// same from here. It says for how long the batch has stood, that it
-    /// cannot tell why, and that the batch carries on.
-    #[test]
-    fn a_batch_standing_still_says_for_how_long_and_neither_that_it_is_lost_nor_whose_fault() {
-        let html = render_followed(followed(half_done_merge()), FIXTURE_NOW + 47 * 60, false);
-
-        assert!(
-            html.contains(
-                r#"<p class="progress-note">No progress for 47m. Whether a call is being retried or the service is down, the dashboard cannot tell; one call may take hours inside its budgets, and the batch is durable in Restate for all of them.</p>"#
-            ),
-            "{html}"
+        assert_eq!(
+            finding_note(&with(Listing::Unreadable), FIXTURE_NOW),
+            "The projection could not be read. Asking Restate where the batch stands..."
         );
-        assert!(!html.to_lowercase().contains("lost"), "{html}");
-        assert!(!html.contains("GitHub"), "{html}");
     }
 
-    /// The dashboard's own snapshot of what it queued is not Restate's word;
-    /// while Restate has not given one, the wait is on Restate, not GitHub.
+    /// Nothing while the batch moved within the minute, nor once it has run
+    /// to the end, however long ago. Past the minute, for how long it has
+    /// stood and what the dashboard can tell of why. While Restate has not
+    /// spoken for a batch the dashboard submitted, the wait is on Restate to
+    /// start it. Once it has, the dashboard cannot tell a call being retried
+    /// inside its budgets from a service that has died — progress is
+    /// published only as verdicts land, so the two look the same from here —
+    /// so it says only for how long: not that the batch is lost, which it is
+    /// not, nor that the wait is on GitHub, which it cannot know.
     #[test]
-    fn a_batch_restate_has_not_started_says_it_waits_on_restate() {
+    fn the_waiting_note_dates_a_batch_that_stands_still_and_says_what_can_be_told_of_why() {
+        let heard = followed(half_done_merge());
+        let notice = WAITING_NOTICE_AFTER.as_secs();
+
+        assert_eq!(waiting_note(&heard, FIXTURE_NOW + notice - 1), None);
+        let standing = waiting_note(&heard, FIXTURE_NOW + 47 * 60).expect("the batch stands still");
+        assert_eq!(
+            standing,
+            "No progress for 47m. Whether a call is being retried or the service is down, the \
+             dashboard cannot tell; one call may take hours inside its budgets, and the batch is \
+             durable in Restate for all of them."
+        );
+        assert!(!standing.to_lowercase().contains("lost"), "{standing}");
+        assert!(!standing.contains("GitHub"), "{standing}");
+
         let queued = Followed::queued(
             "batch-1",
             BulkActionKind::Merge,
             &[pr_target(&grouped_row())],
             FIXTURE_NOW,
         );
-
-        let html = render_followed(queued, FIXTURE_NOW + 3 * 60, false);
-
-        assert!(
-            html.contains("Waiting on Restate to start the batch, 3m after it took it"),
-            "{html}"
-        );
-        assert!(!html.contains("No progress for"), "{html}");
-    }
-
-    /// A finished batch waits on nothing, however long ago it finished.
-    #[test]
-    fn a_finished_batch_gets_no_waiting_note() {
-        let html = render_followed(
-            followed(finished_with_rejection(RejectReason::NotMergeable)),
-            FIXTURE_NOW + 24 * 3600,
-            false,
+        assert_eq!(
+            waiting_note(&queued, FIXTURE_NOW + 3 * 60).as_deref(),
+            Some(
+                "Waiting on Restate to start the batch, 3m after it took it: its service may be \
+                 down or deploying, and the batch starts when it is back."
+            )
         );
 
-        assert!(!html.contains(NOTE), "{html}");
+        let finished = followed(finished_with_rejection(RejectReason::NotMergeable));
+        assert_eq!(waiting_note(&finished, FIXTURE_NOW + 24 * 3600), None);
     }
 
-    /// A poll the server did not answer says nothing about the batch; the
-    /// drawer passes the reason on, over the progress last heard, and says
-    /// the dashboard is still asking.
+    /// Nothing while the polls are answered. While they are not, the fault —
+    /// and, once Restate has been heard on the batch, that the batch carries
+    /// on and the dashboard keeps asking after it; before Restate has been
+    /// heard, the fault alone, since the finding note already says the
+    /// dashboard is asking. Once the server has refused the credentials the
+    /// dashboard has stopped asking, and the note says so, and that the
+    /// reload that signs in again is what brings the follow back — over the
+    /// progress last heard, that the batch carries on in Restate meanwhile;
+    /// for a batch followed by id alone, not even that, since Restate was
+    /// never heard on it. Neither claims to be still asking.
     #[test]
-    fn a_failing_poll_is_reported_over_the_progress_last_heard() {
-        let troubled = Followed {
-            trouble: Some(Fault::Refused("Restate is unavailable".to_owned())),
-            ..followed(half_done_merge())
+    fn the_trouble_note_passes_the_fault_on_and_says_whether_the_dashboard_is_still_asking() {
+        let heard = followed(half_done_merge());
+        let attaching = Followed::attaching("batch-1", FIXTURE_NOW);
+        let troubled = |trouble, followed: &Followed| Followed {
+            trouble: Some(trouble),
+            ..followed.clone()
         };
 
-        let html = render_followed(troubled, FIXTURE_NOW, false);
+        assert_eq!(trouble_note(&heard), None);
+        assert_eq!(trouble_note(&attaching), None);
+
+        assert_eq!(
+            trouble_note(&troubled(unavailable(), &heard)).as_deref(),
+            Some(
+                "Restate is unavailable. The batch carries on in Restate; the dashboard keeps \
+                 asking after it."
+            )
+        );
+        assert_eq!(
+            trouble_note(&troubled(unavailable(), &attaching)).as_deref(),
+            Some("Restate is unavailable")
+        );
+
+        let refused_heard =
+            trouble_note(&troubled(Fault::SignedOut, &heard)).expect("the poll was refused");
+        assert_eq!(
+            refused_heard,
+            "You are no longer signed in — reload to sign in again. The batch carries on in \
+             Restate; the dashboard has stopped asking after it, and picks it up again once the \
+             page is reloaded."
+        );
+        assert!(!refused_heard.contains("keeps asking"), "{refused_heard}");
+
+        let refused_alone =
+            trouble_note(&troubled(Fault::SignedOut, &attaching)).expect("the poll was refused");
+        assert_eq!(
+            refused_alone,
+            "You are no longer signed in — reload to sign in again. The dashboard has stopped \
+             asking where the batch stands, and asks again once the page is reloaded."
+        );
+        assert!(!refused_alone.contains("asking after"), "{refused_alone}");
+        assert!(
+            !refused_alone.contains("carries on in Restate"),
+            "{refused_alone}"
+        );
+    }
+
+    /// Where the notes go on a batch with progress: between the summary and
+    /// the rows, the waiting note first as a plain note and the trouble note
+    /// after it marked as trouble — over the progress last heard, which stays
+    /// on show — and neither while there is nothing to say. What each says is
+    /// its function's, tested above.
+    #[test]
+    fn a_running_batchs_notes_stand_between_the_summary_and_the_rows_over_the_progress_last_heard()
+    {
+        let troubled = Followed {
+            trouble: Some(unavailable()),
+            ..followed(half_done_merge())
+        };
+        let now = FIXTURE_NOW + 47 * 60;
+        let waiting = waiting_note(&troubled, now).expect("the batch stands still");
+        let trouble = trouble_note(&troubled).expect("the polls are failing");
+
+        let html = render_followed(troubled, now, false);
 
         assert!(
-            html.contains(
-                r#"<p class="progress-note progress-trouble">Restate is unavailable. The batch carries on in Restate; the dashboard keeps asking after it.</p>"#
-            ),
+            html.contains(&format!(
+                r#"</div><p class="progress-note">{waiting}</p><p class="progress-note progress-trouble">{trouble}</p><div class="progress-list">"#
+            )),
             "{html}"
         );
         assert!(html.contains("merge progress"), "{html}");
-        assert!(html.contains("1/2"), "{html}");
+        assert!(html.contains("<strong>1/2</strong>"), "{html}");
+
+        let quiet = render_followed(followed(half_done_merge()), FIXTURE_NOW, false);
+
+        assert!(!quiet.contains("progress-note"), "{quiet}");
     }
 
-    /// The server refused the credentials the poll carried, and the follow
-    /// stopped there rather than prompt for them every second. The drawer
-    /// says so over the progress last heard — the batch carries on without
-    /// being asked after — and that the reload that signs in again is what
-    /// picks it up; it does not claim to be still asking.
+    /// A batch known by id alone has no progress to summarise: the drawer
+    /// names it by its id, says how it is being found where the summary
+    /// would be, and offers no retry; the title names the action once the
+    /// listing has said it, as it does once the progress is in. Once the
+    /// server has refused the credentials the dashboard is no longer finding
+    /// the batch, and the drawer does not say it is: the finding note goes,
+    /// and the trouble note stands alone.
     #[test]
-    fn a_refusal_of_the_credentials_says_the_follow_has_stopped_and_what_brings_it_back() {
-        let refused = Followed {
-            trouble: Some(Fault::SignedOut),
-            ..followed(half_done_merge())
-        };
-
-        let html = render_followed(refused, FIXTURE_NOW, false);
-
-        assert!(
-            html.contains(
-                r#"<p class="progress-note progress-trouble">You are no longer signed in — reload to sign in again. The batch carries on in Restate; the dashboard has stopped asking after it, and picks it up again once the page is reloaded.</p>"#
-            ),
-            "{html}"
-        );
-        assert!(!html.contains("keeps asking"), "{html}");
-        assert!(html.contains("1/2"), "{html}");
-    }
-
-    /// A batch known by id alone whose polls were refused before Restate
-    /// answered any: the dashboard is no longer asking where it stands, and
-    /// does not say it is; there is nothing to say the batch carries on in
-    /// Restate either, since Restate was never heard on it.
-    #[test]
-    fn a_batch_followed_by_id_alone_refused_the_credentials_no_longer_says_it_is_asking() {
-        let refused = Followed {
-            trouble: Some(Fault::SignedOut),
-            ..Followed::attaching("batch-1", FIXTURE_NOW)
-        };
-
-        let html = render_followed(refused, FIXTURE_NOW, false);
-
-        assert!(!html.contains("Asking Restate"), "{html}");
-        assert!(
-            html.contains(
-                r#"<p class="progress-note progress-trouble">You are no longer signed in — reload to sign in again. The dashboard has stopped asking where the batch stands, and asks again once the page is reloaded.</p>"#
-            ),
-            "{html}"
-        );
-        assert!(!html.contains("carries on in Restate"), "{html}");
-        assert!(html.contains("Batch batch-1"), "{html}");
-    }
-
-    /// After a reload the dashboard has the id alone; until the projection has
-    /// answered the drawer names the batch and says it is looking it up — not
-    /// that it is asking Restate, which is the second word, not the first.
-    #[test]
-    fn a_batch_followed_by_id_alone_says_it_is_being_looked_up() {
+    fn a_batch_followed_by_id_alone_says_how_it_is_being_found_in_place_of_the_summary_until_signed_out()
+     {
         let attaching = Followed::attaching("batch-1", FIXTURE_NOW);
 
-        let html = render_followed(attaching, FIXTURE_NOW, false);
+        let html = render_followed(attaching.clone(), FIXTURE_NOW, false);
 
         assert!(html.contains("Batch batch-1"), "{html}");
+        assert!(html.contains("Batch progress"), "{html}");
         assert!(
-            html.contains(r#"<p class="progress-note">Looking the batch up...</p>"#),
+            html.contains(&format!(
+                r#"<p class="progress-note">{}</p>"#,
+                finding_note(&attaching, FIXTURE_NOW)
+            )),
             "{html}"
         );
-        assert!(!html.contains("Asking Restate"), "{html}");
         assert!(!html.contains("progress-summary"), "{html}");
         assert!(!html.contains(RETRY_BUTTON), "{html}");
-    }
 
-    /// The projection lists the batch as running: the drawer says so, with
-    /// what the listing knows of it — what was asked, over how many, by whom,
-    /// since when — and that Restate is being asked for the rest. The title
-    /// names the action, as it does once the progress is in.
-    #[test]
-    fn a_batch_the_projection_lists_as_running_is_described_from_the_listing_while_restate_is_asked()
-     {
         let listed = Followed {
-            listing: Listing::Running(RunningBatch {
-                batch_id: "batch-1".to_owned(),
-                installation_id: 1,
-                action: BulkActionKind::Merge,
-                requested_by: UserId::new("alice"),
-                retried_from: None,
-                started_at: FIXTURE_NOW - 3 * 60,
-                target_count: 12,
-            }),
-            ..Followed::attaching("batch-1", FIXTURE_NOW)
+            listing: listed_as_running(),
+            ..attaching.clone()
         };
 
-        let html = render_followed(listed, FIXTURE_NOW, false);
+        let html = render_followed(listed.clone(), FIXTURE_NOW, false);
 
         assert!(html.contains("merge progress"), "{html}");
         assert!(
-            html.contains(
-                r#"<p class="progress-note">Listed as running: merge over 12 pull requests, by alice, started 3m ago. Asking Restate where it stands...</p>"#
-            ),
+            html.contains(&format!(
+                r#"<p class="progress-note">{}</p>"#,
+                finding_note(&listed, FIXTURE_NOW)
+            )),
             "{html}"
         );
         assert!(!html.contains("progress-summary"), "{html}");
-    }
 
-    /// The projection could not be read, and the store's fault has since
-    /// cleared from the polls: the drawer still says the batch is on Restate's
-    /// word alone, rather than that it is being looked up, which it no longer
-    /// is.
-    #[test]
-    fn a_batch_whose_projection_could_not_be_read_says_so_while_restate_is_asked() {
-        let unreadable = Followed {
-            listing: Listing::Unreadable,
-            ..Followed::attaching("batch-1", FIXTURE_NOW)
+        let refused = Followed {
+            trouble: Some(Fault::SignedOut),
+            ..attaching
         };
+        let trouble = trouble_note(&refused).expect("the poll was refused");
 
-        let html = render_followed(unreadable, FIXTURE_NOW, false);
+        let html = render_followed(refused, FIXTURE_NOW, false);
 
         assert!(
-            html.contains(
-                r#"<p class="progress-note">The projection could not be read. Asking Restate where the batch stands...</p>"#
-            ),
-            "{html}"
+            !html.contains(r#"<p class="progress-note">"#),
+            "the finding note goes: {html}"
         );
-        assert!(!html.contains("Looking the batch up"), "{html}");
-    }
-
-    /// The projection has never heard of the id: the drawer says so, and why
-    /// that need not be the end of it, and that Restate is being asked.
-    #[test]
-    fn a_batch_the_projection_has_never_heard_of_says_so_while_restate_is_asked() {
-        let unlisted = Followed {
-            listing: Listing::Unlisted,
-            ..Followed::attaching("batch-1", FIXTURE_NOW)
-        };
-
-        let html = render_followed(unlisted, FIXTURE_NOW, false);
-
-        assert!(html.contains("Batch batch-1"), "{html}");
         assert!(
-            html.contains(
-                r#"<p class="progress-note">The projection has no batch by this id, running or finished; one just queued may not be listed yet. Asking Restate where it stands...</p>"#
-            ),
+            html.contains(&format!(
+                r#"<p class="progress-note progress-trouble">{trouble}</p>"#
+            )),
             "{html}"
         );
     }
