@@ -1542,17 +1542,23 @@ Retrofitting an audit trail into already-merged PRs isn't possible.
 
 ## 6b. Crate choices
 
-**`octoevents` for the receiving edge.** It turns an untrusted request into a verified
+**`octoevents` 0.2 for the receiving edge.** It turns an untrusted request into a verified
 `Envelope`: constant-time HMAC over `X-Hub-Signature-256`, the `X-GitHub-Delivery` and
-content-type checks GitHub's contract requires, a body cap, and the status mapping to
-answer with (`ResponseStatus::for_receive_error`). It stops there, which is the right
+content-type checks GitHub's contract requires, and the status mapping to
+answer with (`ReceiveError::status`). We use `Envelope::from_signed` over Axum's
+headers and buffered body, with Axum enforcing the body cap, and enable the
+crate's `derive` and `tracing` features. The receiving edge stops there, which is the right
 shape — routing stays in `WebhookIngress`, not in the transport.
 
-The `Envelope` already carries the installation and repository probe every event shares,
+`Envelope::meta` already carries the installation and repository probe every event shares,
 so the handler only parses the per-event routing fields — PR number, head SHA, and the PRs
-a check belongs to — with shallow serde structs of its own. That is `Envelope::parse`, not
-the crate's optional `octocrab` feature: those four fields are shallow, and depending on
-octocrab's beta webhook models to read them buys nothing.
+a check belongs to — with shallow serde structs of its own. Each event-specific routing
+struct derives `Payload` and declares its event kind; `FromEnvelope::from_envelope`
+checks that kind before decoding the payload. The edge's central match selects the
+appropriate type, while installation events use the metadata alone. The nested check
+fields are shared between check-run and check-suite payloads. This uses the crate's
+typed payload support, not its optional `octocrab` feature: those four fields are shallow,
+and depending on octocrab's beta webhook models to read them buys nothing.
 
 **Do not hand-roll HMAC verification.** The comparison is the easy part; the delivery
 contract around it (which failure is a `400` and which a `401`, refusing an unsigned

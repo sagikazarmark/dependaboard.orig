@@ -10,9 +10,11 @@ use axum::{
     routing::post,
 };
 use dependaboard_core::WebhookEvent;
-use octoevents::{Envelope, EventKind, ResponseStatus, Secret, Verifier};
+use octoevents::{
+    DecodeError, Envelope, EventKind, FromEnvelope, Payload, Verifier, WebhookSecret,
+};
 use secrecy::{ExposeSecret, SecretString};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::server::restate::RestateIngress;
@@ -26,7 +28,9 @@ pub(crate) struct WebhookState {
 impl WebhookState {
     pub(crate) fn new(webhook_secret: &SecretString, ingress: RestateIngress) -> Self {
         Self {
-            verifier: Verifier::new(Secret::new(webhook_secret.expose_secret().to_owned())),
+            verifier: Verifier::new(WebhookSecret::new(
+                webhook_secret.expose_secret().to_owned(),
+            )),
             ingress,
         }
     }
@@ -43,11 +47,11 @@ async fn github_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let envelope = match Envelope::from_signed_parts(&state.verifier, &headers, body) {
+    let envelope = match Envelope::from_signed(&state.verifier, &headers, body) {
         Ok(envelope) => envelope,
         Err(error) => {
             tracing::warn!(%error, "GitHub webhook delivery was rejected");
-            let status = StatusCode::from(ResponseStatus::for_receive_error(&error));
+            let status = error.status();
             return (status, "webhook delivery was rejected").into_response();
         }
     };
@@ -55,7 +59,7 @@ async fn github_webhook(
         Ok(Disposition::Forward(event)) => event,
         Ok(Disposition::Acknowledge) => return StatusCode::NO_CONTENT.into_response(),
         Err(error) => {
-            tracing::warn!(%error, event = %envelope.kind, "GitHub webhook payload was rejected");
+            tracing::warn!(%error, event = %envelope.meta.kind, "GitHub webhook payload was rejected");
             return (StatusCode::BAD_REQUEST, "invalid GitHub webhook payload").into_response();
         }
     };
@@ -67,13 +71,13 @@ async fn github_webhook(
         .send(
             "WebhookIngress/dispatch",
             &event,
-            Some(&envelope.delivery_id),
+            Some(&envelope.meta.delivery_id),
         )
         .await
     {
         Ok(()) => StatusCode::OK.into_response(),
         Err(error) => {
-            tracing::error!(%error, event = %envelope.kind, "Restate rejected webhook");
+            tracing::error!(%error, event = %envelope.meta.kind, "Restate rejected webhook");
             (StatusCode::BAD_GATEWAY, "could not enqueue webhook").into_response()
         }
     }
@@ -105,7 +109,7 @@ enum RoutingError {
     MissingRepository,
     /// The payload is not the shape the event's routing fields are read from.
     #[error("GitHub webhook payload is missing routing fields: {0}")]
-    Payload(#[source] serde_json::Error),
+    Payload(#[source] DecodeError),
 }
 
 /// Decides what the edge does with a verified delivery: forward it, reduced
@@ -119,9 +123,9 @@ enum RoutingError {
 /// the per-event fields — PR number, head SHA, and the PRs a check belongs to —
 /// need parsing out of the payload.
 fn route_delivery(envelope: &Envelope) -> Result<Disposition, RoutingError> {
-    let (number, sha, pull_requests) = match envelope.kind {
+    let (number, sha, pull_requests) = match envelope.meta.kind {
         EventKind::Installation | EventKind::InstallationRepositories => {
-            if envelope.common.installation_id.is_none() {
+            if envelope.meta.installation_id.is_none() {
                 return Err(RoutingError::MissingInstallation);
             }
             (None, None, Vec::new())
@@ -150,26 +154,27 @@ fn route_delivery(envelope: &Envelope) -> Result<Disposition, RoutingError> {
         }
         _ => return Ok(Disposition::Acknowledge),
     };
-    let repository = match envelope.kind {
+    let repository = match envelope.meta.kind {
         EventKind::PullRequest
         | EventKind::CheckRun
         | EventKind::CheckSuite
         | EventKind::Status => Some(
             envelope
-                .common
+                .meta
                 .repository
                 .as_ref()
                 .ok_or(RoutingError::MissingRepository)?,
         ),
-        _ => envelope.common.repository.as_ref(),
+        _ => envelope.meta.repository.as_ref(),
     };
     Ok(Disposition::Forward(Box::new(WebhookEvent {
-        event: envelope.kind.as_str().to_owned(),
+        event: envelope.meta.kind.as_str().to_owned(),
         action: envelope
+            .meta
             .action
             .as_ref()
             .map(|action| action.as_str().to_owned()),
-        installation_id: envelope.common.installation_id,
+        installation_id: envelope.meta.installation_id,
         repository_id: repository.map(|repository| repository.id),
         owner: repository.map(|repository| repository.owner.clone()),
         repo: repository.map(|repository| repository.name.clone()),
@@ -179,11 +184,12 @@ fn route_delivery(envelope: &Envelope) -> Result<Disposition, RoutingError> {
     })))
 }
 
-fn parse_payload<T: DeserializeOwned>(envelope: &Envelope) -> Result<T, RoutingError> {
-    envelope.parse::<T>().map_err(RoutingError::Payload)
+fn parse_payload<T: FromEnvelope>(envelope: &Envelope) -> Result<T, RoutingError> {
+    T::from_envelope(envelope).map_err(RoutingError::Payload)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Payload)]
+#[payload(EventKind::PullRequest)]
 struct PullRequestRouting {
     pull_request: PullRequestRef,
 }
@@ -199,17 +205,20 @@ struct CommitRef {
     sha: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Payload)]
+#[payload(EventKind::CheckRun)]
 struct CheckRunRouting {
     check_run: CheckRouting,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Payload)]
+#[payload(EventKind::CheckSuite)]
 struct CheckSuiteRouting {
     check_suite: CheckRouting,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Payload)]
+#[payload(EventKind::Status)]
 struct StatusRouting {
     sha: String,
 }
@@ -256,47 +265,48 @@ mod tests {
 
         let body = Bytes::from_static(BODY);
         let headers = |signature: &'static str| {
-            octoevents::HeaderView::new()
-                .signature(signature)
-                .delivery_id("72d3162e-cc78-11e3-81ab-4c9367dc0958")
-                .event_name("installation")
-                .content_type("application/json")
+            let mut headers = HeaderMap::new();
+            headers.insert(octoevents::header::SIGNATURE, signature.parse().unwrap());
+            headers.insert(
+                octoevents::header::DELIVERY_ID,
+                "72d3162e-cc78-11e3-81ab-4c9367dc0958".parse().unwrap(),
+            );
+            headers.insert(
+                octoevents::header::EVENT_NAME,
+                "installation".parse().unwrap(),
+            );
+            headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+            headers
         };
 
         let envelope = Envelope::from_signed(
-            &Verifier::new(Secret::new("secret")),
+            &Verifier::new(WebhookSecret::new("secret")),
             &headers(SIGNATURE),
             body.clone(),
         )
         .expect("a correctly signed delivery is accepted");
-        assert_eq!(envelope.kind, EventKind::Installation);
-        assert_eq!(envelope.common.installation_id, Some(42));
+        assert_eq!(envelope.meta.kind, EventKind::Installation);
+        assert_eq!(envelope.meta.installation_id, Some(42));
         let Ok(Disposition::Forward(event)) = route_delivery(&envelope) else {
             panic!("a verified installation delivery is forwarded");
         };
         assert_eq!(event.installation_id, Some(42));
 
         let mismatched = Envelope::from_signed(
-            &Verifier::new(Secret::new("wrong")),
+            &Verifier::new(WebhookSecret::new("wrong")),
             &headers(SIGNATURE),
             body.clone(),
         )
         .expect_err("a delivery signed with another secret is refused");
-        assert_eq!(
-            ResponseStatus::for_receive_error(&mismatched),
-            ResponseStatus::Unauthorized
-        );
+        assert_eq!(mismatched.status(), StatusCode::UNAUTHORIZED);
 
         let malformed = Envelope::from_signed(
-            &Verifier::new(Secret::new("secret")),
+            &Verifier::new(WebhookSecret::new("secret")),
             &headers("sha1=abcd"),
             body,
         )
         .expect_err("a signature that is not sha256 hexadecimal is refused");
-        assert_eq!(
-            ResponseStatus::for_receive_error(&malformed),
-            ResponseStatus::BadRequest
-        );
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -309,7 +319,7 @@ mod tests {
 
         let (ingress, forwarded) = fake_restate_ingress().await;
         let webhook = serve(webhook_router(WebhookState {
-            verifier: Verifier::new(Secret::new("secret")),
+            verifier: Verifier::new(WebhookSecret::new("secret")),
             ingress,
         }))
         .await;
@@ -347,7 +357,7 @@ mod tests {
 
         let (ingress, forwarded) = fake_restate_ingress().await;
         let webhook = serve(webhook_router(WebhookState {
-            verifier: Verifier::new(Secret::new("secret")),
+            verifier: Verifier::new(WebhookSecret::new("secret")),
             ingress,
         }))
         .await;
@@ -489,7 +499,7 @@ mod tests {
             false,
             &serde_json::json!({ "action": "created" }),
         );
-        anonymous.common.installation_id = None;
+        anonymous.meta.installation_id = None;
         assert!(matches!(
             rejected(&anonymous),
             RoutingError::MissingInstallation
@@ -572,33 +582,31 @@ mod tests {
 
     /// Builds the synthetic envelope a verified delivery would produce.
     ///
-    /// `octoevents` extracts `common` from the payload itself, so the probe is
-    /// mirrored here rather than re-derived: these tests cover this crate's
-    /// routing, not the crate's extraction.
+    /// Include the shared metadata in the payload so `Envelope::new` probes
+    /// it the same way as the receiving path.
     fn envelope(
         event_name: &str,
         action: Option<&str>,
         repository: bool,
         payload: &Value,
     ) -> Envelope {
-        let mut common = octoevents::Common::default();
-        common.installation_id = Some(42);
+        let mut payload = payload.clone();
+        payload["installation"] = serde_json::json!({ "id": 42 });
+        if let Some(action) = action {
+            payload["action"] = serde_json::json!(action);
+        }
         if repository {
-            let mut reference = octoevents::RepositoryRef::default();
-            reference.id = 7;
-            reference.name = "api".to_owned();
-            reference.full_name = "acme/api".to_owned();
-            reference.owner = "acme".to_owned();
-            common.repository = Some(reference);
+            payload["repository"] = serde_json::json!({
+                "id": 7,
+                "name": "api",
+                "full_name": "acme/api",
+                "owner": { "login": "acme" }
+            });
         }
-        Envelope {
-            delivery_id: "72d3162e-cc78-11e3-81ab-4c9367dc0958".to_owned(),
-            kind: event_name.parse().unwrap(),
-            action: action.map(|action| action.parse().unwrap()),
-            common,
-            target_type: None,
-            target_id: None,
-            raw: Bytes::from(serde_json::to_vec(payload).unwrap()),
-        }
+        Envelope::new(
+            "72d3162e-cc78-11e3-81ab-4c9367dc0958",
+            event_name.into(),
+            serde_json::to_vec(&payload).unwrap(),
+        )
     }
 }
