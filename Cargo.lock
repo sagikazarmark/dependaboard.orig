@@ -891,7 +891,7 @@ dependencies = [
 name = "dependaboard-core"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "regex",
  "semver",
  "serde",
@@ -910,7 +910,7 @@ dependencies = [
  "chrono",
  "dependaboard-core",
  "http 1.5.0",
- "jsonwebtoken",
+ "jsonwebtoken 11.0.0",
  "reqwest 0.13.4",
  "secrecy",
  "serde",
@@ -959,14 +959,14 @@ name = "dependaboard-web"
 version = "0.1.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "dependaboard-core",
  "dependaboard-store",
  "dioxus",
  "dioxus-primitives",
  "form_urlencoded",
  "futures-util",
- "gloo-timers",
+ "gloo-timers 0.4.0",
  "octoevents",
  "reqwest 0.13.4",
  "secrecy",
@@ -1530,7 +1530,7 @@ checksum = "80c25ae93a3f72e734873b97fbd09d9b1b6adff97205fb0ffd8543e3564fb78e"
 dependencies = [
  "dioxus",
  "futures",
- "gloo-timers",
+ "gloo-timers 0.3.0",
  "tokio",
 ]
 
@@ -1663,7 +1663,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "generational-box",
- "gloo-timers",
+ "gloo-timers 0.3.0",
  "js-sys",
  "lazy-js-bundle",
  "rustc-hash 2.1.3",
@@ -2072,6 +2072,18 @@ name = "gloo-timers"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "gloo-timers"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "482ce8a491a501da4cd806bd190275363d674f2845005c6ddbd5d3e1dd54495d"
 dependencies = [
  "futures-channel",
  "futures-core",
@@ -2773,6 +2785,28 @@ name = "jsonwebtoken"
 version = "10.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
+dependencies = [
+ "base64 0.22.1",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hmac 0.12.1",
+ "js-sys",
+ "p256",
+ "p384",
+ "rand 0.8.7",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "signature",
+ "zeroize",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "11.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -4063,9 +4097,9 @@ dependencies = [
 
 [[package]]
 name = "restate-sdk"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a900d7d9d250d727034f68b16bdfc5314c64ee8a7e5b78e8f37106e3a98bf88"
+checksum = "b79ce699276687f696c33c90420c36bf867d5157dbaa85324d410d398d6eea13"
 dependencies = [
  "bytes",
  "futures",
@@ -4075,12 +4109,15 @@ dependencies = [
  "hyper 1.11.0",
  "hyper-util",
  "jsonptr",
+ "jsonwebtoken 10.4.0",
+ "percent-encoding",
  "pin-project-lite",
  "prettyplease",
  "rand 0.10.2",
  "regress 0.10.5",
  "restate-sdk-macros",
  "restate-sdk-shared-core",
+ "rustls 0.23.43",
  "serde",
  "serde_json",
  "syn 2.0.119",
@@ -4094,9 +4131,9 @@ dependencies = [
 
 [[package]]
 name = "restate-sdk-macros"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "393a519e55cb4572e916d2023aa778e59864f6e7d6e7c28017d7ad8dfc983272"
+checksum = "bd7aaeaaa1256c6b52ff79fbb7cc1be4fb55de73f6a7aed4d0b710a0f03217c6"
 dependencies = [
  "jiff",
  "proc-macro2",
@@ -4115,7 +4152,7 @@ dependencies = [
  "bytes",
  "bytes-utils",
  "http 1.5.0",
- "jsonwebtoken",
+ "jsonwebtoken 10.4.0",
  "pastey",
  "prost 0.14.4",
  "serde",
@@ -5515,9 +5552,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.25.0"
+version = "1.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
+checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
