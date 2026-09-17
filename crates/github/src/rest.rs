@@ -1,9 +1,12 @@
 //! The wire shapes of GitHub's REST answers, kept to the fields the client
 //! looks at, and how any answer — GraphQL's included — is read: its status,
-//! the rate-limit headers GitHub puts on every one, its timestamps, its body.
-//! The requests that earn the answers are the client's own, in `lib.rs`.
+//! the rate-limit headers GitHub puts on every one, its timestamps, its body —
+//! and how the pages of a repository listing fold into records. The requests
+//! that earn the answers are the client's own, in `lib.rs`.
 
-use dependaboard_core::{GithubErrorResponse, MergeMethod};
+use std::collections::HashSet;
+
+use dependaboard_core::{GithubErrorResponse, MergeMethod, RepoRecord};
 use reqwest::Response;
 use serde::{Deserialize, de::DeserializeOwned};
 
@@ -120,6 +123,61 @@ pub(crate) struct InstallationRepositories {
     pub(crate) repositories: Vec<GithubRepository>,
 }
 
+/// Folds the pages of one repository listing into the records of `installation_id`, or
+/// refuses the listing as [`GithubError::Shifted`] when it moved under its own pages.
+///
+/// Every page reports the installation's total as of that page. One that disagrees with
+/// the first means a repository joined or left in between, and offset pagination cannot
+/// say which item the boundary shift dropped. A boundary that shifted without moving the
+/// total shows as a repository listed twice where another was never listed: the distinct
+/// ids fall short of the total. Either way the set is not authoritative; a fresh listing
+/// starts over from the first page.
+///
+/// A repository whose settings disallow `preferred`, the configured merge method, records
+/// the method to merge with instead (see [`MergeSettings::method_instead_of`]).
+pub(crate) fn fold_repository_pages(
+    pages: impl IntoIterator<Item = InstallationRepositories>,
+    installation_id: u64,
+    preferred: MergeMethod,
+    synced_at: u64,
+) -> Result<Vec<RepoRecord>, GithubError> {
+    let mut total = None;
+    let mut repositories = Vec::new();
+    for page in pages {
+        let total = *total.get_or_insert(page.total_count);
+        if page.total_count != total {
+            return Err(GithubError::Shifted {
+                listing: "installation repositories",
+                detail: format!(
+                    "the total moved from {total} to {} between pages",
+                    page.total_count
+                ),
+            });
+        }
+        repositories.extend(page.repositories.into_iter().map(|repo| RepoRecord {
+            repository_id: repo.id,
+            installation_id,
+            owner: repo.owner.login,
+            repo: repo.name,
+            merge_method: repo.merge_settings.method_instead_of(preferred),
+            synced_at,
+        }));
+    }
+    let total = total.unwrap_or(0);
+    let mut seen = HashSet::new();
+    repositories.retain(|repository| seen.insert(repository.repository_id));
+    if repositories.len() != total {
+        return Err(GithubError::Shifted {
+            listing: "installation repositories",
+            detail: format!(
+                "{} distinct repositories were listed against a total of {total}",
+                repositories.len()
+            ),
+        });
+    }
+    Ok(repositories)
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct GithubRepository {
     pub(crate) id: u64,
@@ -195,4 +253,87 @@ pub(crate) struct IssueComment {
     pub(crate) id: u64,
     #[serde(default)]
     pub(crate) body: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    const INSTALLATION_ID: u64 = 42;
+    const SYNCED_AT: u64 = 1_700_000_000;
+
+    fn repository(id: u64) -> Value {
+        json!({ "id": id, "name": format!("repo-{id}"), "owner": { "login": "acme" } })
+    }
+
+    /// One page of `GET /installation/repositories`, as GitHub shapes it: the page's
+    /// repositories beside the installation's total.
+    fn page(total_count: usize, ids: impl IntoIterator<Item = u64>) -> InstallationRepositories {
+        serde_json::from_value(json!({
+            "total_count": total_count,
+            "repositories": ids.into_iter().map(repository).collect::<Vec<_>>(),
+        }))
+        .expect("a page as GitHub answers with it")
+    }
+
+    fn fold(
+        pages: impl IntoIterator<Item = InstallationRepositories>,
+    ) -> Result<Vec<RepoRecord>, GithubError> {
+        fold_repository_pages(pages, INSTALLATION_ID, MergeMethod::Squash, SYNCED_AT)
+    }
+
+    #[test]
+    fn pages_fold_into_records_in_listing_order() {
+        let repositories = fold([page(103, 1..=100), page(103, 101..=103)]).unwrap();
+
+        assert_eq!(repositories.len(), 103);
+        assert_eq!(
+            repositories[0],
+            RepoRecord {
+                repository_id: 1,
+                installation_id: INSTALLATION_ID,
+                owner: "acme".to_owned(),
+                repo: "repo-1".to_owned(),
+                merge_method: None,
+                synced_at: SYNCED_AT,
+            }
+        );
+        assert_eq!(repositories[102].repository_id, 103);
+    }
+
+    #[test]
+    fn a_listing_whose_total_moved_between_pages_is_refused_as_shifted() {
+        // Repository 50 is removed from the installation after the first page is served, so
+        // the second page starts one position early: 101 is never listed, and the total
+        // GitHub reports has moved. Offset pagination cannot say which one went.
+        let error = fold([page(150, 1..=100), page(149, 102..=150)]).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                GithubError::Shifted { listing: "installation repositories", detail }
+                    if detail == "the total moved from 150 to 149 between pages"
+            ),
+            "a listing that moved under its pages is not an authoritative set: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_listing_whose_pages_do_not_add_up_to_the_total_is_refused_as_shifted() {
+        // One repository leaves the tail and another joins the head between the pages: the
+        // total stands, but the page boundary shifted and repository 100 is listed twice
+        // while the newcomer, sorted before it, is never seen.
+        let error = fold([page(101, 1..=100), page(101, [100])]).unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                GithubError::Shifted { listing: "installation repositories", detail }
+                    if detail == "100 distinct repositories were listed against a total of 101"
+            ),
+            "a duplicate at the boundary means something else was dropped: {error:?}"
+        );
+    }
 }
