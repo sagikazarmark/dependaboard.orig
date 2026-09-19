@@ -1542,7 +1542,7 @@ Retrofitting an audit trail into already-merged PRs isn't possible.
 
 ## 6b. Crate choices
 
-**`octoevents` 0.2 for the receiving edge.** It turns an untrusted request into a verified
+**`octoevents` 0.3 for the receiving edge.** It turns an untrusted request into a verified
 `Envelope`: constant-time HMAC over `X-Hub-Signature-256`, the `X-GitHub-Delivery` and
 content-type checks GitHub's contract requires, and the status mapping to
 answer with (`ReceiveError::status`). We use `Envelope::from_signed` over Axum's
