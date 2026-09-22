@@ -1402,6 +1402,40 @@ mod tests {
         assert_eq!(key.to_string().parse::<PrKey>().unwrap(), key);
     }
 
+    /// A key arrives as text from places we do not control — a Restate object's
+    /// key, a shared or hand-edited link — so every shape that is not
+    /// `{repository_id}#{number}` has to be refused rather than read as some
+    /// nearby key. A bare number is the one worth naming: it is what dropping
+    /// the separator from a link leaves, and it must not be taken as a
+    /// repository with pull request zero.
+    #[test]
+    fn anything_that_is_not_a_repository_and_a_number_is_not_a_pull_request_key() {
+        for value in [
+            "",                       // nothing at all
+            "123",                    // no separator: a repository, or a number, but not both
+            "4-5",                    // the wrong separator
+            "#",                      // the separator alone
+            "7#",                     // no number
+            "#7",                     // no repository
+            "acme#7",                 // a repository by name, not by id
+            "7#seven",                // a number that is not one
+            "7#-1",                   // and one that is signed
+            " 7#1",                   // padded
+            "7#1#2",                  // two separators: the number is "1#2"
+            "7#1.0",                  // a number that is not an integer
+            "18446744073709551616#1", // one past what a u64 holds
+        ] {
+            let error = value
+                .parse::<PrKey>()
+                .expect_err("this is not a pull request key");
+            assert_eq!(
+                error.to_string(),
+                format!("invalid pull request key: {value}"),
+                "the refusal names the whole value it was given, not the part that failed"
+            );
+        }
+    }
+
     #[test]
     fn user_id_is_a_transparent_string() {
         let user_id = UserId::new("dashboard");
@@ -1436,6 +1470,66 @@ mod tests {
                 UpdateType::Major,
             ]
         );
+    }
+
+    /// The third party to the agreement [`UpdateType`] documents between
+    /// `.max()`, sorting and this, and the only one that has to answer for an
+    /// empty group: a grouped pull request is chipped with the worst update in
+    /// it, and one whose dependencies we never parsed is `Unknown` rather than
+    /// the worst of nothing.
+    #[test]
+    fn the_highest_update_type_is_the_worst_in_the_group_and_unknown_for_none() {
+        fn bump(update_type: UpdateType) -> DependencyUpdate {
+            DependencyUpdate {
+                name: format!("dep-{update_type}"),
+                from_version: Some("1.0.0".to_owned()),
+                to_version: Some("2.0.0".to_owned()),
+                update_type,
+            }
+        }
+
+        assert_eq!(highest_update_type(&[]), UpdateType::Unknown);
+
+        for only in UpdateType::ALL {
+            assert_eq!(highest_update_type(&[bump(only)]), only, "{only:?}");
+        }
+
+        assert_eq!(
+            highest_update_type(&[
+                bump(UpdateType::Patch),
+                bump(UpdateType::Major),
+                bump(UpdateType::Minor),
+            ]),
+            UpdateType::Major
+        );
+        assert_eq!(
+            highest_update_type(&[
+                bump(UpdateType::Major),
+                bump(UpdateType::Minor),
+                bump(UpdateType::Patch),
+            ]),
+            UpdateType::Major,
+            "which update is worst cannot depend on where it sits in the group"
+        );
+        assert_eq!(
+            highest_update_type(&[bump(UpdateType::Unknown), bump(UpdateType::Patch)]),
+            UpdateType::Patch,
+            "an unparsed sibling must not outrank one whose severity we know"
+        );
+
+        // The agreement itself, on every pair rather than the few above:
+        // sorting a group and taking its last is the same verdict.
+        for first in UpdateType::ALL {
+            for second in UpdateType::ALL {
+                let mut ranked = [first, second];
+                ranked.sort();
+                assert_eq!(
+                    highest_update_type(&[bump(first), bump(second)]),
+                    ranked[1],
+                    "{first:?} with {second:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1710,6 +1804,47 @@ mod tests {
         assert_eq!(PageCursor::decode(&cursor.encode()).unwrap(), cursor);
     }
 
+    /// A cursor travels in a URL, which means people share it, truncate it and
+    /// edit it by hand. Nothing but a cursor we wrote may decode: whether
+    /// base64 turns it away or the JSON inside does, the answer is the one
+    /// refusal the web edge demotes into an invalid request, never a page read
+    /// from somewhere the caller did not ask for.
+    #[test]
+    fn a_page_cursor_we_did_not_write_is_refused_rather_than_guessed_at() {
+        let malformed = [
+            // `after=` left empty
+            String::new(),
+            // outside base64's alphabet
+            "not base64!".to_owned(),
+            // a length base64 cannot hold
+            "aaaaa".to_owned(),
+            // base64, of something that is not JSON
+            URL_SAFE_NO_PAD.encode("4#5"),
+            // JSON, cut short
+            URL_SAFE_NO_PAD.encode("{"),
+            // no `id`
+            URL_SAFE_NO_PAD.encode(r#"{"updated_at":123}"#),
+            // no `updated_at`
+            URL_SAFE_NO_PAD.encode(r#"{"id":"4#5"}"#),
+            // an instant as text
+            URL_SAFE_NO_PAD.encode(r#"{"updated_at":"123","id":"4#5"}"#),
+            // an instant before the epoch
+            URL_SAFE_NO_PAD.encode(r#"{"updated_at":-1,"id":"4#5"}"#),
+            // the fields unnamed
+            URL_SAFE_NO_PAD.encode(r#"["123","4#5"]"#),
+        ];
+
+        for value in malformed {
+            let error = PageCursor::decode(&value)
+                .expect_err("only a cursor this crate encoded may decode");
+            assert!(
+                matches!(error, CursorError::Invalid),
+                "{value:?}: {error:?}"
+            );
+            assert_eq!(error.to_string(), "invalid page cursor");
+        }
+    }
+
     #[test]
     fn a_bulk_action_kind_travels_in_snake_case_and_reads_as_plain_words() {
         // The wire form is what the dashboard posts to `BulkAction/run`; the display form
@@ -1806,6 +1941,77 @@ mod tests {
         assert_eq!(
             InvalidBatch::RetriedFrom.to_string(),
             "the batch retried must be named by a UUIDv7"
+        );
+    }
+
+    /// A reject reason is the sentence the user is given for an action that did
+    /// not happen — in the drawer's action log, in a finished batch's rejected
+    /// list, and in what **Retry rejected** says it would send again — so the
+    /// wording is pinned here rather than left to whoever next edits the match.
+    /// `StaleSha` is the only arm carrying anything, and it names both heads
+    /// through [`short_sha`]: forty hex characters twice would bury the
+    /// sentence they are in.
+    #[test]
+    fn every_reject_reason_reads_as_a_sentence_and_a_moved_head_is_named_shortly() {
+        assert_eq!(
+            RejectReason::StaleSha {
+                expected: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                actual: "fedcba9876543210fedcba9876543210fedcba98".to_owned(),
+            }
+            .to_string(),
+            "head moved from 0123456 to fedcba9",
+            "both heads are abbreviated, expected first"
+        );
+        assert_eq!(
+            RejectReason::StaleSha {
+                expected: "abc".to_owned(),
+                actual: "def0".to_owned(),
+            }
+            .to_string(),
+            "head moved from abc to def0",
+            "a head already shorter than seven characters is given whole"
+        );
+        assert_eq!(
+            RejectReason::NotMergeable.to_string(),
+            "GitHub reports this pull request is not mergeable"
+        );
+        assert_eq!(
+            RejectReason::MergeMethodDisallowed.to_string(),
+            "the repository disallows this merge method"
+        );
+        assert_eq!(
+            RejectReason::Forbidden.to_string(),
+            "the configured identity is not allowed to perform this action"
+        );
+        assert_eq!(
+            RejectReason::NotFound.to_string(),
+            "the pull request was closed or no longer exists"
+        );
+        assert_eq!(
+            RejectReason::NoUserToken.to_string(),
+            "no GitHub user token is configured for @dependabot commands"
+        );
+    }
+
+    /// How a commit is named in passing, wherever one is mentioned rather than
+    /// linked. It takes bytes it did not choose — a head from GitHub, a sha
+    /// from a journalled request — so the two edges are what matter: it never
+    /// lengthens what it is given, and it answers for a value it cannot cut at
+    /// seven instead of panicking on it.
+    #[test]
+    fn a_sha_is_named_by_its_first_seven_characters_or_given_whole_when_shorter() {
+        assert_eq!(
+            short_sha("0123456789abcdef0123456789abcdef01234567"),
+            "0123456"
+        );
+        assert_eq!(short_sha("0123456"), "0123456");
+        assert_eq!(short_sha("012345"), "012345");
+        assert_eq!(short_sha("0"), "0");
+        assert_eq!(short_sha(""), "");
+        assert_eq!(
+            short_sha("abcdef\u{e9}"),
+            "abcdef\u{e9}",
+            "a value whose seventh byte is mid-character comes back whole, not cut in half"
         );
     }
 
