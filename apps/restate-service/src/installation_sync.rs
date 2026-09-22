@@ -331,12 +331,14 @@ trait InstallationSyncEffects {
     /// error. A partial listing must never become the authoritative set.
     fn list_repositories(&mut self) -> impl Future<Output = HandlerResult<Vec<RepoRecord>>> + Send;
     /// Makes `repositories` the installation's set in the projection, upserting them and
-    /// dropping the rest. The pull requests that went with the dropped ones are queued
-    /// for retirement by the store, fenced by the sweep's start; the drain that follows
-    /// tells them, so nothing here depends on what this step returns.
+    /// dropping the rest, sparing repositories synced since `synced_before`. The pull
+    /// requests that went with the dropped ones are queued for retirement by the store
+    /// under the same fence; the drain that follows tells them, so nothing here depends
+    /// on what this step returns.
     fn replace_repositories(
         &mut self,
         repositories: &[RepoRecord],
+        synced_before: u64,
     ) -> impl Future<Output = HandlerResult<()>> + Send;
     /// Fans a reconcile out to the repository's `RepoSync` object.
     fn reconcile_repository(&mut self, repository: RepoRecord);
@@ -346,7 +348,6 @@ struct RestateSyncEffects<'a, 'ctx> {
     ctx: &'a ObjectContext<'ctx>,
     github: &'a GithubApiHandle,
     store: &'a Arc<dyn ProjectionWriter>,
-    reconcile_start: u64,
 }
 
 impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
@@ -366,10 +367,13 @@ impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
         read_result(repositories)
     }
 
-    async fn replace_repositories(&mut self, repositories: &[RepoRecord]) -> HandlerResult<()> {
+    async fn replace_repositories(
+        &mut self,
+        repositories: &[RepoRecord],
+        synced_before: u64,
+    ) -> HandlerResult<()> {
         let store = self.store.clone();
         let installation_id = self.github.installation_id();
-        let reconcile_start = self.reconcile_start;
         let repositories = repositories.to_vec();
         self.ctx
             .run_store_step(
@@ -377,7 +381,7 @@ impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
                 store_retry_policy(),
                 move || async move {
                     store
-                        .replace_installation_repos(installation_id, &repositories, reconcile_start)
+                        .replace_installation_repos(installation_id, &repositories, synced_before)
                         .await
                         .map(drop)
                         .map_err(store_failure)
@@ -395,17 +399,20 @@ impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
     }
 }
 
-/// Re-enumerates the installation's repositories, makes the projection match, retires the
-/// durable state of every pull request the outbox holds — those that left with a
-/// repository just now, and any an earlier prune removed without getting to tell — then
-/// fans a reconcile out to each repository that remains. Resolves to how many were fanned
-/// out to.
+/// Re-enumerates the installation's repositories, makes the projection match under
+/// `reconcile_start` as the fence, retires the durable state of every pull request the
+/// outbox holds — those that left with a repository just now, and any an earlier prune
+/// removed without getting to tell — then fans a reconcile out to each repository that
+/// remains. Resolves to how many were fanned out to.
 async fn run_installation_sync<E: InstallationSyncEffects, R: RetirementEffects>(
     restate: &mut E,
     retirements: &mut R,
+    reconcile_start: u64,
 ) -> HandlerResult<usize> {
     let repositories = restate.list_repositories().await?;
-    restate.replace_repositories(&repositories).await?;
+    restate
+        .replace_repositories(&repositories, reconcile_start)
+        .await?;
     retire_pending(retirements).await?;
     let count = repositories.len();
     for repository in repositories {
@@ -421,18 +428,16 @@ async fn perform_installation_sync(
     github: &GithubApiHandle,
     store: &Arc<dyn ProjectionWriter>,
 ) -> HandlerResult<usize> {
+    // Read before the listing, and carried across the seam from here: a repository or
+    // pull request written while the listing is in flight is newer than the fence, so the
+    // prune the replace runs spares it.
     let reconcile_start = ctx
         .run(|| async { Ok(unix_seconds()) })
         .name("installation-reconcile-clock")
         .await?;
-    let mut restate = RestateSyncEffects {
-        ctx,
-        github,
-        store,
-        reconcile_start,
-    };
+    let mut restate = RestateSyncEffects { ctx, github, store };
     let mut retirements = RestateRetirements { ctx, store };
-    run_installation_sync(&mut restate, &mut retirements).await
+    run_installation_sync(&mut restate, &mut retirements, reconcile_start).await
 }
 
 /// Side effects a purge asks of Restate and the store, abstracted so
@@ -795,6 +800,8 @@ mod tests {
         listing_failure: Option<HandlerError>,
         replace_failure: Option<HandlerError>,
         replaced: Option<Vec<u64>>,
+        /// The fence the replace was asked to prune under.
+        replaced_under: Option<u64>,
         reconciled: Vec<u64>,
     }
 
@@ -806,13 +813,18 @@ mod tests {
             }
         }
 
-        async fn replace_repositories(&mut self, repositories: &[RepoRecord]) -> HandlerResult<()> {
+        async fn replace_repositories(
+            &mut self,
+            repositories: &[RepoRecord],
+            synced_before: u64,
+        ) -> HandlerResult<()> {
             self.replaced = Some(
                 repositories
                     .iter()
                     .map(|repository| repository.repository_id)
                     .collect(),
             );
+            self.replaced_under = Some(synced_before);
             match self.replace_failure.take() {
                 Some(error) => Err(error),
                 None => Ok(()),
@@ -839,7 +851,7 @@ mod tests {
             Some(1_000),
         );
 
-        let swept = run_installation_sync(&mut restate, &mut retirements)
+        let swept = run_installation_sync(&mut restate, &mut retirements, 1_000)
             .await
             .unwrap();
 
@@ -887,6 +899,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_sweep_prunes_under_the_instant_read_before_its_listing() {
+        // The handler reads the clock at 1_000 and then lists. Repository 9 is added to
+        // the installation at 1_020, while the listing is in flight, so its row is newer
+        // than the fence — and the listing may or may not carry it.
+        let mut restate = RecordedSweep {
+            repositories: vec![
+                installed_repository(7),
+                RepoRecord {
+                    synced_at: 1_020,
+                    ..installed_repository(9)
+                },
+            ],
+            ..Default::default()
+        };
+
+        run_installation_sync(&mut restate, &mut RecordedRetirements::default(), 1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(restate.replaced, Some(vec![7, 9]));
+        assert_eq!(
+            restate.replaced_under,
+            Some(1_000),
+            "the prune runs under the instant read before the listing, not under the \
+             listing's own stamps"
+        );
+        assert!(
+            restate.replaced_under < Some(1_020),
+            "a repository added while the listing was in flight is newer than the fence, \
+             so the prune spares it and the pull requests under it; a fence taken once the \
+             listing returned would take them"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failed_replace_retires_nothing_and_reconciles_nothing() {
         let mut restate = RecordedSweep {
             repositories: vec![installed_repository(7)],
@@ -895,7 +942,7 @@ mod tests {
         };
         let mut retirements = RecordedRetirements::queued(&[PrKey::new(8, 1)], Some(1_000));
 
-        let outcome = run_installation_sync(&mut restate, &mut retirements).await;
+        let outcome = run_installation_sync(&mut restate, &mut retirements, 1_000).await;
 
         assert!(
             outcome.is_err(),
@@ -922,7 +969,7 @@ mod tests {
         };
         let mut retirements = RecordedRetirements::queued(&[PrKey::new(8, 1)], Some(1_000));
 
-        let outcome = run_installation_sync(&mut restate, &mut retirements).await;
+        let outcome = run_installation_sync(&mut restate, &mut retirements, 1_000).await;
 
         assert!(outcome.is_err());
         assert_eq!(
