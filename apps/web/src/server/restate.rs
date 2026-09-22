@@ -500,7 +500,7 @@ mod tests {
             ingress_at(address)
                 .dispatch_webhook(
                     &WebhookEvent {
-                        event: "pull_request".to_owned(),
+                        event: "pull_request".into(),
                         action: Some("synchronize".to_owned()),
                         installation_id: Some(42),
                         repository_id: Some(7),

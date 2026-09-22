@@ -7,7 +7,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -1378,9 +1378,107 @@ impl PrState {
     }
 }
 
+/// The kind of GitHub delivery this deployment routes, named once for both ends.
+///
+/// The web edge reduces a verified delivery to a [`WebhookEvent`] and the Restate service
+/// dispatches on it, so which kinds are routed is a contract held in two binaries. It used
+/// to travel as a `String` matched against literals at both ends, with nothing but a
+/// comment joining the two tables; naming the kinds makes the dispatcher's match
+/// exhaustive, so a kind added here that it does not handle fails to compile rather than
+/// being silently dropped at run time.
+///
+/// Hand-rolled rather than `octoevents::EventKind`, which is what the edge already has:
+/// GitHub's vocabulary deliberately does not live in this crate (it left in "move what
+/// GitHub means out of the shared contract crate"), and this crate compiles to wasm for the
+/// browser bundle while `octoevents` is gated to the server build. Six names cost less than
+/// that dependency. These are only the kinds we route; the App subscribes to what GitHub
+/// sends, which is a longer list the edge reads with `EventKind`.
+///
+/// [`Other`](Self::Other) is what keeps the two binaries deployable apart. They roll out
+/// separately, so the edge may forward a kind the dispatcher does not name yet; it decodes
+/// into `Other` and is ignored, as it was when the field was a `String`, instead of failing
+/// the invocation at deserialization. It costs nothing of the compile-time win, because a
+/// kind we mean to route still needs a variant of its own.
+///
+/// The wire form is the word GitHub put in `X-GitHub-Event`, unchanged: `WebhookEvent`
+/// crosses the Restate ingress as JSON and is durably journaled, so every spelling that
+/// has ever been sent must still decode.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DeliveryKind {
+    PullRequest,
+    CheckSuite,
+    CheckRun,
+    Status,
+    Installation,
+    InstallationRepositories,
+    /// A kind this deployment does not route, kept as GitHub spelled it so the dispatch's
+    /// log line still names the delivery it ignored.
+    Other(String),
+}
+
+impl DeliveryKind {
+    /// The word GitHub sends in `X-GitHub-Event`, which is also the wire form.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::PullRequest => "pull_request",
+            Self::CheckSuite => "check_suite",
+            Self::CheckRun => "check_run",
+            Self::Status => "status",
+            Self::Installation => "installation",
+            Self::InstallationRepositories => "installation_repositories",
+            Self::Other(kind) => kind,
+        }
+    }
+
+    /// The one table of routed kinds; `None` is a kind that becomes [`Self::Other`].
+    fn routed(value: &str) -> Option<Self> {
+        Some(match value {
+            "pull_request" => Self::PullRequest,
+            "check_suite" => Self::CheckSuite,
+            "check_run" => Self::CheckRun,
+            "status" => Self::Status,
+            "installation" => Self::Installation,
+            "installation_repositories" => Self::InstallationRepositories,
+            _ => return None,
+        })
+    }
+}
+
+impl From<&str> for DeliveryKind {
+    fn from(value: &str) -> Self {
+        Self::routed(value).unwrap_or_else(|| Self::Other(value.to_owned()))
+    }
+}
+
+impl From<String> for DeliveryKind {
+    fn from(value: String) -> Self {
+        Self::routed(&value).unwrap_or(Self::Other(value))
+    }
+}
+
+impl fmt::Display for DeliveryKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for DeliveryKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// Hand-written because `#[serde(other)]` only applies to unit variants, and the fallback
+/// has to keep the word it did not recognise.
+impl<'de> Deserialize<'de> for DeliveryKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookEvent {
-    pub event: String,
+    pub event: DeliveryKind,
     pub action: Option<String>,
     pub installation_id: Option<u64>,
     pub repository_id: Option<u64>,
@@ -2456,7 +2554,7 @@ mod tests {
         assert_eq!(
             event,
             WebhookEvent {
-                event: "pull_request".to_owned(),
+                event: DeliveryKind::PullRequest,
                 action: Some("synchronize".to_owned()),
                 installation_id: Some(42),
                 repository_id: Some(7),
@@ -2469,6 +2567,79 @@ mod tests {
         );
         let serialized = serde_json::to_value(&event).unwrap();
         assert!(serialized.get("sync_completion_id").is_none());
+    }
+
+    /// The kind is a type here, but it crosses the Restate ingress as the word GitHub put
+    /// in `X-GitHub-Event`: that wire form is GitHub's vocabulary and must stay exactly
+    /// what the edge forwarded when the field was a `String`. A kind this deployment does
+    /// not route keeps its own spelling instead of being flattened, so a delivery is still
+    /// named by what it was in the dispatch's log line.
+    #[test]
+    fn every_delivery_kind_round_trips_the_word_github_sends() {
+        for (kind, wire) in [
+            (DeliveryKind::PullRequest, "pull_request"),
+            (DeliveryKind::CheckSuite, "check_suite"),
+            (DeliveryKind::CheckRun, "check_run"),
+            (DeliveryKind::Status, "status"),
+            (DeliveryKind::Installation, "installation"),
+            (
+                DeliveryKind::InstallationRepositories,
+                "installation_repositories",
+            ),
+            (DeliveryKind::Other("push".to_owned()), "push"),
+        ] {
+            assert_eq!(kind.as_str(), wire);
+            assert_eq!(kind.to_string(), wire);
+            assert_eq!(DeliveryKind::from(wire), kind);
+            assert_eq!(
+                serde_json::to_value(&kind).unwrap(),
+                serde_json::json!(wire)
+            );
+            assert_eq!(
+                serde_json::from_value::<DeliveryKind>(serde_json::json!(wire)).unwrap(),
+                kind
+            );
+        }
+    }
+
+    /// The kind used to be a `String`, so every `dispatch` Restate has journaled carries
+    /// the bare word; those invocations replay through today's deserializer and must still
+    /// decode. The unrecognised kind is not hypothetical: the edge and the dispatcher are
+    /// deployed apart, so during a rollout the edge may forward a kind this binary does
+    /// not name yet, and a hard deserialization failure would fail the invocation before
+    /// `route_webhook` could ignore it.
+    #[test]
+    fn webhook_events_journaled_with_the_kind_as_a_bare_word_still_deserialize() {
+        let event: WebhookEvent = serde_json::from_str(
+            r#"{"event":"pull_request","action":"synchronize","installation_id":42,"repository_id":7,"owner":"acme","repo":"api","number":9,"sha":"abc123","pull_requests":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(event.event, DeliveryKind::PullRequest);
+        assert_eq!(event.action.as_deref(), Some("synchronize"));
+
+        for (wire, kind) in [
+            ("check_suite", DeliveryKind::CheckSuite),
+            ("check_run", DeliveryKind::CheckRun),
+            ("status", DeliveryKind::Status),
+            ("installation", DeliveryKind::Installation),
+            (
+                "installation_repositories",
+                DeliveryKind::InstallationRepositories,
+            ),
+            (
+                "deployment_status",
+                DeliveryKind::Other("deployment_status".to_owned()),
+            ),
+        ] {
+            let event: WebhookEvent =
+                serde_json::from_value(serde_json::json!({ "event": wire, "action": null }))
+                    .unwrap();
+            assert_eq!(event.event, kind, "{wire}");
+            assert_eq!(
+                serde_json::to_value(&event).unwrap()["event"],
+                serde_json::json!(wire)
+            );
+        }
     }
 
     #[test]

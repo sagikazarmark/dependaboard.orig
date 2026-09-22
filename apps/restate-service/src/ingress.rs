@@ -2,7 +2,7 @@
 //! object that owns them, and `SchedulerIngress` lets the bootstrap arm the installation's
 //! reconcile chain.
 
-use dependaboard_core::{PrKey, SyncRequest, SyncShaRequest, WebhookEvent};
+use dependaboard_core::{DeliveryKind, PrKey, SyncRequest, SyncShaRequest, WebhookEvent};
 use restate_sdk::prelude::*;
 use thiserror::Error;
 
@@ -41,9 +41,12 @@ impl WebhookIngress {
     /// Routes a verified GitHub delivery to the object that owns it.
     ///
     /// The web edge acknowledges kinds with no arm in `route_webhook` before they reach
-    /// Restate, and its copy of this table (`route_delivery` in the web app)
-    /// must be kept in step: adding a kind to `route_webhook` without adding it there
-    /// means the edge silently swallows it.
+    /// Restate. Its copy of this table (`route_delivery` in the web app) matches over
+    /// `octoevents::EventKind`, so it is still the edge's own decision which kinds it
+    /// forwards: a kind routed here but acknowledged there is silently swallowed, and only
+    /// a test or a delivery that never arrives shows it. The other direction the compiler
+    /// now holds — the match below is exhaustive over [`DeliveryKind`], so a routed kind
+    /// this handler forgets does not build.
     #[handler]
     async fn dispatch(&self, ctx: Context<'_>, event: Json<WebhookEvent>) -> HandlerResult<()> {
         let event = event.into_inner();
@@ -74,7 +77,9 @@ enum WebhookRoute {
         action: InstallationLifecycleAction,
     },
     /// A routed kind whose action has no arm: `check_suite.requested`,
-    /// `check_run.rerequested`, `pull_request.assigned`, and the like. Kinds the edge
+    /// `check_run.rerequested`, `pull_request.assigned`, and the like. Also a kind this
+    /// binary does not name at all, which only a rollout produces: an edge deployed ahead
+    /// of this dispatcher, forwarding a kind it has not learned yet. Kinds the edge
     /// acknowledges never get this far.
     Ignore,
 }
@@ -134,22 +139,31 @@ fn route_webhook(
             actual,
         });
     }
-    match event.event.as_str() {
-        "pull_request" => route_pull_request(event),
-        "check_suite" if event.action.as_deref() == Some("completed") => route_sha(event),
-        "check_run" if matches!(event.action.as_deref(), Some("created" | "completed")) => {
+    // Exhaustive on purpose: a kind added to `DeliveryKind` for us to route has to be
+    // answered here before this compiles. The per-kind `Ignore` arms are the action
+    // filters — the edge forwards every check action and we keep only these.
+    match &event.event {
+        DeliveryKind::PullRequest => route_pull_request(event),
+        DeliveryKind::CheckSuite if event.action.as_deref() == Some("completed") => {
             route_sha(event)
         }
-        "status" => route_sha(event),
-        "installation" => route_installation(event),
-        "installation_repositories" => Ok(match event.installation_id {
+        DeliveryKind::CheckSuite => Ok(WebhookRoute::Ignore),
+        DeliveryKind::CheckRun
+            if matches!(event.action.as_deref(), Some("created" | "completed")) =>
+        {
+            route_sha(event)
+        }
+        DeliveryKind::CheckRun => Ok(WebhookRoute::Ignore),
+        DeliveryKind::Status => route_sha(event),
+        DeliveryKind::Installation => route_installation(event),
+        DeliveryKind::InstallationRepositories => Ok(match event.installation_id {
             Some(installation_id) => WebhookRoute::Installation {
                 installation_id,
                 action: InstallationLifecycleAction::SyncNow,
             },
             None => WebhookRoute::Ignore,
         }),
-        _ => Ok(WebhookRoute::Ignore),
+        DeliveryKind::Other(_) => Ok(WebhookRoute::Ignore),
     }
 }
 
@@ -354,9 +368,12 @@ mod tests {
     }
 
     /// A delivery as the web edge forwards it, for installation 1 and repository 7.
+    ///
+    /// Takes the kind as the word GitHub sends, so every caller below reads as the
+    /// delivery it stands for.
     fn delivery(event: &str, action: Option<&str>) -> WebhookEvent {
         WebhookEvent {
-            event: event.to_owned(),
+            event: event.into(),
             action: action.map(str::to_owned),
             installation_id: Some(1),
             repository_id: Some(7),

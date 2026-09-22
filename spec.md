@@ -973,9 +973,17 @@ deliveries and carry no key; they are minted fresh per click and dedup by other 
 **Unroutable kinds stop at the edge.** The edge keeps a copy of dispatch's routing table
 — the six event kinds above — and answers anything else (`ping`, `push`,
 `issue_comment`, kinds GitHub adds later) with a 2xx before Restate is involved, since
-the only thing the invocation would do is drop the event. The cost of the copy is that
-the two tables can drift: a kind added to dispatch without being added to the edge is
-acknowledged and never forwarded. Both sites carry a comment pointing at the other.
+the only thing the invocation would do is drop the event. The two tables are named by one
+type, `dependaboard_core::DeliveryKind`, which is what a forwarded delivery carries its
+kind as. That closes one half of the drift: dispatch matches the type exhaustively, so a
+kind given a variant and left unhandled there does not compile. The other half is still a
+decision the edge makes alone — its match is over `octoevents::EventKind`, every kind
+GitHub sends, so a routed kind the edge acknowledges rather than forwards is caught only
+by a test, not by the compiler. Both sites carry a comment saying which half is which.
+`DeliveryKind` also has a fallback variant for kinds it does not name: the edge and the
+service are deployed separately, so during a rollout the edge may forward a kind the
+dispatcher has never heard of, and it must be ignored as before rather than failing the
+invocation as it is deserialized.
 
 **One Restate entry point, not four.** An earlier draft had the webhook Worker calling
 `PullRequest.sync` and `PullRequest.closed` directly — which contradicted §3b, where

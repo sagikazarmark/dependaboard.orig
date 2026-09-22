@@ -9,7 +9,7 @@ use axum::{
     response::IntoResponse,
     routing::post,
 };
-use dependaboard_core::WebhookEvent;
+use dependaboard_core::{DeliveryKind, WebhookEvent};
 use octoevents::{
     DecodeError, Envelope, EventKind, FromEnvelope, Payload, Verifier, WebhookSecret,
 };
@@ -109,8 +109,13 @@ enum RoutingError {
 /// to the routing fields `WebhookIngress` dispatches on, or acknowledge it.
 ///
 /// The kinds matched here are the edge's copy of the dispatcher's routing
-/// table and must stay in step with `WebhookIngress::dispatch`: a kind added
-/// there but not here is acknowledged at the edge and never reaches Restate.
+/// table. The dispatcher's half of the pair is exhaustive over
+/// `dependaboard_core::DeliveryKind`, so a kind it routes cannot go unanswered
+/// there; this half is a match over `octoevents::EventKind`, whose ~60 variants
+/// are all the kinds GitHub sends, so it is still a choice this file makes alone.
+/// A kind given a `DeliveryKind` variant and a dispatch arm but no arm here is
+/// acknowledged at the edge and never reaches Restate, and nothing but a test
+/// says so.
 ///
 /// The envelope already carries the installation and repository probe, so only
 /// the per-event fields — PR number, head SHA, and the PRs a check belongs to —
@@ -166,7 +171,7 @@ fn route_delivery(envelope: &Envelope) -> Result<Disposition, RoutingError> {
         _ => return Ok(Disposition::Acknowledge),
     };
     Ok(Disposition::Forward(Box::new(WebhookEvent {
-        event: envelope.meta.kind.as_str().to_owned(),
+        event: DeliveryKind::from(envelope.meta.kind.as_str()),
         action: envelope
             .meta
             .action
@@ -337,7 +342,7 @@ mod tests {
             assert_eq!(forward.path, "/restate/send/WebhookIngress/dispatch");
             assert_eq!(forward.idempotency_key.as_deref(), Some(DELIVERY_ID));
             let event: WebhookEvent = serde_json::from_slice(&forward.body).unwrap();
-            assert_eq!(event.event, "pull_request");
+            assert_eq!(event.event, DeliveryKind::PullRequest);
             assert_eq!(event.action.as_deref(), Some("synchronize"));
             assert_eq!(event.installation_id, Some(42));
             assert_eq!(event.repository_id, Some(7));
@@ -583,7 +588,7 @@ mod tests {
                 "pull_requests": [{ "number": 9 }]
             });
             let event = routed(object_name, Some(action), true, payload);
-            assert_eq!(event.event, object_name);
+            assert_eq!(event.event.as_str(), object_name);
             assert_eq!(event.action.as_deref(), Some(action));
             assert_eq!(event.sha.as_deref(), Some("abc123"));
             assert_eq!(event.pull_requests, vec![9]);
