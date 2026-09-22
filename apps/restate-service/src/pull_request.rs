@@ -770,7 +770,10 @@ pub(crate) fn short_sha(value: &str) -> &str {
 mod tests {
     use std::collections::VecDeque;
 
-    use dependaboard_core::{DependabotCommand, RepoRecord, UserId};
+    use dependaboard_core::{
+        DependabotCommand, RepoRecord, UserId,
+        restate::{PULL_REQUEST, PULL_REQUEST_STATUS},
+    };
     use dependaboard_github::GithubErrorResponse;
     use dependaboard_store::LibSqlPrStore;
     use restate_sdk::service::Discoverable;
@@ -1577,25 +1580,29 @@ mod tests {
         );
     }
 
+    /// The one public handler is the one the drawer polls, and the edge addresses it by
+    /// the name in `dependaboard_core::restate`; the private ones are this object's own
+    /// business and are spelled here.
     #[test]
     fn pull_request_exposes_only_status_through_ingress() {
         let discovery = <PullRequest as Discoverable>::discover();
         assert_ne!(discovery.ingress_private, Some(true));
+        assert_eq!(discovery.name.as_str(), PULL_REQUEST);
 
         for handler_name in ["sync", "closed", "merge", "command", "update_branch"] {
             let handler = discovery
                 .handlers
                 .iter()
                 .find(|handler| handler.name.as_str() == handler_name)
-                .unwrap_or_else(|| panic!("missing PullRequest/{handler_name}"));
+                .unwrap_or_else(|| panic!("missing {PULL_REQUEST}/{handler_name}"));
             assert_eq!(handler.ingress_private, Some(true));
         }
 
         let status = discovery
             .handlers
             .iter()
-            .find(|handler| handler.name.as_str() == "status")
-            .expect("missing PullRequest/status");
+            .find(|handler| handler.name.as_str() == PULL_REQUEST_STATUS)
+            .unwrap_or_else(|| panic!("missing {PULL_REQUEST}/{PULL_REQUEST_STATUS}"));
         assert_ne!(status.ingress_private, Some(true));
     }
 

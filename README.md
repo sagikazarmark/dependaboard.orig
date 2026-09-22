@@ -461,7 +461,7 @@ Every Restate handler is reachable through the ingress unless marked private, an
 | `PullRequest.status` — the read the detail drawer polls | |
 | `SchedulerIngress.start` — arms the reconcile chain at startup | |
 
-The webhook dispatcher routes only what GitHub sends; the dashboard's manual refreshes have their own service, so a refresh skips the per-PR webhook debounce and records its completion id without the dispatcher knowing about it. Discovery tests in `pull_request.rs` and `dashboard.rs` pin the mixed-visibility `PullRequest` object and the public `DashboardIngress` service; keep this table in step with the `ingress_private` attributes when you change one.
+The webhook dispatcher routes only what GitHub sends; the dashboard's manual refreshes have their own service, so a refresh skips the per-PR webhook debounce and records its completion id without the dispatcher knowing about it. Every name in the left-hand column is a constant in `dependaboard_core::restate` that the web app builds its ingress paths from; a discovery test beside each service asserts the names and the visibility it registered against those constants, so a handler renamed or hidden on one side fails a test rather than a request. Keep this table in step with them when you change one.
 
 The Restate service stops on `SIGINT` or `SIGTERM`: it closes its listener, gives in-flight invocations up to ten seconds to finish, and leaves anything still running for Restate to retry against the next instance.
 

@@ -30,14 +30,10 @@ use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
 use {
-    crate::server::{
-        restate::{RestateIngressError, pr_status_path},
-        state::ServerState,
-    },
+    crate::server::{restate::RestateIngressError, state::ServerState},
     axum::extract::Extension,
     dependaboard_core::{BulkRequest, ManualSyncRequest, PrTarget, new_batch_id, validate_batch},
     dependaboard_store::{ProjectedPr, StoreError},
-    reqwest::StatusCode,
 };
 
 /// What a server function's body refuses with.
@@ -343,7 +339,7 @@ pub(crate) async fn load_capabilities() -> Result<Capabilities, ServerFnError> {
 /// The body of [`load_capabilities`].
 #[cfg(feature = "server")]
 pub(crate) async fn load_capabilities_in(state: &ServerState) -> Result<Capabilities, ApiError> {
-    Ok(state.ingress.call("DashboardIngress/capabilities").await?)
+    Ok(state.ingress.capabilities().await?)
 }
 
 /// Asks Restate to run the batch. The batch id is the workflow key, which lets
@@ -417,14 +413,7 @@ pub(crate) async fn submit_batch_in(
         user_id: user,
         retried_from,
     };
-    state
-        .ingress
-        .send(
-            &format!("BulkAction/{batch_id}/run"),
-            &request,
-            Some(batch_id),
-        )
-        .await?;
+    state.ingress.run_batch(batch_id, &request).await?;
     Ok(BatchReceipt { left_out })
 }
 
@@ -441,29 +430,18 @@ pub(crate) async fn load_batch_progress(
     Ok(load_batch_progress_in(&state, &batch_id).await?)
 }
 
-/// The body of [`load_batch_progress`]. Restate answers a shared handler of a
-/// workflow it never had with a 404, and that is the `None`: the one refusal
-/// that says something about the batch rather than about Restate, and the
-/// one the follow gives up on. Every other failure is Restate not answering
-/// for the batch, and is reported as such, so the follow waits it out.
+/// The body of [`load_batch_progress`]. A batch this Restate never had is the
+/// ingress client's `None` — the one refusal that says something about the
+/// batch rather than about Restate, and the one the follow gives up on. Every
+/// other failure is Restate not answering for the batch, and is reported as
+/// such, so the follow waits it out.
 #[cfg(feature = "server")]
 pub(crate) async fn load_batch_progress_in(
     state: &ServerState,
     batch_id: &str,
 ) -> Result<Option<BatchProgress>, ApiError> {
     minted_here(batch_id)?;
-    match state
-        .ingress
-        .call(&format!("BulkAction/{batch_id}/progress"))
-        .await
-    {
-        Ok(progress) => Ok(progress),
-        Err(RestateIngressError::Status {
-            code: StatusCode::NOT_FOUND,
-            ..
-        }) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
+    Ok(state.ingress.batch_progress(batch_id).await?)
 }
 
 /// The batches the audit view lists: every batch running, and the `limit`
@@ -548,10 +526,7 @@ pub(crate) async fn load_pr_status_in(
     if projected_pr(state, &key).await?.is_none() {
         return Ok(None);
     }
-    Ok(state
-        .ingress
-        .call(&pr_status_path(key.repository_id, key.number))
-        .await?)
+    Ok(state.ingress.pull_request_status(&key).await?)
 }
 
 /// The pull request's row as the projection has it, or `None` for one the
@@ -588,10 +563,7 @@ pub(crate) async fn request_sync() -> Result<(), ServerFnError> {
 /// The body of [`request_sync`].
 #[cfg(feature = "server")]
 pub(crate) async fn request_sync_in(state: &ServerState) -> Result<(), ApiError> {
-    Ok(state
-        .ingress
-        .send_empty("DashboardIngress/sync_installation")
-        .await?)
+    Ok(state.ingress.sync_installation().await?)
 }
 
 /// Asks Restate to refresh one pull request, and answers with the completion
@@ -625,10 +597,7 @@ pub(crate) async fn request_pr_sync_in(
         number: row.number,
         completion_id: completion_id.clone(),
     };
-    state
-        .ingress
-        .send("DashboardIngress/sync_pull_request", &request, None)
-        .await?;
+    state.ingress.sync_pull_request(&request).await?;
     Ok(completion_id)
 }
 
@@ -682,7 +651,10 @@ mod tests {
     // server functions under test only ever read it.
     use dependaboard_store::ProjectionWriter;
 
+    use reqwest::StatusCode;
+
     use super::*;
+    use crate::server::restate::pr_status_path;
     use crate::server::test_support::{
         Backend, Dashboard, INSTALLATION_ID, USERNAME, backend, dashboard, error_message,
     };

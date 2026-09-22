@@ -534,11 +534,34 @@ mod tests {
 
     use dependaboard_core::{
         RejectReason, RunningBatch, TargetOutcome, TargetProgressState, UserId,
+        restate::{BULK_ACTION, BULK_ACTION_PROGRESS, BULK_ACTION_RUN},
     };
+    use restate_sdk::service::Discoverable;
     use tracing::instrument::WithSubscriber;
 
     use super::*;
     use crate::test_support::{LogSink, captured_logs, target};
+
+    /// A batch is submitted and followed from the web edge, which builds both paths from
+    /// `dependaboard_core::restate`. Both handlers are therefore public, and both must
+    /// carry the names the edge addresses them by — a rename here with the constant left
+    /// behind would leave the edge posting to a workflow Restate has never heard of,
+    /// which for the follow is indistinguishable from a batch that does not exist.
+    #[test]
+    fn bulk_action_is_reachable_through_ingress_under_the_names_the_edge_addresses() {
+        let discovery = <BulkAction as Discoverable>::discover();
+        assert_ne!(discovery.ingress_private, Some(true));
+        assert_eq!(discovery.name.as_str(), BULK_ACTION);
+
+        for handler_name in [BULK_ACTION_RUN, BULK_ACTION_PROGRESS] {
+            let handler = discovery
+                .handlers
+                .iter()
+                .find(|handler| handler.name.as_str() == handler_name)
+                .unwrap_or_else(|| panic!("missing {BULK_ACTION}/{handler_name}"));
+            assert_ne!(handler.ingress_private, Some(true), "{handler_name}");
+        }
+    }
 
     /// A merge target for pull request `number` in repository `repository_id`.
     fn pull(repository_id: u64, number: u64) -> PrTarget {

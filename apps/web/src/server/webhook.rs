@@ -63,16 +63,9 @@ async fn github_webhook(
             return (StatusCode::BAD_REQUEST, "invalid GitHub webhook payload").into_response();
         }
     };
-    // A redelivery from the App's delivery log replays the request under the
-    // same delivery id, so it is the key that lets Restate fold the replay
-    // into the dispatch it already accepted.
     match state
         .ingress
-        .send(
-            "WebhookIngress/dispatch",
-            &event,
-            Some(&envelope.meta.delivery_id),
-        )
+        .dispatch_webhook(&event, &envelope.meta.delivery_id)
         .await
     {
         Ok(()) => StatusCode::OK.into_response(),

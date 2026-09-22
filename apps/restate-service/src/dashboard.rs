@@ -94,21 +94,33 @@ fn manual_sync(request: ManualSyncRequest) -> SyncRequest {
 
 #[cfg(test)]
 mod tests {
+    use dependaboard_core::restate::{
+        DASHBOARD_CAPABILITIES, DASHBOARD_INGRESS, DASHBOARD_SYNC_INSTALLATION,
+        DASHBOARD_SYNC_PULL_REQUEST,
+    };
     use restate_sdk::service::Discoverable;
 
     use super::*;
 
+    /// The names this service registers are the names the web edge addresses it by, and
+    /// both sides take them from `dependaboard_core::restate`: a handler renamed here
+    /// without the constant is a path the edge would still be sending to.
     #[test]
-    fn dashboard_ingress_is_reachable_through_ingress() {
+    fn dashboard_ingress_is_reachable_through_ingress_under_the_names_the_edge_addresses() {
         let discovery = <DashboardIngress as Discoverable>::discover();
         assert_ne!(discovery.ingress_private, Some(true));
+        assert_eq!(discovery.name.as_str(), DASHBOARD_INGRESS);
 
-        for handler_name in ["sync_installation", "sync_pull_request", "capabilities"] {
+        for handler_name in [
+            DASHBOARD_SYNC_INSTALLATION,
+            DASHBOARD_SYNC_PULL_REQUEST,
+            DASHBOARD_CAPABILITIES,
+        ] {
             let handler = discovery
                 .handlers
                 .iter()
                 .find(|handler| handler.name.as_str() == handler_name)
-                .unwrap_or_else(|| panic!("missing DashboardIngress/{handler_name}"));
+                .unwrap_or_else(|| panic!("missing {DASHBOARD_INGRESS}/{handler_name}"));
             assert_ne!(handler.ingress_private, Some(true), "{handler_name}");
         }
     }

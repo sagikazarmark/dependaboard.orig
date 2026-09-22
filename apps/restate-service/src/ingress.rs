@@ -306,7 +306,28 @@ fn installation_lifecycle_action(action: Option<&str>) -> Option<InstallationLif
 
 #[cfg(test)]
 mod tests {
+    use dependaboard_core::restate::{WEBHOOK_DISPATCH, WEBHOOK_INGRESS};
+    use restate_sdk::service::Discoverable;
+
     use super::*;
+
+    /// The web edge forwards every verified delivery here, addressing the service and
+    /// the handler by the names in `dependaboard_core::restate`; this is the only entry
+    /// point it has for webhooks, so a rename that left the constant behind would drop
+    /// every delivery at Restate's door.
+    #[test]
+    fn webhook_ingress_is_reachable_through_ingress_under_the_names_the_edge_addresses() {
+        let discovery = <WebhookIngress as Discoverable>::discover();
+        assert_ne!(discovery.ingress_private, Some(true));
+        assert_eq!(discovery.name.as_str(), WEBHOOK_INGRESS);
+
+        let dispatch = discovery
+            .handlers
+            .iter()
+            .find(|handler| handler.name.as_str() == WEBHOOK_DISPATCH)
+            .unwrap_or_else(|| panic!("missing {WEBHOOK_INGRESS}/{WEBHOOK_DISPATCH}"));
+        assert_ne!(dispatch.ingress_private, Some(true));
+    }
 
     #[test]
     fn installation_webhooks_map_to_distinct_lifecycle_actions() {

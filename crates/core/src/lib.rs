@@ -34,6 +34,55 @@ pub const ROW_LABEL_LIMIT: usize = 2;
 /// Shorter than the hourly reconcile sweep so a missed sweep is visible.
 pub const STALE_AFTER: Duration = Duration::from_secs(45 * 60);
 
+/// The names Restate registers this deployment's handlers under.
+///
+/// The Restate service declares them — `#[restate_sdk::service]` and its siblings take a
+/// service's name from the type and a handler's from the method — and the web edge
+/// addresses them over the ingress. That makes one contract held in two binaries, and
+/// nothing but a matching string joins them: an invocation sent to a name Restate does
+/// not have is refused by the ingress, not by a compiler. Naming them here gives both
+/// sides the same word to compile against — the edge builds every ingress path from
+/// these (`apps/web/src/server/restate.rs`), and each service's discovery test asserts
+/// what it registered against them, so a rename that misses one end fails a test here
+/// rather than a request in production.
+///
+/// Only what the edge addresses is named: the handlers reachable through the ingress
+/// (spec §3b). A private handler is one service's business and stays spelled where it is
+/// declared. A keyed invocation takes the key between the two names —
+/// `BulkAction/{batch_id}/run` — so a service and its handlers are named apart rather
+/// than as one path; how the key is encoded into the path is the edge's business.
+pub mod restate {
+    /// The workflow one batch of bulk actions runs as, keyed by the batch id.
+    pub const BULK_ACTION: &str = "BulkAction";
+    /// Runs the batch: the submission the dashboard enqueues under the batch id.
+    pub const BULK_ACTION_RUN: &str = "run";
+    /// Where the batch stands, as the workflow holds it: the shared read the progress
+    /// pill polls.
+    pub const BULK_ACTION_PROGRESS: &str = "progress";
+
+    /// The virtual object that owns one pull request, keyed by its [`crate::PrKey`].
+    pub const PULL_REQUEST: &str = "PullRequest";
+    /// The durable state the object holds: the shared read the detail drawer polls, and
+    /// the object's one public handler.
+    pub const PULL_REQUEST_STATUS: &str = "status";
+
+    /// The service the dashboard asks for what this deployment can do, and for the
+    /// refreshes it wants now rather than at the next sweep.
+    pub const DASHBOARD_INGRESS: &str = "DashboardIngress";
+    /// What this deployment can do, as the service resolved it at startup.
+    pub const DASHBOARD_CAPABILITIES: &str = "capabilities";
+    /// Reconciles the whole installation now: the dashboard's global **Sync**.
+    pub const DASHBOARD_SYNC_INSTALLATION: &str = "sync_installation";
+    /// Refreshes one pull request now: the drawer's **Sync**.
+    pub const DASHBOARD_SYNC_PULL_REQUEST: &str = "sync_pull_request";
+
+    /// The service verified GitHub deliveries are routed by.
+    pub const WEBHOOK_INGRESS: &str = "WebhookIngress";
+    /// Routes one verified delivery to the object that owns it: the sole entry point the
+    /// webhook edge has.
+    pub const WEBHOOK_DISPATCH: &str = "dispatch";
+}
+
 /// Seconds since the Unix epoch on the host clock. Uses `web_time` so the same
 /// helper compiles for the browser (wasm32) and native targets.
 pub fn unix_seconds() -> u64 {

@@ -505,10 +505,13 @@ nothing waits behind it, and a lost unlist is a stale row, not a lost record.
 
 **The web edge's Restate ingress client fails in three classes** —
 `RestateIngressError::{Transport, Status { code, body }, Decode}`: no answer, a refusal
-with its status, an answer that could not be read — and the server functions consult the
-status, since a 404 on `BulkAction/{id}/progress` is a workflow this Restate never had,
-which is the `None` the by-id follow gives up on, where every other class is "Restate is
-unavailable" and is waited out.
+with its status, an answer that could not be read. The status is consulted in the client,
+which has a method per handler the edge invokes and answers in the handler's own terms: a
+404 on the progress read is a workflow this Restate never had, which the client answers
+as `None` and the by-id follow gives up on, where every other class reaches the server
+function as "Restate is unavailable" and is waited out. The client owning that rule is
+what keeps a path it got wrong from reading as a batch that does not exist, so each of
+its methods is held to a Restate serving exactly the handler it addresses.
 
 **One 405 is special-cased, and it's the one bulk merging hits most.**
 `PUT /pulls/{n}/merge` returns 405 `"Base branch was modified. Review and try the merge
@@ -1069,9 +1072,19 @@ Marking whole services private is simpler to reason about than per-handler flags
 that is how `InstallationSync` and `RepoSync` are marked. `PullRequest` is the one
 mixed-visibility object: its mutations are private one by one and `status` is left public
 for the drawer, which is exactly the "one shared handler exposed from an otherwise private
-service" case. Discovery tests pin the mixed `PullRequest` object and the public
-`DashboardIngress` service, and the README's *Restate ingress visibility* table is the
-operator's copy of this one; change them together.
+service" case. Discovery tests pin the visibility of each of these, and the README's
+*Restate ingress visibility* table is the operator's copy of this one; change them
+together.
+
+**The public names are declared once, in `dependaboard_core::restate`.** A handler
+reachable through the ingress is a contract held in two binaries with nothing but a
+matching string between them — an invocation sent to a name Restate does not have is
+refused by the ingress, not by a compiler — so the service, object and workflow names
+above and the handlers on them are `&'static str` constants both sides compile against.
+The web edge builds every ingress path from them, and each service's discovery test
+asserts the names it registered against the same constants, so a rename that reaches only
+one end fails a test rather than a request. Only the public names are there: a private
+handler is one service's business and stays spelled where it is declared.
 
 ---
 
