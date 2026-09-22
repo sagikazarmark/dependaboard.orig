@@ -9,9 +9,9 @@ use dependaboard_core::{FacetCounts, LabelFacet, PrFilter, RepoFacet};
 use libsql::Value;
 
 use crate::{
-    StoreError,
-    filter::{Facet, filter_sql, without_facet},
-    integer, repo_from_row, scoped_to_installation, stored_enum, unsigned,
+    ScopedFilter, StoreError,
+    filter::{Facet, without_facet},
+    integer, repo_from_row, stored_enum, unsigned,
 };
 
 pub(crate) async fn facet_counts(
@@ -20,46 +20,35 @@ pub(crate) async fn facet_counts(
     filter: &PrFilter,
     now: u64,
 ) -> Result<FacetCounts, StoreError> {
-    let (checks_where, checks_params) = facet_scope(filter, Facet::Checks, now, installation_id)?;
-    let checks = enum_counts(
-        connection,
-        &format!(
-            "SELECT p.check_status, COUNT(*) FROM pull_requests p {checks_where} GROUP BY p.check_status"
-        ),
-        checks_params,
-    )
-    .await?;
+    let checks_scope = facet_scope(filter, Facet::Checks, now, installation_id)?;
+    let checks_where = checks_scope.where_sql();
+    let checks_sql = format!(
+        "SELECT p.check_status, COUNT(*) FROM pull_requests p {checks_where} GROUP BY p.check_status"
+    );
+    let checks = enum_counts(connection, &checks_sql, checks_scope.into_params()).await?;
 
-    let (types_where, types_params) =
-        facet_scope(filter, Facet::UpdateTypes, now, installation_id)?;
-    let update_types = enum_counts(
-        connection,
-        &format!(
-            "SELECT p.update_type, COUNT(*) FROM pull_requests p {types_where} GROUP BY p.update_type"
-        ),
-        types_params,
-    )
-    .await?;
+    let types_scope = facet_scope(filter, Facet::UpdateTypes, now, installation_id)?;
+    let types_where = types_scope.where_sql();
+    let types_sql = format!(
+        "SELECT p.update_type, COUNT(*) FROM pull_requests p {types_where} GROUP BY p.update_type"
+    );
+    let update_types = enum_counts(connection, &types_sql, types_scope.into_params()).await?;
 
     // Ties fall back to case-insensitive name order; the GROUP BY stays
     // exact because the label filter matches labels byte for byte.
-    let (labels_where, labels_params) = facet_scope(filter, Facet::Labels, now, installation_id)?;
-    let labels = grouped_counts(
-        connection,
-        &format!(
-            "SELECT lbl.value, COUNT(*) FROM pull_requests p, json_each(p.labels) lbl {labels_where} GROUP BY lbl.value ORDER BY COUNT(*) DESC, lbl.value COLLATE NOCASE"
-        ),
-        labels_params,
-    )
-    .await?
-    .into_iter()
-    .map(|(label, count)| LabelFacet { label, count })
-    .collect();
+    let labels_scope = facet_scope(filter, Facet::Labels, now, installation_id)?;
+    let labels_where = labels_scope.where_sql();
+    let labels_sql = format!(
+        "SELECT lbl.value, COUNT(*) FROM pull_requests p, json_each(p.labels) lbl {labels_where} GROUP BY lbl.value ORDER BY COUNT(*) DESC, lbl.value COLLATE NOCASE"
+    );
+    let labels = grouped_counts(connection, &labels_sql, labels_scope.into_params())
+        .await?
+        .into_iter()
+        .map(|(label, count)| LabelFacet { label, count })
+        .collect();
 
-    let (repos_where, repos_params) =
-        facet_scope(filter, Facet::Repositories, now, installation_id)?;
-    let repositories =
-        repository_facets(connection, installation_id, &repos_where, repos_params).await?;
+    let repos_scope = facet_scope(filter, Facet::Repositories, now, installation_id)?;
+    let repositories = repository_facets(connection, installation_id, repos_scope).await?;
 
     Ok(FacetCounts {
         checks,
@@ -69,40 +58,38 @@ pub(crate) async fn facet_counts(
     })
 }
 
-/// The `WHERE` clause a facet counts within: `filter` minus the facet's own
-/// dimension, as [`filter_sql`] renders it, held to the installation. Every
-/// facet is scoped the same way, through the one helper, so no facet can be
-/// the one that forgot.
+/// The clause a facet counts within: `filter` minus the facet's own
+/// dimension, held to the installation. Every facet is scoped the same way,
+/// through the one helper, so no facet can be the one that forgot.
 fn facet_scope(
     filter: &PrFilter,
     facet: Facet,
     now: u64,
     installation_id: u64,
-) -> Result<(String, Vec<Value>), StoreError> {
-    let (where_sql, mut params) = filter_sql(&without_facet(filter, facet), None, now)?;
-    let where_sql = scoped_to_installation(&where_sql, &mut params, installation_id)?;
-    Ok((where_sql, params))
+) -> Result<ScopedFilter, StoreError> {
+    ScopedFilter::new(&without_facet(filter, facet), None, now, installation_id)
 }
 
 /// Every repository of `installation_id`, with how many of its pull requests
-/// satisfy `where_sql` (a scoped clause from [`facet_scope`] over
+/// satisfy `scoped` (the clause [`facet_scope`] built over
 /// `pull_requests p`), in owner then name order, case-insensitively, so
 /// consecutive entries share an owner. The clause is used as is, on a grouped
-/// subquery, so its shape stays [`filter_sql`]'s business.
+/// subquery, so its shape stays the filter's business; the repository
+/// predicate this statement needs of its own binds through `scoped`, after
+/// the clause's parameters, so the two cannot disagree about a `?N`.
 ///
 /// This is the one facet that reads `repositories` directly, so it is the one
 /// that needs its own predicate: without it a shared store offers the other
 /// deployment's repositories in the sidebar, at zero, which is how the
 /// tenancy hole showed. The outer `r` is bound here, which is why the clause
-/// inside the subquery cannot name it — see [`scoped_to_installation`].
+/// inside the subquery cannot name it — see [`ScopedFilter`].
 async fn repository_facets(
     connection: &libsql::Connection,
     installation_id: u64,
-    where_sql: &str,
-    mut params: Vec<Value>,
+    mut scoped: ScopedFilter,
 ) -> Result<Vec<RepoFacet>, StoreError> {
-    params.push(integer(installation_id)?);
-    let listed = format!("?{}", params.len());
+    let listed = scoped.bind(integer(installation_id)?);
+    let where_sql = scoped.where_sql();
     let mut rows = connection
         .query(
             &format!(
@@ -114,7 +101,7 @@ async fn repository_facets(
                  WHERE r.installation_id = {listed} \
                  ORDER BY r.owner COLLATE NOCASE, r.repo COLLATE NOCASE"
             ),
-            params,
+            scoped.into_params(),
         )
         .await?;
     let mut facets = Vec::new();

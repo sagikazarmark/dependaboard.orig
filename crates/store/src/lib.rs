@@ -16,6 +16,7 @@ mod facets;
 mod filter;
 mod migrations;
 mod reconcile;
+mod scope;
 #[cfg(test)]
 mod test_support;
 
@@ -26,8 +27,8 @@ use batches::{
     select_batches_sql, select_running_batches_sql,
 };
 use facets::facet_counts;
-use filter::filter_sql;
 use reconcile::{delete_repositories_where, retain_prs_on, retain_repos_on};
+use scope::ScopedFilter;
 
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
@@ -609,19 +610,16 @@ impl ProjectionReader for LibSqlPrStore {
         // with the rows.
         let transaction = connection.transaction().await?;
         let now = unix_seconds();
-        let (where_sql, mut params) = filter_sql(filter, None, now)?;
-        let where_sql = scoped_to_installation(&where_sql, &mut params, installation_id)?;
-        let total = scalar_u64(&transaction, &count_sql(&where_sql), params).await?;
+        let scoped = ScopedFilter::new(filter, None, now, installation_id)?;
+        let count = count_sql(scoped.where_sql());
+        let total = scalar_u64(&transaction, &count, scoped.into_params()).await?;
 
         let cursor = page.after.as_deref().map(PageCursor::decode).transpose()?;
-        let (page_where, mut page_params) = filter_sql(filter, cursor.as_ref(), now)?;
-        let page_where = scoped_to_installation(&page_where, &mut page_params, installation_id)?;
+        let mut scoped = ScopedFilter::new(filter, cursor.as_ref(), now, installation_id)?;
         let limit = page.normalized_limit() as usize;
-        let limit_index = page_params.len() + 1;
-        page_params.push(integer((limit + 1) as u64)?);
-        let page_rows = transaction
-            .query(&page_sql(&page_where, limit_index), page_params)
-            .await?;
+        // One extra row is what tells the page there is another after it.
+        let sql = page_sql(&mut scoped, (limit + 1) as u64)?;
+        let page_rows = transaction.query(&sql, scoped.into_params()).await?;
         let mut rows = collect_prs(page_rows).await?;
         transaction.commit().await?;
         let has_more = rows.len() > limit;
@@ -656,14 +654,13 @@ impl ProjectionReader for LibSqlPrStore {
         // The stamp is for the whole of this deployment's projection, so it
         // ignores the filter — but not the installation: another
         // deployment's sweep is not this one's freshness.
-        let mut freshness_params = Vec::new();
-        let freshness_where = scoped_to_installation("", &mut freshness_params, installation_id)?;
-        let last_synced_at = scalar_optional_u64(
-            &transaction,
-            &format!("SELECT MAX(p.synced_at) FROM pull_requests p {freshness_where}"),
-            freshness_params,
-        )
-        .await?;
+        let scoped = ScopedFilter::new(&PrFilter::default(), None, now, installation_id)?;
+        let freshness = format!(
+            "SELECT MAX(p.synced_at) FROM pull_requests p {}",
+            scoped.where_sql()
+        );
+        let last_synced_at =
+            scalar_optional_u64(&transaction, &freshness, scoped.into_params()).await?;
         transaction.commit().await?;
         Ok(DashboardSummary {
             facets,
@@ -826,47 +823,20 @@ fn select_pr_sql() -> &'static str {
        JOIN repositories r ON r.repository_id = p.repository_id"#
 }
 
-/// A `WHERE` clause from [`filter_sql`] (or an empty one) narrowed to the
-/// pull requests of `installation_id`, with its parameter appended to
-/// `params` — after [`filter_sql`]'s, so the numbering it rendered still
-/// holds and the filter's own SQL stays entirely its business.
-///
-/// The predicate is a subquery over `repositories` rather than a join,
-/// because every statement that takes a [`filter_sql`] clause reads
-/// `pull_requests p` alone — the count, the facet counts — and one of them,
-/// the repository facet, already binds `r` to `repositories` in the query
-/// *around* the clause, where a `r.installation_id = ?` would silently
-/// resolve to that outer row and count the wrong thing. `idx_repo_install`
-/// serves the subquery.
-fn scoped_to_installation(
-    where_sql: &str,
-    params: &mut Vec<Value>,
-    installation_id: u64,
-) -> Result<String, StoreError> {
-    params.push(integer(installation_id)?);
-    let predicate = format!(
-        "p.repository_id IN (SELECT repository_id FROM repositories WHERE installation_id = ?{})",
-        params.len()
-    );
-    Ok(if where_sql.is_empty() {
-        format!("WHERE {predicate}")
-    } else {
-        format!("{where_sql} AND {predicate}")
-    })
-}
-
-/// The dashboard's total for a `WHERE` clause from [`filter_sql`].
+/// The dashboard's total for a [`ScopedFilter`]'s clause.
 fn count_sql(where_sql: &str) -> String {
     format!("SELECT COUNT(*) FROM pull_requests p {where_sql}")
 }
 
-/// One keyset page for a `WHERE` clause from [`filter_sql`]; the limit binds
-/// as parameter `limit_index`.
-fn page_sql(where_sql: &str, limit_index: usize) -> String {
-    format!(
-        "{} {where_sql} ORDER BY p.updated_at DESC, p.id DESC LIMIT ?{limit_index}",
-        select_pr_sql()
-    )
+/// One keyset page for `scoped`; the limit binds through it, so the
+/// placeholder this renders is the position the value took.
+fn page_sql(scoped: &mut ScopedFilter, limit: u64) -> Result<String, StoreError> {
+    let limit = scoped.bind(integer(limit)?);
+    Ok(format!(
+        "{} {} ORDER BY p.updated_at DESC, p.id DESC LIMIT {limit}",
+        select_pr_sql(),
+        scoped.where_sql()
+    ))
 }
 
 fn pr_from_row(row: Row) -> Result<PrRecord, StoreError> {
@@ -1363,6 +1333,72 @@ mod tests {
         }
     }
 
+    /// A scoped, paged read is three appends into one parameter vector —
+    /// the filter's own parameters, then the installation scope, then the
+    /// page limit — and every `?N` the statement renders is a position in
+    /// that vector. `filter_sql`'s own tests pin its numbering; that the
+    /// scope and the limit land where the rendered SQL says they do is
+    /// pinned only here.
+    #[test]
+    fn a_scoped_page_numbers_the_filter_then_the_scope_then_the_limit() {
+        let filter = PrFilter {
+            repos: vec!["acme/api".to_owned()],
+            update_types: vec![UpdateType::Minor],
+            labels: vec!["rust".to_owned()],
+            ..Default::default()
+        };
+        let cursor = PageCursor {
+            updated_at: 500,
+            id: "1#7".to_owned(),
+        };
+
+        let mut scoped = ScopedFilter::new(&filter, Some(&cursor), 10_000, INSTALLATION).unwrap();
+        let sql = page_sql(&mut scoped, 51).unwrap();
+
+        assert_eq!(
+            sql,
+            format!(
+                "{} {} ORDER BY p.updated_at DESC, p.id DESC LIMIT ?7",
+                select_pr_sql(),
+                [
+                    "WHERE (p.owner || '/' || p.repo) IN (?1)",
+                    "p.update_type IN (?2)",
+                    "EXISTS (SELECT 1 FROM json_each(p.labels) l WHERE l.value = ?3)",
+                    "(p.updated_at < ?4 OR (p.updated_at = ?4 AND p.id < ?5))",
+                    "p.repository_id IN (SELECT repository_id FROM repositories WHERE installation_id = ?6)",
+                ]
+                .join(" AND ")
+            )
+        );
+        assert_eq!(
+            scoped.into_params(),
+            [
+                Value::Text("acme/api".to_owned()),
+                Value::Text("minor".to_owned()),
+                Value::Text("rust".to_owned()),
+                Value::Integer(500),
+                Value::Text("1#7".to_owned()),
+                integer(INSTALLATION).unwrap(),
+                Value::Integer(51),
+            ]
+        );
+    }
+
+    /// The scope predicate is spliced wherever the clause goes, including
+    /// into the repository facet's derived table — which sits under a query
+    /// that has already bound `r` to a *different* `repositories` row. So it
+    /// names only `p`; an `r.` here would silently resolve to that outer row.
+    #[test]
+    fn the_installation_scope_predicate_names_no_repositories_alias() {
+        let scoped = ScopedFilter::new(&PrFilter::default(), None, 10_000, INSTALLATION).unwrap();
+
+        assert_eq!(
+            scoped.where_sql(),
+            "WHERE p.repository_id IN (SELECT repository_id FROM repositories WHERE installation_id = ?1)"
+        );
+        assert!(!scoped.where_sql().contains("r."), "{}", scoped.where_sql());
+    }
+
     #[tokio::test]
     async fn the_dependency_filter_is_served_by_its_index() {
         let (_directory, store) = test_store().await;
@@ -1372,13 +1408,12 @@ mod tests {
         };
         // The statements as `list_prs` assembles them, tenancy predicate
         // and all, so the scope cannot cost the filter its index unnoticed.
-        let (where_sql, mut params) = filter_sql(&filter, None, unix_seconds()).unwrap();
-        let where_sql = scoped_to_installation(&where_sql, &mut params, INSTALLATION).unwrap();
+        let mut scoped = ScopedFilter::new(&filter, None, unix_seconds(), INSTALLATION).unwrap();
         let connection = store.connection().await;
 
         for sql in [
-            count_sql(&where_sql),
-            page_sql(&where_sql, params.len() + 1),
+            count_sql(scoped.where_sql()),
+            page_sql(&mut scoped, 51).unwrap(),
         ] {
             let mut rows = connection
                 .query(&format!("EXPLAIN QUERY PLAN {sql}"), ())
