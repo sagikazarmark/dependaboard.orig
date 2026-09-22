@@ -8,12 +8,24 @@
 //! request or the wire's error envelope between the test and what it
 //! asserts. The one exception, [`load_signed_in_user`], has no body: it
 //! answers with what the auth edge extracted.
+//!
+//! A body refuses with an [`ApiError`] rather than the wire's envelope, and
+//! the envelope is minted from it in one place — the `From<ApiError>` the
+//! `#[server]` adapters apply with `?`. That is where an infrastructure
+//! failure's detail is dropped, which is the only place it can be dropped
+//! from, and where the status every refusal carries is decided, which is the
+//! only place the browser's reading of a refusal can be changed.
+
+#[cfg(feature = "server")]
+use std::fmt;
 
 use dependaboard_core::{
     BatchList, BatchProgress, BatchReceipt, BulkActionKind, Capabilities, DashboardPage,
     DashboardSummary, Page, PrFilter, PrRecord, PrState, ProjectedBatch, ProjectionRevision,
     SubmittedTarget, UserId,
 };
+#[cfg(feature = "server")]
+use dependaboard_core::{CursorError, InvalidBatch, PrKey};
 use dioxus::prelude::*;
 
 #[cfg(feature = "server")]
@@ -23,12 +35,191 @@ use {
         state::ServerState,
     },
     axum::extract::Extension,
-    dependaboard_core::{
-        BulkRequest, InvalidBatch, ManualSyncRequest, PrKey, PrTarget, new_batch_id, validate_batch,
-    },
+    dependaboard_core::{BulkRequest, ManualSyncRequest, PrTarget, new_batch_id, validate_batch},
     dependaboard_store::StoreError,
     reqwest::StatusCode,
 };
+
+/// What a server function's body refuses with.
+///
+/// Two kinds of refusal, kept apart because the user is told different
+/// amounts. A request the dashboard should not have sent is named in full:
+/// the message is the whole of what was wrong with it, and it is the user's
+/// or the developer's to act on. A piece of the deployment that did not
+/// answer is named and no more — the failure behind it can carry connection
+/// strings and the credentials in them, so it rides along for the log alone
+/// and goes no further than the conversion at the wire's edge.
+#[cfg(feature = "server")]
+#[derive(Debug)]
+pub(crate) enum ApiError {
+    /// A request no dashboard of this deployment would have sent, or one the
+    /// projection can no longer make sense of.
+    InvalidRequest(InvalidRequest),
+    /// `component` could not be reached, or would not answer; `cause` is what
+    /// it failed with, for the log and never for the browser.
+    Unavailable {
+        component: Upstream,
+        cause: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// A request the dashboard should not have sent, as the body that refused it
+/// saw it. Each variant carries what its message varies by and nothing else,
+/// so a test can assert the refusal rather than the sentence.
+#[cfg(feature = "server")]
+#[derive(Debug)]
+pub(crate) enum InvalidRequest {
+    /// A submission that could not be a batch, by the batch rules.
+    Batch(InvalidBatch),
+    /// A page cursor the browser sent that no longer parses.
+    Cursor(CursorError),
+    /// A pull request of another installation: the projection never showed
+    /// it, so no dashboard of this deployment could have named it.
+    ForeignInstallation(PrKey),
+    /// A pull request the projection no longer has, asked for by a request
+    /// that has nothing to do without it.
+    NoLongerInTheDashboard(PrKey),
+    /// A submission none of whose `submitted` targets the projection still
+    /// has: no batch left to run.
+    NothingLeftToRun { submitted: usize },
+}
+
+/// A part of the deployment the dashboard cannot answer without. Named
+/// `Upstream` rather than the obvious word, which is Dioxus's.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Upstream {
+    /// The store every dashboard read is served from.
+    ReadModel,
+    /// The ingress every action is enqueued on.
+    Restate,
+}
+
+#[cfg(feature = "server")]
+impl Upstream {
+    /// What the user is told when this component does not answer — all of
+    /// it. An action is not withheld while the line is down; it is offered
+    /// and fails with its own message (README §Live refresh), so these two
+    /// sentences are what the dashboard shows in place of an answer, and the
+    /// tests of the controls that show them read them back word for word.
+    const fn unavailable(self) -> &'static str {
+        match self {
+            Self::ReadModel => "The read model is unavailable",
+            Self::Restate => "Restate is unavailable",
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl fmt::Display for ApiError {
+    /// The whole of what the browser is shown. The `cause` of an
+    /// [`ApiError::Unavailable`] is deliberately absent: redaction is this
+    /// impl, not a rule each refusal has to remember.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRequest(invalid) => invalid.fmt(f),
+            Self::Unavailable { component, .. } => f.write_str(component.unavailable()),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::error::Error for ApiError {
+    /// The failure behind an [`ApiError::Unavailable`], which the log is
+    /// given whole. An [`ApiError::InvalidRequest`] has nothing beneath its
+    /// message: the message is the whole of what happened.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRequest(_) => None,
+            Self::Unavailable { cause, .. } => Some(cause.as_ref()),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl fmt::Display for InvalidRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Batch(invalid) => invalid.fmt(f),
+            Self::Cursor(invalid) => invalid.fmt(f),
+            Self::ForeignInstallation(key) => write!(
+                f,
+                "pull request #{} does not belong to the configured installation",
+                key.number
+            ),
+            Self::NoLongerInTheDashboard(key) => {
+                write!(
+                    f,
+                    "pull request #{} is no longer in the dashboard",
+                    key.number
+                )
+            }
+            Self::NothingLeftToRun { submitted } => write!(
+                f,
+                "none of the {submitted} pull requests submitted are still in the dashboard"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::error::Error for InvalidRequest {}
+
+#[cfg(feature = "server")]
+impl From<InvalidRequest> for ApiError {
+    fn from(invalid: InvalidRequest) -> Self {
+        Self::InvalidRequest(invalid)
+    }
+}
+
+/// A read-model failure. A page cursor the browser sent that no longer parses
+/// is the browser's fault and is named as such; every other failure is the
+/// read model not answering.
+#[cfg(feature = "server")]
+impl From<StoreError> for ApiError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Cursor(invalid) => InvalidRequest::Cursor(invalid).into(),
+            error => Self::Unavailable {
+                component: Upstream::ReadModel,
+                cause: Box::new(error),
+            },
+        }
+    }
+}
+
+/// Restate not taking the request. Whether it refused, timed out or was never
+/// reached is the log's business; a refusal that says something about the
+/// request rather than about Restate — the 404 that is a batch it never had —
+/// is read before this conversion, by the body that asked.
+#[cfg(feature = "server")]
+impl From<RestateIngressError> for ApiError {
+    fn from(error: RestateIngressError) -> Self {
+        Self::Unavailable {
+            component: Upstream::Restate,
+            cause: Box::new(error),
+        }
+    }
+}
+
+/// The one place a refusal becomes the wire's envelope, and so the one place
+/// the browser's reading of it is decided.
+///
+/// Every refusal is a 500 carrying a message meant for the user, because
+/// [`crate::ui::fault`] reads the status and nothing else: only a 500 is
+/// shown as the server's own word, and a refusal answered with any other
+/// status would reach the user as "the dashboard server could not be
+/// reached" instead of what it says. This is also where an unreachable
+/// component's failure is logged and dropped.
+#[cfg(feature = "server")]
+impl From<ApiError> for ServerFnError {
+    fn from(error: ApiError) -> Self {
+        if let ApiError::Unavailable { component, cause } = &error {
+            tracing::error!(?component, %cause, "a dependency of the dashboard did not answer");
+        }
+        ServerFnError::new(error)
+    }
+}
 
 /// One page of rows for `filter`. Paging through a filter calls this alone;
 /// the facets around the rows come from [`load_summary`], once per filter.
@@ -37,7 +228,7 @@ pub(crate) async fn load_dashboard(
     filter: PrFilter,
     page: Page,
 ) -> Result<DashboardPage, ServerFnError> {
-    load_dashboard_in(&state, &filter, page).await
+    Ok(load_dashboard_in(&state, &filter, page).await?)
 }
 
 /// The body of [`load_dashboard`].
@@ -46,18 +237,14 @@ pub(crate) async fn load_dashboard_in(
     state: &ServerState,
     filter: &PrFilter,
     page: Page,
-) -> Result<DashboardPage, ServerFnError> {
-    state
-        .store
-        .list_prs(filter, page)
-        .await
-        .map_err(store_failure)
+) -> Result<DashboardPage, ApiError> {
+    Ok(state.store.list_prs(filter, page).await?)
 }
 
 /// The facet counts scoped to `filter` and the read model's freshness.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_summary(filter: PrFilter) -> Result<DashboardSummary, ServerFnError> {
-    load_summary_in(&state, &filter).await
+    Ok(load_summary_in(&state, &filter).await?)
 }
 
 /// The body of [`load_summary`].
@@ -65,12 +252,8 @@ pub(crate) async fn load_summary(filter: PrFilter) -> Result<DashboardSummary, S
 pub(crate) async fn load_summary_in(
     state: &ServerState,
     filter: &PrFilter,
-) -> Result<DashboardSummary, ServerFnError> {
-    state
-        .store
-        .dashboard_summary(filter)
-        .await
-        .map_err(store_failure)
+) -> Result<DashboardSummary, ApiError> {
+    Ok(state.store.dashboard_summary(filter).await?)
 }
 
 /// Every row `filter` matches, as far as one bulk action can take them: the
@@ -82,7 +265,7 @@ pub(crate) async fn load_summary_in(
 /// [`MAX_BATCH_TARGETS`]: dependaboard_core::MAX_BATCH_TARGETS
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_matching(filter: PrFilter) -> Result<DashboardPage, ServerFnError> {
-    load_matching_in(&state, &filter).await
+    Ok(load_matching_in(&state, &filter).await?)
 }
 
 /// The body of [`load_matching`].
@@ -90,17 +273,13 @@ pub(crate) async fn load_matching(filter: PrFilter) -> Result<DashboardPage, Ser
 pub(crate) async fn load_matching_in(
     state: &ServerState,
     filter: &PrFilter,
-) -> Result<DashboardPage, ServerFnError> {
+) -> Result<DashboardPage, ApiError> {
     let batch = Page {
         limit: u32::try_from(dependaboard_core::MAX_BATCH_TARGETS)
             .expect("the batch limit fits in a page"),
         after: None,
     };
-    state
-        .store
-        .list_prs(filter, batch)
-        .await
-        .map_err(store_failure)
+    Ok(state.store.list_prs(filter, batch).await?)
 }
 
 /// The read model's revision: a counter that moves whenever a row changes,
@@ -110,19 +289,15 @@ pub(crate) async fn load_matching_in(
 /// its pull requests landing.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_projection_revision() -> Result<ProjectionRevision, ServerFnError> {
-    load_projection_revision_in(&state).await
+    Ok(load_projection_revision_in(&state).await?)
 }
 
 /// The body of [`load_projection_revision`].
 #[cfg(feature = "server")]
 pub(crate) async fn load_projection_revision_in(
     state: &ServerState,
-) -> Result<ProjectionRevision, ServerFnError> {
-    state
-        .store
-        .projection_revision()
-        .await
-        .map_err(store_failure)
+) -> Result<ProjectionRevision, ApiError> {
+    Ok(state.store.projection_revision().await?)
 }
 
 /// Who the auth edge let this request through as. The browser holds the
@@ -142,19 +317,13 @@ pub(crate) async fn load_signed_in_user() -> Result<UserId, ServerFnError> {
 /// credentials the answer turns on.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_capabilities() -> Result<Capabilities, ServerFnError> {
-    load_capabilities_in(&state).await
+    Ok(load_capabilities_in(&state).await?)
 }
 
 /// The body of [`load_capabilities`].
 #[cfg(feature = "server")]
-pub(crate) async fn load_capabilities_in(
-    state: &ServerState,
-) -> Result<Capabilities, ServerFnError> {
-    state
-        .ingress
-        .call("DashboardIngress/capabilities")
-        .await
-        .map_err(restate_unavailable)
+pub(crate) async fn load_capabilities_in(state: &ServerState) -> Result<Capabilities, ApiError> {
+    Ok(state.ingress.call("DashboardIngress/capabilities").await?)
 }
 
 /// Asks Restate to run the batch. The batch id is the workflow key, which lets
@@ -180,7 +349,7 @@ pub(crate) async fn submit_batch(
     targets: Vec<SubmittedTarget>,
     retried_from: Option<String>,
 ) -> Result<BatchReceipt, ServerFnError> {
-    submit_batch_in(&state, user.0, &batch_id, action, targets, retried_from).await
+    Ok(submit_batch_in(&state, user.0, &batch_id, action, targets, retried_from).await?)
 }
 
 /// The body of [`submit_batch`], for `user`, the identity the auth edge let
@@ -193,13 +362,13 @@ pub(crate) async fn submit_batch_in(
     action: BulkActionKind,
     targets: Vec<SubmittedTarget>,
     retried_from: Option<String>,
-) -> Result<BatchReceipt, ServerFnError> {
+) -> Result<BatchReceipt, ApiError> {
     validate_batch(
         batch_id,
         retried_from.as_deref(),
         targets.iter().map(SubmittedTarget::key),
     )
-    .map_err(|invalid| ServerFnError::new(invalid.to_string()))?;
+    .map_err(InvalidRequest::Batch)?;
     let submitted = targets.len();
     let mut resolved = Vec::with_capacity(submitted);
     let mut left_out = Vec::new();
@@ -220,9 +389,7 @@ pub(crate) async fn submit_batch_in(
         });
     }
     if resolved.is_empty() {
-        return Err(ServerFnError::new(format!(
-            "none of the {submitted} pull requests submitted are still in the dashboard"
-        )));
+        return Err(InvalidRequest::NothingLeftToRun { submitted }.into());
     }
     let request = BulkRequest {
         action,
@@ -237,8 +404,7 @@ pub(crate) async fn submit_batch_in(
             &request,
             Some(batch_id),
         )
-        .await
-        .map_err(restate_unavailable)?;
+        .await?;
     Ok(BatchReceipt { left_out })
 }
 
@@ -252,7 +418,7 @@ pub(crate) async fn submit_batch_in(
 pub(crate) async fn load_batch_progress(
     batch_id: String,
 ) -> Result<Option<BatchProgress>, ServerFnError> {
-    load_batch_progress_in(&state, &batch_id).await
+    Ok(load_batch_progress_in(&state, &batch_id).await?)
 }
 
 /// The body of [`load_batch_progress`]. Restate answers a shared handler of a
@@ -264,10 +430,8 @@ pub(crate) async fn load_batch_progress(
 pub(crate) async fn load_batch_progress_in(
     state: &ServerState,
     batch_id: &str,
-) -> Result<Option<BatchProgress>, ServerFnError> {
-    if !dependaboard_core::valid_batch_id(batch_id) {
-        return Err(ServerFnError::new(InvalidBatch::BatchId.to_string()));
-    }
+) -> Result<Option<BatchProgress>, ApiError> {
+    minted_here(batch_id)?;
     match state
         .ingress
         .call(&format!("BulkAction/{batch_id}/progress"))
@@ -278,7 +442,7 @@ pub(crate) async fn load_batch_progress_in(
             code: StatusCode::NOT_FOUND,
             ..
         }) => Ok(None),
-        Err(error) => Err(restate_unavailable(error)),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -292,7 +456,7 @@ pub(crate) async fn load_batch_progress_in(
 /// [`MAX_RECENT_BATCHES`](dependaboard_core::MAX_RECENT_BATCHES).
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_recent_batches(limit: u32) -> Result<BatchList, ServerFnError> {
-    load_recent_batches_in(&state, limit).await
+    Ok(load_recent_batches_in(&state, limit).await?)
 }
 
 /// The body of [`load_recent_batches`].
@@ -300,20 +464,15 @@ pub(crate) async fn load_recent_batches(limit: u32) -> Result<BatchList, ServerF
 pub(crate) async fn load_recent_batches_in(
     state: &ServerState,
     limit: u32,
-) -> Result<BatchList, ServerFnError> {
-    let running = state
-        .store
-        .running_batches(state.installation_id)
-        .await
-        .map_err(store_failure)?;
+) -> Result<BatchList, ApiError> {
+    let running = state.store.running_batches(state.installation_id).await?;
     let finished = state
         .store
         .recent_batches(
             state.installation_id,
             limit.clamp(1, dependaboard_core::MAX_RECENT_BATCHES),
         )
-        .await
-        .map_err(store_failure)?;
+        .await?;
     Ok(BatchList { running, finished })
 }
 
@@ -331,7 +490,7 @@ pub(crate) async fn load_recent_batches_in(
 pub(crate) async fn load_batch_projection(
     batch_id: String,
 ) -> Result<Option<ProjectedBatch>, ServerFnError> {
-    load_batch_projection_in(&state, &batch_id).await
+    Ok(load_batch_projection_in(&state, &batch_id).await?)
 }
 
 /// The body of [`load_batch_projection`].
@@ -339,15 +498,12 @@ pub(crate) async fn load_batch_projection(
 pub(crate) async fn load_batch_projection_in(
     state: &ServerState,
     batch_id: &str,
-) -> Result<Option<ProjectedBatch>, ServerFnError> {
-    if !dependaboard_core::valid_batch_id(batch_id) {
-        return Err(ServerFnError::new(InvalidBatch::BatchId.to_string()));
-    }
-    state
+) -> Result<Option<ProjectedBatch>, ApiError> {
+    minted_here(batch_id)?;
+    Ok(state
         .store
         .get_batch(state.installation_id, batch_id)
-        .await
-        .map_err(store_failure)
+        .await?)
 }
 
 /// The durable state Restate holds for a pull request, or `None` for one the
@@ -360,7 +516,7 @@ pub(crate) async fn load_pr_status(
     repository_id: u64,
     number: u64,
 ) -> Result<Option<PrState>, ServerFnError> {
-    load_pr_status_in(&state, PrKey::new(repository_id, number)).await
+    Ok(load_pr_status_in(&state, PrKey::new(repository_id, number)).await?)
 }
 
 /// The body of [`load_pr_status`].
@@ -368,15 +524,14 @@ pub(crate) async fn load_pr_status(
 pub(crate) async fn load_pr_status_in(
     state: &ServerState,
     key: PrKey,
-) -> Result<Option<PrState>, ServerFnError> {
+) -> Result<Option<PrState>, ApiError> {
     if projected_pr(state, &key).await?.is_none() {
         return Ok(None);
     }
-    state
+    Ok(state
         .ingress
         .call(&pr_status_path(key.repository_id, key.number))
-        .await
-        .map_err(restate_unavailable)
+        .await?)
 }
 
 /// The pull request's row as the projection has it, or `None` for one the
@@ -388,7 +543,7 @@ pub(crate) async fn load_pr_projection(
     repository_id: u64,
     number: u64,
 ) -> Result<Option<PrRecord>, ServerFnError> {
-    load_pr_projection_in(&state, PrKey::new(repository_id, number)).await
+    Ok(load_pr_projection_in(&state, PrKey::new(repository_id, number)).await?)
 }
 
 /// The body of [`load_pr_projection`]: [`projected_pr`] for the key the
@@ -398,7 +553,7 @@ pub(crate) async fn load_pr_projection(
 pub(crate) async fn load_pr_projection_in(
     state: &ServerState,
     key: PrKey,
-) -> Result<Option<PrRecord>, ServerFnError> {
+) -> Result<Option<PrRecord>, ApiError> {
     projected_pr(state, &key).await
 }
 
@@ -407,17 +562,16 @@ pub(crate) async fn load_pr_projection_in(
 /// Restate takes it, and the dashboard's live refresh sees the sweep land.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn request_sync() -> Result<(), ServerFnError> {
-    request_sync_in(&state).await
+    Ok(request_sync_in(&state).await?)
 }
 
 /// The body of [`request_sync`].
 #[cfg(feature = "server")]
-pub(crate) async fn request_sync_in(state: &ServerState) -> Result<(), ServerFnError> {
-    state
+pub(crate) async fn request_sync_in(state: &ServerState) -> Result<(), ApiError> {
+    Ok(state
         .ingress
         .send_empty("DashboardIngress/sync_installation")
-        .await
-        .map_err(restate_unavailable)
+        .await?)
 }
 
 /// Asks Restate to refresh one pull request, and answers with the completion
@@ -431,7 +585,7 @@ pub(crate) async fn request_pr_sync(
     repository_id: u64,
     number: u64,
 ) -> Result<String, ServerFnError> {
-    request_pr_sync_in(&state, PrKey::new(repository_id, number)).await
+    Ok(request_pr_sync_in(&state, PrKey::new(repository_id, number)).await?)
 }
 
 /// The body of [`request_pr_sync`].
@@ -439,10 +593,10 @@ pub(crate) async fn request_pr_sync(
 pub(crate) async fn request_pr_sync_in(
     state: &ServerState,
     key: PrKey,
-) -> Result<String, ServerFnError> {
+) -> Result<String, ApiError> {
     let row = projected_pr(state, &key)
         .await?
-        .ok_or_else(|| no_longer_in_the_dashboard(&key))?;
+        .ok_or_else(|| InvalidRequest::NoLongerInTheDashboard(key.clone()))?;
     let completion_id = new_batch_id();
     let request = ManualSyncRequest {
         repository_id: row.repository_id,
@@ -454,8 +608,7 @@ pub(crate) async fn request_pr_sync_in(
     state
         .ingress
         .send("DashboardIngress/sync_pull_request", &request, None)
-        .await
-        .map_err(restate_unavailable)?;
+        .await?;
     Ok(completion_id)
 }
 
@@ -470,57 +623,36 @@ pub(crate) async fn request_pr_sync_in(
 /// as a sync or a batch target — resolves it here, so the installation is
 /// held to in one place rather than remembered at each.
 #[cfg(feature = "server")]
-async fn projected_pr(state: &ServerState, key: &PrKey) -> Result<Option<PrRecord>, ServerFnError> {
-    let Some(row) = state.store.get_pr(key).await.map_err(store_failure)? else {
+async fn projected_pr(state: &ServerState, key: &PrKey) -> Result<Option<PrRecord>, ApiError> {
+    let Some(row) = state.store.get_pr(key).await? else {
         return Ok(None);
     };
     if row.installation_id != state.installation_id {
-        return Err(ServerFnError::new(format!(
-            "pull request #{} does not belong to the configured installation",
-            key.number
-        )));
+        return Err(InvalidRequest::ForeignInstallation(key.clone()).into());
     }
     Ok(Some(row))
 }
 
-/// Refuses a request for a pull request the projection no longer has, where
-/// the request has nothing to do without it.
+/// Holds a batch id the browser named to the shape this deployment mints,
+/// for the two reads that take one. Neither looks the id up — an id the
+/// projection has never heard of is an answer, not a refusal — so the shape
+/// is the whole of what they can hold a batch id to, and they hold it to the
+/// same shape in this one place.
 #[cfg(feature = "server")]
-fn no_longer_in_the_dashboard(key: &PrKey) -> ServerFnError {
-    ServerFnError::new(format!(
-        "pull request #{} is no longer in the dashboard",
-        key.number
-    ))
-}
-
-/// Turns a read-model failure into the browser's error. A page cursor the
-/// browser sent that no longer parses is its own fault and is named as such;
-/// anything else is logged in full and reduced to a message that names the
-/// component, not the cause: the cause can carry connection strings and
-/// credentials, and the user cannot act on it anyway.
-#[cfg(feature = "server")]
-fn store_failure(error: StoreError) -> ServerFnError {
-    match error {
-        StoreError::Cursor(error) => ServerFnError::new(error.to_string()),
-        error => {
-            tracing::error!(%error, "read model query failed");
-            ServerFnError::new("The read model is unavailable")
-        }
+fn minted_here(batch_id: &str) -> Result<(), ApiError> {
+    if dependaboard_core::valid_batch_id(batch_id) {
+        Ok(())
+    } else {
+        Err(InvalidRequest::Batch(InvalidBatch::BatchId).into())
     }
-}
-
-/// Logs a Restate failure in full; the browser learns only that Restate did
-/// not take the request.
-#[cfg(feature = "server")]
-fn restate_unavailable(error: RestateIngressError) -> ServerFnError {
-    tracing::error!(%error, "Restate request failed");
-    ServerFnError::new("Restate is unavailable")
 }
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
+    use std::error::Error as _;
+
     use dependaboard_core::{
-        BatchRecord, BatchTargetRecord, CursorError, ProjectedBatch, RunningBatch, TargetOutcome,
+        BatchRecord, BatchTargetRecord, ProjectedBatch, RunningBatch, TargetOutcome,
     };
     use serde_json::json;
 
@@ -581,34 +713,54 @@ mod tests {
         }
     }
 
-    /// The message `error` reaches the browser as: what a failed server
-    /// function's envelope carries, and the user is shown.
-    fn reported(error: ServerFnError) -> String {
-        match error {
+    /// The message `error` reaches the browser as: what the one conversion
+    /// at the wire's edge puts in a failed server function's envelope, and
+    /// the user is shown.
+    fn reported(error: ApiError) -> String {
+        match ServerFnError::from(error) {
             ServerFnError::ServerError { message, .. } => message,
             other => panic!("a server-side failure: {other}"),
         }
     }
 
     /// The message a body refused with; the one the browser would be shown.
-    fn refusal<T: std::fmt::Debug>(result: Result<T, ServerFnError>) -> String {
+    fn refusal<T: std::fmt::Debug>(result: Result<T, ApiError>) -> String {
         reported(result.expect_err("a refusal"))
     }
 
+    /// A store or a Restate failure can name the connection it failed on,
+    /// and the credentials in it. The operator gets it whole — there is
+    /// nothing else to debug an outage with — and the browser gets the
+    /// component's name and not one word more.
+    ///
+    /// Both halves are asserted, and the first is what keeps the second
+    /// honest: the failure must still be *carried* as far as the conversion,
+    /// so that dropping it there is a decision the conversion makes rather
+    /// than something the refusal never had. An [`ApiError`] that stopped
+    /// carrying its cause would redact nothing and still pass a
+    /// browser-side assertion alone.
     #[test]
     fn infrastructure_failures_reach_the_browser_without_their_detail() {
         let detail = "libsql://db.internal: connection refused (token=abc)";
-        let store = store_failure(StoreError::CorruptEnum(detail.to_owned()));
-        let restate = restate_unavailable(RestateIngressError::Status {
+        let store = ApiError::from(StoreError::CorruptEnum(detail.to_owned()));
+        let restate = ApiError::from(RestateIngressError::Status {
             code: StatusCode::BAD_GATEWAY,
             body: detail.to_owned(),
         });
 
-        for error in [store, restate] {
+        for (error, told) in [
+            (store, "The read model is unavailable"),
+            (restate, "Restate is unavailable"),
+        ] {
+            let logged = error
+                .source()
+                .expect("the failure, which the log is given whole")
+                .to_string();
+            assert!(logged.contains(detail), "{logged}");
+
             let message = reported(error);
-            assert!(!message.contains(detail), "{message}");
+            assert_eq!(message, told);
             assert!(!message.contains("libsql"), "{message}");
-            assert!(!message.is_empty());
         }
     }
 
@@ -617,7 +769,7 @@ mod tests {
     #[test]
     fn a_bad_page_cursor_is_reported_as_such() {
         assert_eq!(
-            reported(store_failure(StoreError::Cursor(CursorError::Invalid))),
+            reported(ApiError::from(StoreError::Cursor(CursorError::Invalid))),
             "invalid page cursor"
         );
     }
@@ -763,7 +915,7 @@ mod tests {
         backend: &Backend,
         batch_id: &str,
         targets: Vec<SubmittedTarget>,
-    ) -> Result<BatchReceipt, ServerFnError> {
+    ) -> Result<BatchReceipt, ApiError> {
         submit_retrying(backend, batch_id, targets, None).await
     }
 
@@ -774,7 +926,7 @@ mod tests {
         batch_id: &str,
         targets: Vec<SubmittedTarget>,
         retried_from: Option<&str>,
-    ) -> Result<BatchReceipt, ServerFnError> {
+    ) -> Result<BatchReceipt, ApiError> {
         submit_batch_in(
             backend.state(),
             UserId::new(USERNAME),
