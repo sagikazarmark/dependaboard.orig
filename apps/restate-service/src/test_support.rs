@@ -1,17 +1,25 @@
 //! Shared fixtures for the service's unit tests.
 
-mod memory_store;
-
 use std::sync::{Arc, Mutex};
 
 use dependaboard_core::{
     CheckStatus, Mergeable, PrKey, PrRecord, PrTarget, RepoRecord, Retirement, UpdateType,
 };
+use dependaboard_store::{LibSqlPrStore, StoreConfig};
 use restate_sdk::prelude::*;
 
-pub(crate) use memory_store::MemoryPrStore;
-
 use crate::{pull_request::ClosedRequest, retirement::RetirementEffects};
+
+/// An empty projection the production store owns whole: the same
+/// [`LibSqlPrStore`] both binaries run, over a private `:memory:` database it
+/// migrates on connect. A test writing through it meets the schema itself —
+/// the foreign key, the unique index, the cascade and the retirement outbox —
+/// rather than a second implementation of what the schema says.
+pub(crate) async fn test_store() -> LibSqlPrStore {
+    LibSqlPrStore::connect(&StoreConfig::local(":memory:"))
+        .await
+        .unwrap()
+}
 
 /// Stands in for Restate and the store's retirement outbox during a drain and records
 /// what the drain asked of them: `pending` is what the outbox holds; `closed` and

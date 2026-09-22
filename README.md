@@ -540,7 +540,7 @@ The suite is named by module, so a filterset (`-E`, see `cargo nextest help filt
 
 | Group | Touches | Filterset |
 | --- | --- | --- |
-| Pure | Nothing: core, the GitHub client's own logic, the Restate service against in-memory fixtures | `package(dependaboard-core) + (package(dependaboard-github) & kind(lib)) + package(dependaboard-restate)` |
+| Pure | Nothing outside the process: core, the GitHub client's own logic, the Restate service against an in-memory SQLite projection | `package(dependaboard-core) + (package(dependaboard-github) & kind(lib)) + package(dependaboard-restate)` |
 | Store | SQLite on a temporary directory | `package(dependaboard-store)` |
 | HTTP mock | A wiremock server on loopback, in the GitHub client's integration tests | `package(dependaboard-github) & kind(test)` |
 | VirtualDom | Dioxus' VirtualDom, in the web UI | `package(dependaboard-web) & test(/^ui::/)` |

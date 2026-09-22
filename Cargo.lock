@@ -925,7 +925,6 @@ dependencies = [
 name = "dependaboard-restate"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bytes",
  "dependaboard-core",
  "dependaboard-github",

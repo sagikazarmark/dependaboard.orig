@@ -772,12 +772,13 @@ mod tests {
 
     use dependaboard_core::{DependabotCommand, RepoRecord, UserId};
     use dependaboard_github::GithubErrorResponse;
+    use dependaboard_store::LibSqlPrStore;
     use restate_sdk::service::Discoverable;
 
     use super::*;
     use crate::{
         handler::RetryableServiceError,
-        test_support::{MemoryPrStore, repository, snapshot, target},
+        test_support::{repository, snapshot, target, test_store},
     };
 
     /// The fake clock's first reading, in Unix seconds.
@@ -872,9 +873,8 @@ mod tests {
     /// than the test scripted, or for something else, fails the test. The store is a real
     /// in-memory projection, so a row is dropped or kept as the schema would have it. The
     /// clock advances by a second per reading, so no two readings coincide.
-    #[derive(Default)]
     struct RecordedPullRequest {
-        store: MemoryPrStore,
+        store: LibSqlPrStore,
         /// The object's durable state, as Restate holds it.
         state: Option<PrState>,
         can_post_commands: bool,
@@ -899,19 +899,37 @@ mod tests {
     /// An object whose repository the projection lists, holding `state` and, when that
     /// has a snapshot, the snapshot's row.
     async fn pull_request(state: Option<PrState>) -> RecordedPullRequest {
-        let store = MemoryPrStore::default();
+        let store = test_store().await;
         store.upsert_repo(&repository()).await.unwrap();
         if let Some(snapshot) = state.as_ref().and_then(|state| state.snapshot.as_ref()) {
             store.upsert_pr(snapshot).await.unwrap();
         }
         RecordedPullRequest {
-            store,
             state,
-            ..Default::default()
+            ..RecordedPullRequest::over(store)
         }
     }
 
     impl RecordedPullRequest {
+        /// The recorder around `store`, with nothing scripted and nothing
+        /// recorded yet. Stands in for the `Default` the struct cannot derive:
+        /// a store is a connection, and there is no default one.
+        fn over(store: LibSqlPrStore) -> Self {
+            Self {
+                store,
+                state: None,
+                can_post_commands: false,
+                answers: VecDeque::new(),
+                asked: Vec::new(),
+                scheduled: Vec::new(),
+                store_steps: Vec::new(),
+                clock_readings: 0,
+                held_when_asked: None,
+                held_when_projected: None,
+                store_failure: None,
+            }
+        }
+
         fn answering(mut self, answers: impl IntoIterator<Item = Answer>) -> Self {
             self.answers = answers.into_iter().collect();
             self
@@ -1652,7 +1670,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_merge_uses_the_method_its_repository_resolved_at_its_last_sync() {
-        let store = MemoryPrStore::default();
+        let store = test_store().await;
         store
             .upsert_repo(&RepoRecord {
                 merge_method: Some(MergeMethod::Rebase),

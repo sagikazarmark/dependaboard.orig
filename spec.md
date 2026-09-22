@@ -1081,8 +1081,8 @@ operator's copy of this one; change them together.
 > Workers runtime. The Restate binary is a normal multi-threaded tokio process and the
 > web app runs on Axum, so the traits are plain `#[async_trait]` with `Send + Sync`
 > supertraits and one production implementation, `LibSqlPrStore`, shared by both binaries
-> (the Restate service's tests carry an in-memory writer). A Workers port would need its
-> own impl or a second trait; nothing today asks for it.
+> and by both their tests, which run it over an in-memory database. A Workers port would
+> need its own impl or a second trait; nothing today asks for it.
 
 > **Resolved: two traits, one per process (#71).** The store's contract is split along
 > the line the two binaries already drew. `ProjectionWriter` is what the Restate service
