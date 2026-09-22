@@ -159,8 +159,8 @@ mod tests {
     use dependaboard_core::{PrFilter, PrRecord, RepoRecord};
 
     use crate::{
-        ProjectionReader, ProjectionWriter,
-        test_support::{pr, repo, test_store},
+        LibSqlPrStore, ProjectionReader, ProjectionWriter,
+        test_support::{INSTALLATION, OTHER_INSTALLATION, pr, repo, test_store},
     };
 
     use super::*;
@@ -196,7 +196,7 @@ mod tests {
         store.upsert_repo(&repo(1, 10)).await.unwrap();
         store.upsert_repo(&repo(2, 10)).await.unwrap();
         let other_installation = RepoRecord {
-            installation_id: 11,
+            installation_id: OTHER_INSTALLATION,
             ..repo(3, 10)
         };
         store.upsert_repo(&other_installation).await.unwrap();
@@ -216,24 +216,36 @@ mod tests {
         assert_eq!(
             store.get_pr(&PrKey::new(3, 2)).await.unwrap(),
             Some(PrRecord {
-                installation_id: 11,
+                installation_id: OTHER_INSTALLATION,
                 ..pr(3, 2, 10)
             })
         );
-        let repositories = store
-            .dashboard_summary(&PrFilter::default())
-            .await
-            .unwrap()
-            .facets
-            .repositories;
+        // Each deployment's own read is the instrument: the purged
+        // installation's dashboard is left with nothing, and the other's is
+        // untouched — which is the same fact, seen from both sides.
         assert_eq!(
-            repositories
-                .iter()
-                .map(|facet| facet.repository.repository_id)
-                .collect::<Vec<_>>(),
+            listed_repositories(&store, INSTALLATION).await,
+            Vec::<u64>::new(),
+            "the purged installation has no repository left"
+        );
+        assert_eq!(
+            listed_repositories(&store, OTHER_INSTALLATION).await,
             vec![3],
             "only the other installation's repository survives"
         );
+    }
+
+    /// The repositories `installation_id`'s sidebar lists.
+    async fn listed_repositories(store: &LibSqlPrStore, installation_id: u64) -> Vec<u64> {
+        store
+            .dashboard_summary(installation_id, &PrFilter::default())
+            .await
+            .unwrap()
+            .facets
+            .repositories
+            .iter()
+            .map(|facet| facet.repository.repository_id)
+            .collect()
     }
 
     #[tokio::test]

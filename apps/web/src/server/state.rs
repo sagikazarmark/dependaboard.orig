@@ -16,8 +16,13 @@ pub(crate) struct ServerState {
     /// Restate service holds the pen, and a server function that wanted to
     /// write would have nothing to write with.
     pub(crate) store: Arc<dyn ProjectionReader>,
-    /// Any request that names a pull request by key — a per-PR sync, a batch
-    /// target, or the drawer's reads of a row and its durable state — is
-    /// refused for a pull request of any other installation.
+    /// The installation this deployment serves, and the scope of every read
+    /// and every action: the table, its total, the sidebar's facets and the
+    /// freshness stamp are this installation's alone, as are the batches,
+    /// and any request that names a pull request by key — a per-PR sync, a
+    /// batch target, or the drawer's reads of a row and its durable state —
+    /// is refused for a pull request of any other. It comes from the
+    /// deployment's configuration and never from a request, so nothing the
+    /// browser sends can widen it.
     pub(crate) installation_id: u64,
 }

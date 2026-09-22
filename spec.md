@@ -273,6 +273,9 @@ filter on it, so two deployments sharing one libSQL URL do not list each other's
 and a batch id of another installation is answered as one the projection has never heard
 of rather than refused: a link to it falls to the thirty-poll attach and is given up as a
 stale or foreign one, the same as any unknown id, so the by-id path needs no new words.
+The pull request reads are held to the installation the same way, through their
+repositories (§4), so two deployments sharing a store show each other's rows nowhere:
+not in the table, its total, the sidebar's repositories, or the freshness stamp.
 Nothing is derived from `batch_targets.repository_id` at read time: the record is meant
 to outlive the repositories it names. Rows from before the column was kept were
 attributed once, at migration time, through their targets' repositories where those were
@@ -813,10 +816,11 @@ enumeration that finds live PRs is exactly the set you diff against.
 ## 3. Call flow
 
 ```
-Table render      UI → server fn → ProjectionReader::list_prs(filter, page)
-                       one page and the total, from one snapshot
+Table render      UI → server fn → ProjectionReader::list_prs(installation, filter, page)
+                       one page and the total, from one snapshot; the installation is
+                       the deployment's, never the filter's
 
-Facets            UI → server fn → ProjectionReader::dashboard_summary(filter)
+Facets            UI → server fn → ProjectionReader::dashboard_summary(installation, filter)
                        the sidebar's counts, each scoped to the filter minus its own
                        dimension, and the read model's freshness; asked per filter, not
                        per page
@@ -831,17 +835,19 @@ Capabilities      UI → server fn → POST /restate/call/DashboardIngress/capab
                        once per page; what the deployment can do, so an action the
                        service would reject is withheld rather than offered (§6)
 
-Select all        UI → server fn → ProjectionReader::list_prs(filter, page of MAX_BATCH_TARGETS)
-matching               the selection is resolved server side, newest update first,
+Select all        UI → server fn → ProjectionReader::list_prs(installation, filter,
+matching                                                    page of MAX_BATCH_TARGETS)
+                       the selection is resolved server side, newest update first,
                        and capped at one batch's worth; the total comes back with the
                        rows so the UI can say when the filter matched more than it took
 
 Bulk action       UI → server fn → Restate ingress
                        the UI names each target by key and the head SHA it saw; the
                        server fn resolves the rest — repository, title, link — from
-                       ProjectionReader::get_pr, refuses a target of another installation whole,
-                       and leaves out one the projection no longer has: the batch runs
-                       over the rest, and the receipt names the keys left out
+                       ProjectionReader::get_pr(installation), refuses a target of
+                       another installation whole, and leaves out one the projection no
+                       longer has: the batch runs over the rest, and the receipt names
+                       the keys left out
                        POST /restate/send/BulkAction/{batch_id}/run
                      → workflow lists the batch as running: ProjectionWriter::start_batch,
                        stamped with the installation the service serves
@@ -866,7 +872,7 @@ Batch by id       UI → server fn → ProjectionReader::get_batch(installation,
                        heard of and for another installation's batch alike, so a
                        foreign link is given up as a stale one is
 
-Drawer            UI → server fn → ProjectionReader::get_pr
+Drawer            UI → server fn → ProjectionReader::get_pr(installation)
                        the drawer names a pull request by key: the row it opens on
                        and reads back after a sync, and the durable state it polls,
                        POST /restate/call/PullRequest/{repository_id}%23{number}/status
@@ -1097,7 +1103,8 @@ and `Result<T, StoreError>` written `Result<T>`; the crate's comments are the co
 #[async_trait]
 pub trait ProjectionWriter: Send + Sync {
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<()>;
-    /// Shared with ProjectionReader; see above.
+    /// The same lookup ProjectionReader's `get_pr` is built on, unscoped: this half
+    /// serves a service that owns every row it names.
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>>;
     async fn delete_pr(&self, key: &PrKey) -> Result<()>;
     /// Reconciliation: drop rows for this repo not in `live` AND synced before the
@@ -1139,23 +1146,50 @@ pub trait ProjectionWriter: Send + Sync {
     async fn record_batch(&self, batch: &BatchRecord) -> Result<()>;
 }
 
-/// What the dashboard reads, through the web app's server functions.
+/// What the projection holds for a key within one installation. Three answers, not
+/// two: a key with no row anywhere is nothing to show — merged or closed since the
+/// dashboard drew it — while a key whose row is another installation's is one this
+/// deployment's projection never showed, which the web edge refuses rather than
+/// reports as gone. One read decides it, so the row and the verdict come from one
+/// snapshot. The row is boxed so the answer is a pointer wide either way.
+pub enum ProjectedPr { Row(Box<PrRecord>), Absent, Foreign }
+
+/// What the dashboard reads, through the web app's server functions. Every pull
+/// request read takes the installation the deployment serves and holds its answer to
+/// it, so a shared store shows each deployment only its own rows, totals, facets,
+/// freshness, batches, and keys. `projection_revision` is the one exception, and says
+/// why. The installation is never a field of `PrFilter`: the filter crosses the wire
+/// from the browser, and a client that could name an installation would be naming its
+/// own tenancy.
 #[async_trait]
 pub trait ProjectionReader: Send + Sync {
-    /// Shared with ProjectionWriter; see above.
-    async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>>;
-    /// One keyset page of the pull requests `filter` matches, newest update first,
-    /// plus how many match in all, from one snapshot (count and page in one
-    /// transaction).
-    async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage>;
-    /// What frames the rows for `filter`: every facet's counts, each scoped to the
-    /// filter minus its own dimension, and the read model's freshness. Independent
-    /// of paging, so a caller moving to the next page need not ask again.
-    async fn dashboard_summary(&self, filter: &PrFilter) -> Result<DashboardSummary>;
+    /// The row `key` names within `installation_id`, told apart three ways so the
+    /// caller need not read the row's installation back to know which it got. The
+    /// writer's `get_pr` is the same lookup, unscoped: the service owns every row it
+    /// names, while this key came from a browser.
+    async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr>;
+    /// One keyset page of `installation_id`'s pull requests that `filter` matches,
+    /// newest update first, plus how many match in all, from one snapshot (count and
+    /// page in one transaction). Another installation's rows are neither listed nor
+    /// counted.
+    async fn list_prs(&self, installation_id: u64, filter: &PrFilter, page: Page)
+        -> Result<DashboardPage>;
+    /// What frames the rows for `filter` within `installation_id`: every facet's
+    /// counts, each scoped to the filter minus its own dimension, and the read model's
+    /// freshness. Independent of paging, so a caller moving to the next page need not
+    /// ask again. The repository facet lists the installation's repositories, not the
+    /// database's, and the freshness stamp follows its syncs alone.
+    async fn dashboard_summary(&self, installation_id: u64, filter: &PrFilter)
+        -> Result<DashboardSummary>;
     /// Two counters, one that moves whenever a row of the read model changes and one
     /// that moves only when a pull request row does (see the schema's triggers). Cheap
     /// to read, so a dashboard can ask often and act only when an answer differs from
     /// the one it last saw. How the dashboard uses them is the README's *Live refresh*.
+    /// Deployment-wide on purpose, and the only read here that is: both counters are one
+    /// row kept by table-wide triggers, so a shared store moves them for the other
+    /// installation's writes too. The cost is a poll that reloads and finds nothing
+    /// changed; scoping them would mean a counter per installation that every write
+    /// resolves through its repository's row, which a poll is not worth.
     async fn projection_revision(&self) -> Result<ProjectionRevision>;
     /// The installation's most recently finished batches, newest first, targets and
     /// verdicts included; the limit counts its batches, not everyone's.
@@ -1258,7 +1292,12 @@ CREATE INDEX idx_pr_order      ON pull_requests(updated_at DESC, id DESC); -- st
 CREATE INDEX idx_pr_dependency ON pull_requests(dependency);               -- the dependency filter
 
 -- Two counters the dashboard polls instead of comparing rows (ProjectionReader::projection_revision;
--- README "Live refresh"). Triggers keep them, so no writer can forget to: a repository
+-- README "Live refresh"). One row for the whole deployment, deliberately: the triggers
+-- are table-wide, so on a store shared by two installations each one's writes move the
+-- other's counters. A wasted poll is the cost; a counter per installation would make
+-- every write resolve its repository's row, which is not worth it. Every other pull
+-- request read is held to the installation (§4).
+-- Triggers keep them, so no writer can forget to: a repository
 -- delete that cascades to its pull requests moves them as surely as an upsert. `revision`
 -- moves on any row of either table; `pull_requests` only when a pull request row does, so
 -- the Sync glyph can tell "the sweep reached the pull requests" from "the sweep wrote a

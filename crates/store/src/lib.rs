@@ -102,10 +102,12 @@ impl LibSqlPrStore {
     }
 
     /// The pull request `key` names, or `None` when the projection has no row
-    /// for it. The one method on both halves of the store's contract, so it
-    /// lives here once and each trait's `get_pr` is this one; the store's own
-    /// tests, which hold the concrete type with both traits in scope, resolve
-    /// to it rather than being asked which trait they mean.
+    /// for it, whosever it is. The lookup both halves of the store's contract
+    /// are built on, so it lives here once: [`ProjectionWriter::get_pr`] is
+    /// this one, and [`ProjectionReader::get_pr`] is this one held to an
+    /// installation. The store's own tests, which hold the concrete type with
+    /// both traits in scope, resolve to it rather than being asked which
+    /// trait they mean.
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError> {
         let connection = self.connection().await;
         let mut rows = connection
@@ -196,27 +198,81 @@ pub trait ProjectionWriter: Send + Sync {
     async fn record_batch(&self, batch: &BatchRecord) -> Result<(), StoreError>;
 }
 
+/// What the projection holds for a key, read within one installation.
+///
+/// Three answers rather than two, because the two ways of holding nothing
+/// are told apart differently by the caller. A key with no row anywhere is an
+/// answer — the pull request has been merged or closed since the dashboard
+/// drew it — while a key whose row belongs to another installation is not:
+/// this deployment's projection never showed that row, so no dashboard of
+/// its could have named it, and the web edge refuses the request rather than
+/// telling the browser its pull request has gone. Folding the two into
+/// `None` would quietly turn that refusal into "no longer in the dashboard".
+///
+/// One read decides it, so the row and the verdict on it come from the same
+/// snapshot. The row is boxed so the answer is a pointer wide whichever way
+/// it falls, rather than a whole [`PrRecord`] wide to say there is none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectedPr {
+    /// The row, in the installation it was asked for.
+    Row(Box<PrRecord>),
+    /// No row under any installation.
+    Absent,
+    /// A row, but one of another installation: not this deployment's to read.
+    Foreign,
+}
+
 /// The half of the store's contract the web app's server holds: what the
 /// dashboard reads — the rows and the facets around them, the revision it
 /// polls, the batches it lists for audit — and `get_pr`, through which every
 /// server function that takes a key from the browser resolves the key. Nothing
 /// here writes, so a process holding this half alone cannot reach the write
 /// half however it tries.
+///
+/// Every pull-request read takes the installation it is for and holds its
+/// answer to it, so a store shared by two deployments shows each only its
+/// own: the rows and their total, every facet, the freshness stamp, the
+/// batches, and a key resolved on its own. The one exception is
+/// [`ProjectionReader::projection_revision`], and its doc says why.
 #[async_trait]
 pub trait ProjectionReader: Send + Sync {
-    async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError>;
-    /// One keyset page of the pull requests `filter` matches, newest update
-    /// first, plus how many match in all.
-    async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage, StoreError>;
-    /// What frames the rows for `filter`: every facet's counts, each scoped to
-    /// the filter minus its own dimension, and the read model's freshness. It
-    /// does not depend on paging, so a caller moving to the next page need not
-    /// ask again.
-    async fn dashboard_summary(&self, filter: &PrFilter) -> Result<DashboardSummary, StoreError>;
+    /// What the projection holds for `key` within `installation_id`, told
+    /// apart three ways so the caller need not read the row's installation
+    /// back to know which it got. Unlike [`ProjectionWriter::get_pr`], which
+    /// serves a service that owns every row it names, this one is asked whose
+    /// the row is, because the key came from a browser.
+    async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr, StoreError>;
+    /// One keyset page of `installation_id`'s pull requests that `filter`
+    /// matches, newest update first, plus how many match in all. Another
+    /// installation's rows are neither listed nor counted.
+    async fn list_prs(
+        &self,
+        installation_id: u64,
+        filter: &PrFilter,
+        page: Page,
+    ) -> Result<DashboardPage, StoreError>;
+    /// What frames the rows for `filter` within `installation_id`: every
+    /// facet's counts, each scoped to the filter minus its own dimension, and
+    /// the read model's freshness. It does not depend on paging, so a caller
+    /// moving to the next page need not ask again. The repository facet lists
+    /// the installation's repositories, not the database's.
+    async fn dashboard_summary(
+        &self,
+        installation_id: u64,
+        filter: &PrFilter,
+    ) -> Result<DashboardSummary, StoreError>;
     /// Two counters, one that moves whenever a row of the read model changes,
     /// however it changes, and one that moves only when a pull request row
     /// does. Cheap to read, so a dashboard can ask often and act only when
     /// an answer differs from the one it last saw.
+    ///
+    /// Deployment-wide on purpose, and the one read here that is: both
+    /// counters are a single row kept by table-wide triggers, so a shared
+    /// store moves them for the other installation's writes too. The cost is
+    /// a dashboard that reloads and finds nothing changed; the alternative is
+    /// a counter per installation, which every write would have to resolve
+    /// through its repository's row. A poll is not worth that, so the
+    /// asymmetry stands.
     async fn projection_revision(&self) -> Result<ProjectionRevision, StoreError>;
     /// The `limit` most recently finished batches of `installation_id`, newest
     /// first, each with every target's verdict in batch order. Another
@@ -529,22 +585,37 @@ impl ProjectionWriter for LibSqlPrStore {
 
 #[async_trait]
 impl ProjectionReader for LibSqlPrStore {
-    async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError> {
-        LibSqlPrStore::get_pr(self, key).await
+    /// The row already carries its repository's installation — `select_pr_sql`
+    /// joins `repositories` for it — so one statement answers all three ways
+    /// without a `WHERE` on the installation and without a second read to
+    /// tell an absent key from a foreign one.
+    async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr, StoreError> {
+        Ok(match LibSqlPrStore::get_pr(self, key).await? {
+            None => ProjectedPr::Absent,
+            Some(row) if row.installation_id == installation_id => ProjectedPr::Row(Box::new(row)),
+            Some(_) => ProjectedPr::Foreign,
+        })
     }
 
-    async fn list_prs(&self, filter: &PrFilter, page: Page) -> Result<DashboardPage, StoreError> {
+    async fn list_prs(
+        &self,
+        installation_id: u64,
+        filter: &PrFilter,
+        page: Page,
+    ) -> Result<DashboardPage, StoreError> {
         let connection = self.connection().await;
         // The count and the page are one answer, so they read one snapshot:
         // a sync landing between them must not leave a total that disagrees
         // with the rows.
         let transaction = connection.transaction().await?;
         let now = unix_seconds();
-        let (where_sql, params) = filter_sql(filter, None, now)?;
+        let (where_sql, mut params) = filter_sql(filter, None, now)?;
+        let where_sql = scoped_to_installation(&where_sql, &mut params, installation_id)?;
         let total = scalar_u64(&transaction, &count_sql(&where_sql), params).await?;
 
         let cursor = page.after.as_deref().map(PageCursor::decode).transpose()?;
         let (page_where, mut page_params) = filter_sql(filter, cursor.as_ref(), now)?;
+        let page_where = scoped_to_installation(&page_where, &mut page_params, installation_id)?;
         let limit = page.normalized_limit() as usize;
         let limit_index = page_params.len() + 1;
         page_params.push(integer((limit + 1) as u64)?);
@@ -570,18 +641,27 @@ impl ProjectionReader for LibSqlPrStore {
         })
     }
 
-    async fn dashboard_summary(&self, filter: &PrFilter) -> Result<DashboardSummary, StoreError> {
+    async fn dashboard_summary(
+        &self,
+        installation_id: u64,
+        filter: &PrFilter,
+    ) -> Result<DashboardSummary, StoreError> {
         let connection = self.connection().await;
         // Every facet frames the same rows, so they all count one snapshot:
         // a sync landing between them must not leave facets that do not add
         // up to each other.
         let transaction = connection.transaction().await?;
         let now = unix_seconds();
-        let facets = facet_counts(&transaction, filter, now).await?;
+        let facets = facet_counts(&transaction, installation_id, filter, now).await?;
+        // The stamp is for the whole of this deployment's projection, so it
+        // ignores the filter — but not the installation: another
+        // deployment's sweep is not this one's freshness.
+        let mut freshness_params = Vec::new();
+        let freshness_where = scoped_to_installation("", &mut freshness_params, installation_id)?;
         let last_synced_at = scalar_optional_u64(
             &transaction,
-            "SELECT MAX(synced_at) FROM pull_requests",
-            Vec::new(),
+            &format!("SELECT MAX(p.synced_at) FROM pull_requests p {freshness_where}"),
+            freshness_params,
         )
         .await?;
         transaction.commit().await?;
@@ -746,6 +826,35 @@ fn select_pr_sql() -> &'static str {
        JOIN repositories r ON r.repository_id = p.repository_id"#
 }
 
+/// A `WHERE` clause from [`filter_sql`] (or an empty one) narrowed to the
+/// pull requests of `installation_id`, with its parameter appended to
+/// `params` — after [`filter_sql`]'s, so the numbering it rendered still
+/// holds and the filter's own SQL stays entirely its business.
+///
+/// The predicate is a subquery over `repositories` rather than a join,
+/// because every statement that takes a [`filter_sql`] clause reads
+/// `pull_requests p` alone — the count, the facet counts — and one of them,
+/// the repository facet, already binds `r` to `repositories` in the query
+/// *around* the clause, where a `r.installation_id = ?` would silently
+/// resolve to that outer row and count the wrong thing. `idx_repo_install`
+/// serves the subquery.
+fn scoped_to_installation(
+    where_sql: &str,
+    params: &mut Vec<Value>,
+    installation_id: u64,
+) -> Result<String, StoreError> {
+    params.push(integer(installation_id)?);
+    let predicate = format!(
+        "p.repository_id IN (SELECT repository_id FROM repositories WHERE installation_id = ?{})",
+        params.len()
+    );
+    Ok(if where_sql.is_empty() {
+        format!("WHERE {predicate}")
+    } else {
+        format!("{where_sql} AND {predicate}")
+    })
+}
+
 /// The dashboard's total for a `WHERE` clause from [`filter_sql`].
 fn count_sql(where_sql: &str) -> String {
     format!("SELECT COUNT(*) FROM pull_requests p {where_sql}")
@@ -896,9 +1005,11 @@ fn unsigned(value: i64) -> Result<u64, StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use dependaboard_core::{DependencyUpdate, MergeMethod, UpdateType};
+    use dependaboard_core::{CheckStatus, DependencyUpdate, MergeMethod, UpdateType};
 
-    use crate::test_support::{database_path, pr, repo, sidecar, test_store};
+    use crate::test_support::{
+        INSTALLATION, OTHER_INSTALLATION, database_path, pr, repo, sidecar, test_store,
+    };
 
     use super::*;
 
@@ -932,6 +1043,132 @@ mod tests {
         assert!(debug.contains("libsql://dependaboard.turso.io"), "{debug}");
     }
 
+    /// A deployment serves one installation, and every pull request read is
+    /// held to it: the rows, the total, the freshness stamp, and every facet
+    /// — the repository facet included, which lists repositories directly and
+    /// so would otherwise offer another installation's repositories with
+    /// nothing in them. Two installations share this store, and nothing of
+    /// the other one's is visible from this one's reads.
+    #[tokio::test]
+    async fn every_pull_request_read_is_held_to_the_installation() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store
+            .upsert_repo(&RepoRecord {
+                installation_id: OTHER_INSTALLATION,
+                ..repo(2, 10)
+            })
+            .await
+            .unwrap();
+        for number in [1, 2] {
+            store.upsert_pr(&pr(1, number, 10)).await.unwrap();
+        }
+        // The other installation's row differs in every dimension the
+        // sidebar counts, and was synced later, so each facet and the
+        // freshness stamp would change visibly if it were counted.
+        let mut foreign = pr(2, 3, 900);
+        foreign.check_status = CheckStatus::Failure;
+        foreign.update_type = UpdateType::Major;
+        foreign.labels = vec!["go".to_owned()];
+        store.upsert_pr(&foreign).await.unwrap();
+
+        let page = store
+            .list_prs(INSTALLATION, &PrFilter::default(), Page::default())
+            .await
+            .unwrap();
+        let summary = store
+            .dashboard_summary(INSTALLATION, &PrFilter::default())
+            .await
+            .unwrap();
+
+        assert_eq!(page.total, 2);
+        assert_eq!(
+            page.rows.iter().map(|row| row.number).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(
+            summary
+                .facets
+                .repositories
+                .iter()
+                .map(|facet| (facet.repository.repository_id, facet.count))
+                .collect::<Vec<_>>(),
+            [(1, 2)],
+            "the other installation's repository is not listed at all"
+        );
+        assert_eq!(
+            summary.facets.checks,
+            BTreeMap::from([(CheckStatus::Success, 2)])
+        );
+        assert_eq!(
+            summary.facets.update_types,
+            BTreeMap::from([(UpdateType::Minor, 2)])
+        );
+        assert_eq!(
+            summary
+                .facets
+                .labels
+                .iter()
+                .map(|facet| (facet.label.as_str(), facet.count))
+                .collect::<Vec<_>>(),
+            [("dependencies", 2), ("rust", 2)]
+        );
+        assert_eq!(
+            summary.last_synced_at,
+            Some(10),
+            "the freshness stamp follows this installation's syncs alone"
+        );
+    }
+
+    /// Resolving a key within an installation answers three ways, not two: a
+    /// key with no row anywhere is nothing to show, while a key whose row is
+    /// another installation's is a key this deployment's projection never
+    /// showed. The web edge tells the browser different things about them, so
+    /// the store must not fold them together.
+    #[tokio::test]
+    async fn a_key_of_another_installation_is_not_answered_as_a_key_with_no_row() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store
+            .upsert_repo(&RepoRecord {
+                installation_id: OTHER_INSTALLATION,
+                ..repo(2, 10)
+            })
+            .await
+            .unwrap();
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+        store.upsert_pr(&pr(2, 3, 10)).await.unwrap();
+
+        assert_eq!(
+            ProjectionReader::get_pr(&store, INSTALLATION, &PrKey::new(1, 1))
+                .await
+                .unwrap(),
+            ProjectedPr::Row(Box::new(pr(1, 1, 10)))
+        );
+        assert_eq!(
+            ProjectionReader::get_pr(&store, INSTALLATION, &PrKey::new(2, 3))
+                .await
+                .unwrap(),
+            ProjectedPr::Foreign
+        );
+        assert_eq!(
+            ProjectionReader::get_pr(&store, INSTALLATION, &PrKey::new(1, 99))
+                .await
+                .unwrap(),
+            ProjectedPr::Absent
+        );
+        // And the other deployment reads the same store the other way round.
+        assert_eq!(
+            ProjectionReader::get_pr(&store, OTHER_INSTALLATION, &PrKey::new(2, 3))
+                .await
+                .unwrap(),
+            ProjectedPr::Row(Box::new(PrRecord {
+                installation_id: OTHER_INSTALLATION,
+                ..pr(2, 3, 10)
+            }))
+        );
+    }
+
     #[tokio::test]
     async fn upsert_and_keyset_page_round_trip() {
         let (_directory, store) = test_store().await;
@@ -941,6 +1178,7 @@ mod tests {
         }
         let first = store
             .list_prs(
+                INSTALLATION,
                 &PrFilter::default(),
                 Page {
                     limit: 2,
@@ -956,6 +1194,7 @@ mod tests {
         );
         let second = store
             .list_prs(
+                INSTALLATION,
                 &PrFilter::default(),
                 Page {
                     limit: 2,
@@ -981,7 +1220,7 @@ mod tests {
             store.upsert_pr(&record).await.unwrap();
         }
         let unpaged = store
-            .list_prs(&PrFilter::default(), Page::default())
+            .list_prs(INSTALLATION, &PrFilter::default(), Page::default())
             .await
             .unwrap();
         assert_eq!(
@@ -993,7 +1232,7 @@ mod tests {
         let mut after = None;
         loop {
             let page = store
-                .list_prs(&PrFilter::default(), Page { limit: 1, after })
+                .list_prs(INSTALLATION, &PrFilter::default(), Page { limit: 1, after })
                 .await
                 .unwrap();
             walked.extend(page.rows.iter().map(|pr| pr.number));
@@ -1025,6 +1264,7 @@ mod tests {
         for (query, expected) in [("%", [1]), ("_", [3])] {
             let result = store
                 .list_prs(
+                    INSTALLATION,
                     &PrFilter {
                         query: Some(query.to_owned()),
                         ..Default::default()
@@ -1056,6 +1296,7 @@ mod tests {
         store.upsert_pr(&record).await.unwrap();
         let result = store
             .list_prs(
+                INSTALLATION,
                 &PrFilter {
                     dependency: Some("tokio".to_owned()),
                     labels: vec!["dependencies".to_owned(), "rust".to_owned()],
@@ -1105,6 +1346,7 @@ mod tests {
         ] {
             let result = store
                 .list_prs(
+                    INSTALLATION,
                     &PrFilter {
                         dependency: Some(dependency.to_owned()),
                         ..Default::default()
@@ -1128,10 +1370,16 @@ mod tests {
             dependency: Some("serde".to_owned()),
             ..Default::default()
         };
-        let (where_sql, _) = filter_sql(&filter, None, unix_seconds()).unwrap();
+        // The statements as `list_prs` assembles them, tenancy predicate
+        // and all, so the scope cannot cost the filter its index unnoticed.
+        let (where_sql, mut params) = filter_sql(&filter, None, unix_seconds()).unwrap();
+        let where_sql = scoped_to_installation(&where_sql, &mut params, INSTALLATION).unwrap();
         let connection = store.connection().await;
 
-        for sql in [count_sql(&where_sql), page_sql(&where_sql, 2)] {
+        for sql in [
+            count_sql(&where_sql),
+            page_sql(&where_sql, params.len() + 1),
+        ] {
             let mut rows = connection
                 .query(&format!("EXPLAIN QUERY PLAN {sql}"), ())
                 .await
@@ -1159,7 +1407,10 @@ mod tests {
     async fn last_synced_at_is_the_newest_sync_or_absent_when_empty() {
         let (_directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
-        let empty = store.dashboard_summary(&PrFilter::default()).await.unwrap();
+        let empty = store
+            .dashboard_summary(INSTALLATION, &PrFilter::default())
+            .await
+            .unwrap();
         assert_eq!(empty.last_synced_at, None);
 
         store.upsert_pr(&pr(1, 1, 300)).await.unwrap();
@@ -1168,6 +1419,7 @@ mod tests {
 
         let synced = store
             .dashboard_summary(
+                INSTALLATION,
                 // The freshness stamp is for the whole projection, not the
                 // rows the filter happens to leave visible.
                 &PrFilter {
@@ -1213,11 +1465,14 @@ mod tests {
         let selects = watch_selects(&store).await;
 
         store
-            .list_prs(&PrFilter::default(), Page::default())
+            .list_prs(INSTALLATION, &PrFilter::default(), Page::default())
             .await
             .unwrap();
         let page_selects = std::mem::take(&mut *selects.lock().unwrap());
-        store.dashboard_summary(&PrFilter::default()).await.unwrap();
+        store
+            .dashboard_summary(INSTALLATION, &PrFilter::default())
+            .await
+            .unwrap();
         let summary_selects = std::mem::take(&mut *selects.lock().unwrap());
 
         // A page is two statements, a summary five; subqueries add to the
@@ -1310,10 +1565,13 @@ mod tests {
             .await;
 
         store
-            .list_prs(&PrFilter::default(), Page::default())
+            .list_prs(INSTALLATION, &PrFilter::default(), Page::default())
             .await
             .unwrap();
-        store.dashboard_summary(&PrFilter::default()).await.unwrap();
+        store
+            .dashboard_summary(INSTALLATION, &PrFilter::default())
+            .await
+            .unwrap();
         store.get_pr(&PrKey::new(1, 1)).await.unwrap();
         follower.unchanged("reading").await;
         store.retain_prs(1, &[1], 1_000).await.unwrap();
@@ -1418,6 +1676,7 @@ mod tests {
 
         let result = store
             .list_prs(
+                INSTALLATION,
                 &PrFilter {
                     needs_attention: true,
                     ..Default::default()
@@ -1561,7 +1820,7 @@ mod tests {
         assert_eq!(store.get_repo(2).await.unwrap(), Some(repo(2, 10)));
         assert_eq!(store.get_repo(3).await.unwrap(), None);
         let listed = store
-            .dashboard_summary(&PrFilter::default())
+            .dashboard_summary(INSTALLATION, &PrFilter::default())
             .await
             .unwrap()
             .facets
@@ -1681,18 +1940,21 @@ mod tests {
             sync.await.unwrap().unwrap();
         }
 
-        let summary = store.dashboard_summary(&PrFilter::default()).await.unwrap();
-        let mut survivors = summary
-            .facets
-            .repositories
-            .iter()
-            .map(|facet| {
+        // Each sync's repositories are read as its own deployment would,
+        // since a summary is held to one installation.
+        let mut survivors = Vec::new();
+        for installation in [9_u64, 10] {
+            let summary = store
+                .dashboard_summary(installation, &PrFilter::default())
+                .await
+                .unwrap();
+            survivors.extend(summary.facets.repositories.iter().map(|facet| {
                 (
                     facet.repository.installation_id,
                     facet.repository.repository_id,
                 )
-            })
-            .collect::<Vec<_>>();
+            }));
+        }
         survivors.sort_unstable();
         // Every round retires the previous round's repo, so exactly the last
         // one per installation remains.

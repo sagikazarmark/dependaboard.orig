@@ -1,6 +1,6 @@
 //! The fixtures the store's tests share: a store on a temporary directory, a
 //! second connection to the same file standing in for the other process, and
-//! a repository and a pull request of installation 9.
+//! a repository and a pull request of [`INSTALLATION`].
 
 use dependaboard_core::{
     CheckStatus, DependencyUpdate, Mergeable, PrKey, PrRecord, RepoRecord, UpdateType,
@@ -9,6 +9,14 @@ use libsql::Builder;
 use tempfile::TempDir;
 
 use crate::{LibSqlPrStore, StoreConfig};
+
+/// The installation [`repo`] and [`pr`] belong to, and the one the store's
+/// reads are asked for.
+pub(crate) const INSTALLATION: u64 = 9;
+
+/// A second installation sharing the same store, for the tests that check a
+/// read is held to one of them.
+pub(crate) const OTHER_INSTALLATION: u64 = 11;
 
 pub(crate) async fn test_store() -> (TempDir, LibSqlPrStore) {
     let directory = tempfile::tempdir().unwrap();
@@ -36,7 +44,7 @@ pub(crate) async fn sidecar(directory: &TempDir) -> libsql::Connection {
 pub(crate) fn repo(id: u64, synced_at: u64) -> RepoRecord {
     RepoRecord {
         repository_id: id,
-        installation_id: 9,
+        installation_id: INSTALLATION,
         owner: "acme".to_owned(),
         repo: format!("repo-{id}"),
         merge_method: None,
@@ -48,7 +56,7 @@ pub(crate) fn pr(repository_id: u64, number: u64, synced_at: u64) -> PrRecord {
     PrRecord {
         id: PrKey::new(repository_id, number).to_string(),
         repository_id,
-        installation_id: 9,
+        installation_id: INSTALLATION,
         owner: "acme".to_owned(),
         repo: format!("repo-{repository_id}"),
         number,

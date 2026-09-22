@@ -36,7 +36,7 @@ use {
     },
     axum::extract::Extension,
     dependaboard_core::{BulkRequest, ManualSyncRequest, PrTarget, new_batch_id, validate_batch},
-    dependaboard_store::StoreError,
+    dependaboard_store::{ProjectedPr, StoreError},
     reqwest::StatusCode,
 };
 
@@ -221,8 +221,14 @@ impl From<ApiError> for ServerFnError {
     }
 }
 
-/// One page of rows for `filter`. Paging through a filter calls this alone;
-/// the facets around the rows come from [`load_summary`], once per filter.
+/// One page of rows for `filter`, within the configured installation. Paging
+/// through a filter calls this alone; the facets around the rows come from
+/// [`load_summary`], once per filter.
+///
+/// `filter` comes from the browser and carries no installation — the
+/// dashboard's controls cannot name one, and a client that could would be
+/// naming its own tenancy. The installation is the deployment's, read from
+/// [`ServerState`] here.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_dashboard(
     filter: PrFilter,
@@ -238,10 +244,16 @@ pub(crate) async fn load_dashboard_in(
     filter: &PrFilter,
     page: Page,
 ) -> Result<DashboardPage, ApiError> {
-    Ok(state.store.list_prs(filter, page).await?)
+    Ok(state
+        .store
+        .list_prs(state.installation_id, filter, page)
+        .await?)
 }
 
-/// The facet counts scoped to `filter` and the read model's freshness.
+/// The facet counts scoped to `filter` and the read model's freshness, both
+/// within the configured installation: a store shared with another
+/// deployment offers none of its repositories in the sidebar and none of its
+/// syncs as this dashboard's freshness.
 #[server(state: Extension<ServerState>)]
 pub(crate) async fn load_summary(filter: PrFilter) -> Result<DashboardSummary, ServerFnError> {
     Ok(load_summary_in(&state, &filter).await?)
@@ -253,14 +265,19 @@ pub(crate) async fn load_summary_in(
     state: &ServerState,
     filter: &PrFilter,
 ) -> Result<DashboardSummary, ApiError> {
-    Ok(state.store.dashboard_summary(filter).await?)
+    Ok(state
+        .store
+        .dashboard_summary(state.installation_id, filter)
+        .await?)
 }
 
 /// Every row `filter` matches, as far as one bulk action can take them: the
 /// newest [`MAX_BATCH_TARGETS`], in the table's order, with the total so the
 /// dashboard can say when the limit cut the set short. This is what "select
 /// all matching" resolves to, server side, so the selection need not have
-/// paged through the rows to hold them.
+/// paged through the rows to hold them. Held to the installation like the
+/// table it stands in for, so the keys it hands back are keys
+/// [`submit_batch`] will resolve rather than leave out.
 ///
 /// [`MAX_BATCH_TARGETS`]: dependaboard_core::MAX_BATCH_TARGETS
 #[server(state: Extension<ServerState>)]
@@ -279,7 +296,10 @@ pub(crate) async fn load_matching_in(
             .expect("the batch limit fits in a page"),
         after: None,
     };
-    Ok(state.store.list_prs(filter, batch).await?)
+    Ok(state
+        .store
+        .list_prs(state.installation_id, filter, batch)
+        .await?)
 }
 
 /// The read model's revision: a counter that moves whenever a row changes,
@@ -614,23 +634,25 @@ pub(crate) async fn request_pr_sync_in(
 
 /// The pull request the browser named, as the projection has it, or `None`
 /// for one the projection does not: the browser only ever names a key, and
-/// the projection's row is the word on which installation the pull request
-/// is in and what it is. A key whose repository belongs to another
-/// installation is refused outright rather than answered with nothing: the
-/// projection never showed it, so no dashboard could have named it.
+/// the projection's row is the word on what the pull request is. A key whose
+/// repository belongs to another installation is refused outright rather
+/// than answered with nothing: the projection never showed it, so no
+/// dashboard could have named it, and "no longer in the dashboard" would be
+/// a different and untrue thing to say.
 ///
-/// Every server function that takes a key from the browser — a read as much
-/// as a sync or a batch target — resolves it here, so the installation is
-/// held to in one place rather than remembered at each.
+/// The store holds the key to the installation and tells those two apart in
+/// its answer ([`ProjectedPr`]); this is where the third answer becomes a
+/// refusal, which is the web's word, not the store's. Every server function
+/// that takes a key from the browser — a read as much as a sync or a batch
+/// target — resolves it here, so the refusal is minted in one place rather
+/// than remembered at each.
 #[cfg(feature = "server")]
 async fn projected_pr(state: &ServerState, key: &PrKey) -> Result<Option<PrRecord>, ApiError> {
-    let Some(row) = state.store.get_pr(key).await? else {
-        return Ok(None);
-    };
-    if row.installation_id != state.installation_id {
-        return Err(InvalidRequest::ForeignInstallation(key.clone()).into());
+    match state.store.get_pr(state.installation_id, key).await? {
+        ProjectedPr::Row(row) => Ok(Some(*row)),
+        ProjectedPr::Absent => Ok(None),
+        ProjectedPr::Foreign => Err(InvalidRequest::ForeignInstallation(key.clone()).into()),
     }
-    Ok(Some(row))
 }
 
 /// Holds a batch id the browser named to the shape this deployment mints,
