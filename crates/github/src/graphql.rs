@@ -3,18 +3,18 @@
 //!
 //! GraphQL spells its enums in upper snake case (`STARTUP_FAILURE`, `IN_PROGRESS`) where
 //! REST spells them lower (`startup_failure`, `in_progress`), and the two vocabularies are
-//! otherwise identical, so every value is lowercased and handed to the core mappings
-//! (`check_signal`, `status_signal`, `Mergeable::from_github_state`) rather than mapped
-//! twice.
+//! otherwise identical, so every value is lowercased and handed to the one set of
+//! mappings (`check_signal`, `status_signal`, `Mergeable::from_github_state`) rather than
+//! mapped twice.
 
 use dependaboard_core::{
-    CheckSignal, DEPENDABOT_LOGIN, GithubErrorResponse, Mergeable, PrKey, PrRecord, SyncRequest,
-    check_signal, highest_update_type, parse_dependabot_metadata, rollup_checks, status_signal,
+    CheckStatus, DEPENDABOT_LOGIN, Mergeable, PrKey, PrRecord, SyncRequest, highest_update_type,
 };
 use serde::Deserialize;
 
 use crate::{
-    GithubError,
+    GithubError, GithubErrorResponse,
+    dependabot_metadata::parse_dependabot_metadata,
     rest::{RateLimitHeaders, parse_timestamp},
 };
 
@@ -374,6 +374,61 @@ pub(crate) struct CheckSuite {
     pub(crate) conclusion: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckSignal {
+    Pass,
+    Fail,
+    Pending,
+}
+
+pub fn rollup_checks(signals: impl IntoIterator<Item = CheckSignal>) -> CheckStatus {
+    let mut saw_pass = false;
+    let mut saw_pending = false;
+    for signal in signals {
+        match signal {
+            CheckSignal::Fail => return CheckStatus::Failure,
+            CheckSignal::Pending => saw_pending = true,
+            CheckSignal::Pass => saw_pass = true,
+        }
+    }
+    if saw_pending {
+        CheckStatus::Pending
+    } else if saw_pass {
+        CheckStatus::Success
+    } else {
+        CheckStatus::None
+    }
+}
+
+pub fn check_signal(status: Option<&str>, conclusion: Option<&str>) -> Option<CheckSignal> {
+    if let Some(conclusion) = conclusion {
+        return match conclusion {
+            "success" | "neutral" | "skipped" => Some(CheckSignal::Pass),
+            "failure" | "timed_out" | "action_required" | "cancelled" | "stale"
+            | "startup_failure" => Some(CheckSignal::Fail),
+            _ => None,
+        };
+    }
+    match status {
+        Some("queued" | "in_progress" | "waiting" | "pending" | "requested" | "expected") => {
+            Some(CheckSignal::Pending)
+        }
+        Some("startup_failure") => Some(CheckSignal::Fail),
+        _ => None,
+    }
+}
+
+/// What one commit status contributes, by its state. `expected` is a required context
+/// that has not reported yet, which the truth table counts as pending.
+pub fn status_signal(state: &str) -> Option<CheckSignal> {
+    match state {
+        "success" => Some(CheckSignal::Pass),
+        "failure" | "error" => Some(CheckSignal::Fail),
+        "pending" | "expected" => Some(CheckSignal::Pending),
+        _ => None,
+    }
+}
+
 /// What one rollup context contributes to the check rollup.
 ///
 /// REST's combined status needed its `total_count` to tell "no statuses" from "pending";
@@ -475,7 +530,7 @@ pub(crate) fn project_snapshot(
 #[cfg(test)]
 mod tests {
     use dependaboard_core::{
-        CheckStatus, DependencyUpdate, Mergeable, PrRecord, SyncRequest, UpdateType, rollup_checks,
+        CheckStatus, DependencyUpdate, Mergeable, PrRecord, SyncRequest, UpdateType,
     };
     use serde_json::{Value, json};
 
@@ -851,6 +906,54 @@ mod tests {
             let mut node = pull_request_node();
             node["state"] = json!(state);
             assert!(!pull(node).is_open_dependabot_pull(), "state {state}");
+        }
+    }
+
+    #[test]
+    fn rollup_uses_failure_pending_success_none_precedence() {
+        assert_eq!(rollup_checks([]), CheckStatus::None);
+        assert_eq!(rollup_checks([CheckSignal::Pass]), CheckStatus::Success);
+        assert_eq!(
+            rollup_checks([CheckSignal::Pass, CheckSignal::Pending]),
+            CheckStatus::Pending
+        );
+        assert_eq!(
+            rollup_checks([CheckSignal::Pending, CheckSignal::Fail]),
+            CheckStatus::Failure
+        );
+    }
+
+    #[test]
+    fn all_documented_check_values_are_classified() {
+        for value in ["success", "neutral", "skipped"] {
+            assert_eq!(check_signal(None, Some(value)), Some(CheckSignal::Pass));
+        }
+        for value in [
+            "failure",
+            "timed_out",
+            "action_required",
+            "cancelled",
+            "stale",
+            "startup_failure",
+        ] {
+            assert_eq!(check_signal(None, Some(value)), Some(CheckSignal::Fail));
+        }
+        for value in [
+            "queued",
+            "in_progress",
+            "waiting",
+            "pending",
+            "requested",
+            "expected",
+        ] {
+            assert_eq!(check_signal(Some(value), None), Some(CheckSignal::Pending));
+        }
+        assert_eq!(status_signal("success"), Some(CheckSignal::Pass));
+        for value in ["failure", "error"] {
+            assert_eq!(status_signal(value), Some(CheckSignal::Fail));
+        }
+        for value in ["pending", "expected"] {
+            assert_eq!(status_signal(value), Some(CheckSignal::Pending));
         }
     }
 }

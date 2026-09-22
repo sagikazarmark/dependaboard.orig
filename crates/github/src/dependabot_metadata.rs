@@ -2,16 +2,15 @@
 //! falling back to semver-diffing the pull request title.
 //!
 //! Only the GitHub sync path needs this, and it drags `regex`, `semver` and a
-//! YAML parser into any crate that links it. It is gated behind the
-//! `dependabot-metadata` feature so the browser bundle can leave it out.
+//! YAML parser into any crate that links it, so it lives here in the GitHub
+//! client rather than in the core crate the browser bundle links.
 
 use std::sync::LazyLock;
 
+use dependaboard_core::{DependencyUpdate, UpdateType};
 use regex::Regex;
 use semver::Version;
 use serde::Deserialize;
-
-use crate::{DependencyUpdate, UpdateType};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -131,7 +130,7 @@ fn semver_update_type(from: &str, to: &str) -> UpdateType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::highest_update_type;
+    use dependaboard_core::highest_update_type;
 
     #[test]
     fn parses_single_dependency_metadata_and_versions() {

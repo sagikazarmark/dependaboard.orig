@@ -3,11 +3,8 @@
 
 use std::{ops::Deref, sync::Arc, time::Duration};
 
-use dependaboard_core::{
-    ActionOutcome, Classification, GithubErrorResponse, Operation, RejectReason,
-    classify_github_error, unix_seconds,
-};
-use dependaboard_github::{GithubApi, GithubError, Merged};
+use dependaboard_core::{ActionOutcome, RejectReason, unix_seconds};
+use dependaboard_github::{GithubApi, GithubError, GithubErrorResponse, Merged, Operation};
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::info;
@@ -83,6 +80,80 @@ pub(crate) enum Settled<T> {
         expected: String,
         actual: String,
     },
+}
+
+/// How long to back off from a secondary rate limit that carries no `Retry-After`.
+///
+/// GitHub's guidance is to wait at least one minute before retrying in that case.
+pub const DEFAULT_RATE_LIMIT_WAIT_SECONDS: u64 = 60;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Classification {
+    /// Transient: retrying the identical request with backoff may succeed.
+    Retryable,
+    /// GitHub asked us to back off; do not retry before `until` (unix seconds).
+    RateLimited {
+        until: u64,
+    },
+    Rejected(RejectReason),
+    Fatal,
+}
+
+/// Classifies a failed GitHub response into an outcome for the caller.
+///
+/// `now` is the caller's unix-seconds clock, so the classification is a pure function of
+/// its inputs: journal it once and replay it verbatim rather than recomputing it.
+pub fn classify_github_error(
+    response: &GithubErrorResponse,
+    operation: Operation,
+    known_resource: bool,
+    now: u64,
+) -> Classification {
+    let message = response.message.to_ascii_lowercase();
+    let is_rate_limited = response.rate_limit_remaining == Some(0)
+        || response.retry_after_seconds.is_some()
+        || message.contains("secondary rate limit")
+        || message.contains("rate limit exceeded")
+        || (response.status == 429);
+    if is_rate_limited {
+        let until = response
+            .retry_after_seconds
+            .map(|after| now.saturating_add(after))
+            .or(response.rate_limit_reset)
+            .unwrap_or_else(|| now.saturating_add(DEFAULT_RATE_LIMIT_WAIT_SECONDS));
+        return Classification::RateLimited { until };
+    }
+    if response.status >= 500 {
+        return Classification::Retryable;
+    }
+    if operation == Operation::Merge
+        && response.status == 405
+        && message.contains("base branch was modified")
+    {
+        return Classification::Retryable;
+    }
+    match (response.status, operation) {
+        (404, _) if known_resource => Classification::Rejected(RejectReason::NotFound),
+        (404, _) => Classification::Fatal,
+        (403, Operation::Comment) => Classification::Rejected(RejectReason::Forbidden),
+        // The read that verified the target went through with the same credentials, so
+        // GitHub is refusing this write on this pull request (branch protection, a
+        // repository the installation can see but not push to), not the configuration.
+        // A 401 is different: the client has already refreshed the token and retried
+        // once, so bad credentials are bad for every target and stay fatal below.
+        (403, Operation::Merge | Operation::UpdateBranch) if known_resource => {
+            Classification::Rejected(RejectReason::Forbidden)
+        }
+        (405, Operation::Merge) if message.contains("merge method") => {
+            Classification::Rejected(RejectReason::MergeMethodDisallowed)
+        }
+        (405 | 409 | 422, Operation::Merge) => Classification::Rejected(RejectReason::NotMergeable),
+        (422, Operation::UpdateBranch) => Classification::Rejected(RejectReason::NotMergeable),
+        // Refused before anything was read: the credentials or the installation's access
+        // are wrong for every target, not just this one.
+        (401 | 403, _) => Classification::Fatal,
+        _ => Classification::Fatal,
+    }
 }
 
 /// Maps a GitHub call result to what the `ctx.run` closure journals.
@@ -735,5 +806,172 @@ mod tests {
         })
         .unwrap_err();
         assert!(is_terminal(&error), "{error:?}");
+    }
+
+    #[test]
+    fn rate_limits_are_recognised_regardless_of_status() {
+        for status in [403, 429] {
+            let response = GithubErrorResponse {
+                status,
+                message: "secondary rate limit".to_owned(),
+                ..Default::default()
+            };
+            assert!(matches!(
+                classify_github_error(&response, Operation::Comment, true, 1_000),
+                Classification::RateLimited { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn retry_after_sets_the_rate_limit_deadline_relative_to_now() {
+        let response = GithubErrorResponse {
+            status: 403,
+            message: "slow down".to_owned(),
+            retry_after_seconds: Some(30),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_github_error(&response, Operation::Read, false, 1_000),
+            Classification::RateLimited { until: 1_030 }
+        );
+    }
+
+    #[test]
+    fn a_primary_rate_limit_waits_for_the_advertised_reset() {
+        let response = GithubErrorResponse {
+            status: 403,
+            message: "API rate limit exceeded for installation ID 1.".to_owned(),
+            rate_limit_remaining: Some(0),
+            rate_limit_reset: Some(4_600),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_github_error(&response, Operation::Read, false, 1_000),
+            Classification::RateLimited { until: 4_600 }
+        );
+    }
+
+    #[test]
+    fn a_secondary_rate_limit_without_headers_waits_one_minute() {
+        // GitHub's guidance when Retry-After is absent is to wait at least a minute.
+        let response = GithubErrorResponse {
+            status: 403,
+            message: "You have exceeded a secondary rate limit.".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_github_error(&response, Operation::Comment, true, 1_000),
+            Classification::RateLimited { until: 1_060 }
+        );
+    }
+
+    #[test]
+    fn server_errors_are_retryable_without_a_deadline() {
+        let response = GithubErrorResponse {
+            status: 503,
+            message: "unavailable".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_github_error(&response, Operation::Read, false, 1_000),
+            Classification::Retryable
+        );
+    }
+
+    #[test]
+    fn merge_base_branch_405_is_retryable_but_method_405_is_rejected() {
+        let transient = GithubErrorResponse {
+            status: 405,
+            message: "Base branch was modified. Review and try the merge again.".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_github_error(&transient, Operation::Merge, true, 1_000),
+            Classification::Retryable
+        );
+
+        let permanent = GithubErrorResponse {
+            status: 405,
+            message: "Merge method is not allowed".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_github_error(&permanent, Operation::Merge, true, 1_000),
+            Classification::Rejected(RejectReason::MergeMethodDisallowed)
+        );
+    }
+
+    #[test]
+    fn unknown_404_is_fatal_but_known_resource_is_gone() {
+        let response = GithubErrorResponse {
+            status: 404,
+            message: "Not Found".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_github_error(&response, Operation::Read, false, 1_000),
+            Classification::Fatal
+        );
+        assert_eq!(
+            classify_github_error(&response, Operation::Read, true, 1_000),
+            Classification::Rejected(RejectReason::NotFound)
+        );
+    }
+
+    #[test]
+    fn a_write_refused_on_a_pull_request_just_read_is_that_targets_rejection() {
+        // The read that verified the target went through with the same credentials, so
+        // the refusal is about this pull request, not the configuration: one merge
+        // forbidden by branch protection must not fail the other ninety-nine.
+        let response = GithubErrorResponse {
+            status: 403,
+            message: "Resource not accessible by integration".to_owned(),
+            ..Default::default()
+        };
+        for operation in [Operation::Merge, Operation::UpdateBranch] {
+            assert_eq!(
+                classify_github_error(&response, operation, true, 1_000),
+                Classification::Rejected(RejectReason::Forbidden),
+                "403 on {operation} of a known pull request"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_credentials_are_a_configuration_failure_even_on_a_pull_request_just_read() {
+        // The client has already refreshed the token and retried once before a 401 gets
+        // here, so the fresh token was refused too: the credentials are wrong for every
+        // target, and the one just read is no exception.
+        let response = GithubErrorResponse {
+            status: 401,
+            message: "Bad credentials".to_owned(),
+            ..Default::default()
+        };
+        for operation in [Operation::Merge, Operation::UpdateBranch] {
+            assert_eq!(
+                classify_github_error(&response, operation, true, 1_000),
+                Classification::Fatal,
+                "401 on {operation} of a known pull request"
+            );
+        }
+    }
+
+    #[test]
+    fn a_write_refused_before_anything_was_read_is_a_configuration_failure() {
+        for status in [401, 403] {
+            let response = GithubErrorResponse {
+                status,
+                message: "Bad credentials".to_owned(),
+                ..Default::default()
+            };
+            for operation in [Operation::Merge, Operation::UpdateBranch, Operation::Read] {
+                assert_eq!(
+                    classify_github_error(&response, operation, false, 1_000),
+                    Classification::Fatal,
+                    "{status} on {operation} with nothing verified"
+                );
+            }
+        }
     }
 }

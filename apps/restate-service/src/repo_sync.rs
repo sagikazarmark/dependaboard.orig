@@ -3,9 +3,8 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use dependaboard_core::{
-    Operation, PrKey, PrRecord, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds,
-};
+use dependaboard_core::{PrKey, PrRecord, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds};
+use dependaboard_github::Operation;
 use dependaboard_store::ProjectionWriter;
 use restate_sdk::prelude::*;
 use tracing::warn;

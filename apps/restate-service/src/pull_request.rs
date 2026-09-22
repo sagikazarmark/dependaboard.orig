@@ -5,10 +5,10 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use dependaboard_core::{
-    ActionLog, ActionOutcome, CommandRequest, MergeMethod, MergeRequest, Operation, PrKey,
-    PrRecord, PrState, PrTarget, RejectReason, SyncRequest, UpdateBranchRequest, unix_seconds,
+    ActionLog, ActionOutcome, CommandRequest, MergeMethod, MergeRequest, PrKey, PrRecord, PrState,
+    PrTarget, RejectReason, SyncRequest, UpdateBranchRequest, unix_seconds,
 };
-use dependaboard_github::{GithubError, Merged};
+use dependaboard_github::{GithubError, Merged, Operation};
 use dependaboard_store::{ProjectionWriter, StoreError};
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -770,7 +770,8 @@ pub(crate) fn short_sha(value: &str) -> &str {
 mod tests {
     use std::collections::VecDeque;
 
-    use dependaboard_core::{DependabotCommand, GithubErrorResponse, RepoRecord, UserId};
+    use dependaboard_core::{DependabotCommand, RepoRecord, UserId};
+    use dependaboard_github::GithubErrorResponse;
     use restate_sdk::service::Discoverable;
 
     use super::*;

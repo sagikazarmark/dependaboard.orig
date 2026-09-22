@@ -2,9 +2,8 @@ use std::{collections::HashMap, env, fs, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use dependaboard_core::{
-    CheckSignal, CommandRequest, DEPENDABOT_LOGIN, GithubErrorResponse, MergeMethod, MergeRequest,
-    Operation, PrRecord, PrTarget, RepoRecord, SyncRequest, UpdateBranchRequest, UserId,
-    unix_seconds,
+    CommandRequest, DEPENDABOT_LOGIN, MergeMethod, MergeRequest, PrRecord, PrTarget, RepoRecord,
+    SyncRequest, UpdateBranchRequest, UserId, unix_seconds,
 };
 use jsonwebtoken::EncodingKey;
 use reqwest::{Method, Response, StatusCode};
@@ -14,20 +13,22 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 mod auth;
+mod dependabot_metadata;
 mod error;
 mod graphql;
 mod rest;
 
 pub use auth::TokenProvider;
-pub use error::{GithubError, ProtocolError};
+pub use error::{GithubError, GithubErrorResponse, Operation, ProtocolError};
 
 use crate::{
     auth::{CachedToken, StaticTokenProvider, no_user_token},
     error::{known_http, not_found},
     graphql::{
-        CHECK_CONTEXTS_PAGE_QUERY, CHECK_SUITES_PAGE_QUERY, CheckContextsPage, CheckSuitesPage,
-        CommitData, Connection, GraphqlResponse, SnapshotData, check_context_signal,
-        check_suite_signal, head_commit_query, project_snapshot, snapshot_query,
+        CHECK_CONTEXTS_PAGE_QUERY, CHECK_SUITES_PAGE_QUERY, CheckContextsPage, CheckSignal,
+        CheckSuitesPage, CommitData, Connection, GraphqlResponse, SnapshotData,
+        check_context_signal, check_suite_signal, head_commit_query, project_snapshot,
+        snapshot_query,
     },
     rest::{
         GithubPull, InstallationRepositories, IssueComment, MergeResult, PullListItem,

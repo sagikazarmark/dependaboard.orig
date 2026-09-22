@@ -6,11 +6,11 @@
 
 use std::collections::HashSet;
 
-use dependaboard_core::{GithubErrorResponse, MergeMethod, RepoRecord};
+use dependaboard_core::{MergeMethod, RepoRecord};
 use reqwest::Response;
 use serde::{Deserialize, de::DeserializeOwned};
 
-use crate::{GithubError, ProtocolError};
+use crate::{GithubError, GithubErrorResponse, ProtocolError};
 
 pub(crate) async fn parse_response<T: DeserializeOwned>(
     response: Response,
