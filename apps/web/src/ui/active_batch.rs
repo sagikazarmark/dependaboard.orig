@@ -183,7 +183,52 @@ pub(crate) fn ActiveBatch(
     let Some(current) = &*current else {
         return rsx! {};
     };
-    let (dot, label) = match &current.progress {
+    let (dot, label) = pill(current, now);
+    rsx! {
+        button {
+            class: "progress-pill",
+            onclick: move |_| open.toggle(),
+            span { class: dot }
+            "{label}"
+        }
+        if open() {
+            ProgressDrawer {
+                followed: current.clone(),
+                now,
+                retrying: retrying(),
+                onretry: move |_| {
+                    let finished = followed
+                        .peek()
+                        .as_ref()
+                        .and_then(|followed| followed.progress.clone());
+                    if let Some(finished) = finished {
+                        retry_rejected(finished, retrying, host);
+                    }
+                },
+                onclose: move |_| open.set(false),
+            }
+        }
+    }
+}
+
+/// What the pill says of the batch being followed, as the dot's classes and
+/// the label beside it. With progress in hand it counts the targets settled
+/// out of the targets, and the count carries what the follow is waiting on:
+/// that the credentials were refused, once they have been, or how long the
+/// batch has stood still, once [`Followed::stands_still`] says it has — and
+/// the dot stops throbbing for either, since the follow is no longer moving.
+/// A batch that has run to the end is marked complete whatever the clock
+/// says: it stood still for good, which is not a wait. With no progress to
+/// count, there is only that the batch is being followed, named by the action
+/// once the listing has said what it is.
+///
+/// This is the pill's whole decision, and not the drawer's: the pill collapses
+/// what the drawer's notes exist to tell apart — a batch the dashboard queued
+/// from one Restate has spoken for, and each of the ways a batch known by id
+/// alone is being found — because a word it has room for is the action, and
+/// the drawer below it says the rest.
+fn pill(current: &Followed, now: u64) -> (&'static str, String) {
+    match &current.progress {
         Some(progress) => {
             let count = format!(
                 "{}: {}/{}",
@@ -210,31 +255,6 @@ pub(crate) fn ActiveBatch(
             Some(action) => ("progress-live", format!("{action}: following...")),
             None => ("progress-live", "batch: following...".to_owned()),
         },
-    };
-    rsx! {
-        button {
-            class: "progress-pill",
-            onclick: move |_| open.toggle(),
-            span { class: dot }
-            "{label}"
-        }
-        if open() {
-            ProgressDrawer {
-                followed: current.clone(),
-                now,
-                retrying: retrying(),
-                onretry: move |_| {
-                    let finished = followed
-                        .peek()
-                        .as_ref()
-                        .and_then(|followed| followed.progress.clone());
-                    if let Some(finished) = finished {
-                        retry_rejected(finished, retrying, host);
-                    }
-                },
-                onclose: move |_| open.set(false),
-            }
-        }
     }
 }
 
@@ -488,7 +508,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Duration;
 
-    use dependaboard_core::{ActionOutcome, BulkActionKind, ProjectedBatch, RejectReason};
+    use dependaboard_core::{
+        ActionOutcome, BulkActionKind, ProjectedBatch, RejectReason, RunningBatch, UserId,
+    };
     use dioxus::core::consume_context_from_scope;
 
     use super::*;
@@ -515,34 +537,97 @@ mod tests {
         assert!(!html.contains("progress-drawer"), "{html}");
     }
 
-    #[test]
-    fn the_pill_counts_the_batch_and_keeps_the_drawer_closed_until_asked() {
-        fn Fixture() -> Element {
-            let followed = use_signal(|| Some(followed(half_done_merge())));
-            let follower = use_signal(|| None);
-            let open = use_signal(|| false);
-            rsx! {
-                DashboardFixture { ActiveBatch { followed, follower, open } }
-            }
-        }
-        let html = render(Fixture);
-
-        assert!(
-            html.contains(r#"<span class="progress-live"></span>merge: 1/2"#),
-            "{html}"
-        );
-        assert!(!html.contains("no progress"), "{html}");
-        assert!(!html.contains("progress-drawer"), "{html}");
+    /// The listing the projection holds of `batch-1` while it runs, which is
+    /// what names a batch's action before Restate has answered for it.
+    fn listed_as_running() -> Listing {
+        Listing::Running(RunningBatch {
+            batch_id: "batch-1".to_owned(),
+            installation_id: 1,
+            action: BulkActionKind::Merge,
+            requested_by: UserId::new("alice"),
+            retried_from: None,
+            started_at: FIXTURE_NOW - 3 * 60,
+            target_count: 2,
+        })
     }
 
-    /// The pill is what shows while the drawer is closed, so it is the pill
-    /// that has to say the batch has stopped moving: from the drawer's notice
-    /// on, the count carries how long, and the dot stops throbbing. It does
-    /// not say the batch is stalled or lost — it is neither, as far as anyone
-    /// can tell — and it flips on the dashboard's clock, which it reads
-    /// whether or not the drawer is open.
+    /// What the pill says of the batch it follows, arm by arm. With progress
+    /// in hand it counts the targets settled, and the count carries what the
+    /// follow is waiting on: nothing while the polls are answered and the
+    /// batch is moving, that the credentials were refused once they have
+    /// been, and for how long it has stood still once it has. A finished
+    /// batch is marked complete however long ago it finished — it stood still
+    /// for good, which is not a wait. With no progress to count, the pill
+    /// says the batch is being followed, named by the action once the
+    /// listing has said what it is, or refused the credentials if it was.
+    /// It never calls the batch stalled or lost: it is neither, as far as
+    /// anyone can tell.
     #[test]
-    fn a_pill_whose_batch_has_stood_still_says_for_how_long_and_stops_throbbing() {
+    fn the_pill_counts_the_batch_and_says_what_the_follow_is_waiting_on() {
+        let running = followed(half_done_merge());
+        let attaching = Followed::attaching("batch-1", FIXTURE_NOW);
+        let refused = |followed: &Followed| Followed {
+            trouble: Some(Fault::SignedOut),
+            ..followed.clone()
+        };
+
+        assert_eq!(
+            pill(&running, FIXTURE_NOW),
+            ("progress-live", "merge: 1/2".to_owned())
+        );
+        let done = followed(finished(ActionOutcome::Succeeded {
+            detail: "merged".to_owned(),
+            merge_sha: None,
+        }));
+        assert_eq!(
+            pill(&done, FIXTURE_NOW + 24 * 3600),
+            ("progress-live complete", "merge: 2/2".to_owned()),
+            "a finished batch stood still for good, which is not a wait"
+        );
+        assert_eq!(
+            pill(&refused(&running), FIXTURE_NOW),
+            (
+                "progress-live waiting",
+                "merge: 1/2 · signed out".to_owned()
+            )
+        );
+
+        let (dot, standing) = pill(&running, FIXTURE_NOW + WAITING_NOTICE_AFTER.as_secs());
+
+        assert_eq!(dot, "progress-live waiting");
+        assert_eq!(standing, "merge: 1/2 · no progress 1m");
+        assert!(!standing.to_lowercase().contains("stall"), "{standing}");
+        assert!(!standing.to_lowercase().contains("lost"), "{standing}");
+
+        assert_eq!(
+            pill(&refused(&attaching), FIXTURE_NOW),
+            ("progress-live waiting", "batch: signed out".to_owned())
+        );
+        assert_eq!(
+            pill(
+                &Followed {
+                    listing: listed_as_running(),
+                    ..attaching.clone()
+                },
+                FIXTURE_NOW
+            ),
+            ("progress-live", "merge: following...".to_owned()),
+            "the listing names the action in place of \"batch\""
+        );
+        assert_eq!(
+            pill(&attaching, FIXTURE_NOW),
+            ("progress-live", "batch: following...".to_owned())
+        );
+    }
+
+    /// The pill is what shows while the drawer is closed — which is where it
+    /// stands, the dot before the label and nothing else with it — and it
+    /// reads the dashboard's clock whether or not the drawer is open, so it
+    /// flips to waiting on the tick with the drawer shut. What it says is
+    /// [`pill`]'s, asserted above and taken from it here, so this breaks on
+    /// where the pill is and what it hears and on nothing else.
+    #[test]
+    fn the_pill_stands_alone_over_a_closed_drawer_and_hears_the_clock_tick_there() {
         fn Fixture() -> Element {
             let followed = use_signal(|| Some(followed(half_done_merge())));
             let follower = use_signal(|| None);
@@ -553,50 +638,25 @@ mod tests {
                 }
             }
         }
+        let (dot, label) = pill(
+            &followed(half_done_merge()),
+            FIXTURE_NOW + WAITING_NOTICE_AFTER.as_secs(),
+        );
+
         let html = render(Fixture);
 
         assert!(
-            html.contains(
-                r#"<span class="progress-live waiting"></span>merge: 1/2 · no progress 1m"#
-            ),
+            html.contains(&format!(r#"<span class="{dot}"></span>{label}"#)),
             "{html}"
         );
-        assert!(!html.to_lowercase().contains("stall"), "{html}");
-        assert!(!html.to_lowercase().contains("lost"), "{html}");
+        assert!(!html.contains("progress-drawer"), "{html}");
     }
 
-    /// The throb says the batch is being followed. Once the server has
-    /// refused the credentials it is not, and the pill — what shows with the
-    /// drawer closed — says so beside the count last heard and stops
-    /// throbbing, rather than stand over a follow that has ended as if it
-    /// were live.
+    /// The drawer an open pill shows follows the batch: a finished one is
+    /// summarised with its whole tally, however long ago it finished, and
+    /// every target's reason is on its row.
     #[test]
-    fn a_pill_whose_follow_was_refused_the_credentials_says_so_and_stops_throbbing() {
-        fn Fixture() -> Element {
-            let followed = use_signal(|| {
-                Some(Followed {
-                    trouble: Some(Fault::SignedOut),
-                    ..followed(half_done_merge())
-                })
-            });
-            let follower = use_signal(|| None);
-            let open = use_signal(|| false);
-            rsx! {
-                DashboardFixture { ActiveBatch { followed, follower, open } }
-            }
-        }
-        let html = render(Fixture);
-
-        assert!(
-            html.contains(r#"<span class="progress-live waiting"></span>merge: 1/2 · signed out"#),
-            "{html}"
-        );
-    }
-
-    /// A finished batch stood still for good; that is not a wait, and the
-    /// pill marks it complete however long ago it finished.
-    #[test]
-    fn an_open_drawer_follows_the_batch_and_a_finished_one_marks_the_pill() {
+    fn an_open_drawer_summarises_the_finished_batch_and_gives_each_targets_reason() {
         fn Fixture() -> Element {
             let followed = use_signal(|| {
                 let mut progress = half_done_merge();
@@ -616,11 +676,6 @@ mod tests {
         }
         let html = render(Fixture);
 
-        assert!(html.contains(r#"class="progress-live complete""#), "{html}");
-        assert!(
-            html.contains("merge: 2/2<"),
-            "the pill counts the failed target too, and says nothing of a wait: {html}"
-        );
         assert!(html.contains("merge progress"), "{html}");
         assert!(html.contains("1 succeeded, 0 rejected, 1 failed"), "{html}");
         assert!(
@@ -630,10 +685,10 @@ mod tests {
     }
 
     /// After a reload the dashboard follows the batch its URL names by id
-    /// alone: the pill is up and the drawer open on it before anything has
-    /// answered, so the operator sees at once that the batch is being found.
+    /// alone: the drawer is open on it before anything has answered, so the
+    /// operator sees at once that the batch is being found.
     #[test]
-    fn a_batch_followed_by_id_alone_shows_a_pill_and_an_open_drawer_asking_after_it() {
+    fn a_batch_followed_by_id_alone_opens_a_drawer_asking_after_it() {
         fn Fixture() -> Element {
             let followed = use_signal(|| Some(Followed::attaching("batch-1", FIXTURE_NOW)));
             let follower = use_signal(|| None);
@@ -644,10 +699,6 @@ mod tests {
         }
         let html = render(Fixture);
 
-        assert!(
-            html.contains(r#"<span class="progress-live"></span>batch: following..."#),
-            "{html}"
-        );
         assert!(html.contains("Batch batch-1"), "{html}");
         assert!(html.contains("Looking the batch up..."), "{html}");
     }
