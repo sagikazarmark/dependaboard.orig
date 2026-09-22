@@ -127,6 +127,12 @@ impl FromStr for PrKey {
 /// Ordered by severity: `Unknown < Patch < Minor < Major`. `Ord` is derived
 /// from a severity rank rather than declaration order so that `.max()`,
 /// sorting and [`highest_update_type`] all agree on the "worst" update.
+///
+/// The `Display` form is a persisted token, not a label you may reword: the
+/// store writes it to `pull_requests.update_type` and reads it back with
+/// `FromStr`, the dashboard puts it in the `type=` query parameter of every
+/// shareable link, and the UI shows it as the chip text. Renaming a variant
+/// orphans stored rows and breaks links people have already sent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateType {
@@ -192,6 +198,12 @@ impl FromStr for UpdateType {
 /// `Ord` follows declaration order and exists only so the status can key a
 /// `BTreeMap`; it says nothing about severity. Severity is the GitHub client's
 /// to decide, in `dependaboard_github`'s rollup.
+///
+/// The `Display` form is a persisted token, not a label you may reword: the
+/// store writes it to `pull_requests.check_status` and reads it back with
+/// `FromStr`, the dashboard puts it in the `check=` query parameter of every
+/// shareable link, and the UI shows it as the filter chip text. Renaming a
+/// variant orphans stored rows and breaks links people have already sent.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -552,6 +564,11 @@ pub struct ProjectionRevision {
     pub pull_requests: u64,
 }
 
+/// The `Display` form is a persisted token, not a label you may reword: the
+/// store writes it to `repositories.merge_method` and reads it back with
+/// `FromStr`, and the GitHub client sends the same string as the
+/// `merge_method` field of `PUT /pulls/{n}/merge`, where GitHub's own
+/// vocabulary fixes it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeMethod {
@@ -584,6 +601,13 @@ impl FromStr for MergeMethod {
     }
 }
 
+/// This enum carries two deliberately different string vocabularies; do not
+/// unify them. Serde's is `snake_case` (`update_branch`) and is what the wire
+/// format uses. `Display`/`FromStr` spell the same variant `update branch`,
+/// **with a space**, and that is the form persisted in `batches.action` (see
+/// spec.md §4's schema). Re-spelling `Display` to match serde would make every
+/// batch row already on disk unreadable, so the space is load-bearing;
+/// `a_bulk_action_kind_reads_back_from_its_display_form` pins it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BulkActionKind {
@@ -1497,6 +1521,58 @@ mod tests {
         }
     }
 
+    /// The display form is on disk (`pull_requests.update_type`) and in the
+    /// `type=` parameter of every shared link, so the literals are pinned here
+    /// rather than derived: a round trip alone would stay green through a
+    /// rename of both halves.
+    #[test]
+    fn an_update_type_reads_back_from_its_display_form() {
+        assert_eq!(UpdateType::Major.to_string(), "major");
+        assert_eq!(UpdateType::Minor.to_string(), "minor");
+        assert_eq!(UpdateType::Patch.to_string(), "patch");
+        assert_eq!(UpdateType::Unknown.to_string(), "unknown");
+        for update_type in UpdateType::ALL {
+            assert_eq!(
+                update_type.to_string().parse::<UpdateType>().unwrap(),
+                update_type,
+                "{update_type:?}"
+            );
+        }
+    }
+
+    /// As above, for `pull_requests.check_status` and the `check=` parameter.
+    #[test]
+    fn a_check_status_reads_back_from_its_display_form() {
+        assert_eq!(CheckStatus::Success.to_string(), "success");
+        assert_eq!(CheckStatus::Failure.to_string(), "failure");
+        assert_eq!(CheckStatus::Pending.to_string(), "pending");
+        assert_eq!(CheckStatus::None.to_string(), "none");
+        for status in CheckStatus::ALL {
+            assert_eq!(
+                status.to_string().parse::<CheckStatus>().unwrap(),
+                status,
+                "{status:?}"
+            );
+        }
+    }
+
+    /// The display form is on disk (`repositories.merge_method`) and is also
+    /// the string GitHub's merge endpoint expects, so these literals are
+    /// GitHub's, not ours to rename.
+    #[test]
+    fn a_merge_method_reads_back_from_its_display_form() {
+        assert_eq!(MergeMethod::Merge.to_string(), "merge");
+        assert_eq!(MergeMethod::Squash.to_string(), "squash");
+        assert_eq!(MergeMethod::Rebase.to_string(), "rebase");
+        for method in [MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase] {
+            assert_eq!(
+                method.to_string().parse::<MergeMethod>().unwrap(),
+                method,
+                "{method:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_projection_is_stale_once_it_is_more_than_forty_five_minutes_old() {
         // The dashboard only trusts a row for 45 minutes after we last fetched
@@ -2029,7 +2105,10 @@ mod tests {
     }
 
     /// The store keeps the kind in its display form, as it keeps every enum, so the
-    /// display form must read back.
+    /// display form must read back. The negative case is the point: serde spells the
+    /// variant `update_branch`, `Display` spells it `update branch`, and `batches.action`
+    /// holds the spaced form. Unifying the two vocabularies would silently fail to read
+    /// every batch row already on disk, so this test refuses the serde spelling.
     #[test]
     fn a_bulk_action_kind_reads_back_from_its_display_form() {
         for kind in [

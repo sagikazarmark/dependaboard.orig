@@ -1241,7 +1241,7 @@ CREATE TABLE pull_requests (
   dependencies   TEXT NOT NULL DEFAULT '[]',  -- JSON: full updated-dependencies list
   update_type    TEXT NOT NULL,      -- major|minor|patch|unknown; highest in the group
   head_sha       TEXT NOT NULL,
-  check_status   TEXT NOT NULL,
+  check_status   TEXT NOT NULL,      -- success|failure|pending|none; the rollup of the head's checks
   mergeable      TEXT,               -- GraphQL mergeStateStatus lowercased (= REST mergeable_state):
                                      -- clean|dirty|blocked|behind|unstable|draft|has_hooks|unknown
                                      -- (core::Mergeable);
