@@ -1108,6 +1108,17 @@ handler is one service's business and stays spelled where it is declared.
 > `retain_repos` is no longer on the surface: its only caller was
 > `replace_installation_repos`, which runs the same step inside its own transaction.
 
+> **Resolved: the installation is a parameter, not a property of the reader (ADR-0002).**
+> Six of `ProjectionReader`'s seven methods take `installation_id` as their leading
+> argument, and the web edge passes its one configured value to each. Binding it once into
+> a handle was considered and refused: the projection is genuinely multi-installation — the
+> writer names installations, the reader answers `Foreign`, and the store's tests read two
+> from one database — while only the deployment is single, and it already holds that value
+> once. The exception is legible here for the same reason: `projection_revision` is the
+> signature without the argument. ADR-0002 carries the reasoning, and the trap that makes
+> it worth writing down — a binding reads as though it makes `Foreign` unreachable, and it
+> does not.
+
 The excerpts below are the traits' method sets at HEAD, with the doc comments shortened
 and `Result<T, StoreError>` written `Result<T>`; the crate's comments are the contract.
 
