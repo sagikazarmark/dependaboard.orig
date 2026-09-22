@@ -359,6 +359,7 @@ mod tests {
         pulls: Vec<SyncRequest>,
         listing_failure: Option<HandlerError>,
         sync_failures: BTreeMap<u64, TerminalError>,
+        retain_failure: Option<HandlerError>,
         /// The key of every pull request object the sweep called, in order.
         synced: Vec<PrKey>,
         retained: Option<Vec<u64>>,
@@ -403,7 +404,10 @@ mod tests {
         ) -> HandlerResult<()> {
             self.retained = Some(live.to_vec());
             self.retained_under = Some(synced_before);
-            Ok(())
+            match self.retain_failure.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
         }
 
         async fn pull_requests_at(&mut self, sha: &str) -> HandlerResult<Vec<PrRecord>> {
@@ -568,6 +572,32 @@ mod tests {
         assert!(
             retirements.closed.is_empty(),
             "nothing was pruned, so no durable state may be retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_retain_retires_nothing() {
+        let mut restate = RecordedRepoSync {
+            pulls: vec![dependabot_pull(12)],
+            retain_failure: Some(TerminalError::new("projection store is read-only").into()),
+            ..Default::default()
+        };
+        let mut retirements = RecordedRetirements::queued(&[PrKey::new(7, 3)], Some(900));
+
+        let outcome = run_repo_reconcile(&mut restate, &mut retirements, 900).await;
+
+        assert!(
+            outcome.is_err(),
+            "the failed retain stays visible to Restate"
+        );
+        assert!(
+            retirements.closed.is_empty(),
+            "the prune did not land, so the projection still holds the rows and their \
+             objects keep their state: a drain follows a prune, and only a prune"
+        );
+        assert!(
+            retirements.acknowledged.is_empty(),
+            "nothing was told, so nothing is forgotten"
         );
     }
 
