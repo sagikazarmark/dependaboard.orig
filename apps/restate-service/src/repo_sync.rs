@@ -26,10 +26,13 @@ trait RepoReconcileEffects {
     fn list_pull_requests(
         &mut self,
     ) -> impl Future<Output = HandlerResult<Vec<SyncRequest>>> + Send;
-    /// A Restate-to-Restate call only fails once the callee has failed terminally;
-    /// retryable failures are retried inside `PullRequest::sync` and never surface here.
+    /// Calls the pull request object `key` names to sync `request`, and waits on it. A
+    /// Restate-to-Restate call only fails once the callee has failed terminally; retryable
+    /// failures are retried inside `PullRequest::sync` and never surface here. The key is
+    /// passed rather than derived here so a test sees where the call went.
     fn sync_pull_request(
         &mut self,
+        key: &PrKey,
         request: &SyncRequest,
     ) -> impl Future<Output = Result<(), TerminalError>> + Send;
     /// Prunes the projection down to `live`, sparing rows synced since `synced_before`.
@@ -91,9 +94,13 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
         read_result(pulls)
     }
 
-    async fn sync_pull_request(&mut self, request: &SyncRequest) -> Result<(), TerminalError> {
+    async fn sync_pull_request(
+        &mut self,
+        key: &PrKey,
+        request: &SyncRequest,
+    ) -> Result<(), TerminalError> {
         self.ctx
-            .object_client::<PullRequestClient>(request_key(request).to_string())
+            .object_client::<PullRequestClient>(key.to_string())
             .sync(Json::from(request.clone()))
             .call()
             .await
@@ -169,8 +176,9 @@ async fn run_repo_reconcile<E: RepoReconcileEffects, R: RetirementEffects>(
     let pulls = restate.list_pull_requests().await?;
     let mut failed = Vec::new();
     for request in &pulls {
-        if let Err(error) = restate.sync_pull_request(request).await {
-            let key = request_key(request);
+        // Keyed by the request, as every sender keys a sync, so it is that pull request's.
+        let key = request_key(request);
+        if let Err(error) = restate.sync_pull_request(&key, request).await {
             warn!(
                 repository_id = restate.repository_id(),
                 pull_request = %key,
@@ -351,7 +359,8 @@ mod tests {
         pulls: Vec<SyncRequest>,
         listing_failure: Option<HandlerError>,
         sync_failures: BTreeMap<u64, TerminalError>,
-        synced: Vec<u64>,
+        /// The key of every pull request object the sweep called, in order.
+        synced: Vec<PrKey>,
         retained: Option<Vec<u64>>,
         /// The fence the retain was asked to prune under.
         retained_under: Option<u64>,
@@ -375,8 +384,12 @@ mod tests {
             }
         }
 
-        async fn sync_pull_request(&mut self, request: &SyncRequest) -> Result<(), TerminalError> {
-            self.synced.push(request.number);
+        async fn sync_pull_request(
+            &mut self,
+            key: &PrKey,
+            request: &SyncRequest,
+        ) -> Result<(), TerminalError> {
+            self.synced.push(key.clone());
             match self.sync_failures.remove(&request.number) {
                 Some(error) => Err(error),
                 None => Ok(()),
@@ -515,7 +528,11 @@ mod tests {
 
         let outcome = run_repo_reconcile(&mut restate, &mut retirements, 900).await;
 
-        assert_eq!(restate.synced, vec![12, 19, 23]);
+        assert_eq!(
+            restate.synced,
+            vec![PrKey::new(7, 12), PrKey::new(7, 19), PrKey::new(7, 23)],
+            "each listed pull request is swept through its own object"
+        );
         assert_eq!(
             restate.retained,
             Some(vec![12, 19, 23]),
@@ -598,7 +615,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(synced, 2);
-        assert_eq!(restate.synced, vec![12, 19]);
+        assert_eq!(
+            restate.synced,
+            vec![PrKey::new(7, 12), PrKey::new(7, 19)],
+            "each listed pull request is swept through its own object"
+        );
         assert_eq!(restate.retained, Some(vec![12, 19]));
     }
 

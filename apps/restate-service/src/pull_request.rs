@@ -133,10 +133,10 @@ trait PullRequestEffects {
     fn set_state(&mut self, state: PrState);
     /// Forgets the object's state entirely; the next handler finds a fresh object.
     fn clear_state(&mut self);
-    /// Sends `request` one-way to the object its key names, to run `after` a delay, or as
-    /// soon as the object is free when `None`. Every sender keys a sync by its request, so
-    /// the object a handler here addresses is its own.
-    fn schedule_sync(&mut self, request: SyncRequest, after: Option<Duration>);
+    /// Sends `request` one-way to the pull request object `key` names, to run `after` a
+    /// delay, or as soon as the object is free when `None`. A send cannot fail. The key is
+    /// passed rather than derived here so a test sees where the send went.
+    fn schedule_sync(&mut self, key: &PrKey, request: SyncRequest, after: Option<Duration>);
     /// Reads the pull request's canonical snapshot from GitHub: `Ok(None)` for one that is
     /// open but not Dependabot's, and a 404 settled as rejected not found for one that is
     /// gone. `known_resource` says the object has read it before, so that 404 is the pull
@@ -252,10 +252,10 @@ impl PullRequestEffects for RestatePullRequest<'_, '_> {
         self.ctx.clear_all();
     }
 
-    fn schedule_sync(&mut self, request: SyncRequest, after: Option<Duration>) {
+    fn schedule_sync(&mut self, key: &PrKey, request: SyncRequest, after: Option<Duration>) {
         let sync = self
             .ctx
-            .object_client::<PullRequestClient>(request_key(&request).to_string())
+            .object_client::<PullRequestClient>(key.to_string())
             .sync(Json::from(request));
         match after {
             Some(after) => sync.send_after(after),
@@ -389,7 +389,8 @@ async fn run_sync<E: PullRequestEffects>(
         if !state.sync_pending {
             state.sync_pending = true;
             restate.set_state(state);
-            restate.schedule_sync(request, Some(debounce));
+            // Keyed by the request, as every sender keys a sync, so it is this object.
+            restate.schedule_sync(&request_key(&request), request, Some(debounce));
         }
         return Ok(SyncOutcome::Debounced);
     }
@@ -542,17 +543,16 @@ async fn run_update_branch<E: PullRequestEffects>(
     });
     restate.set_state(state);
     if matches!(outcome, ActionOutcome::Succeeded { .. }) {
-        restate.schedule_sync(
-            SyncRequest {
-                repository_id: request.target.repository_id,
-                owner: request.target.owner,
-                repo: request.target.repo,
-                number: request.target.number,
-                bypass_debounce: false,
-                completion_id: None,
-            },
-            None,
-        );
+        let sync = SyncRequest {
+            repository_id: request.target.repository_id,
+            owner: request.target.owner,
+            repo: request.target.repo,
+            number: request.target.number,
+            bypass_debounce: false,
+            completion_id: None,
+        };
+        // Keyed by the target just updated, so the sync goes to this pull request's object.
+        restate.schedule_sync(&request_key(&sync), sync, None);
     }
     Ok(outcome)
 }
@@ -881,8 +881,9 @@ mod tests {
         answers: VecDeque<Answer>,
         /// Every GitHub step taken, with whether the pull request was a known resource.
         asked: Vec<(Operation, bool)>,
-        /// Every one-way sync sent, with its delay.
-        scheduled: Vec<(SyncRequest, Option<Duration>)>,
+        /// Every one-way sync sent, in order: the key it went to, what it carried, and
+        /// its delay.
+        scheduled: Vec<(PrKey, SyncRequest, Option<Duration>)>,
         /// Every store step taken, by the name its journal entry would carry.
         store_steps: Vec<&'static str>,
         /// Seconds the clock has been read for, from a fixed epoch.
@@ -976,8 +977,8 @@ mod tests {
             self.state = None;
         }
 
-        fn schedule_sync(&mut self, request: SyncRequest, after: Option<Duration>) {
-            self.scheduled.push((request, after));
+        fn schedule_sync(&mut self, key: &PrKey, request: SyncRequest, after: Option<Duration>) {
+            self.scheduled.push((key.clone(), request, after));
         }
 
         async fn fetch_snapshot(
@@ -1077,8 +1078,9 @@ mod tests {
         );
         assert_eq!(
             restate.scheduled,
-            vec![(sync_request(), Some(DEBOUNCE))],
-            "one trailing sync for the storm, not one per event"
+            vec![(PrKey::new(7, 9), sync_request(), Some(DEBOUNCE))],
+            "one trailing sync for the storm, not one per event, and it goes to the object \
+             that debounced it"
         );
         assert!(restate.held().sync_pending);
         assert!(restate.asked.is_empty(), "neither event reached GitHub");
@@ -1408,9 +1410,11 @@ mod tests {
         assert_eq!(restate.asked, vec![(Operation::UpdateBranch, true)]);
         assert_eq!(
             restate.scheduled,
-            vec![(sync_request(), None)],
-            "the row catches up before the webhook does, but the sync queues behind a storm's \
-             coalescing like any event's, and nobody is polling for it"
+            vec![(PrKey::new(7, 9), sync_request(), None)],
+            "the sync goes to this pull request's own object, named by the target just \
+             updated rather than by a stale request; it catches the row up before the \
+             webhook does, but queues behind a storm's coalescing like any event's, and \
+             nobody is polling for it"
         );
         let state = restate.state.expect("the object keeps its state");
         assert_eq!(
