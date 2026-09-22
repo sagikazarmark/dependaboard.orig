@@ -12,11 +12,22 @@ use dioxus::prelude::*;
 use crate::api::{load_pr_projection, load_pr_status};
 use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
-use crate::ui::dashboard_state::{Connection, use_dashboard};
+use crate::ui::dashboard_state::{Connection, DashboardState, use_dashboard};
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
 use crate::ui::pr_sync::{ServerSync, SyncFailure, sync_pr};
 use crate::ui::side_panel::SidePanel;
-use crate::ui::{PendingAction, user_facing};
+use crate::ui::{Fault, PendingAction, user_facing};
+
+/// The pull request `key` names as the read model has it, `None` once it is
+/// no longer in the dashboard, read on the page whose line to the server
+/// `state` carries. A page the server has already refused is not asked on
+/// behalf of: the read goes through [`DashboardState::guarded`], which hands
+/// it the refusal as if it had asked.
+async fn read_row(state: DashboardState, key: PrKey) -> Result<Option<PrRecord>, Fault> {
+    state
+        .guarded(|| load_pr_projection(key.repository_id, key.number))
+        .await
+}
 
 /// The pull request whose drawer is open. A row the user clicked is in hand
 /// at once; a link names the pull request by key alone, and the drawer waits
@@ -85,7 +96,7 @@ pub(crate) fn OpenDetail(
         };
         let key = key.clone();
         spawn(async move {
-            let row = load_pr_projection(key.repository_id, key.number).await;
+            let row = read_row(state, key.clone()).await;
             // The user may have opened another pull request, or moved on,
             // while the row was in flight; then it is not theirs to see.
             if *detail.peek() != Some(OpenPr::Loading(key.clone())) {
@@ -93,8 +104,8 @@ pub(crate) fn OpenDetail(
             }
             detail.set(match row {
                 Ok(row) => row.map(OpenPr::from),
-                Err(error) => {
-                    tracing::warn!(%error, %key, "the linked pull request could not be read");
+                Err(fault) => {
+                    tracing::warn!(%fault, %key, "the linked pull request could not be read");
                     None
                 }
             });
@@ -122,7 +133,7 @@ pub(crate) fn OpenDetail(
                 let asked = OpenPr::Loaded(last.clone());
                 spawn(async move {
                     let key = last.key();
-                    let answer = load_pr_projection(key.repository_id, key.number).await;
+                    let answer = read_row(state, key.clone()).await;
                     // The answer is for the drawer as it was when it asked. The
                     // user may have opened another pull request meanwhile, or
                     // closed it; or a later page may have replaced the row
@@ -134,8 +145,8 @@ pub(crate) fn OpenDetail(
                         Ok(Some(row)) if row != *last => detail.set(Some(OpenPr::from(row))),
                         Ok(Some(_)) => {}
                         Ok(None) => detail.set(Some(OpenPr::Gone(last))),
-                        Err(error) => {
-                            tracing::warn!(%error, %key, "the open pull request could not be read again");
+                        Err(fault) => {
+                            tracing::warn!(%fault, %key, "the open pull request could not be read again");
                         }
                     }
                 });
@@ -442,6 +453,7 @@ fn DurableState(status: DurableStatus, now: u64) -> Element {
 mod tests {
     use dependaboard_core::{Capabilities, DashboardPage, Mergeable, PrFilter};
     use dioxus::core::{ElementId, Mutation, consume_context_from_scope};
+    use futures_util::FutureExt;
 
     use super::*;
     use crate::ui::dashboard_state::{
@@ -449,8 +461,30 @@ mod tests {
         SummaryStatus,
     };
     use crate::ui::test_support::{
-        DashboardFixture, FIXTURE_NOW, grouped_row, loaded_page, off_page_row, render, serde_row,
+        DashboardFixture, FIXTURE_NOW, grouped_row, loaded_page, mount_dashboard, off_page_row,
+        render, serde_row, server_calls,
     };
+
+    /// The drawer reads the row of a pull request a link names, and reads it
+    /// again when the page lands without it. Neither read is made from a
+    /// page the server has already refused: the answer would be another 401,
+    /// and the browser would prompt for credentials over it. The read is
+    /// handed the refusal it would have met without the server function
+    /// being entered.
+    #[test]
+    fn reading_the_open_pull_requests_row_is_refused_without_asking_once_signed_out() {
+        let (dom, mut state) = mount_dashboard();
+
+        dom.in_runtime(|| {
+            state.poll_missed(Connection::SignedOut);
+            let refused = read_row(state, grouped_row().key())
+                .now_or_never()
+                .expect("a call refused on the page's behalf is answered at once")
+                .expect_err("a signed-out page is not asked on behalf of");
+            assert_eq!(server_calls(&refused), 0, "the row was not read");
+            assert_eq!(refused, Fault::SignedOut);
+        });
+    }
 
     #[test]
     fn the_drawer_is_there_for_the_open_pull_request_and_gone_when_none_is() {

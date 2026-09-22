@@ -3,18 +3,27 @@
 //! page; the result bar's link selects everything the filter matches, pages
 //! beyond this one included.
 
-use dependaboard_core::{DEFAULT_PAGE_SIZE, PrRecord};
+use dependaboard_core::{DEFAULT_PAGE_SIZE, DashboardPage, PrFilter, PrRecord};
 use dioxus::prelude::*;
 
 use crate::api::load_matching;
 use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
 use crate::components::toast::use_toast;
-use crate::ui::dashboard_state::{PageStatus, use_dashboard};
+use crate::ui::dashboard_state::{DashboardState, PageStatus, use_dashboard};
 use crate::ui::filters::{ActiveFilters, filter_count};
 use crate::ui::format::{Checkbox, pull_requests};
 use crate::ui::pr_row::PrRow;
-use crate::ui::{sticky, user_facing};
+use crate::ui::{Fault, sticky};
+
+/// The rows the filter in force matches, as many as one batch takes, read
+/// on the page whose line to the server `state` carries. A page the server
+/// has already refused is not asked on behalf of: the read goes through
+/// [`DashboardState::guarded`], which hands it the refusal as if it had
+/// asked.
+async fn matching(state: DashboardState, filter: PrFilter) -> Result<DashboardPage, Fault> {
+    state.guarded(|| load_matching(filter)).await
+}
 
 /// The table; `onopen` receives the row whose drawer the user asked for.
 #[component]
@@ -34,13 +43,10 @@ pub(crate) fn PrTable(onopen: EventHandler<PrRecord>) -> Element {
         let filter = state.filter().clone();
         selecting.set(true);
         spawn(async move {
-            match load_matching(filter.clone()).await {
-                Ok(matching) => state.select_matching(filter, matching),
-                Err(error) => toast.error(
-                    format!(
-                        "Could not select the matching pull requests: {}",
-                        user_facing(&error)
-                    ),
+            match matching(state, filter.clone()).await {
+                Ok(rows) => state.select_matching(filter, rows),
+                Err(fault) => toast.error(
+                    format!("Could not select the matching pull requests: {fault}"),
                     sticky(),
                 ),
             }
@@ -147,8 +153,34 @@ fn EmptyState(filtered: bool) -> Element {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
+    use futures_util::FutureExt;
+
     use super::*;
-    use crate::ui::test_support::{DashboardFixture, grouped_row, loaded_page, render, serde_row};
+    use crate::ui::dashboard_state::Connection;
+    use crate::ui::test_support::{
+        DashboardFixture, grouped_row, loaded_page, mount_dashboard, render, serde_row,
+        server_calls,
+    };
+
+    /// **Select all matching** reads the filter's rows from the server, and
+    /// is not read from a page the server has already refused: the answer
+    /// would be another 401, which the browser turns into a credential
+    /// prompt. The read is handed the refusal it would have met without the
+    /// server function being entered.
+    #[test]
+    fn select_all_matching_is_refused_without_asking_once_the_page_is_signed_out() {
+        let (dom, mut state) = mount_dashboard();
+
+        dom.in_runtime(|| {
+            state.poll_missed(Connection::SignedOut);
+            let refused = matching(state, PrFilter::default())
+                .now_or_never()
+                .expect("a call refused on the page's behalf is answered at once")
+                .expect_err("a signed-out page is not asked on behalf of");
+            assert_eq!(server_calls(&refused), 0, "the read was not made");
+            assert_eq!(refused, Fault::SignedOut);
+        });
+    }
 
     /// With one of the two rows selected, the header's box is mixed, and
     /// the result bar offers the whole filter, pages beyond this one included.

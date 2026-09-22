@@ -9,6 +9,7 @@ use dependaboard_core::{
     DependencyUpdate, FacetCounts, LabelFacet, Mergeable, PrFilter, PrRecord, RepoFacet,
     RepoRecord, UpdateType,
 };
+use dioxus::core::consume_context_from_scope;
 use dioxus::prelude::*;
 
 use crate::components::toast::ToastProvider;
@@ -16,7 +17,7 @@ use crate::ui::batch::{Followed, Listing};
 use crate::ui::dashboard_state::{
     Answers, CapabilitiesStatus, Connection, DashboardState, PageStatus, Selection, SummaryStatus,
 };
-use crate::ui::pr_target;
+use crate::ui::{Fault, pr_target};
 
 pub(crate) const GROUPED_ROW_TITLE: &str =
     "build(deps): bump the github-actions group across 1 directory with 3 updates";
@@ -256,6 +257,49 @@ pub(crate) fn DashboardFixture(
     });
     rsx! {
         ToastProvider { {children} }
+    }
+}
+
+/// A dashboard state alone on the app scope, for a test that drives the
+/// calls a component makes through the state rather than the control that
+/// makes them. The state is the one the components get, signals and all, so
+/// a test can put the line where it wants it — [`DashboardState::poll_missed`]
+/// with [`Connection::SignedOut`] for a page the server has refused — and
+/// then make the call.
+pub(crate) fn mount_dashboard() -> (VirtualDom, DashboardState) {
+    fn Page() -> Element {
+        DashboardState::provide(
+            use_signal(PrFilter::default),
+            use_signal(|| None),
+            use_signal(Selection::default),
+            Answers {
+                page: use_signal(|| PageStatus::Loaded(loaded_page())).into(),
+                summary: use_signal(|| SummaryStatus::Loading).into(),
+                capabilities: use_signal(|| CapabilitiesStatus::Loading).into(),
+            },
+            use_signal(|| FIXTURE_NOW),
+            use_callback(|()| {}),
+        );
+        rsx! {}
+    }
+    let mut dom = VirtualDom::new(Page);
+    dom.rebuild_in_place();
+    let state = dom
+        .in_runtime(|| consume_context_from_scope::<DashboardState>(ScopeId::APP))
+        .expect("the page provides the dashboard state");
+    (dom, state)
+}
+
+/// How many server calls a fault is evidence of: the call counter for a
+/// test that asserts a call was not made. A server function entered outside
+/// a request refuses over the request extension it cannot find, so a fault
+/// carrying that message is proof the call was made; a call the page
+/// refused on its own behalf never reaches the function, and never carries
+/// it.
+pub(crate) fn server_calls(fault: &Fault) -> usize {
+    match fault {
+        Fault::Refused(message) if message.contains("Missing request extension") => 1,
+        _ => 0,
     }
 }
 

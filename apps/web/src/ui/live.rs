@@ -29,7 +29,7 @@ use dioxus::prelude::*;
 
 use crate::api::load_projection_revision;
 use crate::ui::dashboard_state::{Connection, DashboardState};
-use crate::ui::{Fault, POLL_INTERVAL, fault, sleep};
+use crate::ui::{Fault, POLL_INTERVAL, sleep};
 
 /// How often the dashboard asks whether the projection has moved while it is
 /// not waiting on anything in particular.
@@ -291,8 +291,12 @@ pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bo
         loop {
             match refresh.tick(*visible.peek(), state.syncing()) {
                 Step::Wait => {}
-                Step::Poll | Step::Reload if state.signed_out() => break,
-                Step::Poll => match load_projection_revision().await {
+                // A reload asks the read model through the resources that
+                // hold the rows, which are not made through the state and
+                // so do not pass its guard; the rule has to be kept for
+                // them here.
+                Step::Reload if state.signed_out() => break,
+                Step::Poll => match state.guarded(load_projection_revision).await {
                     Ok(revision) => {
                         let moved = refresh.observe(revision);
                         if moved.pull_requests {
@@ -303,9 +307,16 @@ pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bo
                         }
                         state.poll_answered(unix_seconds());
                     }
-                    Err(error) => {
-                        tracing::debug!(%error, "the projection's revision could not be read");
-                        state.poll_missed(refresh.miss(&fault(&error)));
+                    // The guard refused without asking: the page was already
+                    // signed out on another poll's word — a followed batch's,
+                    // which asks every second — and there is nothing left to
+                    // poll for. A 401 to a poll that was made is a miss like
+                    // any other here, and ends the refresh a tick later at
+                    // [`Step::Stop`], after it has put the banner up.
+                    Err(Fault::SignedOut) if state.signed_out() => break,
+                    Err(fault) => {
+                        tracing::debug!(%fault, "the projection's revision could not be read");
+                        state.poll_missed(refresh.miss(&fault));
                     }
                 },
                 Step::Reload => {
@@ -546,5 +557,80 @@ mod tests {
 
         wait(&mut refresh, REFRESH_TICKS - 1, true, false);
         assert_eq!(refresh.tick(true, false), Step::Poll);
+    }
+}
+
+/// The refresh as it runs on a page, which is where the rule about a
+/// signed-out page can be seen: the loop is mounted, the line is put where a
+/// poll found it, and what the loop does about it is read off the state.
+#[cfg(all(test, feature = "server"))]
+mod mounted_tests {
+    use std::time::Duration;
+
+    use dioxus::core::consume_context_from_scope;
+
+    use super::*;
+    use crate::ui::dashboard_state::use_dashboard;
+    use crate::ui::test_support::DashboardFixture;
+
+    /// Where the mounted refresh left the state, read from outside the
+    /// runtime.
+    #[derive(Clone, Copy, PartialEq)]
+    struct Seen(Signal<Option<DashboardState>>);
+
+    fn Polling() -> Element {
+        use_context_provider(|| Seen(Signal::new(None)));
+        rsx! {
+            DashboardFixture { connection: Connection::SignedOut, Poller {} }
+        }
+    }
+
+    #[component]
+    fn Poller() -> Element {
+        let state = use_dashboard();
+        let mut seen = use_context::<Seen>();
+        use_hook(move || seen.0.set(Some(state)));
+        use_live_refresh(state, use_signal(|| true).into());
+        rsx! {}
+    }
+
+    /// Runs the refresh's task as far as it goes. The dom polls its tasks
+    /// while it waits for work, and a refresh that ends leaves it waiting
+    /// for good, so each wait is bounded rather than waited on.
+    async fn drive(dom: &mut VirtualDom) {
+        for _ in 0..4 {
+            let _ = tokio::time::timeout(Duration::from_millis(20), dom.wait_for_work()).await;
+            dom.render_immediate_to_vec();
+        }
+    }
+
+    /// A page the server has already refused — a followed batch's poll met
+    /// the 401 first, say — is not polled at all: the poll goes through the
+    /// page's guard, which hands it the refusal without entering the server
+    /// function, and the refresh ends there rather than prompt for
+    /// credentials every interval. A poll that was made would have been
+    /// answered — in a test, by the request extension it cannot find —
+    /// counted as the first miss, and put the line back online, so the line
+    /// left as the refusal set it is the call counter at zero.
+    #[tokio::test]
+    async fn a_signed_out_page_is_not_polled_and_ends_the_refresh() {
+        let mut dom = VirtualDom::new(Polling);
+        dom.rebuild_in_place();
+
+        drive(&mut dom).await;
+
+        let state = dom.in_runtime(|| {
+            consume_context_from_scope::<Seen>(ScopeId::APP)
+                .expect("the page keeps what the refresh runs on")
+                .0
+                .read()
+                .expect("the refresh was mounted")
+        });
+        assert_eq!(
+            dom.in_runtime(|| state.connection()),
+            Connection::SignedOut,
+            "the poll was not made"
+        );
+        assert_eq!(dom.in_runtime(|| state.refreshed_at()), None);
     }
 }

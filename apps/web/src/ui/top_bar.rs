@@ -6,8 +6,16 @@ use dioxus::prelude::*;
 use crate::api::request_sync;
 use crate::components::button::{Button, ButtonSize};
 use crate::components::toast::{ToastOptions, use_toast};
-use crate::ui::dashboard_state::use_dashboard;
-use crate::ui::{sticky, user_facing};
+use crate::ui::dashboard_state::{DashboardState, use_dashboard};
+use crate::ui::{Fault, sticky};
+
+/// Asks Restate for a sweep of the installation, on the page whose line to
+/// the server `state` carries. A page the server has already refused is not
+/// asked on behalf of: the request goes through [`DashboardState::guarded`],
+/// which hands it the refusal as if it had asked.
+async fn sync(state: DashboardState) -> Result<(), Fault> {
+    state.guarded(request_sync).await
+}
 
 /// The top bar; `dark` is the theme in force, `aside_open` whether the
 /// sidebar is showing, and `batches_open` whether the recent batches drawer
@@ -73,11 +81,11 @@ pub(crate) fn TopBar(
                 onclick: move |_| {
                     state.begin_sync();
                     spawn(async move {
-                        match request_sync().await {
+                        match sync(state).await {
                             Ok(()) => toast.info("Reconciliation queued".to_owned(), ToastOptions::new()),
-                            Err(error) => {
+                            Err(fault) => {
                                 state.end_sync();
-                                toast.error(format!("Sync failed: {}", user_facing(&error)), sticky());
+                                toast.error(format!("Sync failed: {fault}"), sticky());
                             }
                         }
                     });
@@ -93,8 +101,30 @@ pub(crate) fn TopBar(
 mod tests {
     use dependaboard_core::PrFilter;
 
+    use futures_util::FutureExt;
+
     use super::*;
-    use crate::ui::test_support::{DashboardFixture, render};
+    use crate::ui::dashboard_state::Connection;
+    use crate::ui::test_support::{DashboardFixture, mount_dashboard, render, server_calls};
+
+    /// **Sync** queues a sweep, and is not queued from a page the server has
+    /// already refused: the request would be refused the same, with a
+    /// credential prompt for it. It fails with the refusal it would have
+    /// met without the server function being entered.
+    #[test]
+    fn a_manual_sync_is_refused_without_asking_once_the_page_is_signed_out() {
+        let (dom, mut state) = mount_dashboard();
+
+        dom.in_runtime(|| {
+            state.poll_missed(Connection::SignedOut);
+            let refused = sync(state)
+                .now_or_never()
+                .expect("a call refused on the page's behalf is answered at once")
+                .expect_err("a signed-out page is not asked on behalf of");
+            assert_eq!(server_calls(&refused), 0, "the sync was not requested");
+            assert_eq!(refused, Fault::SignedOut);
+        });
+    }
 
     #[test]
     fn the_view_switch_marks_the_view_in_force_and_the_theme_button_offers_the_other() {
