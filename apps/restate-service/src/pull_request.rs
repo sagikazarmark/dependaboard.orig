@@ -19,7 +19,7 @@ use crate::{
         rejected, run_github_step,
     },
     handler::{HandlerOutcome, traced, traced_read},
-    store::{StoreStepContext, store_failure, store_retry_policy},
+    store::{StoreStepContext, StoreStepKind},
 };
 
 const PR_STATE: &str = "pr_state";
@@ -330,8 +330,8 @@ impl PullRequestEffects for RestatePullRequest<'_, '_> {
         self.ctx
             .run_store_step(
                 "upsert-pr-projection",
-                store_retry_policy(),
-                move || async move { store.upsert_pr(&snapshot).await.map_err(store_failure) },
+                StoreStepKind::Ordinary,
+                move || async move { store.upsert_pr(&snapshot).await },
             )
             .await?;
         Ok(())
@@ -341,8 +341,8 @@ impl PullRequestEffects for RestatePullRequest<'_, '_> {
         let store = self.store.clone();
         let key = key.clone();
         self.ctx
-            .run_store_step(step, store_retry_policy(), move || async move {
-                store.delete_pr(&key).await.map_err(store_failure)
+            .run_store_step(step, StoreStepKind::Ordinary, move || async move {
+                store.delete_pr(&key).await
             })
             .await?;
         Ok(())
@@ -357,12 +357,11 @@ impl PullRequestEffects for RestatePullRequest<'_, '_> {
             .ctx
             .run_store_step(
                 "read-repository-merge-method",
-                store_retry_policy(),
+                StoreStepKind::Ordinary,
                 move || async move {
                     repository_merge_method(store.as_ref(), repository_id)
                         .await
                         .map(Json::from)
-                        .map_err(store_failure)
                 },
             )
             .await?
@@ -1052,7 +1051,10 @@ mod tests {
         async fn upsert_projection(&mut self, snapshot: &PrRecord) -> HandlerResult<()> {
             self.held_when_projected = Some(self.held());
             self.store_step("upsert-pr-projection")?;
-            self.store.upsert_pr(snapshot).await.map_err(store_failure)
+            self.store
+                .upsert_pr(snapshot)
+                .await
+                .map_err(|error| StoreStepKind::Ordinary.read_failure(&error))
         }
 
         async fn delete_projection(
@@ -1061,7 +1063,10 @@ mod tests {
             key: &PrKey,
         ) -> HandlerResult<()> {
             self.store_step(step)?;
-            self.store.delete_pr(key).await.map_err(store_failure)
+            self.store
+                .delete_pr(key)
+                .await
+                .map_err(|error| StoreStepKind::Ordinary.read_failure(&error))
         }
 
         async fn repository_merge_method(
@@ -1071,7 +1076,7 @@ mod tests {
             self.store_step("read-repository-merge-method")?;
             repository_merge_method(&self.store, repository_id)
                 .await
-                .map_err(store_failure)
+                .map_err(|error| StoreStepKind::Ordinary.read_failure(&error))
         }
     }
 

@@ -366,9 +366,7 @@ mod tests {
     use dependaboard_github::ProtocolError;
 
     use super::*;
-    use crate::store::{
-        brief_store_retry_policy, persistent_store_retry_policy, store_retry_policy,
-    };
+    use crate::store::StoreStepKind;
 
     fn is_retryable(error: &HandlerError) -> bool {
         let cause: &dyn std::error::Error = error.as_ref();
@@ -720,12 +718,12 @@ mod tests {
         // The SDK exposes no accessor for the policy's bounds, so inspect its Debug form.
         let github = format!("{:?}", github_retry_policy());
         assert!(github.contains("max_duration: Some(1800s)"), "{github}");
-        let store = format!("{:?}", store_retry_policy());
-        assert!(store.contains("max_duration: Some(300s)"), "{store}");
-        let persistent = format!("{:?}", persistent_store_retry_policy());
-        assert!(persistent.contains("max_duration: None"), "{persistent}");
-        assert!(persistent.contains("max_attempts: None"), "{persistent}");
-        let brief = format!("{:?}", brief_store_retry_policy());
+        let ordinary = format!("{:?}", StoreStepKind::Ordinary.retry_policy());
+        assert!(ordinary.contains("max_duration: Some(300s)"), "{ordinary}");
+        let last_chance = format!("{:?}", StoreStepKind::LastChance.retry_policy());
+        assert!(last_chance.contains("max_duration: None"), "{last_chance}");
+        assert!(last_chance.contains("max_attempts: None"), "{last_chance}");
+        let brief = format!("{:?}", StoreStepKind::Brief.retry_policy());
         assert!(brief.contains("max_duration: Some(15s)"), "{brief}");
     }
 

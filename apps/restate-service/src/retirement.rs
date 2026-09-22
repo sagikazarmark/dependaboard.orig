@@ -19,7 +19,7 @@ use restate_sdk::prelude::*;
 
 use crate::{
     pull_request::{ClosedRequest, close_pull_request},
-    store::{StoreStepContext, store_failure, store_retry_policy},
+    store::{StoreStepContext, StoreStepKind},
 };
 
 /// Side effects draining the outbox asks of Restate and the store, abstracted so
@@ -52,14 +52,8 @@ impl RetirementEffects for RestateRetirements<'_, '_> {
             .ctx
             .run_store_step(
                 "read-pending-retirements",
-                store_retry_policy(),
-                move || async move {
-                    store
-                        .pending_retirements()
-                        .await
-                        .map(Json::from)
-                        .map_err(store_failure)
-                },
+                StoreStepKind::Ordinary,
+                move || async move { store.pending_retirements().await.map(Json::from) },
             )
             .await?;
         Ok(pending.into_inner())
@@ -74,13 +68,8 @@ impl RetirementEffects for RestateRetirements<'_, '_> {
         self.ctx
             .run_store_step(
                 "acknowledge-retirements",
-                store_retry_policy(),
-                move || async move {
-                    store
-                        .acknowledge_retirements(through)
-                        .await
-                        .map_err(store_failure)
-                },
+                StoreStepKind::Ordinary,
+                move || async move { store.acknowledge_retirements(through).await },
             )
             .await?;
         Ok(())

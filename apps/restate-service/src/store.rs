@@ -15,7 +15,7 @@ use crate::handler::RetryableServiceError;
 /// which are the ones that write the projection.
 ///
 /// Every store call a handler makes goes through [`Self::run_store_step`], so none is
-/// journaled without a name to find it by in Restate's UI or a retry policy chosen on
+/// journaled without a name to find it by in Restate's UI or a [`StoreStepKind`] chosen on
 /// purpose — a bare `ctx.run` would retry under the server's default, indefinitely.
 ///
 /// A trait with an impl per context rather than one function over `ContextSideEffects`:
@@ -23,23 +23,22 @@ use crate::handler::RetryableServiceError;
 /// context cannot see through to the future that is, so each impl names its context and
 /// lets the compiler look.
 pub(crate) trait StoreStepContext<'ctx> {
-    /// Journals one store step under `name`, retried under `policy`.
+    /// Journals one store step under `name`, as the kind of write `kind` says it is.
     ///
-    /// The caller picks the policy by name: [`store_retry_policy`] for a write something
-    /// later would redo, [`brief_store_retry_policy`] for a convenience that stands in
-    /// the way of the work, and [`persistent_store_retry_policy`] for the one write
-    /// nothing would redo. `step` says how its own failures read, with [`store_failure`]
-    /// or [`batch_record_failure`]; what it resolves to is journaled, so a value goes
-    /// through [`Json`]. Resolves to what the step did, or the terminal failure Restate
-    /// ends it with once the policy's budget is spent.
+    /// The kind carries both halves of what the step needs from Restate — the retry budget
+    /// it is journaled under and how a failure of the store's reads to Restate — so the two
+    /// cannot be picked apart at a call site; see [`StoreStepKind`]. `step` fails with the
+    /// store's own [`StoreError`] and this reads it. What it resolves to is journaled, so a
+    /// value goes through [`Json`]. Resolves to what the step did, or the terminal failure
+    /// Restate ends it with once the kind's budget is spent.
     fn run_store_step<F, T>(
         &self,
         name: &'static str,
-        policy: RunRetryPolicy,
+        kind: StoreStepKind,
         step: impl FnOnce() -> F + Send + 'ctx,
     ) -> impl Future<Output = Result<T, TerminalError>> + Send
     where
-        F: Future<Output = HandlerResult<T>> + Send + 'ctx,
+        F: Future<Output = Result<T, StoreError>> + Send + 'ctx,
         T: Serialize + Deserialize + 'static;
 }
 
@@ -47,14 +46,16 @@ impl<'ctx> StoreStepContext<'ctx> for ObjectContext<'ctx> {
     fn run_store_step<F, T>(
         &self,
         name: &'static str,
-        policy: RunRetryPolicy,
+        kind: StoreStepKind,
         step: impl FnOnce() -> F + Send + 'ctx,
     ) -> impl Future<Output = Result<T, TerminalError>> + Send
     where
-        F: Future<Output = HandlerResult<T>> + Send + 'ctx,
+        F: Future<Output = Result<T, StoreError>> + Send + 'ctx,
         T: Serialize + Deserialize + 'static,
     {
-        self.run(step).retry_policy(policy).name(name)
+        self.run(move || async move { step().await.map_err(|error| kind.read_failure(&error)) })
+            .retry_policy(kind.retry_policy())
+            .name(name)
     }
 }
 
@@ -62,80 +63,87 @@ impl<'ctx> StoreStepContext<'ctx> for WorkflowContext<'ctx> {
     fn run_store_step<F, T>(
         &self,
         name: &'static str,
-        policy: RunRetryPolicy,
+        kind: StoreStepKind,
         step: impl FnOnce() -> F + Send + 'ctx,
     ) -> impl Future<Output = Result<T, TerminalError>> + Send
     where
-        F: Future<Output = HandlerResult<T>> + Send + 'ctx,
+        F: Future<Output = Result<T, StoreError>> + Send + 'ctx,
         T: Serialize + Deserialize + 'static,
     {
-        self.run(step).retry_policy(policy).name(name)
+        self.run(move || async move { step().await.map_err(|error| kind.read_failure(&error)) })
+            .retry_policy(kind.retry_policy())
+            .name(name)
     }
 }
 
-/// Bounded backoff for projection-store writes: SQLite contention, the FK race between a
-/// fresh repository's first webhook and its enumeration, and a remote store's blip — a
-/// dropped stream, a 5xx, a restart — resolve within seconds, so back off from 100ms to
-/// five seconds and give up after five minutes with a terminal failure. A webhook that
-/// outlives the budget is not lost: the next reconcile syncs the same pull request once
-/// its repository row exists.
-pub(crate) fn store_retry_policy() -> RunRetryPolicy {
-    RunRetryPolicy::new()
-        .initial_delay(Duration::from_millis(100))
-        .exponentiation_factor(2.0)
-        .max_delay(Duration::from_secs(5))
-        .max_duration(Duration::from_secs(5 * 60))
+/// What kind of write a store step is: whether anything later would redo it, and whether
+/// the work waits on it. One choice rather than two, because the retry budget and the
+/// reading of a failure only make sense together — a budget that never gives up under a
+/// reading that ends the step on the store's word would give up after all, and the one
+/// write nothing would redo would lose its record. Each kind answers both, through
+/// [`Self::retry_policy`] and [`Self::read_failure`], and a call site names only the kind.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StoreStepKind {
+    /// A write something later would redo — a webhook's upsert, a sweep's prune, a drain's
+    /// read, the unlisting a failed or cancelled workflow does on its way out. SQLite
+    /// contention, the FK race between a fresh repository's first webhook and its
+    /// enumeration, and a remote store's blip — a dropped stream, a 5xx, a restart —
+    /// resolve within seconds, so it backs off for up to five minutes and then gives up
+    /// with a terminal failure. A webhook that outlives the budget is not lost: the next
+    /// reconcile syncs the same pull request once its repository row exists.
+    Ordinary,
+    /// A convenience that stands in the way of the work: listing a batch as running is how
+    /// the audit view shows it before it finishes, and a store away for longer than this
+    /// should not hold up a hundred merges. The budget is cut to seconds and the caller
+    /// carries on without the write once it is spent.
+    Brief,
+    /// The write nothing would redo: a finished batch's record is written by the one run
+    /// its workflow key gets, so giving up would lose the record for good, and a record
+    /// given up on is an audit row lost while the merges it describes stand on GitHub. It
+    /// retries until the store takes it, with no budget and whatever the store said of the
+    /// failure, and the workflow stalls in plain sight until an operator has put the store
+    /// right; the batch's progress is already published, so the dashboard is not kept
+    /// waiting on it.
+    LastChance,
 }
 
-/// The same backoff without the budget, for a projection write nothing would redo: a
-/// finished batch's record is written by the one run its workflow key gets, so giving up
-/// would lose the record for good. The step retries until the store takes it — paired with
-/// [`batch_record_failure`], so no failure of the store's ends it early; the batch's
-/// progress is already published, so the dashboard is not kept waiting on it.
-pub(crate) fn persistent_store_retry_policy() -> RunRetryPolicy {
-    RunRetryPolicy::new()
-        .initial_delay(Duration::from_millis(100))
-        .exponentiation_factor(2.0)
-        .max_delay(Duration::from_secs(5))
-}
-
-/// The same backoff cut short, for a projection write that is a convenience and stands
-/// in the way of the work: listing a batch as running is how the audit view shows it
-/// before it finishes, and a store away for longer than this should not hold up a
-/// hundred merges. The caller carries on without the write once the budget is spent.
-pub(crate) fn brief_store_retry_policy() -> RunRetryPolicy {
-    RunRetryPolicy::new()
-        .initial_delay(Duration::from_millis(100))
-        .exponentiation_factor(2.0)
-        .max_delay(Duration::from_secs(5))
-        .max_duration(Duration::from_secs(15))
-}
-
-/// How a projection-store failure reads to Restate: retried if the store says the failure
-/// will clear, ended if it says a fresh attempt would meet the same. Right for every write
-/// something later would redo — the next webhook, the next reconcile — and wrong for the
-/// one that nothing would, which has [`batch_record_failure`].
-pub(crate) fn store_failure(error: StoreError) -> HandlerError {
-    match error.class() {
-        StoreErrorClass::Retryable => RetryableServiceError::Store(error.to_string()).into(),
-        StoreErrorClass::Terminal => TerminalError::new(error.to_string()).into(),
+impl StoreStepKind {
+    /// The backoff this kind is journaled under. All three climb from 100ms to five
+    /// seconds — the failures a projection write meets clear in that range or not at all —
+    /// and differ only in how long they keep at it.
+    pub(crate) fn retry_policy(self) -> RunRetryPolicy {
+        let backoff = RunRetryPolicy::new()
+            .initial_delay(Duration::from_millis(100))
+            .exponentiation_factor(2.0)
+            .max_delay(Duration::from_secs(5));
+        match self {
+            Self::Ordinary => backoff.max_duration(Duration::from_secs(5 * 60)),
+            Self::Brief => backoff.max_duration(Duration::from_secs(15)),
+            // No budget: see the variant.
+            Self::LastChance => backoff,
+        }
     }
-}
 
-/// How a failure to write the finished batch's record reads to Restate: retryable,
-/// whatever the store said. [`store_failure`] lets a terminal-class error end the step,
-/// because every other write has a later chance; this one has none, and a record given
-/// up on is an audit row lost while the merges it describes stand on GitHub. So a schema
-/// that does not match, a disk that is full, or a `libsql` error the classifier does not
-/// know are all retried under [`persistent_store_retry_policy`], and the workflow stalls
-/// in plain sight until an operator has put the store right. The store's class is kept in
-/// the message, so the failure Restate shows says whether the store expected it to clear
-/// on its own.
-pub(crate) fn batch_record_failure(error: StoreError) -> HandlerError {
-    match error.class() {
-        StoreErrorClass::Retryable => store_failure(error),
-        StoreErrorClass::Terminal => {
-            RetryableServiceError::StoreRefusedRecord(error.to_string()).into()
+    /// How a failure of the store's reads to Restate for this kind of write.
+    ///
+    /// For a write something later would redo the store has the word: retried if it says
+    /// the failure will clear, ended if it says a fresh attempt would meet the same.
+    /// [`Self::LastChance`] inverts that, because it has no later chance: a schema that
+    /// does not match, a disk that is full, or a `libsql` error the classifier does not
+    /// know are all retried, under a budget that does not end. The store's class is kept in
+    /// the message either way, so the failure Restate shows says whether the store expected
+    /// it to clear on its own.
+    pub(crate) fn read_failure(self, error: &StoreError) -> HandlerError {
+        match (self, error.class()) {
+            (_, StoreErrorClass::Retryable) => {
+                RetryableServiceError::Store(error.to_string()).into()
+            }
+            (Self::Ordinary | Self::Brief, StoreErrorClass::Terminal) => {
+                TerminalError::new(error.to_string()).into()
+            }
+            (Self::LastChance, StoreErrorClass::Terminal) => {
+                RetryableServiceError::StoreRefusedRecord(error.to_string()).into()
+            }
         }
     }
 }
@@ -149,22 +157,26 @@ mod tests {
         cause.to_string()
     }
 
-    /// The classifier's word is final for a write something later would redo: a
-    /// terminal-class failure ends the step. The finished batch's record has no later
-    /// chance, so for it the same failure is retried, and the message says the store did
-    /// not expect the failure to clear rather than calling it transient, so an operator
-    /// reading Restate's failure knows to look at the store, not wait it out.
+    /// The kind is the whole choice: each one carries the reading that belongs with its
+    /// budget, so no call site can journal a write under one and read its failures by the
+    /// other. The classifier's word is final for a write something later would redo and
+    /// for the convenience that stands in the way of the work: a terminal-class failure
+    /// ends the step. The finished batch's record has no later chance, so for it the same
+    /// failure is retried, and the message says the store did not expect the failure to
+    /// clear rather than calling it transient, so an operator reading Restate's failure
+    /// knows to look at the store, not wait it out.
     #[test]
-    fn a_terminal_class_store_error_ends_an_ordinary_write_but_not_the_batch_record() {
-        let ordinary = cause(&store_failure(StoreError::MissingScalar));
-        assert!(ordinary.starts_with("Terminal error"), "{ordinary}");
-
-        let record = cause(&batch_record_failure(StoreError::MissingScalar));
-        assert!(
-            record.starts_with(
-                "Retryable error: batch record met a terminal-class store error; retrying regardless: "
+    fn each_kind_reads_a_terminal_class_store_error_the_way_its_budget_needs() {
+        for (kind, expected) in [
+            (StoreStepKind::Ordinary, "Terminal error"),
+            (StoreStepKind::Brief, "Terminal error"),
+            (
+                StoreStepKind::LastChance,
+                "Retryable error: batch record met a terminal-class store error; retrying regardless: ",
             ),
-            "{record}"
-        );
+        ] {
+            let read = cause(&kind.read_failure(&StoreError::MissingScalar));
+            assert!(read.starts_with(expected), "{kind:?}: {read}");
+        }
     }
 }

@@ -14,7 +14,7 @@ use crate::{
     handler::{HandlerOutcome, traced},
     repo_sync::RepoSyncClient,
     retirement::{RestateRetirements, RetirementEffects, retire_pending},
-    store::{StoreStepContext, store_failure, store_retry_policy},
+    store::{StoreStepContext, StoreStepKind},
 };
 
 const SCHEDULER_STARTED: &str = "scheduler_started";
@@ -378,13 +378,12 @@ impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
         self.ctx
             .run_store_step(
                 "replace-installation-repositories",
-                store_retry_policy(),
+                StoreStepKind::Ordinary,
                 move || async move {
                     store
                         .replace_installation_repos(installation_id, &repositories, synced_before)
                         .await
                         .map(drop)
-                        .map_err(store_failure)
                 },
             )
             .await?;
@@ -462,14 +461,8 @@ impl InstallationPurgeEffects for RestatePurgeEffects<'_, '_> {
         self.ctx
             .run_store_step(
                 "purge-installation",
-                store_retry_policy(),
-                move || async move {
-                    store
-                        .purge_installation(installation_id)
-                        .await
-                        .map(drop)
-                        .map_err(store_failure)
-                },
+                StoreStepKind::Ordinary,
+                move || async move { store.purge_installation(installation_id).await.map(drop) },
             )
             .await?;
         Ok(())

@@ -492,16 +492,21 @@ private. That variant is `Retryable` as a whole: it cannot be taken apart withou
 on message text, every caller that consults the class has a bounded retry, and the cost of
 a genuinely bad request is its budget before the same report, where the cost of the other
 choice was every blip failing a webhook, a sync or a retirement on its first attempt. The
-handlers map the class onto Restate under three budgets: the ordinary write something later
-would redo — a webhook's upsert, a sweep's prune, a drain's read — retries a `Retryable`
-for up to five minutes and fails the step on a `Terminal` (`store_retry_policy`,
-`store_failure`); the running-batch listing, a convenience that stands in the way of the
-work, gets fifteen seconds and then the batch runs unlisted (`brief_store_retry_policy`);
-and the finished batch's record, which nothing later would redo, overrides the class —
-every failure is retried, with no budget, the terminal ones named as such in the failure
-Restate shows (`persistent_store_retry_policy`, `batch_record_failure`; see `BulkAction`).
-The unlisting a failed or cancelled workflow does on its way out uses the ordinary budget:
-nothing waits behind it, and a lost unlist is a stale row, not a lost record.
+handlers map the class onto Restate under three budgets, and **the budget and the reading
+of a failure are one choice, not two**: `StoreStepKind` names what kind of write a store
+step is, and every step goes through `run_store_step(name, kind, step)`, which takes the
+kind and reads the step's `StoreError` itself. The step cannot supply a reading of its
+own, so no call site can put a budget with the reading that belongs to another; only the
+journal name stays the caller's, since the projection's delete is journaled under three of
+them, one per reason a pull request leaves the table. The kinds are: `Ordinary`, the write
+something later would redo — a webhook's upsert, a sweep's prune, a drain's read — retries
+a `Retryable` for up to five minutes and fails the step on a `Terminal`; `Brief`, the
+running-batch listing, a convenience that stands in the way of the work, gets fifteen
+seconds and then the batch runs unlisted; and `LastChance`, the finished batch's record,
+which nothing later would redo, overrides the class — every failure is retried, with no
+budget, the terminal ones named as such in the failure Restate shows (see `BulkAction`).
+The unlisting a failed or cancelled workflow does on its way out is `Ordinary`: nothing
+waits behind it, and a lost unlist is a stale row, not a lost record.
 
 **The web edge's Restate ingress client fails in three classes** —
 `RestateIngressError::{Transport, Status { code, body }, Decode}`: no answer, a refusal

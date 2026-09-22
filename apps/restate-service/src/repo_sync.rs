@@ -14,7 +14,7 @@ use crate::{
     handler::traced,
     pull_request::{PullRequestClient, request_key, short_sha},
     retirement::{RestateRetirements, RetirementEffects, retire_pending},
-    store::{StoreStepContext, store_failure, store_retry_policy},
+    store::{StoreStepContext, StoreStepKind},
 };
 
 /// Side effects the repository's handlers ask of Restate, GitHub and the store — the
@@ -117,13 +117,12 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
         self.ctx
             .run_store_step(
                 "retain-live-pull-requests",
-                store_retry_policy(),
+                StoreStepKind::Ordinary,
                 move || async move {
                     store
                         .retain_prs(repository_id, &live, synced_before)
                         .await
                         .map(drop)
-                        .map_err(store_failure)
                 },
             )
             .await?;
@@ -138,14 +137,8 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
             .ctx
             .run_store_step(
                 "resolve-prs-for-sha",
-                store_retry_policy(),
-                move || async move {
-                    store
-                        .prs_for_sha(repository_id, &sha)
-                        .await
-                        .map(Json::from)
-                        .map_err(store_failure)
-                },
+                StoreStepKind::Ordinary,
+                move || async move { store.prs_for_sha(repository_id, &sha).await.map(Json::from) },
             )
             .await?;
         Ok(matches.into_inner())

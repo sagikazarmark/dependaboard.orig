@@ -15,10 +15,7 @@ use tracing::warn;
 use crate::{
     handler::{HandlerOutcome, handler_cause, traced, traced_read},
     pull_request::PullRequestClient,
-    store::{
-        StoreStepContext, batch_record_failure, brief_store_retry_policy,
-        persistent_store_retry_policy, store_failure, store_retry_policy,
-    },
+    store::{StoreStepContext, StoreStepKind},
 };
 
 const BATCH_PROGRESS: &str = "progress";
@@ -204,11 +201,9 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
         let store = self.store.clone();
         let batch = batch.clone();
         self.ctx
-            .run_store_step(
-                "start-batch",
-                brief_store_retry_policy(),
-                move || async move { store.start_batch(&batch).await.map_err(store_failure) },
-            )
+            .run_store_step("start-batch", StoreStepKind::Brief, move || async move {
+                store.start_batch(&batch).await
+            })
             .await?;
         Ok(())
     }
@@ -217,9 +212,11 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
         let store = self.store.clone();
         let batch_id = self.ctx.key().to_owned();
         self.ctx
-            .run_store_step("unlist-batch", store_retry_policy(), move || async move {
-                store.unlist_batch(&batch_id).await.map_err(store_failure)
-            })
+            .run_store_step(
+                "unlist-batch",
+                StoreStepKind::Ordinary,
+                move || async move { store.unlist_batch(&batch_id).await },
+            )
             .await?;
         Ok(())
     }
@@ -228,21 +225,21 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
         let store = self.store.clone();
         let record = record.clone();
         self.ctx
-            .run_store_step(
-                "record-batch",
-                persistent_store_retry_policy(),
-                move || async move {
-                    store.record_batch(&record).await.map_err(|error| {
-                        let failure = batch_record_failure(error);
-                        warn_if_record_stuck(&record, unix_seconds(), &handler_cause(&failure));
-                        failure
-                    })
-                },
-            )
+            .run_store_step("record-batch", RECORD_BATCH_STEP, move || async move {
+                store.record_batch(&record).await.inspect_err(|error| {
+                    let failure = RECORD_BATCH_STEP.read_failure(error);
+                    warn_if_record_stuck(&record, unix_seconds(), &handler_cause(&failure));
+                })
+            })
             .await?;
         Ok(())
     }
 }
+
+/// What kind of write the finished batch's record is, named so the step and the log line
+/// that reports its failures cannot disagree about it, and so a test can hold the step to
+/// the kind the record needs.
+const RECORD_BATCH_STEP: StoreStepKind = StoreStepKind::LastChance;
 
 /// How long a finished batch's record may go unwritten before its failed attempts are
 /// logged. A store away for a few seconds is what the retry is for; a record still
@@ -536,6 +533,7 @@ mod tests {
         RejectReason, RunningBatch, TargetOutcome, TargetProgressState, UserId,
         restate::{BULK_ACTION, BULK_ACTION_PROGRESS, BULK_ACTION_RUN},
     };
+    use dependaboard_store::StoreError;
     use restate_sdk::service::Discoverable;
     use tracing::instrument::WithSubscriber;
 
@@ -1239,6 +1237,22 @@ mod tests {
                 CLOCK_EPOCH + 60,
             )
             .expect("the batch has finished")
+    }
+
+    /// The record step is held to the kind of write the record is, not merely to a policy
+    /// and a reading that happen to agree today: a store failure it is given up on is an
+    /// audit row lost while the merges it describes stand on GitHub. So the kind the step
+    /// is journaled under must retry without a budget and must retry a failure the store
+    /// itself calls terminal.
+    #[test]
+    fn the_record_step_keeps_retrying_whatever_the_store_says_of_the_failure() {
+        let budget = format!("{:?}", RECORD_BATCH_STEP.retry_policy());
+        assert!(budget.contains("max_duration: None"), "{budget}");
+        assert!(budget.contains("max_attempts: None"), "{budget}");
+
+        let failure = RECORD_BATCH_STEP.read_failure(&StoreError::MissingScalar);
+        let cause = handler_cause(&failure).to_string();
+        assert!(cause.starts_with("Retryable error"), "{cause}");
     }
 
     /// Restate retries the record step for as long as it takes and re-runs the handler
