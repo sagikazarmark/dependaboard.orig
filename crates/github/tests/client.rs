@@ -6,11 +6,12 @@
 //! of how the client is structured internally.
 
 use dependaboard_core::{
-    CheckStatus, CommandRequest, DEPENDABOT_LOGIN, DependabotCommand, GithubErrorResponse,
-    MergeMethod, MergeRequest, Operation, PrTarget, SyncRequest, UpdateBranchRequest, UserId,
+    CheckStatus, CommandRequest, DEPENDABOT_LOGIN, DependabotCommand, MergeMethod, MergeRequest,
+    PrTarget, SyncRequest, UpdateBranchRequest, UserId,
 };
 use dependaboard_github::{
-    GithubApi, GithubClient, GithubConfig, GithubError, Merged, ProtocolError,
+    GithubApi, GithubClient, GithubConfig, GithubError, GithubErrorResponse, Merged, Operation,
+    ProtocolError,
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};

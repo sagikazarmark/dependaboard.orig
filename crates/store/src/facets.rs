@@ -11,15 +11,16 @@ use libsql::Value;
 use crate::{
     StoreError,
     filter::{Facet, filter_sql, without_facet},
-    repo_from_row, stored_enum, unsigned,
+    integer, repo_from_row, scoped_to_installation, stored_enum, unsigned,
 };
 
 pub(crate) async fn facet_counts(
     connection: &libsql::Connection,
+    installation_id: u64,
     filter: &PrFilter,
     now: u64,
 ) -> Result<FacetCounts, StoreError> {
-    let (checks_where, checks_params) = facet_scope(filter, Facet::Checks, now)?;
+    let (checks_where, checks_params) = facet_scope(filter, Facet::Checks, now, installation_id)?;
     let checks = enum_counts(
         connection,
         &format!(
@@ -29,7 +30,8 @@ pub(crate) async fn facet_counts(
     )
     .await?;
 
-    let (types_where, types_params) = facet_scope(filter, Facet::UpdateTypes, now)?;
+    let (types_where, types_params) =
+        facet_scope(filter, Facet::UpdateTypes, now, installation_id)?;
     let update_types = enum_counts(
         connection,
         &format!(
@@ -41,7 +43,7 @@ pub(crate) async fn facet_counts(
 
     // Ties fall back to case-insensitive name order; the GROUP BY stays
     // exact because the label filter matches labels byte for byte.
-    let (labels_where, labels_params) = facet_scope(filter, Facet::Labels, now)?;
+    let (labels_where, labels_params) = facet_scope(filter, Facet::Labels, now, installation_id)?;
     let labels = grouped_counts(
         connection,
         &format!(
@@ -54,8 +56,10 @@ pub(crate) async fn facet_counts(
     .map(|(label, count)| LabelFacet { label, count })
     .collect();
 
-    let (repos_where, repos_params) = facet_scope(filter, Facet::Repositories, now)?;
-    let repositories = repository_facets(connection, &repos_where, repos_params).await?;
+    let (repos_where, repos_params) =
+        facet_scope(filter, Facet::Repositories, now, installation_id)?;
+    let repositories =
+        repository_facets(connection, installation_id, &repos_where, repos_params).await?;
 
     Ok(FacetCounts {
         checks,
@@ -66,25 +70,39 @@ pub(crate) async fn facet_counts(
 }
 
 /// The `WHERE` clause a facet counts within: `filter` minus the facet's own
-/// dimension, as [`filter_sql`] renders it.
+/// dimension, as [`filter_sql`] renders it, held to the installation. Every
+/// facet is scoped the same way, through the one helper, so no facet can be
+/// the one that forgot.
 fn facet_scope(
     filter: &PrFilter,
     facet: Facet,
     now: u64,
+    installation_id: u64,
 ) -> Result<(String, Vec<Value>), StoreError> {
-    filter_sql(&without_facet(filter, facet), None, now)
+    let (where_sql, mut params) = filter_sql(&without_facet(filter, facet), None, now)?;
+    let where_sql = scoped_to_installation(&where_sql, &mut params, installation_id)?;
+    Ok((where_sql, params))
 }
 
-/// Every repository, with how many of its pull requests satisfy `where_sql`
-/// (a clause from [`filter_sql`] over `pull_requests p`), in owner then name
-/// order, case-insensitively, so consecutive entries share an owner. The
-/// clause is used as is, on a grouped subquery, so its shape stays
-/// [`filter_sql`]'s business.
+/// Every repository of `installation_id`, with how many of its pull requests
+/// satisfy `where_sql` (a scoped clause from [`facet_scope`] over
+/// `pull_requests p`), in owner then name order, case-insensitively, so
+/// consecutive entries share an owner. The clause is used as is, on a grouped
+/// subquery, so its shape stays [`filter_sql`]'s business.
+///
+/// This is the one facet that reads `repositories` directly, so it is the one
+/// that needs its own predicate: without it a shared store offers the other
+/// deployment's repositories in the sidebar, at zero, which is how the
+/// tenancy hole showed. The outer `r` is bound here, which is why the clause
+/// inside the subquery cannot name it — see [`scoped_to_installation`].
 async fn repository_facets(
     connection: &libsql::Connection,
+    installation_id: u64,
     where_sql: &str,
-    params: Vec<Value>,
+    mut params: Vec<Value>,
 ) -> Result<Vec<RepoFacet>, StoreError> {
+    params.push(integer(installation_id)?);
+    let listed = format!("?{}", params.len());
     let mut rows = connection
         .query(
             &format!(
@@ -93,6 +111,7 @@ async fn repository_facets(
                  FROM repositories r \
                  LEFT JOIN (SELECT p.repository_id, COUNT(*) AS matching FROM pull_requests p {where_sql} GROUP BY p.repository_id) c \
                  ON c.repository_id = r.repository_id \
+                 WHERE r.installation_id = {listed} \
                  ORDER BY r.owner COLLATE NOCASE, r.repo COLLATE NOCASE"
             ),
             params,
@@ -151,7 +170,7 @@ mod tests {
 
     use crate::{
         LibSqlPrStore, ProjectionReader, ProjectionWriter,
-        test_support::{pr, repo, test_store},
+        test_support::{INSTALLATION, pr, repo, test_store},
     };
 
     use super::*;
@@ -176,7 +195,10 @@ mod tests {
             store.upsert_pr(&record).await.unwrap();
         }
 
-        let summary = store.dashboard_summary(&PrFilter::default()).await.unwrap();
+        let summary = store
+            .dashboard_summary(INSTALLATION, &PrFilter::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             ranked_labels(&summary),
@@ -214,7 +236,10 @@ mod tests {
         failing_major.update_type = UpdateType::Major;
         store.upsert_pr(&failing_major).await.unwrap();
 
-        let summary = store.dashboard_summary(&PrFilter::default()).await.unwrap();
+        let summary = store
+            .dashboard_summary(INSTALLATION, &PrFilter::default())
+            .await
+            .unwrap();
 
         assert_eq!(
             summary.facets.checks,
@@ -265,8 +290,14 @@ mod tests {
             ..Default::default()
         };
 
-        let page = store.list_prs(&filter, Page::default()).await.unwrap();
-        let summary = store.dashboard_summary(&filter).await.unwrap();
+        let page = store
+            .list_prs(INSTALLATION, &filter, Page::default())
+            .await
+            .unwrap();
+        let summary = store
+            .dashboard_summary(INSTALLATION, &filter)
+            .await
+            .unwrap();
 
         // The rows honour every filter: only #3 is failing and rust.
         assert_eq!(page.total, 1);
@@ -306,7 +337,10 @@ mod tests {
             ..Default::default()
         };
 
-        let summary = store.dashboard_summary(&filter).await.unwrap();
+        let summary = store
+            .dashboard_summary(INSTALLATION, &filter)
+            .await
+            .unwrap();
 
         // Without the repository filter, the failing pull requests are #2 in
         // repo-1 and #3 in repo-2: choosing repo-2 instead would show one.
@@ -342,7 +376,10 @@ mod tests {
             ..Default::default()
         };
 
-        let summary = store.dashboard_summary(&filter).await.unwrap();
+        let summary = store
+            .dashboard_summary(INSTALLATION, &filter)
+            .await
+            .unwrap();
 
         assert_eq!(
             summary.facets.checks,
@@ -403,7 +440,10 @@ mod tests {
             ..Default::default()
         };
 
-        let summary = store.dashboard_summary(&filter).await.unwrap();
+        let summary = store
+            .dashboard_summary(INSTALLATION, &filter)
+            .await
+            .unwrap();
 
         assert_eq!(
             summary

@@ -11,11 +11,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-#[cfg(feature = "dependabot-metadata")]
-mod dependabot_metadata;
-#[cfg(feature = "dependabot-metadata")]
-pub use dependabot_metadata::parse_dependabot_metadata;
-
 pub const DEPENDABOT_LOGIN: &str = "dependabot[bot]";
 pub const DEFAULT_PAGE_SIZE: u32 = 50;
 pub const MAX_PAGE_SIZE: u32 = 100;
@@ -132,6 +127,12 @@ impl FromStr for PrKey {
 /// Ordered by severity: `Unknown < Patch < Minor < Major`. `Ord` is derived
 /// from a severity rank rather than declaration order so that `.max()`,
 /// sorting and [`highest_update_type`] all agree on the "worst" update.
+///
+/// The `Display` form is a persisted token, not a label you may reword: the
+/// store writes it to `pull_requests.update_type` and reads it back with
+/// `FromStr`, the dashboard puts it in the `type=` query parameter of every
+/// shareable link, and the UI shows it as the chip text. Renaming a variant
+/// orphans stored rows and breaks links people have already sent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateType {
@@ -195,7 +196,14 @@ impl FromStr for UpdateType {
 }
 
 /// `Ord` follows declaration order and exists only so the status can key a
-/// `BTreeMap`; it says nothing about severity. Use `rollup_checks` for that.
+/// `BTreeMap`; it says nothing about severity. Severity is the GitHub client's
+/// to decide, in `dependaboard_github`'s rollup.
+///
+/// The `Display` form is a persisted token, not a label you may reword: the
+/// store writes it to `pull_requests.check_status` and reads it back with
+/// `FromStr`, the dashboard puts it in the `check=` query parameter of every
+/// shareable link, and the UI shows it as the filter chip text. Renaming a
+/// variant orphans stored rows and breaks links people have already sent.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -324,61 +332,6 @@ impl fmt::Display for Mergeable {
             Self::HasHooks => "has_hooks",
             Self::Unknown => "unknown",
         })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckSignal {
-    Pass,
-    Fail,
-    Pending,
-}
-
-pub fn rollup_checks(signals: impl IntoIterator<Item = CheckSignal>) -> CheckStatus {
-    let mut saw_pass = false;
-    let mut saw_pending = false;
-    for signal in signals {
-        match signal {
-            CheckSignal::Fail => return CheckStatus::Failure,
-            CheckSignal::Pending => saw_pending = true,
-            CheckSignal::Pass => saw_pass = true,
-        }
-    }
-    if saw_pending {
-        CheckStatus::Pending
-    } else if saw_pass {
-        CheckStatus::Success
-    } else {
-        CheckStatus::None
-    }
-}
-
-pub fn check_signal(status: Option<&str>, conclusion: Option<&str>) -> Option<CheckSignal> {
-    if let Some(conclusion) = conclusion {
-        return match conclusion {
-            "success" | "neutral" | "skipped" => Some(CheckSignal::Pass),
-            "failure" | "timed_out" | "action_required" | "cancelled" | "stale"
-            | "startup_failure" => Some(CheckSignal::Fail),
-            _ => None,
-        };
-    }
-    match status {
-        Some("queued" | "in_progress" | "waiting" | "pending" | "requested" | "expected") => {
-            Some(CheckSignal::Pending)
-        }
-        Some("startup_failure") => Some(CheckSignal::Fail),
-        _ => None,
-    }
-}
-
-/// What one commit status contributes, by its state. `expected` is a required context
-/// that has not reported yet, which the truth table counts as pending.
-pub fn status_signal(state: &str) -> Option<CheckSignal> {
-    match state {
-        "success" => Some(CheckSignal::Pass),
-        "failure" | "error" => Some(CheckSignal::Fail),
-        "pending" | "expected" => Some(CheckSignal::Pending),
-        _ => None,
     }
 }
 
@@ -611,6 +564,11 @@ pub struct ProjectionRevision {
     pub pull_requests: u64,
 }
 
+/// The `Display` form is a persisted token, not a label you may reword: the
+/// store writes it to `repositories.merge_method` and reads it back with
+/// `FromStr`, and the GitHub client sends the same string as the
+/// `merge_method` field of `PUT /pulls/{n}/merge`, where GitHub's own
+/// vocabulary fixes it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeMethod {
@@ -643,6 +601,13 @@ impl FromStr for MergeMethod {
     }
 }
 
+/// This enum carries two deliberately different string vocabularies; do not
+/// unify them. Serde's is `snake_case` (`update_branch`) and is what the wire
+/// format uses. `Display`/`FromStr` spell the same variant `update branch`,
+/// **with a space**, and that is the form persisted in `batches.action` (see
+/// spec.md §4's schema). Re-spelling `Display` to match serde would make every
+/// batch row already on disk unreadable, so the space is load-bearing;
+/// `a_bulk_action_kind_reads_back_from_its_display_form` pins it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BulkActionKind {
@@ -1378,109 +1343,6 @@ pub struct WebhookEvent {
     pub pull_requests: Vec<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Operation {
-    Read,
-    Merge,
-    Comment,
-    UpdateBranch,
-}
-
-impl fmt::Display for Operation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Read => "read",
-            Self::Merge => "merge",
-            Self::Comment => "comment",
-            Self::UpdateBranch => "update_branch",
-        })
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GithubErrorResponse {
-    pub status: u16,
-    pub message: String,
-    pub documentation_url: Option<String>,
-    pub rate_limit_remaining: Option<u64>,
-    pub rate_limit_reset: Option<u64>,
-    pub retry_after_seconds: Option<u64>,
-}
-
-/// How long to back off from a secondary rate limit that carries no `Retry-After`.
-///
-/// GitHub's guidance is to wait at least one minute before retrying in that case.
-pub const DEFAULT_RATE_LIMIT_WAIT_SECONDS: u64 = 60;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Classification {
-    /// Transient: retrying the identical request with backoff may succeed.
-    Retryable,
-    /// GitHub asked us to back off; do not retry before `until` (unix seconds).
-    RateLimited {
-        until: u64,
-    },
-    Rejected(RejectReason),
-    Fatal,
-}
-
-/// Classifies a failed GitHub response into an outcome for the caller.
-///
-/// `now` is the caller's unix-seconds clock, so the classification is a pure function of
-/// its inputs: journal it once and replay it verbatim rather than recomputing it.
-pub fn classify_github_error(
-    response: &GithubErrorResponse,
-    operation: Operation,
-    known_resource: bool,
-    now: u64,
-) -> Classification {
-    let message = response.message.to_ascii_lowercase();
-    let is_rate_limited = response.rate_limit_remaining == Some(0)
-        || response.retry_after_seconds.is_some()
-        || message.contains("secondary rate limit")
-        || message.contains("rate limit exceeded")
-        || (response.status == 429);
-    if is_rate_limited {
-        let until = response
-            .retry_after_seconds
-            .map(|after| now.saturating_add(after))
-            .or(response.rate_limit_reset)
-            .unwrap_or_else(|| now.saturating_add(DEFAULT_RATE_LIMIT_WAIT_SECONDS));
-        return Classification::RateLimited { until };
-    }
-    if response.status >= 500 {
-        return Classification::Retryable;
-    }
-    if operation == Operation::Merge
-        && response.status == 405
-        && message.contains("base branch was modified")
-    {
-        return Classification::Retryable;
-    }
-    match (response.status, operation) {
-        (404, _) if known_resource => Classification::Rejected(RejectReason::NotFound),
-        (404, _) => Classification::Fatal,
-        (403, Operation::Comment) => Classification::Rejected(RejectReason::Forbidden),
-        // The read that verified the target went through with the same credentials, so
-        // GitHub is refusing this write on this pull request (branch protection, a
-        // repository the installation can see but not push to), not the configuration.
-        // A 401 is different: the client has already refreshed the token and retried
-        // once, so bad credentials are bad for every target and stay fatal below.
-        (403, Operation::Merge | Operation::UpdateBranch) if known_resource => {
-            Classification::Rejected(RejectReason::Forbidden)
-        }
-        (405, Operation::Merge) if message.contains("merge method") => {
-            Classification::Rejected(RejectReason::MergeMethodDisallowed)
-        }
-        (405 | 409 | 422, Operation::Merge) => Classification::Rejected(RejectReason::NotMergeable),
-        (422, Operation::UpdateBranch) => Classification::Rejected(RejectReason::NotMergeable),
-        // Refused before anything was read: the credentials or the installation's access
-        // are wrong for every target, not just this one.
-        (401 | 403, _) => Classification::Fatal,
-        _ => Classification::Fatal,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1592,54 +1454,6 @@ mod tests {
     }
 
     #[test]
-    fn rollup_uses_failure_pending_success_none_precedence() {
-        assert_eq!(rollup_checks([]), CheckStatus::None);
-        assert_eq!(rollup_checks([CheckSignal::Pass]), CheckStatus::Success);
-        assert_eq!(
-            rollup_checks([CheckSignal::Pass, CheckSignal::Pending]),
-            CheckStatus::Pending
-        );
-        assert_eq!(
-            rollup_checks([CheckSignal::Pending, CheckSignal::Fail]),
-            CheckStatus::Failure
-        );
-    }
-
-    #[test]
-    fn all_documented_check_values_are_classified() {
-        for value in ["success", "neutral", "skipped"] {
-            assert_eq!(check_signal(None, Some(value)), Some(CheckSignal::Pass));
-        }
-        for value in [
-            "failure",
-            "timed_out",
-            "action_required",
-            "cancelled",
-            "stale",
-            "startup_failure",
-        ] {
-            assert_eq!(check_signal(None, Some(value)), Some(CheckSignal::Fail));
-        }
-        for value in [
-            "queued",
-            "in_progress",
-            "waiting",
-            "pending",
-            "requested",
-            "expected",
-        ] {
-            assert_eq!(check_signal(Some(value), None), Some(CheckSignal::Pending));
-        }
-        assert_eq!(status_signal("success"), Some(CheckSignal::Pass));
-        for value in ["failure", "error"] {
-            assert_eq!(status_signal(value), Some(CheckSignal::Fail));
-        }
-        for value in ["pending", "expected"] {
-            assert_eq!(status_signal(value), Some(CheckSignal::Pending));
-        }
-    }
-
-    #[test]
     fn all_documented_mergeable_states_are_classified() {
         for (value, expected) in [
             ("clean", Mergeable::Clean),
@@ -1703,6 +1517,58 @@ mod tests {
                 Mergeable::from_github_state(&state.to_string()),
                 state,
                 "{state:?}"
+            );
+        }
+    }
+
+    /// The display form is on disk (`pull_requests.update_type`) and in the
+    /// `type=` parameter of every shared link, so the literals are pinned here
+    /// rather than derived: a round trip alone would stay green through a
+    /// rename of both halves.
+    #[test]
+    fn an_update_type_reads_back_from_its_display_form() {
+        assert_eq!(UpdateType::Major.to_string(), "major");
+        assert_eq!(UpdateType::Minor.to_string(), "minor");
+        assert_eq!(UpdateType::Patch.to_string(), "patch");
+        assert_eq!(UpdateType::Unknown.to_string(), "unknown");
+        for update_type in UpdateType::ALL {
+            assert_eq!(
+                update_type.to_string().parse::<UpdateType>().unwrap(),
+                update_type,
+                "{update_type:?}"
+            );
+        }
+    }
+
+    /// As above, for `pull_requests.check_status` and the `check=` parameter.
+    #[test]
+    fn a_check_status_reads_back_from_its_display_form() {
+        assert_eq!(CheckStatus::Success.to_string(), "success");
+        assert_eq!(CheckStatus::Failure.to_string(), "failure");
+        assert_eq!(CheckStatus::Pending.to_string(), "pending");
+        assert_eq!(CheckStatus::None.to_string(), "none");
+        for status in CheckStatus::ALL {
+            assert_eq!(
+                status.to_string().parse::<CheckStatus>().unwrap(),
+                status,
+                "{status:?}"
+            );
+        }
+    }
+
+    /// The display form is on disk (`repositories.merge_method`) and is also
+    /// the string GitHub's merge endpoint expects, so these literals are
+    /// GitHub's, not ours to rename.
+    #[test]
+    fn a_merge_method_reads_back_from_its_display_form() {
+        assert_eq!(MergeMethod::Merge.to_string(), "merge");
+        assert_eq!(MergeMethod::Squash.to_string(), "squash");
+        assert_eq!(MergeMethod::Rebase.to_string(), "rebase");
+        for method in [MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase] {
+            assert_eq!(
+                method.to_string().parse::<MergeMethod>().unwrap(),
+                method,
+                "{method:?}"
             );
         }
     }
@@ -2239,7 +2105,10 @@ mod tests {
     }
 
     /// The store keeps the kind in its display form, as it keeps every enum, so the
-    /// display form must read back.
+    /// display form must read back. The negative case is the point: serde spells the
+    /// variant `update_branch`, `Display` spells it `update branch`, and `batches.action`
+    /// holds the spaced form. Unifying the two vocabularies would silently fail to read
+    /// every batch row already on disk, so this test refuses the serde spelling.
     #[test]
     fn a_bulk_action_kind_reads_back_from_its_display_form() {
         for kind in [
@@ -2372,172 +2241,5 @@ mod tests {
         );
         let serialized = serde_json::to_value(&request).unwrap();
         assert!(serialized.get("observed_sha").is_none());
-    }
-
-    #[test]
-    fn rate_limits_are_recognised_regardless_of_status() {
-        for status in [403, 429] {
-            let response = GithubErrorResponse {
-                status,
-                message: "secondary rate limit".to_owned(),
-                ..Default::default()
-            };
-            assert!(matches!(
-                classify_github_error(&response, Operation::Comment, true, 1_000),
-                Classification::RateLimited { .. }
-            ));
-        }
-    }
-
-    #[test]
-    fn retry_after_sets_the_rate_limit_deadline_relative_to_now() {
-        let response = GithubErrorResponse {
-            status: 403,
-            message: "slow down".to_owned(),
-            retry_after_seconds: Some(30),
-            ..Default::default()
-        };
-        assert_eq!(
-            classify_github_error(&response, Operation::Read, false, 1_000),
-            Classification::RateLimited { until: 1_030 }
-        );
-    }
-
-    #[test]
-    fn a_primary_rate_limit_waits_for_the_advertised_reset() {
-        let response = GithubErrorResponse {
-            status: 403,
-            message: "API rate limit exceeded for installation ID 1.".to_owned(),
-            rate_limit_remaining: Some(0),
-            rate_limit_reset: Some(4_600),
-            ..Default::default()
-        };
-        assert_eq!(
-            classify_github_error(&response, Operation::Read, false, 1_000),
-            Classification::RateLimited { until: 4_600 }
-        );
-    }
-
-    #[test]
-    fn a_secondary_rate_limit_without_headers_waits_one_minute() {
-        // GitHub's guidance when Retry-After is absent is to wait at least a minute.
-        let response = GithubErrorResponse {
-            status: 403,
-            message: "You have exceeded a secondary rate limit.".to_owned(),
-            ..Default::default()
-        };
-        assert_eq!(
-            classify_github_error(&response, Operation::Comment, true, 1_000),
-            Classification::RateLimited { until: 1_060 }
-        );
-    }
-
-    #[test]
-    fn server_errors_are_retryable_without_a_deadline() {
-        let response = GithubErrorResponse {
-            status: 503,
-            message: "unavailable".to_owned(),
-            ..Default::default()
-        };
-        assert_eq!(
-            classify_github_error(&response, Operation::Read, false, 1_000),
-            Classification::Retryable
-        );
-    }
-
-    #[test]
-    fn merge_base_branch_405_is_retryable_but_method_405_is_rejected() {
-        let transient = GithubErrorResponse {
-            status: 405,
-            message: "Base branch was modified. Review and try the merge again.".to_owned(),
-            ..Default::default()
-        };
-        assert_eq!(
-            classify_github_error(&transient, Operation::Merge, true, 1_000),
-            Classification::Retryable
-        );
-
-        let permanent = GithubErrorResponse {
-            status: 405,
-            message: "Merge method is not allowed".to_owned(),
-            ..Default::default()
-        };
-        assert_eq!(
-            classify_github_error(&permanent, Operation::Merge, true, 1_000),
-            Classification::Rejected(RejectReason::MergeMethodDisallowed)
-        );
-    }
-
-    #[test]
-    fn unknown_404_is_fatal_but_known_resource_is_gone() {
-        let response = GithubErrorResponse {
-            status: 404,
-            message: "Not Found".to_owned(),
-            ..Default::default()
-        };
-        assert_eq!(
-            classify_github_error(&response, Operation::Read, false, 1_000),
-            Classification::Fatal
-        );
-        assert_eq!(
-            classify_github_error(&response, Operation::Read, true, 1_000),
-            Classification::Rejected(RejectReason::NotFound)
-        );
-    }
-
-    #[test]
-    fn a_write_refused_on_a_pull_request_just_read_is_that_targets_rejection() {
-        // The read that verified the target went through with the same credentials, so
-        // the refusal is about this pull request, not the configuration: one merge
-        // forbidden by branch protection must not fail the other ninety-nine.
-        let response = GithubErrorResponse {
-            status: 403,
-            message: "Resource not accessible by integration".to_owned(),
-            ..Default::default()
-        };
-        for operation in [Operation::Merge, Operation::UpdateBranch] {
-            assert_eq!(
-                classify_github_error(&response, operation, true, 1_000),
-                Classification::Rejected(RejectReason::Forbidden),
-                "403 on {operation} of a known pull request"
-            );
-        }
-    }
-
-    #[test]
-    fn bad_credentials_are_a_configuration_failure_even_on_a_pull_request_just_read() {
-        // The client has already refreshed the token and retried once before a 401 gets
-        // here, so the fresh token was refused too: the credentials are wrong for every
-        // target, and the one just read is no exception.
-        let response = GithubErrorResponse {
-            status: 401,
-            message: "Bad credentials".to_owned(),
-            ..Default::default()
-        };
-        for operation in [Operation::Merge, Operation::UpdateBranch] {
-            assert_eq!(
-                classify_github_error(&response, operation, true, 1_000),
-                Classification::Fatal,
-                "401 on {operation} of a known pull request"
-            );
-        }
-    }
-
-    #[test]
-    fn a_write_refused_before_anything_was_read_is_a_configuration_failure() {
-        for status in [401, 403] {
-            let response = GithubErrorResponse {
-                status,
-                message: "Bad credentials".to_owned(),
-                ..Default::default()
-            };
-            for operation in [Operation::Merge, Operation::UpdateBranch, Operation::Read] {
-                assert_eq!(
-                    classify_github_error(&response, operation, false, 1_000),
-                    Classification::Fatal,
-                    "{status} on {operation} with nothing verified"
-                );
-            }
-        }
     }
 }

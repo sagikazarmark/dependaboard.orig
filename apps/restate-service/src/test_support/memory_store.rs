@@ -17,9 +17,11 @@ use dependaboard_store::{ProjectionWriter, StoreError};
 ///
 /// What the schema enforces, this enforces: a pull request needs its repository's row
 /// first (libSQL rejects the foreign key; this panics, since only a test can get it wrong),
-/// deleting a repository takes its pull requests with it, a pull request reads back
-/// with its repository's `installation_id`, as the store's `JOIN` gives it, a batch
-/// recorded twice keeps its first record, recording a batch stops listing it as
+/// a record whose `id` disagrees with the row already held for its `(repository_id, number)`
+/// is a second row for the same pull request and panics the same way (libSQL rejects the
+/// unique index), deleting a repository takes its pull requests with it, a pull request
+/// reads back with its repository's `installation_id`, as the store's `JOIN` gives it, a
+/// batch recorded twice keeps its first record, recording a batch stops listing it as
 /// running, and every prune queues the keys it removed for retirement under its fence.
 #[derive(Default)]
 pub(crate) struct MemoryPrStore {
@@ -120,6 +122,17 @@ impl ProjectionWriter for MemoryPrStore {
             pr.key(),
             pr.repository_id
         );
+        if let Some(held) = tables.pull_requests.get(&(pr.repository_id, pr.number)) {
+            assert!(
+                held.id == pr.id,
+                "MemoryPrStore: pull request {} carries id {}, but the row for it already \
+                 holds id {}; the id is derived from (repository_id, number), so this is a \
+                 second row for the same pull request, which the schema's unique index rejects",
+                pr.key(),
+                pr.id,
+                held.id
+            );
+        }
         tables
             .pull_requests
             .insert((pr.repository_id, pr.number), pr.clone());
@@ -295,6 +308,23 @@ mod tests {
             synced_at,
             ..snapshot()
         }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "but the row for it already holds id 7#9")]
+    async fn a_second_row_for_the_same_repository_and_number_is_rejected() {
+        let store = MemoryPrStore::default();
+        store.upsert_repo(&repository()).await.unwrap();
+        store.upsert_pr(&pull(7, 9, 0)).await.unwrap();
+        // The id is derived from (repository_id, number), so a row that
+        // disagrees with its own id would be a second row for the same pull
+        // request, and the schema's unique index refuses it.
+        let rogue = PrRecord {
+            id: "rogue".to_owned(),
+            ..pull(7, 9, 0)
+        };
+
+        let _ = store.upsert_pr(&rogue).await;
     }
 
     #[tokio::test]

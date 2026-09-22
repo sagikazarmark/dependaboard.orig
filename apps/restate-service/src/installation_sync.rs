@@ -4,7 +4,8 @@
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use dependaboard_core::{Operation, RepoRecord, unix_seconds};
+use dependaboard_core::{RepoRecord, unix_seconds};
+use dependaboard_github::Operation;
 use dependaboard_store::ProjectionWriter;
 use restate_sdk::prelude::*;
 

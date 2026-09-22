@@ -122,13 +122,25 @@ enum RoutingError {
 /// The envelope already carries the installation and repository probe, so only
 /// the per-event fields — PR number, head SHA, and the PRs a check belongs to —
 /// need parsing out of the payload.
+///
+/// Each kind's arm states both of the facts that kind carries: the per-event
+/// routing fields, and the repository it is addressed by — mandatory for the
+/// repository-scoped kinds, merely passed through for the installation ones.
 fn route_delivery(envelope: &Envelope) -> Result<Disposition, RoutingError> {
-    let (number, sha, pull_requests) = match envelope.meta.kind {
+    // A kind whose arm calls this cannot be routed without a repository.
+    let repository_required = || {
+        envelope
+            .meta
+            .repository
+            .as_ref()
+            .ok_or(RoutingError::MissingRepository)
+    };
+    let (number, sha, pull_requests, repository) = match envelope.meta.kind {
         EventKind::Installation | EventKind::InstallationRepositories => {
             if envelope.meta.installation_id.is_none() {
                 return Err(RoutingError::MissingInstallation);
             }
-            (None, None, Vec::new())
+            (None, None, Vec::new(), envelope.meta.repository.as_ref())
         }
         EventKind::PullRequest => {
             let payload: PullRequestRouting = parse_payload(envelope)?;
@@ -136,36 +148,29 @@ fn route_delivery(envelope: &Envelope) -> Result<Disposition, RoutingError> {
                 Some(payload.pull_request.number),
                 Some(payload.pull_request.head.sha),
                 Vec::new(),
+                Some(repository_required()?),
             )
         }
         EventKind::CheckRun => {
             let payload: CheckRunRouting = parse_payload(envelope)?;
             let (sha, numbers) = payload.check_run.into_routing();
-            (None, Some(sha), numbers)
+            (None, Some(sha), numbers, Some(repository_required()?))
         }
         EventKind::CheckSuite => {
             let payload: CheckSuiteRouting = parse_payload(envelope)?;
             let (sha, numbers) = payload.check_suite.into_routing();
-            (None, Some(sha), numbers)
+            (None, Some(sha), numbers, Some(repository_required()?))
         }
         EventKind::Status => {
             let payload: StatusRouting = parse_payload(envelope)?;
-            (None, Some(payload.sha), Vec::new())
+            (
+                None,
+                Some(payload.sha),
+                Vec::new(),
+                Some(repository_required()?),
+            )
         }
         _ => return Ok(Disposition::Acknowledge),
-    };
-    let repository = match envelope.meta.kind {
-        EventKind::PullRequest
-        | EventKind::CheckRun
-        | EventKind::CheckSuite
-        | EventKind::Status => Some(
-            envelope
-                .meta
-                .repository
-                .as_ref()
-                .ok_or(RoutingError::MissingRepository)?,
-        ),
-        _ => envelope.meta.repository.as_ref(),
     };
     Ok(Disposition::Forward(Box::new(WebhookEvent {
         event: envelope.meta.kind.as_str().to_owned(),
@@ -565,6 +570,30 @@ mod tests {
                 matches!(disposition, Disposition::Acknowledge),
                 "{event_name} should be acknowledged without a forward"
             );
+        }
+    }
+
+    #[test]
+    fn the_edge_forwards_check_actions_the_dispatcher_then_ignores() {
+        // Records present behaviour, not desired behaviour. The edge matches on
+        // the event kind alone and never inspects the action, so these two
+        // deliveries are forwarded and then dropped by the dispatcher, whose
+        // half of the asymmetry is pinned by
+        // `routed_kinds_with_unhandled_actions_are_ignored_not_rejected` in
+        // `apps/restate-service/src/ingress.rs`. Moving the action filter to the
+        // edge would change what GitHub's Recent deliveries pane shows, so it
+        // must be a deliberate, visible decision — this test makes it one.
+        for (object_name, action) in [("check_suite", "requested"), ("check_run", "rerequested")] {
+            let mut payload = serde_json::json!({ "action": action });
+            payload[object_name] = serde_json::json!({
+                "head_sha": "abc123",
+                "pull_requests": [{ "number": 9 }]
+            });
+            let event = routed(object_name, Some(action), true, payload);
+            assert_eq!(event.event, object_name);
+            assert_eq!(event.action.as_deref(), Some(action));
+            assert_eq!(event.sha.as_deref(), Some("abc123"));
+            assert_eq!(event.pull_requests, vec![9]);
         }
     }
 

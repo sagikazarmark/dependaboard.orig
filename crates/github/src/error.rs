@@ -1,9 +1,40 @@
 //! What a call to GitHub can fail with, and the mark that says whether the
 //! failure came back from a resource the client had already read.
 
-use dependaboard_core::{GithubErrorResponse, Operation};
+use std::fmt;
+
 use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operation {
+    Read,
+    Merge,
+    Comment,
+    UpdateBranch,
+}
+
+impl fmt::Display for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Read => "read",
+            Self::Merge => "merge",
+            Self::Comment => "comment",
+            Self::UpdateBranch => "update_branch",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubErrorResponse {
+    pub status: u16,
+    pub message: String,
+    pub documentation_url: Option<String>,
+    pub rate_limit_remaining: Option<u64>,
+    pub rate_limit_reset: Option<u64>,
+    pub retry_after_seconds: Option<u64>,
+}
 
 #[derive(Debug, Error)]
 pub enum GithubError {
