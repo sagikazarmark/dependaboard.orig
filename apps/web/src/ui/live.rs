@@ -568,6 +568,7 @@ mod mounted_tests {
     use std::time::Duration;
 
     use dioxus::core::consume_context_from_scope;
+    use futures_util::FutureExt;
 
     use super::*;
     use crate::ui::dashboard_state::use_dashboard;
@@ -582,6 +583,17 @@ mod mounted_tests {
         use_context_provider(|| Seen(Signal::new(None)));
         rsx! {
             DashboardFixture { connection: Connection::SignedOut, Poller {} }
+        }
+    }
+
+    /// The same refresh over a page whose line is up, with a manual sync in
+    /// flight for the follow budget to run out on, and the reloads the
+    /// refresh asks for counted.
+    fn Following() -> Element {
+        use_context_provider(|| Seen(Signal::new(None)));
+        let reloads = use_context_provider(|| Signal::new(0u32));
+        rsx! {
+            DashboardFixture { syncing: true, reloads, Poller {} }
         }
     }
 
@@ -604,6 +616,43 @@ mod mounted_tests {
         }
     }
 
+    /// Runs the refresh for `ticks` of the poll interval, one tick at a time:
+    /// whatever is ready to run runs, and the clock then moves on by exactly
+    /// one interval. The clock is the test's — paused, and nothing but the
+    /// refresh holds a timer on it — so no tick is taken that the test did
+    /// not ask for, and a signal set between two calls is set between the two
+    /// ticks they run.
+    async fn run(dom: &mut VirtualDom, ticks: u32) {
+        for _ in 0..ticks {
+            for _ in 0..4 {
+                let _ = dom.wait_for_work().now_or_never();
+                dom.render_immediate_to_vec();
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(POLL_INTERVAL).await;
+        }
+    }
+
+    /// The state the mounted refresh runs on, read from outside the runtime.
+    fn refreshing(dom: &VirtualDom) -> DashboardState {
+        dom.in_runtime(|| {
+            consume_context_from_scope::<Seen>(ScopeId::APP)
+                .expect("the page keeps what the refresh runs on")
+                .0
+                .read()
+                .expect("the refresh was mounted")
+        })
+    }
+
+    /// How often the mounted refresh has asked for the rows again.
+    fn reloads(dom: &VirtualDom) -> u32 {
+        dom.in_runtime(|| {
+            *consume_context_from_scope::<Signal<u32>>(ScopeId::APP)
+                .expect("the page counts the reloads")
+                .read()
+        })
+    }
+
     /// A page the server has already refused — a followed batch's poll met
     /// the 401 first, say — is not polled at all: the poll goes through the
     /// page's guard, which hands it the refusal without entering the server
@@ -619,18 +668,65 @@ mod mounted_tests {
 
         drive(&mut dom).await;
 
-        let state = dom.in_runtime(|| {
-            consume_context_from_scope::<Seen>(ScopeId::APP)
-                .expect("the page keeps what the refresh runs on")
-                .0
-                .read()
-                .expect("the refresh was mounted")
-        });
+        let state = refreshing(&dom);
         assert_eq!(
             dom.in_runtime(|| state.connection()),
             Connection::SignedOut,
             "the poll was not made"
         );
         assert_eq!(dom.in_runtime(|| state.refreshed_at()), None);
+    }
+
+    /// The follow budget running out is the one step the refresh takes that
+    /// asks nothing of the server itself: it reloads the rows, and the rows
+    /// are read by resources that never go through the page's guard. So the
+    /// rule about a signed-out page has to be kept where the step is taken,
+    /// and the page it has to be kept on is one whose credentials were
+    /// refused *while* the sync was being followed, by a poll made elsewhere:
+    /// the batch a drawer follows asks every second, and meets the 401 first.
+    /// The refresh's own polls never saw it, so it has no refusal of its own
+    /// to stop on, and the tick the budget runs out on would otherwise reload
+    /// — whose reads would each be answered with the credential prompt.
+    ///
+    /// The reload counter is what says the reload was not made, and the sync
+    /// left in flight says the refresh ended before doing anything about it
+    /// at all. The same budget spent on a page that has only lost the line is
+    /// asserted first, and is what says the ticks below are the ticks the
+    /// budget is counted in: a reload that never came due would satisfy the
+    /// second half on its own.
+    #[tokio::test(start_paused = true)]
+    async fn a_follow_budget_runs_out_into_a_reload_unless_the_page_was_signed_out_meanwhile() {
+        // Every tick of the budget polls, and every poll misses — there is no
+        // request for the server function to find — so the line goes down
+        // while the page stays signed in. The tick after the budget reloads.
+        let mut dom = VirtualDom::new(Following);
+        dom.rebuild_in_place();
+
+        run(&mut dom, SYNC_FOLLOW_TICKS + 1).await;
+
+        let state = refreshing(&dom);
+        assert_eq!(
+            dom.in_runtime(|| state.connection()),
+            Connection::Disconnected,
+            "the budget was spent on polls that were made and missed"
+        );
+        assert_eq!(reloads(&dom), 1, "the budget ran out and the rows reloaded");
+        assert!(!dom.in_runtime(|| state.syncing()), "the sync is over");
+
+        // The same budget, on a page a poll made elsewhere had the
+        // credentials refused for on the last tick of it.
+        let mut dom = VirtualDom::new(Following);
+        dom.rebuild_in_place();
+        run(&mut dom, SYNC_FOLLOW_TICKS).await;
+        let mut state = refreshing(&dom);
+        dom.in_runtime(|| state.poll_missed(Connection::SignedOut));
+
+        run(&mut dom, 1).await;
+
+        assert_eq!(reloads(&dom), 0, "the rows were not asked for again");
+        assert!(
+            dom.in_runtime(|| state.syncing()),
+            "the refresh ended rather than end the sync it had stopped following"
+        );
     }
 }
