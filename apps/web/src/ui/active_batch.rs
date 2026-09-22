@@ -376,13 +376,17 @@ fn completion_notice(progress: &BatchProgress) -> Option<String> {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
-    use dependaboard_core::{ActionOutcome, BulkActionKind, RejectReason};
+    use std::time::Duration;
+
+    use dependaboard_core::{ActionOutcome, BulkActionKind, PrRecord, RejectReason};
+    use dioxus::core::consume_context_from_scope;
 
     use super::*;
     use crate::ui::batch::WAITING_NOTICE_AFTER;
     use crate::ui::pr_target;
     use crate::ui::test_support::{
-        DashboardFixture, FIXTURE_NOW, followed, grouped_row, half_done_merge, render, serde_row,
+        BATCH, DashboardFixture, FIXTURE_NOW, followed, grouped_row, half_done_merge, off_page_row,
+        render, serde_row,
     };
 
     #[test]
@@ -685,5 +689,514 @@ mod tests {
             not_submitted_notice(&Fault::SignedOut),
             "Batch was not submitted: You are no longer signed in — reload to sign in again"
         );
+    }
+
+    // The tests below record what these five functions do today, ahead of the
+    // reseaming that will put them behind a gateway and let them be tested as
+    // decisions. Where a toast is the only thing a decision leaves behind,
+    // they read the rendered toast region; that assertion is scaffolding for
+    // the seam to replace, not a considered choice of what to assert on.
+
+    /// What a mounted [`Harness`] does with the host it built. It is called
+    /// from the component that built it, so the signal writes and the
+    /// `spawn`s the functions under test make have a live scope around them.
+    ///
+    /// A props field has to compare, and function pointers do not compare
+    /// meaningfully; a harness is mounted once and never rediffed against
+    /// another, so every action counts as the one already mounted.
+    #[derive(Clone, Copy)]
+    struct Act(fn(BatchHost, Seen));
+
+    impl PartialEq for Act {
+        fn eq(&self, _: &Self) -> bool {
+            true
+        }
+    }
+
+    /// The host's own signals, whether a retry is in flight, how often the
+    /// page was reloaded, and the host itself once the driver has built it —
+    /// provided on the app scope, so a test can read them from outside the
+    /// runtime once the action has run.
+    #[derive(Clone, Copy)]
+    struct Seen {
+        followed: Signal<Option<Followed>>,
+        open: Signal<bool>,
+        retrying: Signal<bool>,
+        reloads: Signal<u32>,
+        host: Signal<Option<BatchHost>>,
+    }
+
+    /// A [`BatchHost`] under the toast provider and the dashboard state, with
+    /// `act` run against it once, as the confirmation's and the drawer's
+    /// handlers run against the one [`ActiveBatch`] builds.
+    #[component]
+    fn Harness(
+        #[props(default)] followed: Option<Followed>,
+        #[props(default = Connection::Online)] connection: Connection,
+        #[props(default)] selected: Vec<PrRecord>,
+        act: Act,
+    ) -> Element {
+        let seen = use_context_provider(|| Seen {
+            followed: Signal::new(followed),
+            open: Signal::new(false),
+            retrying: Signal::new(false),
+            reloads: Signal::new(0),
+            host: Signal::new(None),
+        });
+        rsx! {
+            DashboardFixture {
+                connection,
+                selected,
+                reloads: seen.reloads,
+                Driver { act }
+            }
+        }
+    }
+
+    /// Builds the host where the toasts and the dashboard are, and runs the
+    /// action on it.
+    #[component]
+    fn Driver(act: Act) -> Element {
+        let mut seen = use_context::<Seen>();
+        let host = BatchHost {
+            followed: seen.followed,
+            follower: use_signal(|| None),
+            open: seen.open,
+            toast: use_toast(),
+            state: use_dashboard(),
+        };
+        use_hook(move || {
+            seen.host.set(Some(host));
+            (act.0)(host, seen);
+        });
+        rsx! {}
+    }
+
+    /// The harness with nothing followed, nothing selected, and the line to
+    /// the server online.
+    fn harness(act: fn(BatchHost, Seen)) -> HarnessProps {
+        HarnessProps {
+            followed: None,
+            connection: Connection::Online,
+            selected: Vec::new(),
+            act: Act(act),
+        }
+    }
+
+    /// Mounts the harness and runs its action.
+    fn mount(props: HarnessProps) -> (VirtualDom, Seen) {
+        let mut dom = VirtualDom::new_with_props(Harness, props);
+        dom.rebuild_in_place();
+        let seen = dom
+            .in_runtime(|| consume_context_from_scope::<Seen>(ScopeId::APP))
+            .expect("the harness provides what the host left");
+        (dom, seen)
+    }
+
+    /// Renders every scope the action left dirty, and the ones their writes
+    /// dirty in turn: a toast is sent into a signal the provider reads, one
+    /// level above where it was sent from.
+    fn settle(dom: &mut VirtualDom) {
+        for _ in 0..8 {
+            dom.render_immediate_to_vec();
+        }
+    }
+
+    /// Runs the task the action spawned to its end. Every flow driven here is
+    /// refused the credentials before it would reach the server, so it ends
+    /// without a poll, a sleep, or a server function being called.
+    ///
+    /// The dom polls its tasks while it waits for work, and a flow that ends
+    /// without dirtying a component leaves it waiting for good, so each wait
+    /// is bounded rather than waited on. A task that did not run shows up in
+    /// the assertions, not here.
+    async fn drive(dom: &mut VirtualDom) {
+        for _ in 0..4 {
+            let _ = tokio::time::timeout(Duration::from_millis(20), dom.wait_for_work()).await;
+            settle(dom);
+        }
+    }
+
+    /// The toast region as it stands, which is where a decision whose only
+    /// mark is a toast can be read.
+    fn toasts(dom: &mut VirtualDom) -> String {
+        settle(dom);
+        dioxus::ssr::render(dom)
+    }
+
+    /// The host the driver built, as the action left it.
+    fn host(dom: &VirtualDom, seen: Seen) -> BatchHost {
+        dom.in_runtime(|| (*seen.host.peek()).expect("the driver published the host"))
+    }
+
+    /// The line to the server as the action left it.
+    fn connection(dom: &VirtualDom, seen: Seen) -> Connection {
+        let host = host(dom, seen);
+        dom.in_runtime(|| host.state.connection())
+    }
+
+    /// The batch followed as the action left it.
+    fn following(dom: &VirtualDom, seen: Seen) -> Option<Followed> {
+        dom.in_runtime(|| seen.followed.peek().clone())
+    }
+
+    /// A finished merge with one target rejected over a head that moved,
+    /// which is a rejection a retry can cure.
+    fn with_a_curable_rejection() -> BatchProgress {
+        finished(ActionOutcome::Rejected {
+            reason: RejectReason::StaleSha {
+                expected: "def456".to_owned(),
+                actual: "def457".to_owned(),
+            },
+        })
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// A batch that ran to the end is announced and the page reloaded, and
+    /// the follow is left standing: the drawer stays open on the finished
+    /// batch, and the URL keeps it.
+    #[test]
+    fn a_batch_that_ran_to_the_end_is_announced_and_reloads_the_page_with_the_follow_left_standing()
+    {
+        let (mut dom, seen) = mount(HarnessProps {
+            followed: Some(followed(half_done_merge())),
+            ..harness(|host, _| conclude(BatchOutcome::Completed(one_of_each()), host))
+        });
+
+        assert_eq!(dom.in_runtime(|| *seen.reloads.peek()), 1);
+        assert!(following(&dom, seen).is_some(), "the follow stands");
+        assert_eq!(connection(&dom, seen), Connection::Online);
+        let html = toasts(&mut dom);
+        assert!(html.contains(r#"data-type="warning""#), "{html}");
+        assert!(
+            html.contains("Batch complete: 1 succeeded, 1 rejected, 1 failed."),
+            "{html}"
+        );
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// A batch Restate would not take is no batch to follow: the pill and
+    /// drawer stand down, which takes it out of the URL too, and the page is
+    /// not reloaded — nothing ran. The line to the server is left as it was:
+    /// Restate not answering is not the browser being signed out.
+    #[test]
+    fn a_batch_restate_would_not_take_stands_the_follow_down_without_a_reload_or_a_sign_out() {
+        let (mut dom, seen) = mount(HarnessProps {
+            followed: Some(followed(half_done_merge())),
+            ..harness(|host, _| {
+                conclude(
+                    BatchOutcome::NotSubmitted(Fault::Refused("Restate is unavailable".to_owned())),
+                    host,
+                );
+            })
+        });
+
+        assert_eq!(following(&dom, seen), None, "the follow stood down");
+        assert_eq!(dom.in_runtime(|| *seen.reloads.peek()), 0);
+        assert_eq!(connection(&dom, seen), Connection::Online);
+        let html = toasts(&mut dom);
+        assert!(html.contains(r#"data-type="error""#), "{html}");
+        assert!(
+            html.contains("Batch was not submitted after 5 attempts: Restate is unavailable"),
+            "{html}"
+        );
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// The submission being refused the credentials is the one fault that
+    /// both stands the follow down — there is no batch to pick up on the
+    /// reload, so nothing should stay in the URL — and signs the page out, so
+    /// the banner goes up at once and the live refresh asks nothing more. It
+    /// is the pair of the refused *follow* below, which does the second and
+    /// not the first.
+    #[test]
+    fn a_submission_the_credentials_were_refused_of_stands_the_follow_down_and_signs_the_page_out()
+    {
+        let (mut dom, seen) = mount(HarnessProps {
+            followed: Some(followed(half_done_merge())),
+            ..harness(|host, _| conclude(BatchOutcome::NotSubmitted(Fault::SignedOut), host))
+        });
+
+        assert_eq!(following(&dom, seen), None, "the follow stood down");
+        assert_eq!(connection(&dom, seen), Connection::SignedOut);
+        assert_eq!(dom.in_runtime(|| *seen.reloads.peek()), 0);
+        let html = toasts(&mut dom);
+        assert!(
+            html.contains("Batch was not submitted: You are no longer signed in"),
+            "{html}"
+        );
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// A follow the server refused the credentials of stands as it was: the
+    /// batch is still running in Restate, so it stays followed and stays in
+    /// the URL for the reload to pick up. The page is signed out all the
+    /// same, and nothing is said in a toast — the drawer says it.
+    #[test]
+    fn a_follow_the_credentials_were_refused_of_signs_the_page_out_and_leaves_the_follow_standing()
+    {
+        let (mut dom, seen) = mount(HarnessProps {
+            followed: Some(followed(half_done_merge())),
+            ..harness(|host, _| conclude(BatchOutcome::SignedOut, host))
+        });
+
+        assert!(
+            following(&dom, seen).is_some(),
+            "the batch stays followed, so the URL keeps it across the reload"
+        );
+        assert_eq!(connection(&dom, seen), Connection::SignedOut);
+        assert_eq!(dom.in_runtime(|| *seen.reloads.peek()), 0);
+        let html = toasts(&mut dom);
+        assert!(html.contains(r#"aria-label="0 notifications""#), "{html}");
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// A batch nobody would vouch for stands the follow down with the
+    /// projection's word on it in the notice, read off the follow as it
+    /// ended — before it is taken down. The page is neither reloaded nor
+    /// signed out.
+    #[test]
+    fn a_batch_nobody_would_vouch_for_stands_the_follow_down_and_says_which_link_it_was() {
+        let (mut dom, seen) = mount(HarnessProps {
+            followed: Some(Followed {
+                listing: Listing::Unlisted,
+                ..followed(half_done_merge())
+            }),
+            ..harness(|host, _| conclude(BatchOutcome::Unknown, host))
+        });
+
+        assert_eq!(following(&dom, seen), None, "the follow stood down");
+        assert_eq!(dom.in_runtime(|| *seen.reloads.peek()), 0);
+        assert_eq!(connection(&dom, seen), Connection::Online);
+        let html = toasts(&mut dom);
+        assert!(html.contains(r#"data-type="warning""#), "{html}");
+        assert!(
+            html.contains("No batch batch-1: the projection has no record of it"),
+            "the notice is read off the follow before it is taken down: {html}"
+        );
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// Queuing a batch takes the drawer over at once, before anything has
+    /// been submitted: the pill and drawer show the dashboard's own snapshot
+    /// of what was queued, in place of whatever was followed before. From a
+    /// page the server has already refused, the submission is not made at
+    /// all, and the batch is reported as not submitted for that reason.
+    #[tokio::test]
+    async fn queuing_a_batch_takes_the_drawer_over_and_a_refused_submission_hands_it_back() {
+        let (mut dom, seen) = mount(HarnessProps {
+            followed: Some(followed(half_done_merge())),
+            connection: Connection::SignedOut,
+            ..harness(|host, _| {
+                queue_batch(
+                    PendingAction {
+                        action: BulkActionKind::Merge,
+                        rows: vec![grouped_row()],
+                        retried_from: None,
+                    },
+                    host,
+                );
+            })
+        });
+
+        let queued = following(&dom, seen).expect("the queued batch is followed at once");
+        assert_ne!(
+            queued.batch_id, "batch-1",
+            "it took over from the batch before it"
+        );
+        assert!(!queued.heard, "Restate has not spoken for it yet");
+        assert_eq!(
+            queued
+                .progress
+                .as_ref()
+                .map(|progress| progress.targets.len()),
+            Some(1),
+            "the drawer shows the row queued before the first answer"
+        );
+        assert!(
+            dom.in_runtime(|| *seen.open.peek()),
+            "the drawer opened on it"
+        );
+
+        drive(&mut dom).await;
+
+        assert_eq!(following(&dom, seen), None, "the follow stood down");
+        let html = toasts(&mut dom);
+        assert!(
+            html.contains("Batch was not submitted: You are no longer signed in"),
+            "{html}"
+        );
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// Following the batch already followed changes nothing: it does not
+    /// restart the follow, throw away the progress in hand, or reopen a
+    /// drawer the user has closed.
+    #[test]
+    fn following_the_batch_already_followed_leaves_it_and_the_closed_drawer_as_they_were() {
+        let (dom, seen) = mount(HarnessProps {
+            followed: Some(followed(half_done_merge())),
+            ..harness(|host, _| attach_batch("batch-1".to_owned(), host))
+        });
+
+        assert_eq!(
+            following(&dom, seen),
+            Some(followed(half_done_merge())),
+            "the follow in hand is left alone, progress and all"
+        );
+        assert!(
+            !dom.in_runtime(|| *seen.open.peek()),
+            "the drawer is not reopened"
+        );
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// Following another batch by id takes the drawer over from the one
+    /// followed and asks after the new one. From a page the server has
+    /// already refused nothing is asked, and the follow ends signed out: it
+    /// stands as it was, so the reload picks the batch up from the URL, and
+    /// nothing is toasted.
+    #[tokio::test]
+    async fn following_another_batch_by_id_takes_the_drawer_over_and_a_refused_follow_stands() {
+        let (mut dom, seen) = mount(HarnessProps {
+            followed: Some(followed(half_done_merge())),
+            connection: Connection::SignedOut,
+            ..harness(|host, _| attach_batch(BATCH.to_owned(), host))
+        });
+
+        let attaching = following(&dom, seen).expect("the new batch is followed at once");
+        assert_eq!(attaching.batch_id, BATCH);
+        assert_eq!(attaching.progress, None, "nothing is known of it yet");
+        assert!(
+            dom.in_runtime(|| *seen.open.peek()),
+            "the drawer opened on it"
+        );
+
+        drive(&mut dom).await;
+
+        let stood = following(&dom, seen).expect("a refused follow stands as it was");
+        assert_eq!(stood.batch_id, BATCH);
+        assert!(stood.signed_out(), "the drawer says why it stopped asking");
+        assert_eq!(connection(&dom, seen), Connection::SignedOut);
+        let html = toasts(&mut dom);
+        assert!(html.contains(r#"aria-label="0 notifications""#), "{html}");
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// Once Restate has the batch, every row the action was queued with
+    /// leaves the selection — the ones it runs and the ones the server left
+    /// out alike, since neither is for a next batch — and the left-out ones
+    /// are named with their repositories, in the retry's words.
+    #[test]
+    fn accounting_for_a_queued_batch_deselects_its_rows_and_names_the_ones_left_out() {
+        let (mut dom, seen) = mount(HarnessProps {
+            selected: vec![grouped_row(), serde_row(), off_page_row()],
+            ..harness(|host, _| {
+                let pending = PendingAction {
+                    action: BulkActionKind::Merge,
+                    rows: vec![grouped_row(), serde_row()],
+                    retried_from: None,
+                };
+                let receipt = BatchReceipt {
+                    left_out: vec![pr_target(&serde_row()).key()],
+                };
+                account_for(&pending, &receipt, host);
+            })
+        });
+
+        let state = host(&dom, seen).state;
+        dom.in_runtime(|| {
+            assert!(!state.is_selected(&grouped_row().id), "the queued row left");
+            assert!(
+                !state.is_selected(&serde_row().id),
+                "the left-out row left too"
+            );
+            assert!(
+                state.is_selected(&off_page_row().id),
+                "the rest of the selection stands for the next batch"
+            );
+        });
+        let html = toasts(&mut dom);
+        assert!(html.contains(r#"data-type="warning""#), "{html}");
+        assert!(
+            html.contains("Left out of the batch: acme/web#12 is no longer open."),
+            "{html}"
+        );
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// A retry the server refused the credentials of is given up whole,
+    /// saying so, and the page is told it is signed out; nothing is queued,
+    /// so the finished batch stays in the drawer. The retry is held while
+    /// the targets are refreshed, so a second click while the first is in
+    /// flight does nothing, and it is let go once the refresh is over.
+    #[tokio::test]
+    async fn a_retry_the_credentials_were_refused_of_is_given_up_whole_and_is_asked_for_once() {
+        let (mut dom, seen) = mount(HarnessProps {
+            followed: Some(followed(with_a_curable_rejection())),
+            connection: Connection::SignedOut,
+            ..harness(|host, seen| {
+                retry_rejected(with_a_curable_rejection(), seen.retrying, host);
+                retry_rejected(with_a_curable_rejection(), seen.retrying, host);
+            })
+        });
+
+        assert!(
+            dom.in_runtime(|| *seen.retrying.peek()),
+            "the retry is held while the targets are refreshed"
+        );
+
+        drive(&mut dom).await;
+
+        assert!(
+            !dom.in_runtime(|| *seen.retrying.peek()),
+            "and let go once the refresh is over"
+        );
+        assert_eq!(connection(&dom, seen), Connection::SignedOut);
+        assert_eq!(
+            following(&dom, seen).map(|followed| followed.batch_id),
+            Some("batch-1".to_owned()),
+            "nothing was queued, so the finished batch keeps the drawer"
+        );
+        let html = toasts(&mut dom);
+        assert!(
+            html.contains(r#"aria-label="1 notifications""#),
+            "the second ask did nothing: {html}"
+        );
+        assert!(
+            html.contains("The retry was given up: You are no longer signed in"),
+            "{html}"
+        );
+    }
+
+    /// Records present behaviour ahead of a reseaming.
+    ///
+    /// The guard a retry stands down on: whether the host is still following
+    /// the batch whose targets were refreshed. The stand-down itself cannot
+    /// be reached from a test today — it needs a refresh that answers with
+    /// rows, which is the server — so the predicate it turns on is pinned
+    /// here on its own, and the notice it leads to is not.
+    #[test]
+    fn a_host_follows_only_the_batch_id_it_holds() {
+        let (dom, seen) = mount(HarnessProps {
+            followed: Some(followed(half_done_merge())),
+            ..harness(|_, _| {})
+        });
+        let host = host(&dom, seen);
+
+        dom.in_runtime(|| {
+            assert!(host.follows("batch-1"));
+            assert!(!host.follows(BATCH));
+        });
     }
 }

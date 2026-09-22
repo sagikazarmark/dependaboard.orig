@@ -204,7 +204,8 @@ pub(crate) fn loaded_summary() -> DashboardSummary {
 /// (cut short by the batch limit from `capped_from` matching rows, if given),
 /// the clock at `now`, a manual sync in flight if `syncing`, and the line to
 /// the server as `connection` found it with the last poll answered at
-/// `refreshed_at`. Reloads go nowhere.
+/// `refreshed_at`. Reloads go nowhere; `reloads` counts them for a test
+/// that has to see one.
 #[component]
 pub(crate) fn DashboardFixture(
     #[props(default)] filter: PrFilter,
@@ -217,6 +218,7 @@ pub(crate) fn DashboardFixture(
     #[props(default)] syncing: bool,
     #[props(default = Connection::Online)] connection: Connection,
     #[props(default)] refreshed_at: Option<u64>,
+    #[props(default)] reloads: Option<Signal<u32>>,
     children: Element,
 ) -> Element {
     let mut state = DashboardState::provide(
@@ -235,7 +237,11 @@ pub(crate) fn DashboardFixture(
             capabilities: use_signal(|| capabilities).into(),
         },
         use_signal(|| now),
-        use_callback(|_| {}),
+        use_callback(move |()| {
+            if let Some(mut reloads) = reloads {
+                *reloads.write() += 1;
+            }
+        }),
     );
     use_hook(move || {
         if syncing {
