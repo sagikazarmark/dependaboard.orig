@@ -9,7 +9,7 @@ use dependaboard_core::{FacetCounts, LabelFacet, PrFilter, RepoFacet};
 use libsql::Value;
 
 use crate::{
-    ScopedFilter, StoreError,
+    REPO_EXTRA_INDEX, ScopedFilter, StoreError,
     filter::{Facet, without_facet},
     integer, repo_columns, repo_from_row, stored_enum, unsigned,
 };
@@ -107,7 +107,7 @@ async fn repository_facets(
         .await?;
     let mut facets = Vec::new();
     while let Some(row) = rows.next().await? {
-        let count = unsigned(row.get::<i64>(6)?)?;
+        let count = unsigned(row.get::<i64>(REPO_EXTRA_INDEX)?)?;
         facets.push(RepoFacet {
             repository: repo_from_row(row)?,
             count,

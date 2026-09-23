@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, sync::LazyLock, time::Duration,
+};
 
 use async_trait::async_trait;
 use dependaboard_core::{
@@ -352,32 +354,7 @@ impl ProjectionWriter for LibSqlPrStore {
         let id = pr.key().to_string();
         connection
             .execute(
-                r#"INSERT INTO pull_requests (
-                    id, repository_id, owner, repo, number, title, html_url, dependency,
-                    from_version, to_version, dependencies, update_type, head_sha,
-                    check_status, mergeable, labels, created_at, updated_at, synced_at
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?19
-                ) ON CONFLICT(id) DO UPDATE SET
-                    repository_id = excluded.repository_id,
-                    owner = excluded.owner,
-                    repo = excluded.repo,
-                    number = excluded.number,
-                    title = excluded.title,
-                    html_url = excluded.html_url,
-                    dependency = excluded.dependency,
-                    from_version = excluded.from_version,
-                    to_version = excluded.to_version,
-                    dependencies = excluded.dependencies,
-                    update_type = excluded.update_type,
-                    head_sha = excluded.head_sha,
-                    check_status = excluded.check_status,
-                    mergeable = excluded.mergeable,
-                    labels = excluded.labels,
-                    created_at = excluded.created_at,
-                    updated_at = excluded.updated_at,
-                    synced_at = excluded.synced_at"#,
+                upsert_pr_sql(),
                 vec![
                     Value::Text(id),
                     integer(pr.repository_id)?,
@@ -897,14 +874,88 @@ impl ProjectionReader for LibSqlPrStore {
     }
 }
 
+/// The columns of `pull_requests`, in the order the projection writes them and
+/// reads them back. Minted from one list rather than written out per
+/// statement, so a column the record gains cannot reach the insert and miss
+/// the rewrite, or reach both and miss the projection a reader decodes — the
+/// argument [`repo_columns`] makes for the other table, with four statements
+/// to keep in step here instead of two.
+///
+/// The order is the decoder's: [`pr_from_row`] reads `0..PR_COLUMNS.len()`
+/// straight through, so an entry's place here is the index that reads it.
+const PR_COLUMNS: [&str; 19] = [
+    "id",
+    "repository_id",
+    "owner",
+    "repo",
+    "number",
+    "title",
+    "html_url",
+    "dependency",
+    "from_version",
+    "to_version",
+    "dependencies",
+    "update_type",
+    "head_sha",
+    "check_status",
+    "mergeable",
+    "labels",
+    "created_at",
+    "updated_at",
+    "synced_at",
+];
+
+/// Where [`select_pr_sql`] puts the installation it joins in: past the pull
+/// request's own columns, so its index is the roster's length rather than a
+/// literal in the middle that every column after it has to be counted around.
+const PR_INSTALLATION_INDEX: i32 = PR_COLUMNS.len() as i32;
+
+/// [`PR_COLUMNS`] under `alias`, for the statements that name the table.
+fn pr_columns(alias: &str) -> String {
+    PR_COLUMNS
+        .map(|column| format!("{alias}{column}"))
+        .join(", ")
+}
+
+/// The projection's write for one pull request: insert it, or rewrite every
+/// column but the one it is keyed by. Rendered from [`PR_COLUMNS`] so the
+/// three forms a column takes in this statement — its name, its placeholder,
+/// and its `excluded` assignment — are one list, and the parameter vector the
+/// caller binds is the only thing left to keep in step by hand.
+fn upsert_pr_sql() -> &'static str {
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        let columns = PR_COLUMNS.join(", ");
+        let placeholders = (1..=PR_COLUMNS.len())
+            .map(|position| format!("?{position}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // `id` is the conflict target, so it is the one column a rewrite
+        // leaves alone — and the one value derived rather than taken from the
+        // record, which is why it could never be rewritten from `excluded`.
+        let rewrite = PR_COLUMNS
+            .iter()
+            .filter(|column| **column != "id")
+            .map(|column| format!("{column} = excluded.{column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "INSERT INTO pull_requests ({columns}) VALUES ({placeholders}) \
+             ON CONFLICT(id) DO UPDATE SET {rewrite}"
+        )
+    });
+    &SQL
+}
+
 fn select_pr_sql() -> &'static str {
-    r#"SELECT
-        p.id, p.repository_id, r.installation_id, p.owner, p.repo, p.number,
-        p.title, p.html_url, p.dependency, p.from_version, p.to_version,
-        p.dependencies, p.update_type, p.head_sha, p.check_status, p.mergeable,
-        p.labels, p.created_at, p.updated_at, p.synced_at
-       FROM pull_requests p
-       JOIN repositories r ON r.repository_id = p.repository_id"#
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            "SELECT {}, r.installation_id \
+             FROM pull_requests p \
+             JOIN repositories r ON r.repository_id = p.repository_id",
+            pr_columns("p.")
+        )
+    });
+    &SQL
 }
 
 /// The dashboard's total for a [`ScopedFilter`]'s clause.
@@ -923,43 +974,45 @@ fn page_sql(scoped: &mut ScopedFilter, limit: u64) -> Result<String, StoreError>
     ))
 }
 
-/// The pull request's own columns of a [`select_pr_sql`] row; column 2, the
-/// installation joined in from `repositories`, is [`installation_from_row`]'s.
+/// The pull request's own columns of a [`select_pr_sql`] row, which are
+/// [`PR_COLUMNS`] in order; the installation joined in past them is
+/// [`installation_from_row`]'s.
 fn pr_from_row(row: &Row) -> Result<PrRecord, StoreError> {
     Ok(PrRecord {
         id: row.get(0)?,
         repository_id: unsigned(row.get::<i64>(1)?)?,
-        owner: row.get(3)?,
-        repo: row.get(4)?,
-        number: unsigned(row.get::<i64>(5)?)?,
-        title: row.get(6)?,
-        html_url: row.get(7)?,
-        dependency: row.get(8)?,
-        from_version: row.get(9)?,
-        to_version: row.get(10)?,
-        dependencies: serde_json::from_str(&row.get::<String>(11)?)?,
-        update_type: stored_enum(row.get(12)?)?,
-        head_sha: row.get(13)?,
-        check_status: stored_enum(row.get(14)?)?,
+        owner: row.get(2)?,
+        repo: row.get(3)?,
+        number: unsigned(row.get::<i64>(4)?)?,
+        title: row.get(5)?,
+        html_url: row.get(6)?,
+        dependency: row.get(7)?,
+        from_version: row.get(8)?,
+        to_version: row.get(9)?,
+        dependencies: serde_json::from_str(&row.get::<String>(10)?)?,
+        update_type: stored_enum(row.get(11)?)?,
+        head_sha: row.get(12)?,
+        check_status: stored_enum(row.get(13)?)?,
         // The column is nullable and was once written verbatim from GitHub, so
         // NULL and any unrecognised legacy text deliberately fold into Unknown
         // rather than surfacing as CorruptEnum.
         mergeable: row
-            .get::<Option<String>>(15)?
+            .get::<Option<String>>(14)?
             .as_deref()
             .map_or(Mergeable::Unknown, Mergeable::from_github_state),
-        labels: serde_json::from_str(&row.get::<String>(16)?)?,
-        created_at: unsigned(row.get::<i64>(17)?)?,
-        updated_at: unsigned(row.get::<i64>(18)?)?,
-        synced_at: unsigned(row.get::<i64>(19)?)?,
+        labels: serde_json::from_str(&row.get::<String>(15)?)?,
+        created_at: unsigned(row.get::<i64>(16)?)?,
+        updated_at: unsigned(row.get::<i64>(17)?)?,
+        synced_at: unsigned(row.get::<i64>(18)?)?,
     })
 }
 
 /// The installation of the repository a [`select_pr_sql`] row's pull request
-/// hangs off, joined in as column 2. The pull request's own columns hold no
+/// hangs off, joined in past the pull request's own columns at
+/// [`PR_INSTALLATION_INDEX`]. The pull request's own columns hold no
 /// installation: the repository row is what says whose it is.
 fn installation_from_row(row: &Row) -> Result<u64, StoreError> {
-    unsigned(row.get::<i64>(2)?)
+    unsigned(row.get::<i64>(PR_INSTALLATION_INDEX)?)
 }
 
 /// Drains the rows of a [`select_pr_sql`] query, in the order the database
@@ -984,17 +1037,25 @@ fn stored_enum<T: FromStr>(value: String) -> Result<T, StoreError> {
 /// `"r."` for one that binds it beside another. Minted from one list rather
 /// than written out per statement, so a column the mapper gains cannot reach
 /// one reader's `SELECT` and miss the other's.
+/// The columns of `repositories`, in the order [`repo_from_row`] reads them.
+pub(crate) const REPO_COLUMNS: [&str; 6] = [
+    "repository_id",
+    "installation_id",
+    "owner",
+    "repo",
+    "merge_method",
+    "synced_at",
+];
+
+/// Where a statement that appends a column of its own to [`REPO_COLUMNS`]
+/// finds it: past the repository's own, so its index is the roster's length.
+/// The repository facet appends a count that way.
+pub(crate) const REPO_EXTRA_INDEX: i32 = REPO_COLUMNS.len() as i32;
+
 pub(crate) fn repo_columns(alias: &str) -> String {
-    [
-        "repository_id",
-        "installation_id",
-        "owner",
-        "repo",
-        "merge_method",
-        "synced_at",
-    ]
-    .map(|column| format!("{alias}{column}"))
-    .join(", ")
+    REPO_COLUMNS
+        .map(|column| format!("{alias}{column}"))
+        .join(", ")
 }
 
 fn select_repo_sql() -> String {
@@ -1298,6 +1359,39 @@ mod tests {
             ]
         );
         assert_eq!(store.get_prs(INSTALLATION, &[]).await.unwrap(), Vec::new());
+    }
+
+    /// The roster the statements are minted from and the table the migrations
+    /// build name the same columns. A migration that adds one the roster never
+    /// learns of is a column nothing writes and nothing reads; a roster entry
+    /// the table has not got is a statement SQLite refuses, which every other
+    /// test here would already be shouting about. This is the direction
+    /// nothing else covers: the migrations are only ever compared with each
+    /// other (`migrations::tests`), so a column added to the schema alone is
+    /// silent everywhere.
+    ///
+    /// By name and not by position: a later `ALTER TABLE ... ADD COLUMN`
+    /// appends physically wherever SQLite likes, while the roster's order is
+    /// the decoder's, and the two have no reason to agree.
+    #[tokio::test]
+    async fn the_roster_names_exactly_the_columns_the_pull_requests_table_has() {
+        let (_directory, store) = test_store().await;
+        let connection = store.connection().await;
+
+        let mut declared = Vec::new();
+        let mut rows = connection
+            .query("PRAGMA table_info(pull_requests)", ())
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            declared.push(row.get::<String>(1).unwrap());
+        }
+        declared.sort_unstable();
+
+        let mut rostered = PR_COLUMNS.map(str::to_owned).to_vec();
+        rostered.sort_unstable();
+
+        assert_eq!(declared, rostered);
     }
 
     /// One pull request whose every field of a given type holds a value no
