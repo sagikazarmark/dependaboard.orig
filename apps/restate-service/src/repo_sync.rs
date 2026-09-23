@@ -13,7 +13,7 @@ use crate::{
     github::{GithubApiHandle, RestateGithubStep, read_result, run_github_step},
     handler::traced,
     pull_request::{PullRequestClient, request_key, short_sha},
-    retirement::{RestateRetirements, RetirementEffects, retire_pending},
+    retirement::{Pruned, RestateRetirements, RetirementEffects, retire_pending},
     store::{StoreStepContext, StoreStepKind},
 };
 
@@ -39,14 +39,14 @@ trait RepoReconcileEffects {
         request: &SyncRequest,
     ) -> impl Future<Output = Result<(), TerminalError>> + Send;
     /// Prunes the projection down to `live`, sparing rows synced since `synced_before`.
-    /// The keys it removes are queued for retirement by the store under the same fence;
-    /// the drain that follows tells them, so nothing here depends on what this step
-    /// returns.
+    /// The keys it removes are queued for retirement by the store under the same fence,
+    /// so what this resolves to is not them but a [`Pruned`]: nothing to read, and no
+    /// way to reach the end of a reconcile without handing it to the drain.
     fn retain_pull_requests(
         &mut self,
         live: &[u64],
         synced_before: u64,
-    ) -> impl Future<Output = HandlerResult<()>> + Send;
+    ) -> impl Future<Output = HandlerResult<Pruned>> + Send;
     /// The repository's pull requests whose head is `sha`, as the projection has them.
     fn pull_requests_at(
         &mut self,
@@ -121,7 +121,7 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
         &mut self,
         live: &[u64],
         synced_before: u64,
-    ) -> HandlerResult<()> {
+    ) -> HandlerResult<Pruned> {
         let store = self.store.clone();
         let repository_id = self.repository_id;
         let live = live.to_vec();
@@ -137,7 +137,7 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
                 },
             )
             .await?;
-        Ok(())
+        Ok(Pruned::landed())
     }
 
     async fn pull_requests_at(&mut self, sha: &str) -> HandlerResult<Vec<PrRecord>> {
@@ -199,8 +199,8 @@ async fn run_repo_reconcile<E: RepoReconcileEffects, R: RetirementEffects>(
         .iter()
         .map(|request| request.number)
         .collect::<Vec<_>>();
-    restate.retain_pull_requests(&live, reconcile_start).await?;
-    retire_pending(retirements).await?;
+    let pruned = restate.retain_pull_requests(&live, reconcile_start).await?;
+    retire_pending(pruned, retirements).await?;
     if failed.is_empty() {
         return Ok(pulls.len());
     }
@@ -316,6 +316,8 @@ impl RepoSync {
 mod tests {
     use std::collections::BTreeMap;
 
+    use dependaboard_core::Retirement;
+
     use super::*;
     use crate::{
         pull_request::ClosedRequest,
@@ -418,12 +420,12 @@ mod tests {
             &mut self,
             live: &[u64],
             synced_before: u64,
-        ) -> HandlerResult<()> {
+        ) -> HandlerResult<Pruned> {
             self.retained = Some(live.to_vec());
             self.retained_under = Some(synced_before);
             match self.retain_failure.take() {
                 Some(error) => Err(error),
-                None => Ok(()),
+                None => Ok(Pruned::landed()),
             }
         }
 
@@ -529,6 +531,65 @@ mod tests {
              unless it was re-synced since the sweep began"
         );
         assert_eq!(retirements.acknowledged, vec![2]);
+    }
+
+    /// The token a prune hands the drain unlocks it; it does not scope it. Every prune
+    /// writes to one outbox and any drain empties the whole of it, which is what makes a
+    /// drain lost to a crash harmless — the next handler to prune anything finishes it —
+    /// and it is the property a prune that owned its queue entries would destroy.
+    #[tokio::test]
+    async fn one_repositorys_drain_also_retires_what_another_repositorys_sweep_pruned() {
+        let mut restate = RecordedRepoSync {
+            pulls: vec![dependabot_pull(12)],
+            ..Default::default()
+        };
+        // Repository 8's sweep pruned 8#1 an hour ago under its own fence and died before
+        // draining; repository 7's retain has just queued 7#3 under this sweep's.
+        let mut retirements = RecordedRetirements {
+            pending: vec![
+                Retirement {
+                    id: 4,
+                    key: PrKey::new(8, 1),
+                    synced_before: Some(CLOCK_EPOCH - 3_600),
+                },
+                Retirement {
+                    id: 5,
+                    key: PrKey::new(7, 3),
+                    synced_before: Some(CLOCK_EPOCH),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let swept = run_repo_reconcile(&mut restate, &mut retirements)
+            .await
+            .unwrap();
+
+        assert_eq!(swept, 1);
+        assert_eq!(
+            retirements.closed,
+            vec![
+                (
+                    PrKey::new(8, 1),
+                    ClosedRequest {
+                        synced_before: Some(CLOCK_EPOCH - 3_600)
+                    }
+                ),
+                (
+                    PrKey::new(7, 3),
+                    ClosedRequest {
+                        synced_before: Some(CLOCK_EPOCH)
+                    }
+                ),
+            ],
+            "this repository's drain tells the pull request another repository's sweep \
+             pruned, under the fence that sweep recorded and not this one's"
+        );
+        assert_eq!(
+            retirements.acknowledged,
+            vec![5],
+            "the whole outbox is emptied, not this repository's share of it"
+        );
     }
 
     #[tokio::test]

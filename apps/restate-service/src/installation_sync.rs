@@ -13,7 +13,7 @@ use crate::{
     github::{GithubApiHandle, RestateGithubStep, read_result, run_github_step},
     handler::{HandlerOutcome, traced},
     repo_sync::RepoSyncClient,
-    retirement::{RestateRetirements, RetirementEffects, retire_pending},
+    retirement::{Pruned, RestateRetirements, RetirementEffects, retire_pending},
     store::{StoreStepContext, StoreStepKind},
 };
 
@@ -161,16 +161,17 @@ impl InstallationSync {
                 .key()
                 .parse::<u64>()
                 .map_err(|_| TerminalError::new("installation key must be an integer"))?;
-            let mut restate = RestatePurgeEffects {
+            let mut restate = RestateSyncEffects {
                 ctx: &ctx,
+                github: &self.github,
                 store: &self.store,
-                installation_id,
             };
             let mut retirements = RestateRetirements {
                 ctx: &ctx,
                 store: &self.store,
             };
-            let pull_requests = run_installation_purge(&mut restate, &mut retirements).await?;
+            let pull_requests =
+                run_installation_purge(&mut restate, installation_id, &mut retirements).await?;
             Ok(format!("retired {pull_requests} pull requests"))
         })
         .await
@@ -324,8 +325,11 @@ async fn run_scheduler_tick<E: SchedulerTickEffects>(
     Ok(SchedulerTickOutcome::Swept { repositories })
 }
 
-/// Side effects an installation sweep asks of Restate, GitHub and the store, abstracted
-/// so `run_installation_sync` can be exercised against a recording fake without a runtime.
+/// Side effects the installation's handlers ask of Restate, GitHub and the store — the
+/// sweep's fence, listing, replace and fan-out, and the purge's drop — abstracted so
+/// `run_installation_sync` and `run_installation_purge` can be exercised against a
+/// recording fake without a runtime. One seam for the object, so the two prunes it owns
+/// are pruned, and drained, the same way.
 trait InstallationSyncEffects {
     /// The wall clock, in Unix seconds, journaled under `step` so a replay reads the
     /// same moment.
@@ -336,13 +340,23 @@ trait InstallationSyncEffects {
     /// Makes `repositories` the installation's set in the projection, upserting them and
     /// dropping the rest, sparing repositories synced since `synced_before`. The pull
     /// requests that went with the dropped ones are queued for retirement by the store
-    /// under the same fence; the drain that follows tells them, so nothing here depends
-    /// on what this step returns.
+    /// under the same fence, so what this resolves to is not them but a [`Pruned`]:
+    /// nothing to read, and no way to reach the end of a sweep without handing it to the
+    /// drain.
     fn replace_repositories(
         &mut self,
         repositories: &[RepoRecord],
         synced_before: u64,
-    ) -> impl Future<Output = HandlerResult<()>> + Send;
+    ) -> impl Future<Output = HandlerResult<Pruned>> + Send;
+    /// Drops `installation_id`'s repositories and pull requests from the projection. The
+    /// pull requests are queued for retirement by the store, unfenced: the App has lost
+    /// the installation, so no webhook can reopen them. The installation is the one the
+    /// object is keyed by, passed rather than taken from the GitHub handle, which knows
+    /// only the deployment's own.
+    fn purge_projection(
+        &mut self,
+        installation_id: u64,
+    ) -> impl Future<Output = HandlerResult<Pruned>> + Send;
     /// Fans a reconcile out to the repository's `RepoSync` object.
     fn reconcile_repository(&mut self, repository: RepoRecord);
 }
@@ -382,7 +396,7 @@ impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
         &mut self,
         repositories: &[RepoRecord],
         synced_before: u64,
-    ) -> HandlerResult<()> {
+    ) -> HandlerResult<Pruned> {
         let store = self.store.clone();
         let installation_id = self.github.installation_id();
         let repositories = repositories.to_vec();
@@ -398,7 +412,19 @@ impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
                 },
             )
             .await?;
-        Ok(())
+        Ok(Pruned::landed())
+    }
+
+    async fn purge_projection(&mut self, installation_id: u64) -> HandlerResult<Pruned> {
+        let store = self.store.clone();
+        self.ctx
+            .run_store_step(
+                "purge-installation",
+                StoreStepKind::Ordinary,
+                move || async move { store.purge_installation(installation_id).await.map(drop) },
+            )
+            .await?;
+        Ok(Pruned::landed())
     }
 
     fn reconcile_repository(&mut self, repository: RepoRecord) {
@@ -423,10 +449,10 @@ async fn run_installation_sync<E: InstallationSyncEffects, R: RetirementEffects>
     // runs spares it.
     let reconcile_start = restate.now("installation-reconcile-clock").await?;
     let repositories = restate.list_repositories().await?;
-    restate
+    let pruned = restate
         .replace_repositories(&repositories, reconcile_start)
         .await?;
-    retire_pending(retirements).await?;
+    retire_pending(pruned, retirements).await?;
     let count = repositories.len();
     for repository in repositories {
         restate.reconcile_repository(repository);
@@ -446,45 +472,16 @@ async fn perform_installation_sync(
     run_installation_sync(&mut restate, &mut retirements).await
 }
 
-/// Side effects a purge asks of Restate and the store, abstracted so
-/// `run_installation_purge` can be exercised against a recording fake without a runtime.
-trait InstallationPurgeEffects {
-    /// Drops the installation's repositories and pull requests from the projection. The
-    /// pull requests are queued for retirement by the store, unfenced: the App has lost
-    /// the installation, so no webhook can reopen them.
-    fn purge_projection(&mut self) -> impl Future<Output = HandlerResult<()>> + Send;
-}
-
-struct RestatePurgeEffects<'a, 'ctx> {
-    ctx: &'a ObjectContext<'ctx>,
-    store: &'a Arc<dyn ProjectionWriter>,
-    installation_id: u64,
-}
-
-impl InstallationPurgeEffects for RestatePurgeEffects<'_, '_> {
-    async fn purge_projection(&mut self) -> HandlerResult<()> {
-        let store = self.store.clone();
-        let installation_id = self.installation_id;
-        self.ctx
-            .run_store_step(
-                "purge-installation",
-                StoreStepKind::Ordinary,
-                move || async move { store.purge_installation(installation_id).await.map(drop) },
-            )
-            .await?;
-        Ok(())
-    }
-}
-
 /// Purges the installation's projection, then retires the durable state of every pull
 /// request the outbox holds, so no object keeps serving a snapshot for a repository the
 /// App can no longer see. Resolves to how many pull requests were retired.
-async fn run_installation_purge<E: InstallationPurgeEffects, R: RetirementEffects>(
+async fn run_installation_purge<E: InstallationSyncEffects, R: RetirementEffects>(
     restate: &mut E,
+    installation_id: u64,
     retirements: &mut R,
 ) -> HandlerResult<usize> {
-    restate.purge_projection().await?;
-    retire_pending(retirements).await
+    let pruned = restate.purge_projection(installation_id).await?;
+    retire_pending(pruned, retirements).await
 }
 
 #[cfg(test)]
@@ -715,72 +712,6 @@ mod tests {
         );
     }
 
-    /// Stands in for Restate and the store during an installation purge and records what
-    /// the purge asked of them.
-    #[derive(Default)]
-    struct RecordedPurge {
-        purge_failure: Option<HandlerError>,
-        purged: bool,
-    }
-
-    impl InstallationPurgeEffects for RecordedPurge {
-        async fn purge_projection(&mut self) -> HandlerResult<()> {
-            self.purged = true;
-            match self.purge_failure.take() {
-                Some(error) => Err(error),
-                None => Ok(()),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn a_purge_retires_the_durable_state_of_every_pull_request_it_removed() {
-        let mut restate = RecordedPurge::default();
-        // What the projection queued when the installation's repositories went: unfenced,
-        // since the App has lost the installation and nothing can reopen them.
-        let mut retirements = RecordedRetirements::queued(
-            &[PrKey::new(7, 3), PrKey::new(7, 9), PrKey::new(8, 1)],
-            None,
-        );
-
-        let retired = run_installation_purge(&mut restate, &mut retirements)
-            .await
-            .unwrap();
-
-        assert_eq!(retired, 3);
-        assert!(restate.purged);
-        assert_eq!(
-            retirements.closed,
-            vec![
-                (PrKey::new(7, 3), ClosedRequest::default()),
-                (PrKey::new(7, 9), ClosedRequest::default()),
-                (PrKey::new(8, 1), ClosedRequest::default()),
-            ],
-            "no pull request of a deleted installation may keep a snapshot"
-        );
-        assert_eq!(retirements.acknowledged, vec![3]);
-    }
-
-    #[tokio::test]
-    async fn a_failed_purge_retires_nothing() {
-        let mut restate = RecordedPurge {
-            purge_failure: Some(TerminalError::new("projection store is read-only").into()),
-            ..Default::default()
-        };
-        let mut retirements = RecordedRetirements::queued(&[PrKey::new(7, 3)], None);
-
-        let outcome = run_installation_purge(&mut restate, &mut retirements).await;
-
-        assert!(
-            outcome.is_err(),
-            "the failed purge stays visible to Restate"
-        );
-        assert!(
-            retirements.closed.is_empty(),
-            "the projection still holds the rows, so their objects keep their state"
-        );
-    }
-
     fn installed_repository(repository_id: u64) -> RepoRecord {
         RepoRecord {
             repository_id,
@@ -794,8 +725,8 @@ mod tests {
 
     const CLOCK_EPOCH: u64 = 1_700_000_000;
 
-    /// Stands in for Restate, GitHub and the store during an installation sweep and
-    /// records what the sweep asked of them.
+    /// Stands in for Restate, GitHub and the store during an installation sweep or
+    /// purge, and records what it asked of them.
     #[derive(Default)]
     struct RecordedSweep {
         repositories: Vec<RepoRecord>,
@@ -811,6 +742,9 @@ mod tests {
         /// What the clock stood at when the listing was asked for: a fence read before
         /// it is strictly smaller.
         clock_when_listed: Option<u64>,
+        purge_failure: Option<HandlerError>,
+        /// The installation the purge was asked to drop, if it was asked.
+        purged: Option<u64>,
     }
 
     impl InstallationSyncEffects for RecordedSweep {
@@ -832,7 +766,7 @@ mod tests {
             &mut self,
             repositories: &[RepoRecord],
             synced_before: u64,
-        ) -> HandlerResult<()> {
+        ) -> HandlerResult<Pruned> {
             self.replaced = Some(
                 repositories
                     .iter()
@@ -842,7 +776,15 @@ mod tests {
             self.replaced_under = Some(synced_before);
             match self.replace_failure.take() {
                 Some(error) => Err(error),
-                None => Ok(()),
+                None => Ok(Pruned::landed()),
+            }
+        }
+
+        async fn purge_projection(&mut self, installation_id: u64) -> HandlerResult<Pruned> {
+            self.purged = Some(installation_id);
+            match self.purge_failure.take() {
+                Some(error) => Err(error),
+                None => Ok(Pruned::landed()),
             }
         }
 
@@ -998,5 +940,58 @@ mod tests {
         );
         assert!(retirements.closed.is_empty());
         assert!(restate.reconciled.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_purge_retires_the_durable_state_of_every_pull_request_it_removed() {
+        let mut restate = RecordedSweep::default();
+        // What the projection queued when the installation's repositories went: unfenced,
+        // since the App has lost the installation and nothing can reopen them.
+        let mut retirements = RecordedRetirements::queued(
+            &[PrKey::new(7, 3), PrKey::new(7, 9), PrKey::new(8, 1)],
+            None,
+        );
+
+        let retired = run_installation_purge(&mut restate, 1, &mut retirements)
+            .await
+            .unwrap();
+
+        assert_eq!(retired, 3);
+        assert_eq!(
+            restate.purged,
+            Some(1),
+            "the installation dropped is the one the object is keyed by"
+        );
+        assert_eq!(
+            retirements.closed,
+            vec![
+                (PrKey::new(7, 3), ClosedRequest::default()),
+                (PrKey::new(7, 9), ClosedRequest::default()),
+                (PrKey::new(8, 1), ClosedRequest::default()),
+            ],
+            "no pull request of a deleted installation may keep a snapshot, and none is \
+             spared: the purge queued them unfenced, so every close is unconditional"
+        );
+        assert_eq!(retirements.acknowledged, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_purge_retires_nothing() {
+        let mut restate = RecordedSweep {
+            purge_failure: Some(TerminalError::new("projection store is read-only").into()),
+            ..Default::default()
+        };
+        let mut retirements = RecordedRetirements::queued(&[PrKey::new(7, 3)], None);
+
+        let outcome = run_installation_purge(&mut restate, 1, &mut retirements).await;
+
+        assert!(
+            outcome.is_err(),
+            "the failed purge stays visible to Restate"
+        );
+        assert!(
+            retirements.closed.is_empty(),
+            "the projection still holds the rows, so their objects keep their state"
+        );
     }
 }

@@ -10,6 +10,11 @@
 //! the delete's own transaction, and the sweep drains the queue afterwards in steps that
 //! are each safe to run again: a re-run read sees the same rows, a duplicate `closed` is
 //! idempotent, and a re-run acknowledgement is a no-op.
+//!
+//! A drain follows a prune, and only a prune. That pairing is [`Pruned`]: a prune's step
+//! resolves to one, this module's drain is the only thing that takes one, and it cannot
+//! be dropped on the floor — so a prune added later that forgets its drain is a compile
+//! error rather than a projection quietly ahead of its objects.
 
 use std::sync::Arc;
 
@@ -76,16 +81,40 @@ impl RetirementEffects for RestateRetirements<'_, '_> {
     }
 }
 
+/// What a prune's step hands its drain: proof that the delete landed and queued what it
+/// removed.
+///
+/// Every prune resolves to one and nothing else makes one, [`retire_pending`] is the
+/// only thing that takes one, and the token is `#[must_use]`, so a prune written without
+/// a drain does not compile — the rule stops being one three call sites remember. It is
+/// proof that a prune ran, never a claim on the rows it queued: the drain it unlocks
+/// still sends the whole outbox.
+#[must_use = "a prune's removals reach their objects only through `retire_pending`; pass this to it"]
+pub(crate) struct Pruned(());
+
+impl Pruned {
+    /// Taken by a prune whose delete has committed, queueing what it removed.
+    pub(crate) fn landed() -> Self {
+        Self(())
+    }
+}
+
 /// Tells every pull request the projection has pruned and not yet told that it is gone,
 /// then forgets them. Resolves to how many were told.
 ///
-/// Run it after a prune, whatever the prune's step returned: the outbox holds the keys
-/// of this prune and of any earlier one whose drain did not complete. Each close carries
-/// the fence its own prune recorded — the instant that sweep's listing started, so an
-/// object synced since was reopened behind it and keeps its state — never the drain's
-/// clock. The acknowledgement covers exactly what was read; anything queued in between
-/// waits for the next drain.
-pub(crate) async fn retire_pending<E: RetirementEffects>(restate: &mut E) -> HandlerResult<usize> {
+/// The [`Pruned`] is consumed and never read: holding it is the whole of its job, and
+/// what it proves — that a prune landed — is not what this drains. The outbox holds the
+/// keys of that prune and of any earlier one whose drain did not complete, whichever
+/// handler pruned them, and all of them go; a `RepoSync` may tell an object another
+/// repository's sweep pruned, which is what makes a lost drain harmless. Each close
+/// carries the fence its own prune recorded — the instant that sweep's listing started,
+/// so an object synced since was reopened behind it and keeps its state — never the
+/// drain's clock. The acknowledgement covers exactly what was read; anything queued in
+/// between waits for the next drain.
+pub(crate) async fn retire_pending<E: RetirementEffects>(
+    _pruned: Pruned,
+    restate: &mut E,
+) -> HandlerResult<usize> {
     let pending = restate.pending_retirements().await?;
     let Some(last) = pending.last() else {
         return Ok(0);
@@ -128,7 +157,9 @@ mod tests {
             ..Default::default()
         };
 
-        let retired = retire_pending(&mut restate).await.unwrap();
+        let retired = retire_pending(Pruned::landed(), &mut restate)
+            .await
+            .unwrap();
 
         assert_eq!(retired, 3);
         assert_eq!(
@@ -161,7 +192,9 @@ mod tests {
     async fn an_empty_outbox_acknowledges_nothing() {
         let mut restate = RecordedRetirements::default();
 
-        let retired = retire_pending(&mut restate).await.unwrap();
+        let retired = retire_pending(Pruned::landed(), &mut restate)
+            .await
+            .unwrap();
 
         assert_eq!(retired, 0);
         assert!(restate.closed.is_empty());
@@ -176,7 +209,7 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = retire_pending(&mut restate).await;
+        let outcome = retire_pending(Pruned::landed(), &mut restate).await;
 
         assert!(outcome.is_err(), "the failed read stays visible to Restate");
         assert!(
