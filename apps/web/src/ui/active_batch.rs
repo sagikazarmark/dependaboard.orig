@@ -591,6 +591,24 @@ mod tests {
                 "merge: 1/2 · signed out".to_owned()
             )
         );
+        assert_eq!(
+            pill(&refused(&done), FIXTURE_NOW),
+            ("progress-live complete", "merge: 2/2".to_owned()),
+            "a batch already finished when the credentials were refused is complete, \
+             not waiting: the refusal leaves nothing for the follow to wait on"
+        );
+        assert_eq!(
+            pill(
+                &refused(&running),
+                FIXTURE_NOW + WAITING_NOTICE_AFTER.as_secs()
+            ),
+            (
+                "progress-live waiting",
+                "merge: 1/2 · signed out".to_owned()
+            ),
+            "a refusal is why the batch stopped moving, so the pill says that \
+             rather than how long it has stood still"
+        );
 
         let (dot, standing) = pill(&running, FIXTURE_NOW + WAITING_NOTICE_AFTER.as_secs());
 

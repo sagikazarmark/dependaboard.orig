@@ -177,6 +177,12 @@ mod tests {
         store.upsert_pr(&pr(1, 2, 10)).await.unwrap();
         // Written by a concurrent webhook sync after the listing started: kept.
         store.upsert_pr(&pr(1, 3, 30)).await.unwrap();
+        // Synced at the instant the listing started, and absent from it: kept. The
+        // guard is `synced_at < synced_before`, strictly, so a row written at the
+        // fence is one the listing could not have seen and is spared like a later
+        // one. Nothing else in this test sits on the boundary, so a guard relaxed to
+        // `<=` would prune this row and only this row.
+        store.upsert_pr(&pr(1, 5, 20)).await.unwrap();
         // Another repository: out of scope.
         store.upsert_pr(&pr(2, 1, 10)).await.unwrap();
 
@@ -187,6 +193,7 @@ mod tests {
         assert!(store.get_pr(&PrKey::new(1, 4)).await.unwrap().is_none());
         assert!(store.get_pr(&PrKey::new(1, 2)).await.unwrap().is_some());
         assert!(store.get_pr(&PrKey::new(1, 3)).await.unwrap().is_some());
+        assert!(store.get_pr(&PrKey::new(1, 5)).await.unwrap().is_some());
         assert!(store.get_pr(&PrKey::new(2, 1)).await.unwrap().is_some());
     }
 

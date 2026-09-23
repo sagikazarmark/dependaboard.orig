@@ -3,13 +3,14 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use dependaboard_core::{PrKey, PrRecord, RepoRecord, SyncRequest, SyncShaRequest, unix_seconds};
+use dependaboard_core::{PrKey, PrRecord, RepoRecord, SyncRequest, SyncShaRequest};
 use dependaboard_github::Operation;
 use dependaboard_store::ProjectionWriter;
 use restate_sdk::prelude::*;
 use tracing::warn;
 
 use crate::{
+    clock::ClockStepContext,
     github::{GithubApiHandle, RestateGithubStep, read_result, run_github_step},
     handler::traced,
     pull_request::{PullRequestClient, request_key, short_sha},
@@ -73,11 +74,7 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
     }
 
     async fn now(&mut self, step: &'static str) -> HandlerResult<u64> {
-        Ok(self
-            .ctx
-            .run(|| async { Ok(unix_seconds()) })
-            .name(step)
-            .await?)
+        Ok(self.ctx.run_clock_step(step).await?)
     }
 
     async fn list_pull_requests(&mut self) -> HandlerResult<Vec<SyncRequest>> {
@@ -321,7 +318,7 @@ mod tests {
     use super::*;
     use crate::{
         pull_request::ClosedRequest,
-        test_support::{RecordedRetirements, snapshot},
+        test_support::{CLOCK_EPOCH, FakeClock, RecordedRetirements, snapshot},
     };
 
     fn dependabot_pull(number: u64) -> SyncRequest {
@@ -356,8 +353,6 @@ mod tests {
         }
     }
 
-    const CLOCK_EPOCH: u64 = 1_700_000_000;
-
     /// Stands in for Restate, GitHub and the store during a repository reconcile or a
     /// commit-status fan-out and records what each asked of them.
     #[derive(Default)]
@@ -377,9 +372,9 @@ mod tests {
         resolved: Vec<String>,
         /// Every sync sent one-way, in order: the key it went to and what it carried.
         sent: Vec<(PrKey, SyncRequest)>,
-        /// How many times the clock has been read; each reading is a second later than
-        /// the last, so what the reconcile did first is visible in what it holds.
-        clock_readings: u64,
+        /// The clock the handler reads, a second per reading, and the steps it read
+        /// them under.
+        clock: FakeClock,
         /// What the clock stood at when the listing was asked for: a fence read before
         /// it is strictly smaller.
         clock_when_listed: Option<u64>,
@@ -390,14 +385,12 @@ mod tests {
             7
         }
 
-        async fn now(&mut self, _step: &'static str) -> HandlerResult<u64> {
-            let reading = CLOCK_EPOCH + self.clock_readings;
-            self.clock_readings += 1;
-            Ok(reading)
+        async fn now(&mut self, step: &'static str) -> HandlerResult<u64> {
+            Ok(self.clock.now(step))
         }
 
         async fn list_pull_requests(&mut self) -> HandlerResult<Vec<SyncRequest>> {
-            self.clock_when_listed = Some(CLOCK_EPOCH + self.clock_readings);
+            self.clock_when_listed = Some(self.clock.peek());
             match self.listing_failure.take() {
                 Some(error) => Err(error),
                 None => Ok(self.pulls.clone()),

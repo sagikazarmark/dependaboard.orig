@@ -41,12 +41,14 @@ impl WebhookIngress {
     /// Routes a verified GitHub delivery to the object that owns it.
     ///
     /// The web edge acknowledges kinds with no arm in `route_webhook` before they reach
-    /// Restate. Its copy of this table (`route_delivery` in the web app) matches over
-    /// `octoevents::EventKind`, so it is still the edge's own decision which kinds it
-    /// forwards: a kind routed here but acknowledged there is silently swallowed, and only
-    /// a test or a delivery that never arrives shows it. The other direction the compiler
-    /// now holds — the match below is exhaustive over [`DeliveryKind`], so a routed kind
-    /// this handler forgets does not build.
+    /// Restate. Its copy of this table (`route_delivery` in the web app) converts the
+    /// delivery to a [`DeliveryKind`] before it decides, so both halves match one enum
+    /// exhaustively and a kind given a variant and left unhandled at either end does not
+    /// compile. What the compiler still cannot tell is a forward from an arm that
+    /// acknowledges: a kind routed here but acknowledged there would be silently
+    /// swallowed, and only a test or a delivery that never arrives would show it. The
+    /// edge's `every_kind_the_edge_names_is_forwarded_or_refused_but_never_acknowledged`
+    /// is what holds that direction; the match below holds this one.
     #[handler]
     async fn dispatch(&self, ctx: Context<'_>, event: Json<WebhookEvent>) -> HandlerResult<()> {
         let event = event.into_inner();

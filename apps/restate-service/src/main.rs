@@ -2,6 +2,7 @@
 //! component to the endpoint, and asks Restate to arm the installation scheduler.
 
 mod bulk_action;
+mod clock;
 mod dashboard;
 mod github;
 mod handler;

@@ -11,7 +11,7 @@ use libsql::Value;
 use crate::{
     ScopedFilter, StoreError,
     filter::{Facet, without_facet},
-    integer, repo_from_row, stored_enum, unsigned,
+    integer, repo_columns, repo_from_row, stored_enum, unsigned,
 };
 
 pub(crate) async fn facet_counts(
@@ -89,11 +89,12 @@ async fn repository_facets(
     mut scoped: ScopedFilter,
 ) -> Result<Vec<RepoFacet>, StoreError> {
     let listed = scoped.bind(integer(installation_id)?);
+    let columns = repo_columns("r.");
     let where_sql = scoped.where_sql();
     let mut rows = connection
         .query(
             &format!(
-                "SELECT r.repository_id, r.installation_id, r.owner, r.repo, r.merge_method, r.synced_at, \
+                "SELECT {columns}, \
                  COALESCE(c.matching, 0) \
                  FROM repositories r \
                  LEFT JOIN (SELECT p.repository_id, COUNT(*) AS matching FROM pull_requests p {where_sql} GROUP BY p.repository_id) c \

@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 use bytes::Bytes;
 use dependaboard_core::{
     ActionLog, ActionOutcome, CommandRequest, MergeMethod, MergeRequest, PrKey, PrRecord, PrState,
-    PrTarget, RejectReason, SyncRequest, UpdateBranchRequest, unix_seconds,
+    PrTarget, RejectReason, SyncRequest, UpdateBranchRequest,
 };
 use dependaboard_github::{GithubError, Merged, Operation};
 use dependaboard_store::{ProjectionWriter, StoreError};
@@ -14,6 +14,7 @@ use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    clock::ClockStepContext,
     github::{
         GithubApiHandle, RestateGithubStep, Settled, action_result, merge_result, read_result,
         rejected, run_github_step,
@@ -228,11 +229,7 @@ impl PullRequestEffects for RestatePullRequest<'_, '_> {
     }
 
     async fn now(&mut self, step: &'static str) -> HandlerResult<u64> {
-        Ok(self
-            .ctx
-            .run(|| async { Ok(unix_seconds()) })
-            .name(step)
-            .await?)
+        Ok(self.ctx.run_clock_step(step).await?)
     }
 
     async fn state(&mut self) -> HandlerResult<Option<PrState>> {
@@ -770,11 +767,9 @@ mod tests {
     use super::*;
     use crate::{
         handler::RetryableServiceError,
-        test_support::{repository, snapshot, target, test_store},
+        test_support::{CLOCK_EPOCH, FakeClock, repository, snapshot, target, test_store},
     };
 
-    /// The fake clock's first reading, in Unix seconds.
-    const CLOCK_EPOCH: u64 = 1_700_000_000;
     /// The event debounce the object under test runs with.
     const DEBOUNCE: Duration = Duration::from_secs(20);
     /// The commit every merge in these tests makes.
@@ -897,8 +892,9 @@ mod tests {
         scheduled: Vec<(PrKey, SyncRequest, Option<Duration>)>,
         /// Every store step taken, by the name its journal entry would carry.
         store_steps: Vec<&'static str>,
-        /// Seconds the clock has been read for, from a fixed epoch.
-        clock_readings: u64,
+        /// The clock the handler reads, a second per reading, and the steps it read
+        /// them under.
+        clock: FakeClock,
         /// The state the object held when GitHub was first asked, if it was.
         held_when_asked: Option<PrState>,
         /// The state the object held when the projection's row was written, if it was.
@@ -934,7 +930,7 @@ mod tests {
                 asked: Vec::new(),
                 scheduled: Vec::new(),
                 store_steps: Vec::new(),
-                clock_readings: 0,
+                clock: FakeClock::default(),
                 held_when_asked: None,
                 held_when_projected: None,
                 store_failure: None,
@@ -948,7 +944,7 @@ mod tests {
 
         /// Lets `duration` pass on the fake clock.
         fn wait(&mut self, duration: Duration) {
-            self.clock_readings += duration.as_secs();
+            self.clock.wait(duration);
         }
 
         /// What the object holds: its state, or a fresh object's.
@@ -989,10 +985,8 @@ mod tests {
             self.can_post_commands
         }
 
-        async fn now(&mut self, _step: &'static str) -> HandlerResult<u64> {
-            let reading = CLOCK_EPOCH + self.clock_readings;
-            self.clock_readings += 1;
-            Ok(reading)
+        async fn now(&mut self, step: &'static str) -> HandlerResult<u64> {
+            Ok(self.clock.now(step))
         }
 
         async fn state(&mut self) -> HandlerResult<Option<PrState>> {

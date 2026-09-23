@@ -979,8 +979,26 @@ fn stored_enum<T: FromStr>(value: String) -> Result<T, StoreError> {
     T::from_str(&value).map_err(|_| StoreError::CorruptEnum(value))
 }
 
-fn select_repo_sql() -> &'static str {
-    "SELECT repository_id, installation_id, owner, repo, merge_method, synced_at FROM repositories"
+/// The `repositories` columns in the order [`repo_from_row`] reads them, each
+/// qualified with `alias`: empty for a statement that names the table alone,
+/// `"r."` for one that binds it beside another. Minted from one list rather
+/// than written out per statement, so a column the mapper gains cannot reach
+/// one reader's `SELECT` and miss the other's.
+pub(crate) fn repo_columns(alias: &str) -> String {
+    [
+        "repository_id",
+        "installation_id",
+        "owner",
+        "repo",
+        "merge_method",
+        "synced_at",
+    ]
+    .map(|column| format!("{alias}{column}"))
+    .join(", ")
+}
+
+fn select_repo_sql() -> String {
+    format!("SELECT {} FROM repositories", repo_columns(""))
 }
 
 fn repo_from_row(row: Row) -> Result<RepoRecord, StoreError> {
