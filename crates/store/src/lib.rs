@@ -1300,6 +1300,121 @@ mod tests {
         assert_eq!(store.get_prs(INSTALLATION, &[]).await.unwrap(), Vec::new());
     }
 
+    /// One pull request whose every field of a given type holds a value no
+    /// other field of that type holds, so no two columns can trade places and
+    /// come back looking right. `generation` picks a second, wholly different
+    /// set of values for the same pull request, for the write that has to go
+    /// through `ON CONFLICT ... DO UPDATE SET` rather than through the insert.
+    ///
+    /// The integers are the ones to watch: `repository_id`, `number` and the
+    /// three stamps are stored side by side and read back by position, so
+    /// equal values there are what would let a swap pass unseen.
+    fn distinctly_valued_pr(generation: u64) -> PrRecord {
+        let tag = |what: &str| format!("{what}-{generation}");
+        PrRecord {
+            id: PrKey::new(41, 53).to_string(),
+            repository_id: 41,
+            owner: tag("owner"),
+            repo: tag("repo"),
+            number: 53,
+            title: tag("title"),
+            html_url: tag("html-url"),
+            dependency: Some(tag("dependency")),
+            from_version: Some(tag("from-version")),
+            to_version: Some(tag("to-version")),
+            dependencies: vec![DependencyUpdate {
+                name: tag("grouped-name"),
+                from_version: Some(tag("grouped-from")),
+                to_version: Some(tag("grouped-to")),
+                update_type: UpdateType::Patch,
+            }],
+            update_type: if generation == 1 {
+                UpdateType::Major
+            } else {
+                UpdateType::Patch
+            },
+            head_sha: tag("head-sha"),
+            check_status: if generation == 1 {
+                CheckStatus::Failure
+            } else {
+                CheckStatus::Pending
+            },
+            mergeable: if generation == 1 {
+                Mergeable::Behind
+            } else {
+                Mergeable::Draft
+            },
+            labels: vec![tag("label")],
+            created_at: 60 + generation,
+            updated_at: 70 + generation,
+            synced_at: 80 + generation,
+        }
+    }
+
+    /// Every column the projection keeps for a pull request goes to its own
+    /// place and comes back from it: through the insert, through the
+    /// `excluded` rewrite a second write of the same key takes, and through
+    /// each of the four reads that decode a row.
+    ///
+    /// The second write is the half nothing else covers. The column list, the
+    /// placeholders, the `excluded` assignments, the parameter vector and the
+    /// decoder are five hand-written statements of one order, and only the
+    /// first write is exercised anywhere: a row written once and read back
+    /// says nothing about the eighteen `x = excluded.x` lines that carry every
+    /// write after it. Drop `synced_at` from them and staleness never
+    /// refreshes; drop `head_sha` and a check webhook stops finding the pull
+    /// request at the head it just reported.
+    #[tokio::test]
+    async fn every_column_of_a_pull_request_survives_a_write_a_rewrite_and_each_read_path() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(41, 10)).await.unwrap();
+
+        for generation in 1..=2 {
+            let written = distinctly_valued_pr(generation);
+            let key = written.key();
+
+            store.upsert_pr(&written).await.unwrap();
+
+            assert_eq!(
+                LibSqlPrStore::get_pr(&store, &key).await.unwrap().as_ref(),
+                Some(&written),
+                "the writer's own lookup, generation {generation}"
+            );
+            assert_eq!(
+                ProjectionReader::get_pr(&store, INSTALLATION, &key)
+                    .await
+                    .unwrap(),
+                ProjectedPr::Row(Box::new(written.clone())),
+                "the reader's lookup, generation {generation}"
+            );
+            assert_eq!(
+                store
+                    .get_prs(INSTALLATION, std::slice::from_ref(&key))
+                    .await
+                    .unwrap(),
+                vec![ProjectedPr::Row(Box::new(written.clone()))],
+                "the set read, generation {generation}"
+            );
+            assert_eq!(
+                store
+                    .list_prs(INSTALLATION, &PrFilter::default(), Page::default())
+                    .await
+                    .unwrap()
+                    .rows,
+                vec![written.clone()],
+                "the dashboard's page, generation {generation}"
+            );
+            assert_eq!(
+                store
+                    .prs_for_sha(written.repository_id, &written.head_sha)
+                    .await
+                    .unwrap(),
+                vec![written.clone()],
+                "the head lookup, generation {generation}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn upsert_and_keyset_page_round_trip() {
         let (_directory, store) = test_store().await;
