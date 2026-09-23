@@ -946,4 +946,85 @@ mod tests {
             assert_eq!(status_signal(value), Some(CheckSignal::Pending));
         }
     }
+
+    /// Every signal the check rollup is computed from has to be asked for, on
+    /// the first page and on each page after it. The rollup itself is a truth
+    /// table with a test per cell, and none of that helps if the answer it is
+    /// given is missing a source: a field dropped from a selection set does not
+    /// fail, it arrives as `None` and folds away silently, so the table returns
+    /// a confident verdict over less than it was meant to see.
+    ///
+    /// The two that decide a colour are the legacy status contexts — a
+    /// repository whose CI reports through the Statuses API has no check runs
+    /// at all, so losing them turns every failure it reports into no signal —
+    /// and the check suites, which are asked for separately and only because a
+    /// suite that failed at startup has no runs to show up as contexts. Both
+    /// losses read the same way on the dashboard: green, on a pull request a
+    /// bulk merge will then take.
+    ///
+    /// `pageInfo` is the third, and it fails even more quietly: it is
+    /// `#[serde(default)]`, so a query that stops asking for it yields
+    /// `hasNextPage: false` and the walk simply never starts.
+    #[test]
+    fn every_query_asks_for_the_signals_the_rollup_is_folded_from() {
+        let snapshot = snapshot_query();
+        for (query, asked) in [
+            ("PullRequestSnapshot", snapshot.as_str()),
+            ("CheckContextsPage", CHECK_CONTEXTS_PAGE_QUERY),
+        ] {
+            for selection in [
+                "... on CheckRun { status conclusion }",
+                "... on StatusContext { state }",
+            ] {
+                assert!(
+                    asked.contains(selection),
+                    "{query} does not ask for `{selection}`"
+                );
+            }
+        }
+
+        // Counted, not merely found: the snapshot opens two connections and
+        // each needs its own, so a `pageInfo` dropped from the contexts alone
+        // would still be answered for by the suites'.
+        assert_eq!(
+            snapshot
+                .matches("pageInfo { hasNextPage endCursor }")
+                .count(),
+            2,
+            "both of the snapshot's connections ask how to page on"
+        );
+        for (query, asked) in [
+            ("CheckContextsPage", CHECK_CONTEXTS_PAGE_QUERY),
+            ("CheckSuitesPage", CHECK_SUITES_PAGE_QUERY),
+        ] {
+            assert!(
+                asked.contains("pageInfo { hasNextPage endCursor }"),
+                "{query} does not ask how to page on"
+            );
+        }
+
+        for (query, asked) in [
+            ("PullRequestSnapshot", snapshot.as_str()),
+            ("CheckSuitesPage", CHECK_SUITES_PAGE_QUERY),
+        ] {
+            for selection in ["checkSuites", "nodes { status conclusion }"] {
+                assert!(
+                    asked.contains(selection),
+                    "{query} does not ask for `{selection}`"
+                );
+            }
+        }
+
+        // Both pages continue from where the last one ended; a page query that
+        // dropped `after` would re-read the first page for ever.
+        for (query, asked) in [
+            ("CheckContextsPage", CHECK_CONTEXTS_PAGE_QUERY),
+            ("CheckSuitesPage", CHECK_SUITES_PAGE_QUERY),
+        ] {
+            assert!(
+                asked.contains("first: 100, after: $after"),
+                "{query} does not continue after the page it was given"
+            );
+        }
+    }
 }

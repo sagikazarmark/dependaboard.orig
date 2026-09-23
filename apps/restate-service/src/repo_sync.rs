@@ -59,18 +59,52 @@ trait RepoReconcileEffects {
     fn send_sync(&mut self, key: &PrKey, request: SyncRequest);
 }
 
-struct RestateReconcileEffects<'a, 'ctx> {
-    ctx: &'a ObjectContext<'ctx>,
-    github: &'a GithubApiHandle,
-    store: &'a Arc<dyn ProjectionWriter>,
+/// Which repository a reconcile or a fan-out is for: the id it is keyed and
+/// pruned by, and the owner and name its GitHub reads are made under.
+///
+/// Named apart from the effects it is handed to, because the effects need a
+/// Restate context and this does not. What can go wrong here is which of the
+/// two names goes where — and an owner and a name transposed is a 404 on every
+/// listing of every repository, which is to say an outage no test of the
+/// reconcile itself would see, since the reconcile is driven against a fake
+/// that was handed the same two names the wrong way round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Addressed {
     repository_id: u64,
     owner: String,
     repo: String,
 }
 
+impl From<RepoRecord> for Addressed {
+    fn from(repository: RepoRecord) -> Self {
+        Self {
+            repository_id: repository.repository_id,
+            owner: repository.owner,
+            repo: repository.repo,
+        }
+    }
+}
+
+impl From<&SyncShaRequest> for Addressed {
+    fn from(request: &SyncShaRequest) -> Self {
+        Self {
+            repository_id: request.repository_id,
+            owner: request.owner.clone(),
+            repo: request.repo.clone(),
+        }
+    }
+}
+
+struct RestateReconcileEffects<'a, 'ctx> {
+    ctx: &'a ObjectContext<'ctx>,
+    github: &'a GithubApiHandle,
+    store: &'a Arc<dyn ProjectionWriter>,
+    addressed: Addressed,
+}
+
 impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
     fn repository_id(&self) -> u64 {
-        self.repository_id
+        self.addressed.repository_id
     }
 
     async fn now(&mut self, step: &'static str) -> HandlerResult<u64> {
@@ -79,9 +113,9 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
 
     async fn list_pull_requests(&mut self) -> HandlerResult<Vec<SyncRequest>> {
         let github = self.github.clone();
-        let owner = self.owner.clone();
-        let repo = self.repo.clone();
-        let repository_id = self.repository_id;
+        let owner = self.addressed.owner.clone();
+        let repo = self.addressed.repo.clone();
+        let repository_id = self.addressed.repository_id;
         let pulls = run_github_step(&mut RestateGithubStep {
             ctx: self.ctx,
             name: "list-open-dependabot-prs",
@@ -120,7 +154,7 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
         synced_before: u64,
     ) -> HandlerResult<Pruned> {
         let store = self.store.clone();
-        let repository_id = self.repository_id;
+        let repository_id = self.addressed.repository_id;
         let live = live.to_vec();
         self.ctx
             .run_store_step(
@@ -139,7 +173,7 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
 
     async fn pull_requests_at(&mut self, sha: &str) -> HandlerResult<Vec<PrRecord>> {
         let store = self.store.clone();
-        let repository_id = self.repository_id;
+        let repository_id = self.addressed.repository_id;
         let sha = sha.to_owned();
         let matches = self
             .ctx
@@ -267,9 +301,7 @@ impl RepoSync {
                 ctx: &ctx,
                 github: &self.github,
                 store: &self.store,
-                repository_id: repository.repository_id,
-                owner: repository.owner,
-                repo: repository.repo,
+                addressed: repository.into(),
             };
             let mut retirements = RestateRetirements {
                 ctx: &ctx,
@@ -294,9 +326,7 @@ impl RepoSync {
                 ctx: &ctx,
                 github: &self.github,
                 store: &self.store,
-                repository_id: request.repository_id,
-                owner: request.owner.clone(),
-                repo: request.repo.clone(),
+                addressed: (&request).into(),
             };
             let told = run_sync_sha(&mut restate, &request).await?;
             Ok(format!(
@@ -318,7 +348,7 @@ mod tests {
     use super::*;
     use crate::{
         pull_request::ClosedRequest,
-        test_support::{CLOCK_EPOCH, FakeClock, RecordedRetirements, snapshot},
+        test_support::{CLOCK_EPOCH, FakeClock, RecordedRetirements, repository, snapshot},
     };
 
     fn dependabot_pull(number: u64) -> SyncRequest {
@@ -762,6 +792,35 @@ mod tests {
             restate.retained,
             Some(vec![]),
             "every pull request closed means every stale row goes"
+        );
+    }
+
+    /// Both ways into a reconcile address the same repository the same way.
+    /// The sweep hands it a `RepoRecord` and a check webhook hands it a
+    /// `SyncShaRequest`, and each carries an owner and a name whose types
+    /// cannot tell them apart — so the one mistake available here is silent in
+    /// Rust and loud in production: every listing of every repository would go
+    /// to `GET /repos/{name}/{owner}/pulls` and 404, on every sweep, and the
+    /// reconcile's own tests would not see it, because the fake they drive is
+    /// handed whatever these two produced.
+    #[test]
+    fn a_reconcile_addresses_the_repository_whichever_way_it_was_asked_for() {
+        let expected = Addressed {
+            repository_id: 7,
+            owner: "acme".to_owned(),
+            repo: "api".to_owned(),
+        };
+
+        assert_eq!(Addressed::from(repository()), expected);
+        assert_eq!(
+            Addressed::from(&SyncShaRequest {
+                repository_id: 7,
+                owner: "acme".to_owned(),
+                repo: "api".to_owned(),
+                sha: "abc123".to_owned(),
+                pull_requests: Vec::new(),
+            }),
+            expected
         );
     }
 }

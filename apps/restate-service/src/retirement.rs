@@ -136,7 +136,7 @@ mod tests {
     use dependaboard_core::PrKey;
 
     use super::*;
-    use crate::test_support::RecordedRetirements;
+    use crate::test_support::{RecordedRetirements, RetirementEvent};
 
     fn retirement(id: u64, key: PrKey, synced_before: Option<u64>) -> Retirement {
         Retirement {
@@ -184,7 +184,24 @@ mod tests {
         assert_eq!(
             restate.acknowledged,
             vec![9],
-            "the read is acknowledged through its last row, once every close is sent"
+            "the read is acknowledged through its last row"
+        );
+        // And after every close, not before: the acknowledgement is what
+        // forgets the outbox rows, so a drain that advanced the watermark
+        // first and died mid-loop would leave those pull requests carrying
+        // durable state their projection row no longer has, with nothing left
+        // to tell them again. Asserted on one ordered log because two lists
+        // cannot say which came first.
+        let acknowledged_at = restate
+            .events
+            .iter()
+            .position(|event| matches!(event, RetirementEvent::Acknowledged(_)))
+            .expect("the drain acknowledged what it read");
+        assert_eq!(
+            acknowledged_at,
+            restate.events.len() - 1,
+            "the acknowledgement is the last thing the drain does: {:?}",
+            restate.events
         );
     }
 

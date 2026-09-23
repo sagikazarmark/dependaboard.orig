@@ -182,4 +182,86 @@ updated-dependencies:
         assert_eq!(updates[0].name, "serde");
         assert_eq!(updates[0].update_type, UpdateType::Patch);
     }
+
+    /// Every semver step, from a title alone. The fallback is what a pull
+    /// request gets when the metadata block is missing or says nothing useful,
+    /// and the badge it produces is what a person reads before deciding
+    /// whether to look. `malformed_metadata_falls_back_to_title` reaches this
+    /// function too, but only ever over a minor bump — the one step that stays
+    /// where it is if the major and patch arms are transposed, which would
+    /// badge a `1.x` to `2.x` bump as a patch in a dashboard whose whole
+    /// business is merging patches without reading them.
+    ///
+    /// The `v` prefixes are here because Go modules and GitHub Actions write
+    /// their versions that way, and a version that does not parse falls to
+    /// `Unknown` — dropping such a bump out of a filter on its real kind.
+    #[test]
+    fn a_titles_versions_say_which_step_it_is_and_an_unparsable_pair_says_nothing() {
+        let step = |from: &str, to: &str| {
+            parse_dependabot_metadata("", &format!("Bump thing from {from} to {to}"))
+                .first()
+                .map(|update| update.update_type)
+        };
+
+        assert_eq!(step("1.2.3", "2.0.0"), Some(UpdateType::Major));
+        assert_eq!(step("1.2.3", "1.3.0"), Some(UpdateType::Minor));
+        assert_eq!(step("1.2.3", "1.2.4"), Some(UpdateType::Patch));
+        assert_eq!(
+            step("v1.2.3", "v2.0.0"),
+            Some(UpdateType::Major),
+            "a go module"
+        );
+        assert_eq!(step("v3", "v4"), Some(UpdateType::Unknown), "an action tag");
+        assert_eq!(step("21.0.0.1", "21.0.0.2"), Some(UpdateType::Unknown));
+    }
+
+    /// The metadata block is Dependabot's own word on what kind of update this
+    /// is; the title is a sentence it wrote for people. Where both are present
+    /// the block wins, and the title is read only for the versions it names —
+    /// otherwise an ordinary four-part or date-shaped version, which no semver
+    /// parser accepts, would overwrite a perfectly good `major` with nothing.
+    #[test]
+    fn the_metadata_block_says_which_step_it_is_and_the_title_only_says_the_versions() {
+        let message = r#"Bump thing from 21.0.0.1 to 22.0.0.1
+
+---
+updated-dependencies:
+- dependency-name: thing
+  update-type: version-update:semver-major
+..."#;
+
+        let updates = parse_dependabot_metadata(message, "Bump thing from 21.0.0.1 to 22.0.0.1");
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].update_type,
+            UpdateType::Major,
+            "the block is believed over a title semver cannot read"
+        );
+        assert_eq!(updates[0].from_version.as_deref(), Some("21.0.0.1"));
+        assert_eq!(updates[0].to_version.as_deref(), Some("22.0.0.1"));
+    }
+
+    /// A block whose `update-type` is missing or unrecognised says nothing
+    /// about the step, and nothing is what it must be reported as. The field
+    /// is `#[serde(default)]` precisely because it goes missing, so this is a
+    /// path Dependabot takes rather than one only a corrupt message reaches —
+    /// and every other answer is a claim the block did not make.
+    #[test]
+    fn a_block_that_names_no_step_is_unknown_rather_than_the_gentlest_guess() {
+        let without = r#"---
+updated-dependencies:
+- dependency-name: thing
+..."#;
+        let updates = parse_dependabot_metadata(without, "a title semver cannot read");
+        assert_eq!(updates[0].update_type, UpdateType::Unknown);
+
+        let unrecognised = r#"---
+updated-dependencies:
+- dependency-name: thing
+  update-type: version-update:calendar
+..."#;
+        let updates = parse_dependabot_metadata(unrecognised, "a title semver cannot read");
+        assert_eq!(updates[0].update_type, UpdateType::Unknown);
+    }
 }

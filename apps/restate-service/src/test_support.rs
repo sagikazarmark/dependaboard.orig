@@ -79,6 +79,20 @@ pub(crate) struct RecordedRetirements {
     pub(crate) read_failure: Option<HandlerError>,
     pub(crate) closed: Vec<(PrKey, ClosedRequest)>,
     pub(crate) acknowledged: Vec<u64>,
+    /// Closes and acknowledgements in the one order they happened.
+    ///
+    /// The two lists above answer *what* the drain did and cannot answer
+    /// *when*: kept apart, an acknowledgement that ran before its closes looks
+    /// exactly like one that ran after. That order is the whole of what makes
+    /// a lost drain harmless, so it is recorded where it can be asserted.
+    pub(crate) events: Vec<RetirementEvent>,
+}
+
+/// What a drain did, in order; see [`RecordedRetirements::events`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RetirementEvent {
+    Closed(PrKey),
+    Acknowledged(u64),
 }
 
 impl RecordedRetirements {
@@ -113,10 +127,12 @@ impl RetirementEffects for RecordedRetirements {
     }
 
     fn close_pull_request(&mut self, key: &PrKey, request: ClosedRequest) {
+        self.events.push(RetirementEvent::Closed(key.clone()));
         self.closed.push((key.clone(), request));
     }
 
     async fn acknowledge_retirements(&mut self, through: u64) -> HandlerResult<()> {
+        self.events.push(RetirementEvent::Acknowledged(through));
         self.acknowledged.push(through);
         self.pending.retain(|retirement| retirement.id > through);
         Ok(())
