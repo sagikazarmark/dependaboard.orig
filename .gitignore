@@ -22,3 +22,7 @@ data/
 .env
 .env.restate
 .env.web
+
+# cargo-mutants working output: the tree it builds mutants in, and its logs.
+mutants.out/
+mutants.out.old/

@@ -1,0 +1,51 @@
+# Mutation testing: change one line, and see whether anything fails.
+#
+# Every significant gap the last review found was found this way rather than by
+# reading — a prune fence that pruned nothing, a facet that grouped by its
+# neighbour's column, a `DO UPDATE SET` no test had ever driven, and a check
+# rollup that stopped reading after its second page and so rendered a red pull
+# request green. Each of those was a one-line edit the whole suite accepted.
+#
+# `cargo mutants --in-diff` over a branch's own diff is the cheap way to run it;
+# the whole workspace is some thousands of mutants and belongs in a nightly.
+
+# The workspace's one feature set, the same one `cargo test` and `cargo clippy`
+# carry, so neither cooks the dependency tree a second time for the other. See
+# README's *Development Verification*.
+additional_cargo_args = [
+    # `--workspace` first, and it is load-bearing rather than tidy.
+    # cargo-mutants scopes its build to the mutated package, and the feature
+    # below names one — `dependaboard-web/server` is not a feature of
+    # `dependaboard-github`, so a package-scoped build refuses it outright.
+    # Cargo lets `--workspace` win over the `--package` cargo-mutants adds,
+    # which both makes the feature legal and runs every crate's tests against
+    # each mutant. That second part matters on its own: the tests that catch a
+    # mutant are often not in the crate that holds it — the store's reconcile
+    # fence is asserted from the Restate service, and the drawer's refusals
+    # from the web crate against `crates/core`'s types.
+    "--workspace",
+    "--no-default-features",
+    "--features",
+    "dependaboard-web/server",
+]
+
+# The test runner CI uses; one process per test, which is what keeps a mutant
+# that wedges from taking the run with it.
+test_tool = "nextest"
+
+
+# A mutant can turn a bounded loop into an unbounded one — the sweep that
+# re-arms with no delay is a real example — so a run that has stopped making
+# progress is a killed mutant rather than a hung job. The floor is for the
+# store and web suites, whose fixtures stand a database up per test.
+timeout_multiplier = 4.0
+minimum_test_timeout = 60
+
+exclude_globs = [
+    # Fixtures, scripted gateways and recording fakes. A mutant here changes
+    # what a test says, not what the dashboard does, so it is noise rather
+    # than signal — and `--in-diff` would otherwise flag every fixture a
+    # branch touches.
+    "**/test_support.rs",
+    "**/test_support/**",
+]

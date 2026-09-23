@@ -532,6 +532,16 @@ docker compose config --quiet
 dx build --package dependaboard-web --platform web
 ```
 
+Mutation testing is not in that list because it is slower than the rest put together, but it is what the list cannot do: every line above says the suite passes, and none says the suite would notice if the code were wrong.
+
+```sh
+cargo install cargo-mutants --locked
+cargo mutants --in-diff <(git diff origin/main...)   # what this branch changed
+cargo mutants                                        # the workspace, in a few hours
+```
+
+A *missed* mutant is a line that could be edited into a defect with everything green. The settings live in `.cargo/mutants.toml`; `--in-diff` is the one to reach for, since it asks the question only of what you touched.
+
 The test and clippy lines carry one feature set, so neither builds the dependency tree a second time for another. The web crate's default `web` feature is the browser bundle; its server, its API and most of its UI tests are compiled only under `server`, and `--no-default-features` changes nothing for the other members, none of which defines a default.
 
 The tests run under [cargo-nextest](https://nexte.st), which `devenv shell` provides (elsewhere, `cargo install cargo-nextest --locked`, or a pre-built binary from the same site). Each test runs in a process of its own, so a leaked global or a racing `env::set_var` fails one named test instead of racing the rest silently. `.config/nextest.toml` adds a slow-test limit — a test still running after 30s is reported, and terminated after a second period, so a hang is a failure with a name rather than a hung run — and one retry, scoped to the single store test that meets a real SQLite file lock from a second connection; the file names the test and says why, and nothing else is retried. `cargo test` over the same flags is the fallback: it must also pass, it is what CI runs today, and it is the only runner for doctests, of which there are none. `-P ci` selects the CI profile, which turns fail-fast off and writes a JUnit report to `target/nextest/ci/junit.xml`.

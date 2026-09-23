@@ -264,4 +264,40 @@ updated-dependencies:
         let updates = parse_dependabot_metadata(unrecognised, "a title semver cannot read");
         assert_eq!(updates[0].update_type, UpdateType::Unknown);
     }
+
+    /// Each step Dependabot names in a block, read back as itself. Asserted
+    /// beside the unrecognised case above rather than folded into it, because
+    /// what is being pinned is that the three named steps are *not* the
+    /// unnamed one — a table that lost an arm answers Unknown for that step
+    /// and stays perfectly plausible everywhere else.
+    #[test]
+    fn a_block_naming_a_step_is_read_back_as_that_step() {
+        let step = |named: &str| {
+            let message = format!(
+                "---\nupdated-dependencies:\n- dependency-name: thing\n  update-type: version-update:{named}\n..."
+            );
+            parse_dependabot_metadata(&message, "a title semver cannot read")[0].update_type
+        };
+
+        assert_eq!(step("semver-major"), UpdateType::Major);
+        assert_eq!(step("semver-minor"), UpdateType::Minor);
+        assert_eq!(step("semver-patch"), UpdateType::Patch);
+    }
+
+    /// Dependabot ends some subjects with punctuation, and a version is what
+    /// precedes it rather than what includes it. A `to` left as `1.0.2.` parses
+    /// as no version at all, so the step falls to Unknown and the trailing
+    /// character is rendered to the user beside it.
+    #[test]
+    fn a_titles_version_stops_before_the_punctuation_that_ends_the_sentence() {
+        for title in [
+            "Bump serde from 1.0.1 to 1.0.2.",
+            "Bump serde from 1.0.1 to 1.0.2,",
+            "Bump serde from 1.0.1 to `1.0.2`",
+        ] {
+            let updates = parse_dependabot_metadata("", title);
+            assert_eq!(updates[0].to_version.as_deref(), Some("1.0.2"), "{title}");
+            assert_eq!(updates[0].update_type, UpdateType::Patch, "{title}");
+        }
+    }
 }
