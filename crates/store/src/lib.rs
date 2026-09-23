@@ -352,29 +352,56 @@ impl ProjectionWriter for LibSqlPrStore {
         let labels = serde_json::to_string(&pr.labels)?;
         // Derived, not taken from the record: see the trait's doc comment.
         let id = pr.key().to_string();
+        // Named one by one, and exhaustively, so a column the record gains
+        // stops compiling here rather than going quietly unwritten. The read
+        // side has this already — `pr_from_row` builds the struct, so it
+        // cannot miss a field and still compile — and this is its other half.
+        // The two `_`s are the fields serialised into the locals above, whose
+        // names they would otherwise shadow.
+        let PrRecord {
+            id: _,
+            repository_id,
+            owner,
+            repo,
+            number,
+            title,
+            html_url,
+            dependency,
+            from_version,
+            to_version,
+            dependencies: _,
+            update_type,
+            head_sha,
+            check_status,
+            mergeable,
+            labels: _,
+            created_at,
+            updated_at,
+            synced_at,
+        } = pr;
         connection
             .execute(
                 upsert_pr_sql(),
                 vec![
                     Value::Text(id),
-                    integer(pr.repository_id)?,
-                    Value::Text(pr.owner.clone()),
-                    Value::Text(pr.repo.clone()),
-                    integer(pr.number)?,
-                    Value::Text(pr.title.clone()),
-                    Value::Text(pr.html_url.clone()),
-                    option_text(pr.dependency.clone()),
-                    option_text(pr.from_version.clone()),
-                    option_text(pr.to_version.clone()),
+                    integer(*repository_id)?,
+                    Value::Text(owner.clone()),
+                    Value::Text(repo.clone()),
+                    integer(*number)?,
+                    Value::Text(title.clone()),
+                    Value::Text(html_url.clone()),
+                    option_text(dependency.clone()),
+                    option_text(from_version.clone()),
+                    option_text(to_version.clone()),
                     Value::Text(dependencies),
-                    Value::Text(pr.update_type.to_string()),
-                    Value::Text(pr.head_sha.clone()),
-                    Value::Text(pr.check_status.to_string()),
-                    Value::Text(pr.mergeable.to_string()),
+                    Value::Text(update_type.to_string()),
+                    Value::Text(head_sha.clone()),
+                    Value::Text(check_status.to_string()),
+                    Value::Text(mergeable.to_string()),
                     Value::Text(labels),
-                    integer(pr.created_at)?,
-                    integer(pr.updated_at)?,
-                    integer(pr.synced_at)?,
+                    integer(*created_at)?,
+                    integer(*updated_at)?,
+                    integer(*synced_at)?,
                 ],
             )
             .await?;
