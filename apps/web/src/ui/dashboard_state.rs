@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use dependaboard_core::{Capabilities, DashboardPage, DashboardSummary, PrFilter, PrRecord};
 use dioxus::prelude::*;
 
-use crate::ui::{Fault, logged_fault, repository_count, user_facing};
+use crate::ui::{Fault, logged_fault, repository_count};
 
 /// What the dashboard has heard from the read model in answer to one
 /// question.
@@ -27,10 +27,15 @@ pub(crate) enum Remote<T> {
 }
 
 impl<T: Clone> Remote<T> {
-    pub(crate) fn from_resource(value: Option<&Result<T, ServerFnError>>) -> Self {
+    /// What a resource's answer means. The read is a [`Fault`] and not a
+    /// `ServerFnError` because every one of them goes through
+    /// [`guarded_by`] — which is the point: a resource holds a read of the
+    /// read model like any other, and there is no way to build one of these
+    /// from a read that did not pass the guard.
+    pub(crate) fn from_faulted(value: Option<&Result<T, Fault>>) -> Self {
         match value {
             None => Self::Loading,
-            Some(Err(error)) => Self::Failed(user_facing(error)),
+            Some(Err(fault)) => Self::Failed(fault.to_string()),
             Some(Ok(answer)) => Self::Loaded(answer.clone()),
         }
     }
@@ -68,6 +73,38 @@ pub(crate) type CapabilitiesStatus = Remote<Capabilities>;
 /// deployment has no user PAT to post `@dependabot` commands with.
 pub(crate) const REBASE_UNAVAILABLE: &str =
     "rebase is unavailable: no GitHub user token is configured";
+
+/// Makes `call` on the page's line to the server, and keeps for it the rule
+/// every outgoing read keeps: a page whose credentials the server has already
+/// refused is not asked again, and a call that meets the refusal records it
+/// where it was met rather than leaving it to the next poll.
+///
+/// A free function over the line rather than a method on [`DashboardState`],
+/// because the resources that hold the rows, the facets, the name and the
+/// capabilities are built before the state that would own them — and they are
+/// calls to the server like any other, however little they look like one from
+/// where they are written. [`DashboardState::guarded`] is this, with the line
+/// taken from the state.
+pub(crate) async fn guarded_by<T, Fut>(
+    mut connection: Signal<Connection>,
+    call: impl FnOnce() -> Fut,
+) -> Result<T, Fault>
+where
+    Fut: Future<Output = Result<T, ServerFnError>>,
+{
+    if *connection.peek() == Connection::SignedOut {
+        return Err(Fault::SignedOut);
+    }
+    let answer = call().await.map_err(|error| logged_fault(&error));
+    // Only a change is written, as `set_connection` does, so a second refusal
+    // wakes no component.
+    if answer.as_ref().err() == Some(&Fault::SignedOut)
+        && *connection.peek() != Connection::SignedOut
+    {
+        connection.set(Connection::SignedOut);
+    }
+    answer
+}
 
 /// The server's answers the state carries, as the component that asked holds
 /// them: the rows for the filter and cursor in force, the facets for the
@@ -171,9 +208,9 @@ impl DashboardState {
         answers: Answers,
         now: impl Into<ReadSignal<u64>>,
         reload: Callback<()>,
+        connection: Signal<Connection>,
     ) -> Self {
         let syncing = use_signal(|| false);
-        let connection = use_signal(|| Connection::Online);
         let refreshed_at = use_signal(|| None);
         use_context_provider(|| Self {
             filter,
@@ -275,18 +312,11 @@ impl DashboardState {
     /// showing, and further while it is hidden. The banner goes up from
     /// whichever call meets the 401 first, and every call after it is refused
     /// without being made.
-    pub(crate) async fn guarded<T, Fut>(mut self, call: impl FnOnce() -> Fut) -> Result<T, Fault>
+    pub(crate) async fn guarded<T, Fut>(self, call: impl FnOnce() -> Fut) -> Result<T, Fault>
     where
         Fut: Future<Output = Result<T, ServerFnError>>,
     {
-        if self.signed_out() {
-            return Err(Fault::SignedOut);
-        }
-        let answer = call().await.map_err(|error| logged_fault(&error));
-        if answer.as_ref().err() == Some(&Fault::SignedOut) {
-            self.set_connection(Connection::SignedOut);
-        }
-        answer
+        guarded_by(self.connection, call).await
     }
 
     /// When a poll was last answered, in Unix seconds; `None` before the
@@ -581,6 +611,7 @@ mod tests {
     use futures_util::FutureExt;
 
     use super::*;
+    use crate::ui::SIGNED_OUT_MESSAGE;
     use crate::ui::test_support::{
         FIXTURE_NOW, grouped_row, loaded_page, loaded_summary, off_page_row, serde_row,
     };
@@ -603,6 +634,7 @@ mod tests {
                 let mut reloads = reloads;
                 *reloads.write() += 1;
             }),
+            use_signal(|| Connection::Online),
         );
         rsx! {}
     }
@@ -646,6 +678,28 @@ mod tests {
             assert!(!state.syncing());
             assert_eq!(reloads(&dom), 1, "ending a sync does not reload");
         });
+    }
+
+    /// Every answer the page shows for the read model is read through this,
+    /// and nothing else builds one: an answer not yet had is still loading,
+    /// and one that failed carries the words the user reads, which are the
+    /// fault's own rather than a second spelling of them.
+    #[test]
+    fn an_answer_not_yet_had_is_loading_and_a_failed_one_carries_what_the_user_reads() {
+        assert_eq!(Remote::<u8>::from_faulted(None), Remote::Loading);
+        assert_eq!(Remote::from_faulted(Some(&Ok(7u8))), Remote::Loaded(7));
+        assert_eq!(
+            Remote::<u8>::from_faulted(Some(&Err(Fault::SignedOut))),
+            Remote::Failed(SIGNED_OUT_MESSAGE.to_owned()),
+            "a refused credential reads as the banner's words"
+        );
+        assert_eq!(
+            Remote::<u8>::from_faulted(Some(&Err(Fault::Refused(
+                "The read model is unavailable".to_owned()
+            )))),
+            Remote::Failed("The read model is unavailable".to_owned()),
+            "a server's own message is shown as it wrote it"
+        );
     }
 
     /// The rows are read by resources the page holds, not by a call the state

@@ -227,12 +227,6 @@ pub(crate) fn logged_fault(error: &ServerFnError) -> Fault {
     fault(error)
 }
 
-/// The text a failed server call shows the user: its [`logged_fault`], in
-/// words.
-pub(crate) fn user_facing(error: &ServerFnError) -> String {
-    logged_fault(error).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use dioxus::fullstack::RequestError;
@@ -259,11 +253,11 @@ mod tests {
     #[test]
     fn a_401_asks_the_user_to_sign_in_again_and_other_statuses_say_what_they_are() {
         assert_eq!(
-            user_facing(&answered(500, "The read model is unavailable")),
+            fault(&answered(500, "The read model is unavailable")).to_string(),
             "The read model is unavailable"
         );
         assert_eq!(
-            user_facing(&answered(401, "HTTP 401: authentication required")),
+            fault(&answered(401, "HTTP 401: authentication required")).to_string(),
             SIGNED_OUT_MESSAGE
         );
         assert!(
@@ -271,13 +265,14 @@ mod tests {
             "{SIGNED_OUT_MESSAGE}"
         );
         assert_eq!(
-            user_facing(&answered(502, "HTTP 502: <html>Bad Gateway</html>")),
+            fault(&answered(502, "HTTP 502: <html>Bad Gateway</html>")).to_string(),
             UNREACHABLE_MESSAGE
         );
         assert_eq!(
-            user_facing(&ServerFnError::Request(RequestError::Request(
+            fault(&ServerFnError::Request(RequestError::Request(
                 "Failed to fetch".to_owned()
-            ))),
+            )))
+            .to_string(),
             UNREACHABLE_MESSAGE
         );
     }

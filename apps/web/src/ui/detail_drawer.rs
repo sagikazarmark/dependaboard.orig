@@ -12,11 +12,11 @@ use dioxus::prelude::*;
 use crate::api::{load_pr_projection, load_pr_status};
 use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
-use crate::ui::dashboard_state::{DashboardState, use_dashboard};
+use crate::ui::dashboard_state::{DashboardState, Remote, use_dashboard};
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
 use crate::ui::pr_sync::{ServerSync, SyncFailure, sync_pr};
 use crate::ui::side_panel::SidePanel;
-use crate::ui::{Fault, PendingAction, user_facing};
+use crate::ui::{Fault, PendingAction};
 
 /// The pull request `key` names as the read model has it, `None` once it is
 /// no longer in the dashboard, read on the page whose line to the server
@@ -248,7 +248,11 @@ pub(crate) fn DetailDrawer(
     // change under one drawer, which is keyed by it.
     let status = use_resource(use_reactive(
         (&row.synced_at, &gone),
-        move |(_synced_at, _gone)| load_pr_status(sync_repository_id, sync_number),
+        move |(_synced_at, _gone)| async move {
+            state
+                .guarded(|| load_pr_status(sync_repository_id, sync_number))
+                .await
+        },
     ));
     let durable_state = DurableStatus::from_resource(status.read().as_ref());
     let subject = row.clone();
@@ -391,12 +395,18 @@ enum DurableStatus {
 }
 
 impl DurableStatus {
-    fn from_resource(resource: Option<&Result<Option<PrState>, ServerFnError>>) -> Self {
-        match resource {
-            None => Self::Loading,
-            Some(Err(error)) => Self::Failed(user_facing(error)),
-            Some(Ok(None)) => Self::Gone,
-            Some(Ok(Some(state))) => Self::Present(Box::new(state.clone())),
+    /// What a resource's answer means, read through [`Remote`] so that the
+    /// two arms this shares with every other read of the read model — nothing
+    /// yet is loading, a fault is its words — are written once. The two arms
+    /// that are this drawer's own stay here, because `Gone` is not
+    /// `Loaded(None)` to anyone reading it: it is the object holding nothing
+    /// after the pull request closed and its state was retired.
+    fn from_resource(resource: Option<&Result<Option<PrState>, Fault>>) -> Self {
+        match Remote::from_faulted(resource) {
+            Remote::Loading => Self::Loading,
+            Remote::Failed(error) => Self::Failed(error),
+            Remote::Loaded(None) => Self::Gone,
+            Remote::Loaded(Some(state)) => Self::Present(Box::new(state)),
         }
     }
 }
@@ -613,6 +623,7 @@ mod tests {
             },
             use_signal(|| FIXTURE_NOW),
             use_callback(|_| {}),
+            use_signal(|| Connection::Online),
         );
         rsx! {
             OpenDetail { detail, now: FIXTURE_NOW, onaction: move |_| {}, onsync: move |_| {} }
