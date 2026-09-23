@@ -105,7 +105,6 @@ pub(crate) fn snapshot() -> PrRecord {
     PrRecord {
         id: "7#9".to_owned(),
         repository_id: 7,
-        installation_id: 1,
         owner: "acme".to_owned(),
         repo: "api".to_owned(),
         number: 9,

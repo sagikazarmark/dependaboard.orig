@@ -1143,6 +1143,8 @@ and `Result<T, StoreError>` written `Result<T>`; the crate's comments are the co
 /// What the Restate service writes, and the lookups it makes on the way.
 #[async_trait]
 pub trait ProjectionWriter: Send + Sync {
+    /// Writes the row under the id (repository_id, number) derives, not the one the
+    /// record carries, so no caller can store a PR whose id disagrees with its pair.
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<()>;
     /// The same lookup ProjectionReader's `get_pr` is built on, unscoped: this half
     /// serves a service that owns every row it names.
@@ -1205,9 +1207,10 @@ pub enum ProjectedPr { Row(Box<PrRecord>), Absent, Foreign }
 #[async_trait]
 pub trait ProjectionReader: Send + Sync {
     /// The row `key` names within `installation_id`, told apart three ways so the
-    /// caller need not read the row's installation back to know which it got. The
-    /// writer's `get_pr` is the same lookup, unscoped: the service owns every row it
-    /// names, while this key came from a browser.
+    /// caller need not work out whose the row is to know which it got — a PrRecord
+    /// says nothing of installations, and the repository row it hangs off is what
+    /// does. The writer's `get_pr` is the same lookup, unscoped: the service owns
+    /// every row it names, while this key came from a browser.
     async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr>;
     /// One keyset page of `installation_id`'s pull requests that `filter` matches,
     /// newest update first, plus how many match in all, from one snapshot (count and

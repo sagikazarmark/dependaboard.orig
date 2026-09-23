@@ -414,11 +414,18 @@ pub struct RepoRecord {
     pub synced_at: u64,
 }
 
+/// One pull request as the projection holds it, and as Restate journals it.
+///
+/// It carries no installation of its own: whose a pull request is, is its
+/// repository's row's to say (`RepoRecord::installation_id`), and the store
+/// answers with the repository the row hangs off rather than with anything a
+/// caller wrote here. `id` is `{repository_id}#{number}`, which the store
+/// derives when it writes the row and [`PrRecord::key`] derives when it reads
+/// one, so neither takes the field's word for it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrRecord {
     pub id: String,
     pub repository_id: u64,
-    pub installation_id: u64,
     pub owner: String,
     pub repo: String,
     pub number: u64,
@@ -1823,7 +1830,6 @@ mod tests {
         let record = PrRecord {
             id: "7#9".to_owned(),
             repository_id: 7,
-            installation_id: 1,
             owner: "acme".to_owned(),
             repo: "api".to_owned(),
             number: 9,
@@ -1858,7 +1864,6 @@ mod tests {
             serde_json::json!({
                 "id": "7#9",
                 "repository_id": 7,
-                "installation_id": 1,
                 "owner": "acme",
                 "repo": "api",
                 "number": 9,
@@ -1891,6 +1896,46 @@ mod tests {
         absent.as_object_mut().unwrap().remove("mergeable");
         let record: PrRecord = serde_json::from_value(absent).unwrap();
         assert_eq!(record.mergeable, Mergeable::Unknown);
+    }
+
+    /// The same journals hold snapshots written when a `PrRecord` carried its
+    /// repository's `installation_id` of its own. The field is gone — the
+    /// store reads the installation from the repository row the pull request
+    /// hangs off — and a record that still carries one must read as a record
+    /// without it, not as a snapshot Restate can no longer replay.
+    #[test]
+    fn a_journaled_snapshot_that_still_carries_an_installation_deserializes_without_one() {
+        let mut journaled = serde_json::json!({
+            "id": "7#9",
+            "repository_id": 7,
+            "installation_id": 1,
+            "owner": "acme",
+            "repo": "api",
+            "number": 9,
+            "title": "Bump serde",
+            "html_url": "https://github.com/acme/api/pull/9",
+            "dependency": null,
+            "from_version": null,
+            "to_version": null,
+            "dependencies": [],
+            "update_type": "unknown",
+            "head_sha": "abc123",
+            "check_status": "none",
+            "mergeable": "clean",
+            "labels": [],
+            "created_at": 0,
+            "updated_at": 0,
+            "synced_at": 0
+        });
+        let record: PrRecord = serde_json::from_value(journaled.clone()).unwrap();
+
+        assert_eq!(record.key(), PrKey::new(7, 9));
+        journaled.as_object_mut().unwrap().remove("installation_id");
+        assert_eq!(
+            record,
+            serde_json::from_value(journaled).unwrap(),
+            "the key the old snapshot carried is ignored, not read into anything"
+        );
     }
 
     #[test]

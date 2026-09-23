@@ -56,7 +56,6 @@ pub(crate) fn pr(repository_id: u64, number: u64, synced_at: u64) -> PrRecord {
     PrRecord {
         id: PrKey::new(repository_id, number).to_string(),
         repository_id,
-        installation_id: INSTALLATION,
         owner: "acme".to_owned(),
         repo: format!("repo-{repository_id}"),
         number,

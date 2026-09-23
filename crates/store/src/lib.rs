@@ -110,6 +110,15 @@ impl LibSqlPrStore {
     /// both traits in scope, resolve to it rather than being asked which
     /// trait they mean.
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError> {
+        Ok(self.pr_row(key).await?.map(|(record, _)| record))
+    }
+
+    /// The row `key` names and the installation it belongs to, from one read.
+    /// A pull request has no installation of its own — its repository's row is
+    /// what says whose it is — so the reader, which must tell a foreign row
+    /// from an absent one, takes the pair, and the writers take the record
+    /// alone through [`LibSqlPrStore::get_pr`].
+    async fn pr_row(&self, key: &PrKey) -> Result<Option<(PrRecord, u64)>, StoreError> {
         let connection = self.connection().await;
         let mut rows = connection
             .query(
@@ -117,7 +126,10 @@ impl LibSqlPrStore {
                 vec![Value::Text(key.to_string())],
             )
             .await?;
-        rows.next().await?.map(pr_from_row).transpose()
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        Ok(Some((pr_from_row(&row)?, installation_from_row(&row)?)))
     }
 
     /// Holds the connection for the duration of one store operation. The
@@ -137,6 +149,9 @@ impl LibSqlPrStore {
 /// service's in-memory store does not.
 #[async_trait]
 pub trait ProjectionWriter: Send + Sync {
+    /// Writes the row under the id `(repository_id, number)` derives, not the
+    /// one the record carries, so no caller can store a pull request whose id
+    /// disagrees with the pair every lookup names it by.
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<(), StoreError>;
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError>;
     async fn delete_pr(&self, key: &PrKey) -> Result<(), StoreError>;
@@ -238,10 +253,12 @@ pub enum ProjectedPr {
 #[async_trait]
 pub trait ProjectionReader: Send + Sync {
     /// What the projection holds for `key` within `installation_id`, told
-    /// apart three ways so the caller need not read the row's installation
-    /// back to know which it got. Unlike [`ProjectionWriter::get_pr`], which
-    /// serves a service that owns every row it names, this one is asked whose
-    /// the row is, because the key came from a browser.
+    /// apart three ways so the caller need not work out whose the row is to
+    /// know which it got — a [`PrRecord`] says nothing of installations, and
+    /// the repository row it hangs off is what does. Unlike
+    /// [`ProjectionWriter::get_pr`], which serves a service that owns every
+    /// row it names, this one is asked whose the row is, because the key came
+    /// from a browser.
     async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr, StoreError>;
     /// One keyset page of `installation_id`'s pull requests that `filter`
     /// matches, newest update first, plus how many match in all. Another
@@ -307,6 +324,8 @@ impl ProjectionWriter for LibSqlPrStore {
         let connection = self.connection().await;
         let dependencies = serde_json::to_string(&pr.dependencies)?;
         let labels = serde_json::to_string(&pr.labels)?;
+        // Derived, not taken from the record: see the trait's doc comment.
+        let id = pr.key().to_string();
         connection
             .execute(
                 r#"INSERT INTO pull_requests (
@@ -336,7 +355,7 @@ impl ProjectionWriter for LibSqlPrStore {
                     updated_at = excluded.updated_at,
                     synced_at = excluded.synced_at"#,
                 vec![
-                    Value::Text(pr.id.clone()),
+                    Value::Text(id),
                     integer(pr.repository_id)?,
                     Value::Text(pr.owner.clone()),
                     Value::Text(pr.repo.clone()),
@@ -586,14 +605,16 @@ impl ProjectionWriter for LibSqlPrStore {
 
 #[async_trait]
 impl ProjectionReader for LibSqlPrStore {
-    /// The row already carries its repository's installation — `select_pr_sql`
-    /// joins `repositories` for it — so one statement answers all three ways
-    /// without a `WHERE` on the installation and without a second read to
-    /// tell an absent key from a foreign one.
+    /// The read comes back with the installation beside the row —
+    /// `select_pr_sql` joins `repositories` for it, and
+    /// [`LibSqlPrStore::pr_row`] hands both back — so one statement answers
+    /// all three ways without a `WHERE` on the installation and without a
+    /// second read to tell an absent key from a foreign one. The repository's
+    /// row is the only thing that says whose a pull request is.
     async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr, StoreError> {
-        Ok(match LibSqlPrStore::get_pr(self, key).await? {
+        Ok(match self.pr_row(key).await? {
             None => ProjectedPr::Absent,
-            Some(row) if row.installation_id == installation_id => ProjectedPr::Row(Box::new(row)),
+            Some((row, owner)) if owner == installation_id => ProjectedPr::Row(Box::new(row)),
             Some(_) => ProjectedPr::Foreign,
         })
     }
@@ -839,11 +860,12 @@ fn page_sql(scoped: &mut ScopedFilter, limit: u64) -> Result<String, StoreError>
     ))
 }
 
-fn pr_from_row(row: Row) -> Result<PrRecord, StoreError> {
+/// The pull request's own columns of a [`select_pr_sql`] row; column 2, the
+/// installation joined in from `repositories`, is [`installation_from_row`]'s.
+fn pr_from_row(row: &Row) -> Result<PrRecord, StoreError> {
     Ok(PrRecord {
         id: row.get(0)?,
         repository_id: unsigned(row.get::<i64>(1)?)?,
-        installation_id: unsigned(row.get::<i64>(2)?)?,
         owner: row.get(3)?,
         repo: row.get(4)?,
         number: unsigned(row.get::<i64>(5)?)?,
@@ -870,13 +892,20 @@ fn pr_from_row(row: Row) -> Result<PrRecord, StoreError> {
     })
 }
 
+/// The installation of the repository a [`select_pr_sql`] row's pull request
+/// hangs off, joined in as column 2. The pull request's own columns hold no
+/// installation: the repository row is what says whose it is.
+fn installation_from_row(row: &Row) -> Result<u64, StoreError> {
+    unsigned(row.get::<i64>(2)?)
+}
+
 /// Drains the rows of a [`select_pr_sql`] query, in the order the database
 /// produced them. Taking the rows by value means nothing of the statement
 /// outlives the call, so a caller can end its transaction right after.
 async fn collect_prs(mut rows: libsql::Rows) -> Result<Vec<PrRecord>, StoreError> {
     let mut records = Vec::new();
     while let Some(row) = rows.next().await? {
-        records.push(pr_from_row(row)?);
+        records.push(pr_from_row(&row)?);
     }
     Ok(records)
 }
@@ -1090,13 +1119,16 @@ mod tests {
         );
     }
 
-    /// Resolving a key within an installation answers three ways, not two: a
-    /// key with no row anywhere is nothing to show, while a key whose row is
-    /// another installation's is a key this deployment's projection never
-    /// showed. The web edge tells the browser different things about them, so
-    /// the store must not fold them together.
+    /// A pull request is of whichever installation its repository's row is
+    /// of — the row itself says nothing about it — and resolving a key within
+    /// an installation answers three ways, not two: a key with no row
+    /// anywhere is nothing to show, while a key whose repository is another
+    /// installation's is a key this deployment's projection never showed. The
+    /// web edge tells the browser different things about them, so the store
+    /// must not fold them together.
     #[tokio::test]
-    async fn a_key_of_another_installation_is_not_answered_as_a_key_with_no_row() {
+    async fn the_repository_a_pull_request_hangs_off_decides_whose_it_is_and_a_foreign_key_is_not_an_absent_one()
+     {
         let (_directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
         store
@@ -1106,6 +1138,8 @@ mod tests {
             })
             .await
             .unwrap();
+        // Both pull requests are written the same way; only their
+        // repositories differ, and that is what parts them.
         store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
         store.upsert_pr(&pr(2, 3, 10)).await.unwrap();
 
@@ -1132,10 +1166,7 @@ mod tests {
             ProjectionReader::get_pr(&store, OTHER_INSTALLATION, &PrKey::new(2, 3))
                 .await
                 .unwrap(),
-            ProjectedPr::Row(Box::new(PrRecord {
-                installation_id: OTHER_INSTALLATION,
-                ..pr(2, 3, 10)
-            }))
+            ProjectedPr::Row(Box::new(pr(2, 3, 10)))
         );
     }
 
@@ -1778,17 +1809,67 @@ mod tests {
         }
     }
 
+    /// `upsert_pr` writes the id `(repository_id, number)` derives, not the
+    /// one the record carries, so no caller can put a row in the projection
+    /// under an id that disagrees with the pull request it describes — the
+    /// row would then be unreachable by its own key, and a second write for
+    /// the same pull request would land beside it rather than over it.
     #[tokio::test]
-    async fn a_second_row_for_the_same_repository_and_number_is_rejected() {
+    async fn a_row_is_stored_under_the_id_its_repository_and_number_derive_and_not_the_one_it_carries()
+     {
         let (_directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
-        store.upsert_pr(&pr(1, 7, 10)).await.unwrap();
-        // The id is derived from (repository_id, number), so a row that
-        // disagrees with its own id would be a second row for the same PR.
-        let mut rogue = pr(1, 7, 10);
-        rogue.id = "rogue".to_owned();
+        let mut mislabelled = pr(1, 7, 10);
+        mislabelled.id = PrKey::new(1, 8).to_string();
 
-        let error = store.upsert_pr(&rogue).await.unwrap_err();
+        store.upsert_pr(&mislabelled).await.unwrap();
+
+        assert_eq!(
+            store.get_pr(&PrKey::new(1, 7)).await.unwrap(),
+            Some(pr(1, 7, 10)),
+            "the row is there under the key it actually has, id and all"
+        );
+        assert_eq!(
+            store.get_pr(&PrKey::new(1, 8)).await.unwrap(),
+            None,
+            "and nowhere under the id it was handed"
+        );
+        // A second write of the same pull request goes over the first, so the
+        // mislabelled id left no row of its own behind.
+        store.upsert_pr(&pr(1, 7, 20)).await.unwrap();
+        assert_eq!(
+            store
+                .list_prs(INSTALLATION, &PrFilter::default(), Page::default())
+                .await
+                .unwrap()
+                .total,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_row_for_the_same_repository_and_number_is_rejected() {
+        let (directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        // A row under some id of its own already holds (1, 7) — written
+        // before ids were derived, or by hand. The index makes the pair as
+        // unique as the derived id, so the store's own write for that pull
+        // request is refused rather than becoming a second row for it.
+        sidecar(&directory)
+            .await
+            .execute(
+                r#"INSERT INTO pull_requests (
+                    id, repository_id, owner, repo, number, title, html_url,
+                    dependencies, update_type, head_sha, check_status, labels,
+                    created_at, updated_at, synced_at
+                ) VALUES ('rogue', 1, 'acme', 'repo-1', 7, 'Bump serde', '',
+                    '[]', 'minor', 'sha-7', 'success', '[]', 0, 0, 10)"#,
+                (),
+            )
+            .await
+            .unwrap();
+
+        let error = store.upsert_pr(&pr(1, 7, 10)).await.unwrap_err();
 
         assert!(
             error.to_string().contains(
@@ -1803,7 +1884,8 @@ mod tests {
         );
         assert_eq!(
             store.get_pr(&PrKey::new(1, 7)).await.unwrap(),
-            Some(pr(1, 7, 10))
+            None,
+            "the refused row was not written under its derived id either"
         );
     }
 

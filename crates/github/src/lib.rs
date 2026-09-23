@@ -654,15 +654,7 @@ impl GithubApi for GithubClient {
         }
         let head = self.fetch_head_commit(request, &pull).await?;
         let signals = self.check_signals(request, &head).await?;
-        project_snapshot(
-            request,
-            self.config.installation_id,
-            &pull,
-            &head,
-            signals,
-            unix_seconds(),
-        )
-        .map(Some)
+        project_snapshot(request, &pull, &head, signals, unix_seconds()).map(Some)
     }
 
     /// Reads every page of the installation's repositories — until one is short, or the

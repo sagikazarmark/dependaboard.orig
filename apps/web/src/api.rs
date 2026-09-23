@@ -1200,13 +1200,7 @@ mod tests {
         assert_eq!(unknown.unwrap(), None);
 
         let own = read(grouped_row()).await;
-        assert_eq!(
-            own.unwrap(),
-            Some(PrRecord {
-                installation_id: INSTALLATION_ID,
-                ..grouped_row()
-            })
-        );
+        assert_eq!(own.unwrap(), Some(grouped_row()));
     }
 
     /// The durable state lives in Restate, whose `PullRequest` objects know

@@ -156,7 +156,7 @@ pub(crate) async fn delete_repositories_where(
 
 #[cfg(test)]
 mod tests {
-    use dependaboard_core::{PrFilter, PrRecord, RepoRecord};
+    use dependaboard_core::{PrFilter, RepoRecord};
 
     use crate::{
         LibSqlPrStore, ProjectionReader, ProjectionWriter,
@@ -215,10 +215,7 @@ mod tests {
         assert!(store.get_pr(&PrKey::new(2, 1)).await.unwrap().is_none());
         assert_eq!(
             store.get_pr(&PrKey::new(3, 2)).await.unwrap(),
-            Some(PrRecord {
-                installation_id: OTHER_INSTALLATION,
-                ..pr(3, 2, 10)
-            })
+            Some(pr(3, 2, 10))
         );
         // Each deployment's own read is the instrument: the purged
         // installation's dashboard is left with nothing, and the other's is

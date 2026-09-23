@@ -472,7 +472,6 @@ fn lowercase(value: Option<&str>) -> Option<String> {
 /// every dependency in `dependencies`. Fails only on a timestamp that cannot be read.
 pub(crate) fn project_snapshot(
     request: &SyncRequest,
-    installation_id: u64,
     pull: &PullRequestNode,
     head: &Commit,
     signals: impl IntoIterator<Item = CheckSignal>,
@@ -506,7 +505,6 @@ pub(crate) fn project_snapshot(
     Ok(PrRecord {
         id: PrKey::new(request.repository_id, request.number).to_string(),
         repository_id: request.repository_id,
-        installation_id,
         owner: request.owner.clone(),
         repo: request.repo.clone(),
         number: request.number,
@@ -733,7 +731,6 @@ mod tests {
 
     // --- the snapshot projection ------------------------------------------
 
-    const INSTALLATION_ID: u64 = 42;
     const REPOSITORY_ID: u64 = 7;
     const OWNER: &str = "acme";
     const REPO: &str = "api";
@@ -809,7 +806,6 @@ mod tests {
 
         let record = project_snapshot(
             &sync_request(),
-            INSTALLATION_ID,
             &pull,
             &head,
             [CheckSignal::Pass, CheckSignal::Pass],
@@ -822,7 +818,6 @@ mod tests {
             PrRecord {
                 id: "7#9".to_owned(),
                 repository_id: REPOSITORY_ID,
-                installation_id: INSTALLATION_ID,
                 owner: OWNER.to_owned(),
                 repo: REPO.to_owned(),
                 number: NUMBER,
@@ -862,7 +857,6 @@ mod tests {
         // The head's one signal is a suite that failed to start, with no run to show for it.
         let record = project_snapshot(
             &sync_request(),
-            INSTALLATION_ID,
             &pull,
             &head,
             [CheckSignal::Fail],
