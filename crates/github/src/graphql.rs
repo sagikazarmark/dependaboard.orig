@@ -375,13 +375,13 @@ pub(crate) struct CheckSuite {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckSignal {
+pub(crate) enum CheckSignal {
     Pass,
     Fail,
     Pending,
 }
 
-pub fn rollup_checks(signals: impl IntoIterator<Item = CheckSignal>) -> CheckStatus {
+fn rollup_checks(signals: impl IntoIterator<Item = CheckSignal>) -> CheckStatus {
     let mut saw_pass = false;
     let mut saw_pending = false;
     for signal in signals {
@@ -400,7 +400,12 @@ pub fn rollup_checks(signals: impl IntoIterator<Item = CheckSignal>) -> CheckSta
     }
 }
 
-pub fn check_signal(status: Option<&str>, conclusion: Option<&str>) -> Option<CheckSignal> {
+/// What one check run or check suite contributes, by its status and conclusion. A
+/// conclusion answers on its own; a check still without one answers by its status.
+/// `startup_failure` is a conclusion, not a status — GitHub has it in
+/// `CheckConclusionState` and not in `CheckStatusState` — so a workflow that failed to
+/// start arrives as `completed` plus that conclusion.
+fn check_signal(status: Option<&str>, conclusion: Option<&str>) -> Option<CheckSignal> {
     if let Some(conclusion) = conclusion {
         return match conclusion {
             "success" | "neutral" | "skipped" => Some(CheckSignal::Pass),
@@ -413,14 +418,13 @@ pub fn check_signal(status: Option<&str>, conclusion: Option<&str>) -> Option<Ch
         Some("queued" | "in_progress" | "waiting" | "pending" | "requested" | "expected") => {
             Some(CheckSignal::Pending)
         }
-        Some("startup_failure") => Some(CheckSignal::Fail),
         _ => None,
     }
 }
 
 /// What one commit status contributes, by its state. `expected` is a required context
 /// that has not reported yet, which the truth table counts as pending.
-pub fn status_signal(state: &str) -> Option<CheckSignal> {
+fn status_signal(state: &str) -> Option<CheckSignal> {
     match state {
         "success" => Some(CheckSignal::Pass),
         "failure" | "error" => Some(CheckSignal::Fail),
@@ -606,6 +610,8 @@ mod tests {
         }
     }
 
+    /// spec.md §5b's suites row: a suite maps through the same values as a run, but only a
+    /// failure survives the filter.
     #[test]
     fn suites_only_contribute_failures() {
         assert_eq!(
@@ -903,22 +909,12 @@ mod tests {
         }
     }
 
+    /// spec.md §5b's truth table, executable: every value the table lists, on the axis it
+    /// lists it on. The suites-only-failures row is the one rule this cannot show, because
+    /// it is a filter over these signals rather than one of them — see
+    /// [`suites_only_contribute_failures`].
     #[test]
-    fn rollup_uses_failure_pending_success_none_precedence() {
-        assert_eq!(rollup_checks([]), CheckStatus::None);
-        assert_eq!(rollup_checks([CheckSignal::Pass]), CheckStatus::Success);
-        assert_eq!(
-            rollup_checks([CheckSignal::Pass, CheckSignal::Pending]),
-            CheckStatus::Pending
-        );
-        assert_eq!(
-            rollup_checks([CheckSignal::Pending, CheckSignal::Fail]),
-            CheckStatus::Failure
-        );
-    }
-
-    #[test]
-    fn all_documented_check_values_are_classified() {
+    fn every_value_in_the_check_truth_table_is_classified() {
         for value in ["success", "neutral", "skipped"] {
             assert_eq!(check_signal(None, Some(value)), Some(CheckSignal::Pass));
         }

@@ -1494,17 +1494,29 @@ collapse is where accidental behaviour creeps in.
 Checks move through a *status* and, once `completed`, receive a *conclusion*. GitHub
 treats `neutral` and `skipped` as successes for dependent checks; `stale` means the run
 was marked stale by GitHub **because it took too long** — that's a failure, not a
-supersession (an earlier draft had this backwards).
+supersession (an earlier draft had this backwards). `startup_failure` is a *conclusion*
+too, not a status: it is in GraphQL's `CheckConclusionState` and not in
+`CheckStatusState`, so a workflow that failed to start reports status `completed` with
+that conclusion (an earlier draft filed it on the status axis, where nothing can ever
+match it).
 
 | Source value | Contributes |
 |---|---|
 | conclusion `success`, `neutral`, `skipped` | pass |
-| conclusion `failure`, `timed_out`, `action_required`, `cancelled`, `stale` | fail |
+| conclusion `failure`, `timed_out`, `action_required`, `cancelled`, `stale`, `startup_failure` | fail |
 | status `queued`, `in_progress`, `waiting`, `pending`, `requested`, `expected` | pending |
-| suite status `startup_failure` | fail |
+| check suite — any value above that contributes fail | fail |
+| check suite — anything else | nothing |
 | commit status `success` | pass |
 | commit status `failure`, `error` | fail |
-| commit status `pending` | pending |
+| commit status `pending`, `expected` | pending |
+
+Suites map through the same values as runs, but **only their failures count**. Runs
+already carry the active and passing state of everything a suite contains, so a passing
+suite says nothing new and a queued one must not drag a rollup of finished runs back to
+pending; what a suite adds is the failure that can happen before any run exists — a
+workflow that failed to start. Commit status `expected` is a required context that has
+not reported yet, which is pending for the same reason `pending` is.
 
 Rollup, in order:
 
