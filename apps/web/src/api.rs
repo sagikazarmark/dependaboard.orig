@@ -1424,4 +1424,44 @@ mod tests {
         assert_eq!(own.json::<Option<PrState>>().await.unwrap(), Some(synced));
         dashboard.the_one_forward("/restate/call/PullRequest/7%239/status");
     }
+
+    /// A key of another installation is refused outright, and refused before
+    /// Restate hears of it. Two things ride on that. The refusal itself:
+    /// `None` is how the drawer learns a pull request is no longer open, so a
+    /// foreign key folded into `None` would tell the browser about a pull
+    /// request that had closed rather than about one that was never its to ask
+    /// after. And where the refusal falls: the `PullRequest` object knows
+    /// nothing of installations and answers whatever key it is handed, so the
+    /// resolution is the whole of what stands between a key the browser named
+    /// and another installation's durable state.
+    ///
+    /// Which is why the foreign key is seeded at its status path with state
+    /// Restate would gladly hand back. It is what makes the second half of the
+    /// assertion mean anything: a resolution that ever stopped refusing would
+    /// come back carrying that state, rather than pass because Restate
+    /// happened to hold nothing for the key.
+    #[tokio::test]
+    async fn a_pull_request_status_is_refused_for_a_foreign_key_before_restate_is_asked() {
+        let backend = backend().await;
+        backend.project(INSTALLATION_ID, &grouped_row()).await;
+        backend.project(INSTALLATION_ID + 1, &serde_row()).await;
+        let foreign = serde_row();
+        let mut synced = PrState::default();
+        synced.complete_sync("sync-1".to_owned());
+        backend.restate_answers(
+            &pr_status_path(foreign.repository_id, foreign.number),
+            json!(synced),
+        );
+
+        let refused = load_pr_status_in(backend.state(), foreign.key()).await;
+
+        assert_eq!(
+            refusal(refused),
+            "pull request #12 does not belong to the configured installation"
+        );
+        assert!(
+            backend.forwards().is_empty(),
+            "a key of another installation is refused before Restate is asked"
+        );
+    }
 }

@@ -497,4 +497,101 @@ mod tests {
             );
         }
     }
+
+    /// The completion line `traced` logs is where an operator reads what became of a
+    /// delivery: the span names `WebhookIngress/dispatch` and the kind that arrived, and
+    /// the outcome names the object and handler the route was sent to. Nothing downstream
+    /// parses that line, so nothing but a test notices when it stops being true. The
+    /// service names, the handler names and the keys are spelled out in `outcome` and
+    /// nowhere else, which leaves every one of them free to drift from what
+    /// `send_webhook_route` actually does while the suite stays green and the log goes on
+    /// confidently naming an object the delivery never reached. Suspending an installation
+    /// against purging it is the sharpest case: both are real handlers on the same object,
+    /// so a swapped arm reads as a perfectly ordinary line, and the operator looking for
+    /// why an installation was torn down finds a line saying it was only paused.
+    ///
+    /// The walk's list is written out, so on its own it could age behind the enums: a
+    /// route, or a lifecycle action, given a variant and an arm in `outcome` but never
+    /// walked here would leave this test passing over the cases it does name and saying
+    /// nothing about the new one. The two matches below are exhaustive and do nothing
+    /// else — a variant added to either enum does not compile until it is named there,
+    /// which is where a reader is sent to the list that follows.
+    #[test]
+    fn the_completion_line_names_the_object_and_handler_each_route_was_sent_to() {
+        fn named_in_the_walk_below(route: &WebhookRoute) {
+            match route {
+                WebhookRoute::ClosePullRequest(_)
+                | WebhookRoute::SyncPullRequest(_)
+                | WebhookRoute::SyncSha(_)
+                | WebhookRoute::Installation { .. }
+                | WebhookRoute::Ignore => {}
+            }
+        }
+
+        fn lifecycle_action_named_in_the_walk_below(action: &InstallationLifecycleAction) {
+            match action {
+                InstallationLifecycleAction::Start
+                | InstallationLifecycleAction::SyncNow
+                | InstallationLifecycleAction::Pause
+                | InstallationLifecycleAction::Purge => {}
+            }
+        }
+
+        // The same installation and repository the `delivery` fixture stands for, so each
+        // line below reads as the one that delivery would have logged.
+        let installation = |action| WebhookRoute::Installation {
+            installation_id: 1,
+            action,
+        };
+        for (route, line) in [
+            (
+                WebhookRoute::ClosePullRequest(PrKey::new(7, 9)),
+                "sent PullRequest/7#9.closed",
+            ),
+            (
+                WebhookRoute::SyncPullRequest(SyncRequest {
+                    repository_id: 7,
+                    owner: "acme".to_owned(),
+                    repo: "api".to_owned(),
+                    number: 9,
+                    bypass_debounce: false,
+                    completion_id: None,
+                }),
+                "sent PullRequest/7#9.sync",
+            ),
+            (
+                WebhookRoute::SyncSha(SyncShaRequest {
+                    repository_id: 7,
+                    owner: "acme".to_owned(),
+                    repo: "api".to_owned(),
+                    sha: "abc123".to_owned(),
+                    pull_requests: vec![9],
+                }),
+                "sent RepoSync/7.sync_sha",
+            ),
+            (
+                installation(InstallationLifecycleAction::Start),
+                "sent InstallationSync/1.start",
+            ),
+            (
+                installation(InstallationLifecycleAction::SyncNow),
+                "sent InstallationSync/1.sync_now",
+            ),
+            (
+                installation(InstallationLifecycleAction::Pause),
+                "sent InstallationSync/1.pause",
+            ),
+            (
+                installation(InstallationLifecycleAction::Purge),
+                "sent InstallationSync/1.purge",
+            ),
+            (WebhookRoute::Ignore, "ignored"),
+        ] {
+            named_in_the_walk_below(&route);
+            if let WebhookRoute::Installation { action, .. } = &route {
+                lifecycle_action_named_in_the_walk_below(action);
+            }
+            assert_eq!(route.outcome(), line, "{route:?}");
+        }
+    }
 }

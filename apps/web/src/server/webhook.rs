@@ -558,21 +558,50 @@ mod tests {
         // The walk's list is written out, so on its own it could age behind the
         // enum: a kind given a variant and routed by the dispatcher, but never
         // walked here, would leave this test passing over the kinds it does name
-        // and saying nothing about the new one. This match is exhaustive and does
-        // nothing else — a variant added to `DeliveryKind` does not compile until
-        // it is named here, which is where a reader is sent to the list below.
-        fn named_in_the_walk_below(kind: &DeliveryKind) {
-            match kind {
-                DeliveryKind::PullRequest
-                | DeliveryKind::CheckSuite
-                | DeliveryKind::CheckRun
-                | DeliveryKind::Status
-                | DeliveryKind::Installation
-                | DeliveryKind::InstallationRepositories
-                | DeliveryKind::Other(_) => {}
-            }
+        // and saying nothing about the new one. This match is exhaustive, so a
+        // variant added to `DeliveryKind` does not compile until it is named
+        // here, which is where a reader is sent to the list below.
+        //
+        // Naming alone would only half-close the hole: an arm written here with no
+        // envelope added below would still compile, and that kind — routed, named,
+        // and unwatched — is exactly the one the edge would then swallow. So the
+        // match does not merely name a kind, it answers with the slot the walk
+        // holds it at; the walk marks the slots it fills, and the coverage
+        // assertion afterwards reads the empty ones back out. The slots are
+        // bounded at compile time, so a new arm cannot reach past the list for a
+        // slot of its own: the arm's slot forces `ROUTED_KINDS` up, and
+        // `ROUTED_KINDS` leaves a slot no envelope fills until the list grows one.
+        //
+        // `Other` is the kind this deployment does not route, so it answers with no
+        // slot at all and stays out of the walk. That is the one way out, and it
+        // costs a claim a reader can weigh — which is what `Other` has always meant.
+        const ROUTED_KINDS: usize = 6;
+
+        struct Slot<const AT: usize>;
+
+        impl<const AT: usize> Slot<AT> {
+            const IN_THE_WALK: usize = {
+                assert!(
+                    AT < ROUTED_KINDS,
+                    "the walk below has no such slot; grow it and `ROUTED_KINDS` together"
+                );
+                AT
+            };
         }
 
+        fn slot_in_the_walk_below(kind: &DeliveryKind) -> Option<usize> {
+            Some(match kind {
+                DeliveryKind::PullRequest => Slot::<0>::IN_THE_WALK,
+                DeliveryKind::CheckSuite => Slot::<1>::IN_THE_WALK,
+                DeliveryKind::CheckRun => Slot::<2>::IN_THE_WALK,
+                DeliveryKind::Status => Slot::<3>::IN_THE_WALK,
+                DeliveryKind::Installation => Slot::<4>::IN_THE_WALK,
+                DeliveryKind::InstallationRepositories => Slot::<5>::IN_THE_WALK,
+                DeliveryKind::Other(_) => return None,
+            })
+        }
+
+        let mut walked = [false; ROUTED_KINDS];
         for kind in [
             DeliveryKind::PullRequest,
             DeliveryKind::CheckSuite,
@@ -581,13 +610,29 @@ mod tests {
             DeliveryKind::Installation,
             DeliveryKind::InstallationRepositories,
         ] {
-            named_in_the_walk_below(&kind);
+            let slot = slot_in_the_walk_below(&kind).unwrap_or_else(|| {
+                panic!(
+                    "{kind} answers the match above with no slot, so it is not the edge's to route"
+                )
+            });
+            assert!(
+                !std::mem::replace(&mut walked[slot], true),
+                "{kind} shares slot {slot} with a kind already walked"
+            );
             let bare = envelope(kind.as_str(), None, true, &serde_json::json!({}));
             match route_delivery(&bare) {
                 Ok(Disposition::Forward(event)) => assert_eq!(event.event, kind),
                 Err(RoutingError::Payload(_)) => {}
                 answered => panic!("{kind} should not be acknowledged at the edge: {answered:?}"),
             }
+        }
+
+        for (slot, filled) in walked.iter().enumerate() {
+            assert!(
+                filled,
+                "nothing in the list above walked the kind the match answers with slot {slot}; \
+                 it is routed and named, so the list has to grow an envelope for it"
+            );
         }
     }
 

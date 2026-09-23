@@ -1366,11 +1366,26 @@ pub struct PrState {
     pub completed_sync_ids: Vec<String>,
 }
 
+/// How far back the drawer's action trail reads. The history is durable state
+/// a Restate object carries for as long as the pull request is open, so it is
+/// bounded rather than appended to forever; what the bound answers is how much
+/// of a pull request's story a person can still see.
+const RETAINED_HISTORY: usize = 20;
+
+/// How many manual syncs can be waiting to be acknowledged at once. A sync the
+/// dashboard asks for carries a completion id, which the object records here
+/// and the page polls for; an id that has fallen out of this window is a sync
+/// the page can no longer be told completed. It is the same number as
+/// [`RETAINED_HISTORY`] and not the same rule — one bounds what is read, the
+/// other bounds what is still being waited on — so a change to the poll window
+/// must not quietly shorten the trail.
+const RETAINED_SYNC_IDS: usize = 20;
+
 impl PrState {
     pub fn push_history(&mut self, entry: ActionLog) {
         self.history.push(entry);
-        if self.history.len() > 20 {
-            self.history.drain(..self.history.len() - 20);
+        if self.history.len() > RETAINED_HISTORY {
+            self.history.drain(..self.history.len() - RETAINED_HISTORY);
         }
     }
 
@@ -1378,9 +1393,9 @@ impl PrState {
         if !self.completed_sync_ids.contains(&completion_id) {
             self.completed_sync_ids.push(completion_id);
         }
-        if self.completed_sync_ids.len() > 20 {
+        if self.completed_sync_ids.len() > RETAINED_SYNC_IDS {
             self.completed_sync_ids
-                .drain(..self.completed_sync_ids.len() - 20);
+                .drain(..self.completed_sync_ids.len() - RETAINED_SYNC_IDS);
         }
     }
 }
@@ -2712,5 +2727,71 @@ mod tests {
         );
         let serialized = serde_json::to_value(&request).unwrap();
         assert!(serialized.get("observed_sha").is_none());
+    }
+
+    /// The action trail a `PullRequest` object carries is durable state, kept
+    /// for as long as the pull request is open, so it is bounded — and the end
+    /// it is bounded from is what matters. A trail trimmed from the wrong end
+    /// holds its length and shows a person the first twenty things that ever
+    /// happened to a pull request instead of the last twenty, which reads as a
+    /// drawer that stopped being told anything. So the entries are named, not
+    /// counted: the oldest go, the newest stay, in the order they arrived.
+    #[test]
+    fn an_objects_history_keeps_the_newest_entries_and_drops_the_oldest() {
+        let mut state = PrState::default();
+        for at in 1..=(RETAINED_HISTORY as u64 + 5) {
+            state.push_history(ActionLog {
+                at,
+                action: "sync".to_owned(),
+                detail: format!("detail-{at}"),
+            });
+        }
+
+        assert_eq!(state.history.len(), RETAINED_HISTORY);
+        assert_eq!(
+            state
+                .history
+                .iter()
+                .map(|entry| entry.at)
+                .collect::<Vec<_>>(),
+            (6..=25).collect::<Vec<_>>(),
+            "the five oldest went and the newest twenty stayed, in order"
+        );
+    }
+
+    /// The completion ids an object remembers are the window a manual sync can
+    /// still be acknowledged in: the dashboard asks for a sync under an id and
+    /// then polls the object for it, so an id that has fallen out of this list
+    /// is a sync the page can no longer be told finished. It is bounded from
+    /// the same end as the history and for a different reason, and a repeat is
+    /// not a new entry — a page that polls the same id twice must not cost
+    /// another sync its place.
+    #[test]
+    fn completed_sync_ids_keep_the_newest_refreshes_and_a_repeat_costs_no_room() {
+        let mut state = PrState::default();
+        state.complete_sync("sync-1".to_owned());
+        for _ in 0..3 {
+            state.complete_sync("sync-1".to_owned());
+        }
+        assert_eq!(
+            state.completed_sync_ids,
+            ["sync-1"],
+            "the same sync acknowledged again is the same sync"
+        );
+
+        for id in 2..=(RETAINED_SYNC_IDS as u64 + 3) {
+            state.complete_sync(format!("sync-{id}"));
+        }
+
+        assert_eq!(state.completed_sync_ids.len(), RETAINED_SYNC_IDS);
+        assert_eq!(
+            state.completed_sync_ids.first().map(String::as_str),
+            Some("sync-4"),
+            "the three oldest went, the repeats having taken no room of their own"
+        );
+        assert_eq!(
+            state.completed_sync_ids.last().map(String::as_str),
+            Some("sync-23")
+        );
     }
 }
