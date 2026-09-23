@@ -554,6 +554,25 @@ mod tests {
         // arm that answers with `Acknowledge`, which would drop deliveries the
         // dispatcher routes. A bare envelope of each routed kind is either
         // forwarded or refused for the routing fields its payload lacks.
+        //
+        // The walk's list is written out, so on its own it could age behind the
+        // enum: a kind given a variant and routed by the dispatcher, but never
+        // walked here, would leave this test passing over the kinds it does name
+        // and saying nothing about the new one. This match is exhaustive and does
+        // nothing else — a variant added to `DeliveryKind` does not compile until
+        // it is named here, which is where a reader is sent to the list below.
+        fn named_in_the_walk_below(kind: &DeliveryKind) {
+            match kind {
+                DeliveryKind::PullRequest
+                | DeliveryKind::CheckSuite
+                | DeliveryKind::CheckRun
+                | DeliveryKind::Status
+                | DeliveryKind::Installation
+                | DeliveryKind::InstallationRepositories
+                | DeliveryKind::Other(_) => {}
+            }
+        }
+
         for kind in [
             DeliveryKind::PullRequest,
             DeliveryKind::CheckSuite,
@@ -562,6 +581,7 @@ mod tests {
             DeliveryKind::Installation,
             DeliveryKind::InstallationRepositories,
         ] {
+            named_in_the_walk_below(&kind);
             let bare = envelope(kind.as_str(), None, true, &serde_json::json!({}));
             match route_delivery(&bare) {
                 Ok(Disposition::Forward(event)) => assert_eq!(event.event, kind),
