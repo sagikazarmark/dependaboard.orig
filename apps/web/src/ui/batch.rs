@@ -357,9 +357,13 @@ pub(crate) enum BatchOutcome {
 /// what is known of it, until it completes or cannot be submitted.
 /// `on_accepted` is called once, when Restate is known to have the batch,
 /// with the receipt: which of the targets submitted the server left out of
-/// it. A round trip that failed after Restate took the batch has no receipt
-/// to hand over, so the receipt is read off Restate's progress instead: what
-/// the dashboard queued that Restate does not run was left out.
+/// it. Only the first submission's answer is a receipt. A round trip that
+/// failed after Restate took the batch carries none, and one the server
+/// answered after a failed round trip carries one Restate folded away on the
+/// batch id, describing a resolution that never ran; for both, the receipt is
+/// read off Restate's progress instead — what the dashboard queued that
+/// Restate does not run was left out — and a batch Restate has taken but not
+/// started yet leaves no target named, since nothing has said any was.
 pub(crate) async fn run_batch<G: SubmitGateway>(
     gateway: &mut G,
     mut followed: Followed,
@@ -374,15 +378,22 @@ pub(crate) async fn run_batch<G: SubmitGateway>(
             }
             on_accepted(receipt);
         }
-        Ok(Taken::Running(progress)) => {
+        Ok(Taken::Already(progress)) => {
             // Read against the dashboard's own snapshot, before Restate's
-            // word replaces it.
+            // word replaces it. A batch Restate has taken and not started
+            // leaves nothing to read: no target is named left out, since the
+            // only word that could name one is the progress there is not yet.
             let receipt = BatchReceipt {
-                left_out: followed.left_out_of(&progress),
+                left_out: progress
+                    .as_ref()
+                    .map(|progress| followed.left_out_of(progress))
+                    .unwrap_or_default(),
             };
-            let now = gateway.now();
-            if followed.hear(progress, now) {
-                report(&followed);
+            if let Some(progress) = progress {
+                let now = gateway.now();
+                if followed.hear(progress, now) {
+                    report(&followed);
+                }
             }
             on_accepted(receipt);
             if let Some(progress) = followed.progress.as_ref().filter(|it| it.completed) {
@@ -493,11 +504,16 @@ async fn poll<G: BatchGateway>(
 
 /// How Restate came to have the batch.
 enum Taken {
-    /// The submission was answered: a clean acceptance, with its receipt.
+    /// The first submission was answered: a clean acceptance, with its
+    /// receipt.
     Accepted(BatchReceipt),
-    /// A round trip failed after Restate had already taken the batch; carries
-    /// the progress that proved it.
-    Running(BatchProgress),
+    /// Restate already had the batch when the attempt that found out was
+    /// made: a round trip was lost after it took the batch, so whatever a
+    /// later submission answers was folded onto the first on the batch id,
+    /// and only Restate's own progress says which targets it runs. Carries
+    /// that progress, or nothing where Restate has taken the batch and not
+    /// started it, and so has no word to give.
+    Already(Option<BatchProgress>),
 }
 
 /// Gets the batch accepted, or gives up after [`SUBMIT_ATTEMPTS`] with the
@@ -511,7 +527,15 @@ async fn submit<G: SubmitGateway>(gateway: &mut G) -> Result<Taken, Fault> {
     loop {
         attempt += 1;
         let error = match gateway.submit().await {
-            Ok(receipt) => return Ok(Taken::Accepted(receipt)),
+            Ok(receipt) if attempt == 1 => return Ok(Taken::Accepted(receipt)),
+            // Only the first submission's receipt describes the batch
+            // Restate runs. A later one is folded onto the first on the
+            // batch id, so the resolution it reports — taken against a
+            // projection that has moved on since — never ran, and naming
+            // its targets would tell the user the batch left out targets
+            // it is running. Restate is asked instead, as it is for a
+            // submission that failed.
+            Ok(_) => return Ok(Taken::Already(gateway.progress().await.ok().flatten())),
             Err(Fault::SignedOut) => return Err(Fault::SignedOut),
             Err(error) => error,
         };
@@ -519,7 +543,7 @@ async fn submit<G: SubmitGateway>(gateway: &mut G) -> Result<Taken, Fault> {
         // the workflow's own progress is the authority, and a batch that is
         // running must not be submitted again.
         match gateway.progress().await {
-            Ok(Some(progress)) => return Ok(Taken::Running(progress)),
+            Ok(Some(progress)) => return Ok(Taken::Already(Some(progress))),
             Err(Fault::SignedOut) => return Err(Fault::SignedOut),
             Ok(None) | Err(_) => {}
         }
@@ -816,6 +840,102 @@ mod tests {
             Some(BatchReceipt::default()),
             "Restate runs every target, so none was left out"
         );
+    }
+
+    /// A lost round trip is submitted again, and Restate folds the second
+    /// submission onto the first on its idempotency key: the batch it runs is
+    /// the one the first submission resolved. The second answer's receipt
+    /// describes a resolution that never ran — it resolved the targets against
+    /// a projection that has moved on since — so it is no word on the batch,
+    /// and Restate's own progress is asked for instead.
+    #[tokio::test]
+    async fn a_resubmitted_batch_is_accounted_for_by_what_restate_runs_not_by_the_folded_receipt() {
+        let folded_away = BatchReceipt {
+            left_out: vec![targets()[1].key()],
+        };
+        let mut gateway = Scripted::new(
+            [Err(unavailable()), Ok(folded_away)],
+            [Ok(None), Ok(Some(queued())), Ok(Some(after(2)))],
+        );
+
+        let (outcome, reported, accepted) = run(&mut gateway).await;
+
+        assert_eq!(outcome, BatchOutcome::Completed(after(2)));
+        assert_eq!(gateway.submit_calls, 2, "the lost round trip is retried");
+        assert_eq!(
+            accepted,
+            Some(BatchReceipt::default()),
+            "Restate runs both targets, so none was left out: taking the \
+             second submission's receipt instead would tell the user a target \
+             was dropped by a resolution that never ran, on a batch that is \
+             running it"
+        );
+        assert_eq!(
+            reported.first().map(|it| (it.heard, it.progress.clone())),
+            Some((true, Some(queued()))),
+            "and the batch shown is the one Restate runs, with both targets"
+        );
+    }
+
+    /// The resubmission may be taken and Restate still have nothing to say:
+    /// it has the batch and has not started it. There is then no word on
+    /// which targets it runs — the answer to the resubmission describes a
+    /// resolution that was folded away — so the dashboard claims none was
+    /// left out rather than name one from it, and the first progress it
+    /// hears is the snapshot it shows.
+    #[tokio::test]
+    async fn a_resubmission_restate_has_not_started_yet_names_no_target_left_out() {
+        let folded_away = BatchReceipt {
+            left_out: vec![targets()[1].key()],
+        };
+        let mut gateway = Scripted::new(
+            [Err(unavailable()), Ok(folded_away)],
+            [Ok(None), Ok(None), Ok(Some(queued())), Ok(Some(after(2)))],
+        );
+
+        let (outcome, reported, accepted) = run(&mut gateway).await;
+
+        assert_eq!(outcome, BatchOutcome::Completed(after(2)));
+        assert_eq!(
+            accepted,
+            Some(BatchReceipt::default()),
+            "a batch that was taken and not started says nothing about what \
+             it runs, and the dashboard does not answer for it out of a \
+             resolution that never ran"
+        );
+        assert_eq!(
+            heard(&reported),
+            [queued(), after(2)],
+            "and the batch is shown from the first word Restate gives"
+        );
+    }
+
+    /// The resubmission of a lost round trip can be refused outright: the
+    /// targets have since merged or closed, so resolving them again leaves
+    /// nothing to run. That is a word on the projection, not on the batch —
+    /// which Restate is running over the targets the first submission
+    /// resolved — and it is answered the way any failed submission is, by
+    /// asking Restate where the batch stands.
+    #[tokio::test]
+    async fn a_resubmission_refused_because_nothing_is_left_to_run_is_answered_by_what_restate_runs()
+     {
+        let nothing_left = Fault::Refused(
+            "none of the 2 pull requests submitted are still in the dashboard".to_owned(),
+        );
+        let mut gateway = Scripted::new(
+            [Err(unavailable()), Err(nothing_left)],
+            [Ok(None), Ok(Some(after(1))), Ok(Some(after(2)))],
+        );
+
+        let (outcome, _, accepted) = run(&mut gateway).await;
+
+        assert_eq!(
+            outcome,
+            BatchOutcome::Completed(after(2)),
+            "a batch Restate is running is not reported as not submitted"
+        );
+        assert_eq!(gateway.submit_calls, 2, "nor submitted again after that");
+        assert_eq!(accepted, Some(BatchReceipt::default()));
     }
 
     /// Restate took the batch; a service that is down or deploying starts it
