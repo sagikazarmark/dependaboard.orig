@@ -13,6 +13,7 @@ use restate_sdk::prelude::*;
 use tracing::warn;
 
 use crate::{
+    clock::ClockStepContext,
     handler::{HandlerOutcome, handler_cause, traced, traced_read},
     pull_request::PullRequestClient,
     store::{StoreStepContext, StoreStepKind},
@@ -190,11 +191,7 @@ impl BulkActionEffects for RestateBulkAction<'_, '_> {
     }
 
     async fn now(&mut self, step: &'static str) -> HandlerResult<u64> {
-        Ok(self
-            .ctx
-            .run(|| async { Ok(unix_seconds()) })
-            .name(step)
-            .await?)
+        Ok(self.ctx.run_clock_step(step).await?)
     }
 
     async fn start_batch(&mut self, batch: &RunningBatch) -> HandlerResult<()> {
@@ -538,7 +535,7 @@ mod tests {
     use tracing::instrument::WithSubscriber;
 
     use super::*;
-    use crate::test_support::{LogSink, captured_logs, target};
+    use crate::test_support::{CLOCK_EPOCH, FakeClock, LogSink, captured_logs, target};
 
     /// A batch is submitted and followed from the web edge, which builds both paths from
     /// `dependaboard_core::restate`. Both handlers are therefore public, and both must
@@ -636,8 +633,9 @@ mod tests {
         /// The pull request numbers of each concurrent round, in the order sent.
         rounds: Vec<Vec<u64>>,
         pauses: u32,
-        /// Minutes the clock has been read for, from a fixed epoch.
-        clock_readings: u64,
+        /// The clock the handler reads, a second per reading, and the steps it read
+        /// them under.
+        clock: FakeClock,
         /// Every running batch listed in the projection, in order.
         started: Vec<RunningBatch>,
         /// What had been sent when the batch was listed as running, if it was.
@@ -654,8 +652,6 @@ mod tests {
         recorded: Vec<BatchRecord>,
     }
 
-    /// The fake clock's first reading, in Unix seconds.
-    const CLOCK_EPOCH: u64 = 1_700_000_000;
     /// The installation the service under test serves, which every batch it runs is
     /// stamped with.
     const INSTALLATION_ID: u64 = 42;
@@ -732,10 +728,8 @@ mod tests {
             Ok(())
         }
 
-        async fn now(&mut self, _step: &'static str) -> HandlerResult<u64> {
-            let reading = CLOCK_EPOCH + self.clock_readings * 60;
-            self.clock_readings += 1;
-            Ok(reading)
+        async fn now(&mut self, step: &'static str) -> HandlerResult<u64> {
+            Ok(self.clock.now(step))
         }
 
         async fn start_batch(&mut self, batch: &RunningBatch) -> HandlerResult<()> {
@@ -759,6 +753,43 @@ mod tests {
             self.recorded.push(record.clone());
             Ok(())
         }
+    }
+
+    /// A clock reading is a journaled step, and the name it is journaled under is what
+    /// a replay matches the entry by. `run_bulk_action` reads the clock twice in one
+    /// invocation — once to stamp when the batch started, once when it finished — so the
+    /// two reads need two names: under one name a replay would answer the second read
+    /// with the first reading, and a batch would finish at the instant it started.
+    ///
+    /// The names are pinned, not just counted, because they are durable identity: a
+    /// rename lands on a service with invocations already journaled under the old one.
+    #[tokio::test]
+    async fn the_batch_stamps_its_start_and_its_finish_under_two_journal_names() {
+        let mut restate = RecordedBulkAction::default();
+
+        let (progress, _) = run(
+            &mut restate,
+            &request(BulkActionKind::Merge, vec![pull(7, 1)]),
+        )
+        .await;
+
+        assert_eq!(
+            restate.clock.steps(),
+            ["batch-start-clock", "batch-finish-clock"]
+        );
+        let record = progress
+            .completed_record(
+                INSTALLATION_ID,
+                UserId::new("alice"),
+                None,
+                CLOCK_EPOCH,
+                CLOCK_EPOCH + 1,
+            )
+            .expect("the batch has finished");
+        assert!(
+            record.completed_at > record.started_at,
+            "two readings under two names, so the finish is later than the start"
+        );
     }
 
     async fn run(
@@ -1058,7 +1089,7 @@ mod tests {
                     UserId::new("alice"),
                     Some("batch-0".to_owned()),
                     CLOCK_EPOCH,
-                    CLOCK_EPOCH + 60,
+                    CLOCK_EPOCH + 1,
                 )
                 .expect("the batch has finished"),
             "the record is the finished progress, stamped with the installation, who asked, \
@@ -1234,7 +1265,7 @@ mod tests {
                 UserId::new("alice"),
                 None,
                 CLOCK_EPOCH,
-                CLOCK_EPOCH + 60,
+                CLOCK_EPOCH + 1,
             )
             .expect("the batch has finished")
     }

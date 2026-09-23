@@ -1,6 +1,9 @@
 //! Shared fixtures for the service's unit tests.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use dependaboard_core::{
     CheckStatus, Mergeable, PrKey, PrRecord, PrTarget, RepoRecord, Retirement, UpdateType,
@@ -19,6 +22,52 @@ pub(crate) async fn test_store() -> LibSqlPrStore {
     LibSqlPrStore::connect(&StoreConfig::local(":memory:"))
         .await
         .unwrap()
+}
+
+/// The fake clock's first reading, in Unix seconds.
+pub(crate) const CLOCK_EPOCH: u64 = 1_700_000_000;
+
+/// The clock a handler's recorded effects read, for a test that cares when something
+/// happened relative to something else rather than what the wall clock said.
+///
+/// One reading per second from [`CLOCK_EPOCH`], so what a handler did first is visible
+/// in what it stamped, and a fence read before a listing is strictly smaller than one
+/// read after it. One epoch and one tick across every handler's fake, so two tests that
+/// stamp the same order read alike.
+///
+/// It also keeps the names the reads were journaled under. A clock reading is a
+/// journaled step and `name` is what a replay matches it by, so two reads in one
+/// invocation under one name would replay the first reading for both — the fake records
+/// the names so a test can say they are distinct.
+#[derive(Default)]
+pub(crate) struct FakeClock {
+    readings: u64,
+    steps: Vec<&'static str>,
+}
+
+impl FakeClock {
+    /// The next reading, journaled under `step`.
+    pub(crate) fn now(&mut self, step: &'static str) -> u64 {
+        self.steps.push(step);
+        let reading = CLOCK_EPOCH + self.readings;
+        self.readings += 1;
+        reading
+    }
+
+    /// What the next reading will be, without taking it.
+    pub(crate) fn peek(&self) -> u64 {
+        CLOCK_EPOCH + self.readings
+    }
+
+    /// Lets `duration` pass, as a durable sleep between two readings does.
+    pub(crate) fn wait(&mut self, duration: Duration) {
+        self.readings += duration.as_secs();
+    }
+
+    /// The steps the handler journaled its clock reads under, in order.
+    pub(crate) fn steps(&self) -> &[&'static str] {
+        &self.steps
+    }
 }
 
 /// Stands in for Restate and the store's retirement outbox during a drain and records
