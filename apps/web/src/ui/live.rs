@@ -292,18 +292,16 @@ pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bo
         loop {
             match refresh.tick(*visible.peek(), state.syncing()) {
                 Step::Wait => {}
-                // A reload asks the read model through the resources that
-                // hold the rows, which are not made through the state and
-                // so do not pass its guard; the rule has to be kept for
-                // them here.
-                Step::Reload if state.signed_out() => break,
-                // The page was already signed out before this poll was due —
+                // The page was already signed out before this step was due —
                 // on another call's word, a followed batch's poll asking every
-                // second, say — so there is nothing left to poll for: the
-                // guard would hand this poll the refusal without asking, and
-                // the banner is already up. Asked before the guard is, so that
-                // the arm below is only ever a poll that was made.
-                Step::Poll if state.signed_out() => break,
+                // second, say — so there is nothing left to do. A poll would
+                // be handed its refusal without being made, and the banner is
+                // already up; a reload would ask the read model through the
+                // resources that hold the rows, which
+                // [`DashboardState::reload`] now declines for the same reason.
+                // Asked before the guard is, so that the poll arm below is
+                // only ever a poll that was made.
+                Step::Poll | Step::Reload if state.signed_out() => break,
                 Step::Poll => match state.guarded(load_projection_revision).await {
                     Ok(revision) => {
                         let moved = refresh.observe(revision);

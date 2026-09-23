@@ -320,11 +320,29 @@ impl DashboardState {
         }
     }
 
-    /// Asks the read model again for the same filter and cursor. A manual
-    /// sync in flight stays in flight: the rows reloading is not what it is
-    /// waiting for — a sweep writes every repository before it reaches a
-    /// pull request, and a retry after a failed read reloads them too.
+    /// [`signed_out`](Self::signed_out) without subscribing the caller, for
+    /// the commands here that only read the line to decide what to do.
+    fn refused(&self) -> bool {
+        *self.connection.peek() == Connection::SignedOut
+    }
+
+    /// Asks the read model again for the same filter and cursor, unless the
+    /// server has refused the page's credentials. A manual sync in flight
+    /// stays in flight: the rows reloading is not what it is waiting for — a
+    /// sweep writes every repository before it reaches a pull request, and a
+    /// retry after a failed read reloads them too.
+    ///
+    /// The rows are read by resources the page holds rather than by a call
+    /// the page makes, so nothing about them passes
+    /// [`guarded`](Self::guarded); the rule that a signed-out page asks the
+    /// server for nothing is kept here instead, once, for every caller —
+    /// the table's and the sidebar's **Retry**, a batch that finished, the
+    /// drawer's sync, and the live refresh's own reload step. A line that is
+    /// merely down is asked again, since the retry is what clears it.
     pub(crate) fn reload(&mut self) {
+        if self.refused() {
+            return;
+        }
         self.reload.call(());
     }
 
@@ -627,6 +645,41 @@ mod tests {
             state.end_sync();
             assert!(!state.syncing());
             assert_eq!(reloads(&dom), 1, "ending a sync does not reload");
+        });
+    }
+
+    /// The rows are read by resources the page holds, not by a call the state
+    /// makes, so nothing about them passes [`DashboardState::guarded`]; the
+    /// rule that a signed-out page asks the server for nothing is kept by
+    /// [`DashboardState::reload`] instead. Whoever asks is declined the same —
+    /// the table's **Retry**, the sidebar's, a batch that finished, the
+    /// drawer's sync, or the live refresh's own reload step — since each of
+    /// those reads would meet the same refusal, with a credential prompt for
+    /// it. A line that is merely down is asked again: the retry is what
+    /// clears it.
+    #[test]
+    fn a_signed_out_page_does_not_ask_the_read_model_again_and_a_line_that_is_down_still_does() {
+        let (dom, mut state) = mount();
+
+        dom.in_runtime(|| {
+            state.reload();
+            assert_eq!(reloads(&dom), 1, "a page whose line is up reloads");
+
+            state.poll_missed(Connection::Disconnected);
+            state.reload();
+            assert_eq!(
+                reloads(&dom),
+                2,
+                "a line that is merely down is retried, not withheld"
+            );
+
+            state.poll_missed(Connection::SignedOut);
+            state.reload();
+            assert_eq!(reloads(&dom), 2, "the rows were not asked for again");
+
+            state.poll_answered(FIXTURE_NOW);
+            state.reload();
+            assert_eq!(reloads(&dom), 3, "the reload is made once the line is back");
         });
     }
 
