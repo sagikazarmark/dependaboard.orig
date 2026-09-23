@@ -75,7 +75,11 @@ pub(crate) fn pr(repository_id: u64, number: u64, synced_at: u64) -> PrRecord {
         check_status: CheckStatus::Success,
         mergeable: Mergeable::Clean,
         labels: vec!["dependencies".to_owned(), "rust".to_owned()],
-        created_at: 10,
+        // Distinct from every `synced_at` a caller passes (10, 20, 30) and from
+        // `updated_at`: all three are stored as integers, side by side, and read
+        // back by position, so equal values would let two of those columns swap
+        // without a test noticing.
+        created_at: 7,
         updated_at: 20 + number,
         synced_at,
     }
