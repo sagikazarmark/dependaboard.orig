@@ -3,13 +3,20 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
-use dependaboard_core::{PrRecord, RepoRecord};
-use dependaboard_store::{LibSqlPrStore, ProjectionWriter, StoreConfig};
+use dependaboard_core::{
+    BatchRecord, DashboardPage, DashboardSummary, Page, PrFilter, PrKey, PrRecord, ProjectedBatch,
+    ProjectionRevision, RepoRecord, RunningBatch,
+};
+use dependaboard_store::{
+    LibSqlPrStore, ProjectedPr, ProjectionReader, ProjectionWriter, StoreConfig, StoreError,
+};
 use dioxus::server::{DioxusRouterExt, ServeConfig};
 use secrecy::SecretString;
 
@@ -237,6 +244,20 @@ impl Backend {
         &self.store
     }
 
+    /// Puts a turnstile between the state and the read model, and answers
+    /// with its counter: from here on, every lookup of pull requests by key
+    /// a server function makes ticks it once, however many keys that lookup
+    /// names. Seeded rows still go in through [`Self::project`], which
+    /// writes to the store directly and is not counted.
+    pub(crate) fn counting_key_reads(&mut self) -> Arc<AtomicUsize> {
+        let reads = Arc::new(AtomicUsize::new(0));
+        self.state.store = Arc::new(CountedReads {
+            inner: Arc::clone(&self.state.store),
+            reads: Arc::clone(&reads),
+        });
+        reads
+    }
+
     /// Puts `row` in the read model, under a repository of `installation_id`:
     /// the repository row is what says which installation a pull request
     /// belongs to.
@@ -253,6 +274,74 @@ impl Backend {
             .await
             .unwrap();
         self.store.upsert_pr(row).await.unwrap();
+    }
+}
+
+/// A read model with a turnstile on it: every lookup of pull requests by
+/// key made through it is counted, and everything else goes straight to the
+/// store behind it. The count is what a test asserts a cost with, since the
+/// store's one connection serialises its reads — a lookup per target is a
+/// round trip per target, whatever the concurrency around it — and the
+/// number of reads is the only part of that a test can see.
+///
+/// [`ProjectionReader::get_prs`] is the trait's only lookup, and the
+/// single-key one is provided in terms of it, so counting the one here
+/// counts them both: nothing resolves a key past this turnstile.
+struct CountedReads {
+    inner: Arc<dyn ProjectionReader>,
+    reads: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ProjectionReader for CountedReads {
+    async fn get_prs(
+        &self,
+        installation_id: u64,
+        keys: &[PrKey],
+    ) -> Result<Vec<ProjectedPr>, StoreError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_prs(installation_id, keys).await
+    }
+
+    async fn list_prs(
+        &self,
+        installation_id: u64,
+        filter: &PrFilter,
+        page: Page,
+    ) -> Result<DashboardPage, StoreError> {
+        self.inner.list_prs(installation_id, filter, page).await
+    }
+
+    async fn dashboard_summary(
+        &self,
+        installation_id: u64,
+        filter: &PrFilter,
+    ) -> Result<DashboardSummary, StoreError> {
+        self.inner.dashboard_summary(installation_id, filter).await
+    }
+
+    async fn projection_revision(&self) -> Result<ProjectionRevision, StoreError> {
+        self.inner.projection_revision().await
+    }
+
+    async fn recent_batches(
+        &self,
+        installation_id: u64,
+        limit: u32,
+    ) -> Result<Vec<BatchRecord>, StoreError> {
+        self.inner.recent_batches(installation_id, limit).await
+    }
+
+    async fn running_batches(&self, installation_id: u64) -> Result<Vec<RunningBatch>, StoreError> {
+        self.inner.running_batches(installation_id).await
+    }
+
+    async fn get_batch(
+        &self,
+        installation_id: u64,
+        batch_id: &str,
+    ) -> Result<Option<ProjectedBatch>, StoreError> {
+        self.inner.get_batch(installation_id, batch_id).await
     }
 }
 

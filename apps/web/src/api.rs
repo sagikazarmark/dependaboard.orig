@@ -379,19 +379,18 @@ pub(crate) async fn submit_batch_in(
     targets: Vec<SubmittedTarget>,
     retried_from: Option<String>,
 ) -> Result<BatchReceipt, ApiError> {
-    validate_batch(
-        batch_id,
-        retried_from.as_deref(),
-        targets.iter().map(SubmittedTarget::key),
-    )
-    .map_err(InvalidRequest::Batch)?;
+    let keys = targets.iter().map(SubmittedTarget::key).collect::<Vec<_>>();
+    validate_batch(batch_id, retried_from.as_deref(), keys.iter().cloned())
+        .map_err(InvalidRequest::Batch)?;
     let submitted = targets.len();
     let mut resolved = Vec::with_capacity(submitted);
     let mut left_out = Vec::new();
-    for target in targets {
-        let key = target.key();
-        let Some(row) = projected_pr(state, &key).await? else {
-            left_out.push(key);
+    // One read for all hundred of them, and what comes back lines up with
+    // what was sent, so the batch is a partition of the submission rather
+    // than a walk that stops to ask about each target in turn.
+    for (target, row) in targets.into_iter().zip(projected_prs(state, &keys).await?) {
+        let Some(row) = row else {
+            left_out.push(target.key());
             continue;
         };
         resolved.push(PrTarget {
@@ -610,14 +609,55 @@ pub(crate) async fn request_pr_sync_in(
 /// a different and untrue thing to say.
 ///
 /// The store holds the key to the installation and tells those two apart in
-/// its answer ([`ProjectedPr`]); this is where the third answer becomes a
-/// refusal, which is the web's word, not the store's. Every server function
-/// that takes a key from the browser — a read as much as a sync or a batch
-/// target — resolves it here, so the refusal is minted in one place rather
+/// its answer ([`ProjectedPr`]); turning the third answer into a refusal is
+/// the web's word, not the store's, and it is
+/// [`held_to_the_installation`]'s, which this and the batch's
+/// [`projected_prs`] both go through. Every server function that takes a key
+/// from the browser — a read as much as a sync or a batch target — resolves
+/// it one of those two ways, so the refusal is minted in one place rather
 /// than remembered at each.
 #[cfg(feature = "server")]
 async fn projected_pr(state: &ServerState, key: &PrKey) -> Result<Option<PrRecord>, ApiError> {
-    match state.store.get_pr(state.installation_id, key).await? {
+    held_to_the_installation(key, state.store.get_pr(state.installation_id, key).await?)
+}
+
+/// [`projected_pr`] for every key a batch submitted, in the order they were
+/// submitted, from one read: the store answers a whole set of keys at once
+/// and lines its answers up with them, so the hundred targets a batch may
+/// carry cost one round trip rather than a hundred queued behind each other
+/// while the browser waits.
+///
+/// A foreign key among them refuses the whole call, as it does for a single
+/// key, and the refusal names the first one submitted — the same key a walk
+/// that stopped at the first foreign target would have named. That the
+/// refusal comes out of the resolution at all is what keeps it ahead of
+/// everything the caller would otherwise go on to decide, such as whether
+/// any target is left to run.
+#[cfg(feature = "server")]
+async fn projected_prs(
+    state: &ServerState,
+    keys: &[PrKey],
+) -> Result<Vec<Option<PrRecord>>, ApiError> {
+    state
+        .store
+        .get_prs(state.installation_id, keys)
+        .await?
+        .into_iter()
+        .zip(keys)
+        .map(|(projected, key)| held_to_the_installation(key, projected))
+        .collect()
+}
+
+/// The store's three-way answer for `key` as the web edge has it: a row, no
+/// row, or a refusal. The one place the foreign refusal is minted, so the
+/// singular resolution and the batch's plural one cannot drift over what a
+/// key of another installation means.
+#[cfg(feature = "server")]
+fn held_to_the_installation(
+    key: &PrKey,
+    projected: ProjectedPr,
+) -> Result<Option<PrRecord>, ApiError> {
+    match projected {
         ProjectedPr::Row(row) => Ok(Some(*row)),
         ProjectedPr::Absent => Ok(None),
         ProjectedPr::Foreign => Err(InvalidRequest::ForeignInstallation(key.clone()).into()),
@@ -641,6 +681,7 @@ fn minted_here(batch_id: &str) -> Result<(), ApiError> {
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use std::error::Error as _;
+    use std::sync::atomic::Ordering;
 
     use dependaboard_core::{
         BatchRecord, BatchTargetRecord, ProjectedBatch, RunningBatch, TargetOutcome,
@@ -1084,6 +1125,141 @@ mod tests {
             "pull request #12 does not belong to the configured installation"
         );
         assert!(dashboard.forwards().is_empty());
+    }
+
+    /// The projection behind the two mixed-submission tests: two rows of the
+    /// installation the dashboard serves, `7#9` and `7#11`, and one of
+    /// another installation's, `8#12`. Nothing in any projection is keyed
+    /// `7#99` or `7#10`.
+    async fn a_projection_holding_two_of_ours_and_one_of_anothers() -> Backend {
+        let backend = backend().await;
+        backend.project(INSTALLATION_ID, &grouped_row()).await;
+        backend
+            .project(
+                INSTALLATION_ID,
+                &PrRecord {
+                    id: "7#11".to_owned(),
+                    number: 11,
+                    html_url: "https://github.example/acme/api/pull/11".to_owned(),
+                    ..grouped_row()
+                },
+            )
+            .await;
+        backend.project(INSTALLATION_ID + 1, &serde_row()).await;
+        backend
+    }
+
+    /// Present, absent, present, absent, in that order: a submission whose
+    /// outcomes interleave, so no answer to it can be a by-product of the
+    /// order the keys happen to arrive in. The two absent keys descend, so
+    /// submission order is neither sorted order nor any order the projection
+    /// could hand back.
+    fn interleaved_targets() -> Vec<SubmittedTarget> {
+        vec![
+            submitted(7, 9, "abc123"),
+            submitted(7, 99, "abc199"),
+            submitted(7, 11, "abc111"),
+            submitted(7, 10, "abc110"),
+        ]
+    }
+
+    /// A submission mixing all three outcomes is refused on the foreign one,
+    /// wherever in the submission it sits: a target of another installation
+    /// comes from a client that should not exist, and that outranks both the
+    /// absent keys, which alone would only have thinned the batch, and the
+    /// question of whether anything is left to run at all. Nothing reaches
+    /// Restate, so no part of the batch runs.
+    #[tokio::test]
+    async fn a_foreign_target_refuses_a_submission_the_absent_ones_would_only_have_thinned() {
+        let backend = a_projection_holding_two_of_ours_and_one_of_anothers().await;
+        let mut targets = interleaved_targets();
+        targets.push(submitted(8, 12, "def456"));
+
+        let refused = submit(&backend, &new_batch_id(), targets).await;
+
+        assert_eq!(
+            refusal(refused),
+            "pull request #12 does not belong to the configured installation"
+        );
+        assert!(backend.forwards().is_empty());
+
+        // It outranks the emptiness of what is left, too: strip the
+        // submission down to one absent key and the foreign one, and the
+        // refusal is still the foreign key's, not "nothing left to run".
+        let nothing_but_the_foreign_one = submit(
+            &backend,
+            &new_batch_id(),
+            vec![submitted(7, 99, "abc199"), submitted(8, 12, "def456")],
+        )
+        .await;
+
+        assert_eq!(
+            refusal(nothing_but_the_foreign_one),
+            "pull request #12 does not belong to the configured installation"
+        );
+        assert!(backend.forwards().is_empty());
+    }
+
+    /// The same submission without the foreign target runs, and the receipt
+    /// names the keys the projection no longer has in the order they were
+    /// submitted — not sorted, and not in whatever order the projection was
+    /// read in — so a browser can put each left-out key back against the
+    /// selection it sent. The targets that did resolve reach Restate in
+    /// submission order too.
+    #[tokio::test]
+    async fn the_keys_left_out_of_a_batch_come_back_in_the_order_they_were_submitted() {
+        let backend = a_projection_holding_two_of_ours_and_one_of_anothers().await;
+        let batch_id = new_batch_id();
+
+        let receipt = submit(&backend, &batch_id, interleaved_targets())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            receipt,
+            BatchReceipt {
+                left_out: vec![PrKey::new(7, 99), PrKey::new(7, 10)],
+            }
+        );
+        let request = the_one_request(
+            &backend,
+            &format!("/restate/send/BulkAction/{batch_id}/run"),
+        );
+        assert_eq!(
+            request["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|target| target["number"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [9, 11]
+        );
+    }
+
+    /// A batch resolves every target it carries in one read of the
+    /// projection, not one read per target. The cost is the point: the store
+    /// serialises its reads behind a single connection, so a key at a time
+    /// is a round trip at a time however they are launched, and a batch may
+    /// carry a hundred of them with the browser waiting on all of them. The
+    /// count is asserted rather than the SQL, which is the store's business.
+    #[tokio::test]
+    async fn a_batch_resolves_all_its_targets_in_one_read_of_the_projection() {
+        let mut backend = a_projection_holding_two_of_ours_and_one_of_anothers().await;
+        let mut targets = interleaved_targets();
+        targets.push(submitted(7, 12, "abc112"));
+        let reads = backend.counting_key_reads();
+
+        let receipt = submit(&backend, &new_batch_id(), targets).await.unwrap();
+
+        assert_eq!(
+            receipt.left_out,
+            vec![PrKey::new(7, 99), PrKey::new(7, 10), PrKey::new(7, 12)]
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "five targets, one read of the projection"
+        );
     }
 
     /// The batch rules come first: a submission that could not run as a

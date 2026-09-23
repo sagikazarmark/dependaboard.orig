@@ -103,22 +103,14 @@ impl LibSqlPrStore {
     }
 
     /// The pull request `key` names, or `None` when the projection has no row
-    /// for it, whosever it is. The lookup both halves of the store's contract
-    /// are built on, so it lives here once: [`ProjectionWriter::get_pr`] is
-    /// this one, and [`ProjectionReader::get_pr`] is this one held to an
-    /// installation. The store's own tests, which hold the concrete type with
-    /// both traits in scope, resolve to it rather than being asked which
-    /// trait they mean.
+    /// for it, whosever it is. The writers' lookup, and the one the store's
+    /// own tests resolve to when they hold the concrete type with both traits
+    /// in scope rather than being asked which trait they mean. The reader's
+    /// side of the contract does not come through here: it must tell a
+    /// foreign row from an absent one, and it reads a whole set of keys at
+    /// once, so it has its own statement in
+    /// [`ProjectionReader::get_prs`].
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>, StoreError> {
-        Ok(self.pr_row(key).await?.map(|(record, _)| record))
-    }
-
-    /// The row `key` names and the installation it belongs to, from one read.
-    /// A pull request has no installation of its own — its repository's row is
-    /// what says whose it is — so the reader, which must tell a foreign row
-    /// from an absent one, takes the pair, and the writers take the record
-    /// alone through [`LibSqlPrStore::get_pr`].
-    async fn pr_row(&self, key: &PrKey) -> Result<Option<(PrRecord, u64)>, StoreError> {
         let connection = self.connection().await;
         let mut rows = connection
             .query(
@@ -129,7 +121,7 @@ impl LibSqlPrStore {
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };
-        Ok(Some((pr_from_row(&row)?, installation_from_row(&row)?)))
+        Ok(Some(pr_from_row(&row)?))
     }
 
     /// Holds the connection for the duration of one store operation. The
@@ -252,14 +244,46 @@ pub enum ProjectedPr {
 /// [`ProjectionReader::projection_revision`], and its doc says why.
 #[async_trait]
 pub trait ProjectionReader: Send + Sync {
-    /// What the projection holds for `key` within `installation_id`, told
-    /// apart three ways so the caller need not work out whose the row is to
-    /// know which it got — a [`PrRecord`] says nothing of installations, and
-    /// the repository row it hangs off is what does. Unlike
-    /// [`ProjectionWriter::get_pr`], which serves a service that owns every
-    /// row it names, this one is asked whose the row is, because the key came
-    /// from a browser.
-    async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr, StoreError>;
+    /// What the projection holds for each of `keys` within `installation_id`,
+    /// each told apart three ways so the caller need not work out whose a row
+    /// is to know which answer it got — a [`PrRecord`] says nothing of
+    /// installations, and the repository row it hangs off is what does.
+    /// Unlike [`ProjectionWriter::get_pr`], which serves a service that owns
+    /// every row it names, this one is asked whose each row is, because the
+    /// keys came from a browser.
+    ///
+    /// **The answers align positionally with `keys`**: the nth answer is the
+    /// nth key's, whatever the projection holds for it and whatever order the
+    /// database produced its rows in. That is part of the interface, not an
+    /// accident of an implementation — a caller pairs the two up by position,
+    /// and reports what it leaves out in the order it was asked. A key
+    /// repeated in `keys` is answered at each of its positions, and an empty
+    /// `keys` is an empty answer, not a read.
+    ///
+    /// The plural is the lookup: a batch resolves a hundred keys at once, and
+    /// a store serialises its reads, so a key at a time is a hundred round
+    /// trips with the browser waiting on all of them.
+    /// [`ProjectionReader::get_pr`] is this one for a single key.
+    async fn get_prs(
+        &self,
+        installation_id: u64,
+        keys: &[PrKey],
+    ) -> Result<Vec<ProjectedPr>, StoreError>;
+    /// [`ProjectionReader::get_prs`] for the one key the caller has, which is
+    /// what a read of a row, a per-pull-request sync, or the drawer asks for.
+    /// Provided, not implemented: there is one lookup on this trait, and this
+    /// is the shape most of its callers want it in.
+    async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr, StoreError> {
+        Ok(self
+            .get_prs(installation_id, std::slice::from_ref(key))
+            .await?
+            .into_iter()
+            .next()
+            // Not a failure the store can have: one key is one answer, by the
+            // alignment `get_prs` promises, so nothing here is an implementer
+            // having broken its own contract.
+            .expect("one key is answered with one answer"))
+    }
     /// One keyset page of `installation_id`'s pull requests that `filter`
     /// matches, newest update first, plus how many match in all. Another
     /// installation's rows are neither listed nor counted.
@@ -605,18 +629,57 @@ impl ProjectionWriter for LibSqlPrStore {
 
 #[async_trait]
 impl ProjectionReader for LibSqlPrStore {
-    /// The read comes back with the installation beside the row —
-    /// `select_pr_sql` joins `repositories` for it, and
-    /// [`LibSqlPrStore::pr_row`] hands both back — so one statement answers
-    /// all three ways without a `WHERE` on the installation and without a
-    /// second read to tell an absent key from a foreign one. The repository's
-    /// row is the only thing that says whose a pull request is.
-    async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr, StoreError> {
-        Ok(match self.pr_row(key).await? {
-            None => ProjectedPr::Absent,
-            Some((row, owner)) if owner == installation_id => ProjectedPr::Row(Box::new(row)),
-            Some(_) => ProjectedPr::Foreign,
-        })
+    /// One statement for the whole set, and it answers all three ways at
+    /// once: the keys match on `p.id`, which is what a [`PrKey`] spells, and
+    /// `select_pr_sql` joins `repositories`, so each row arrives with the
+    /// installation that owns it. Nothing is held to `installation_id` in the
+    /// `WHERE` — a foreign row must come back to be told from an absent one —
+    /// and a key no row came back for is the absent one. A hundred keys is a
+    /// hundred parameters, well inside SQLite's limit, and one round trip on
+    /// a connection every other read is queued behind.
+    ///
+    /// The rows are gathered by id and then read off in `keys` order, which
+    /// is what makes the answers positional: the database is free to produce
+    /// an `IN` set in whatever order it likes, and a repeated key gets its
+    /// answer at each position rather than at the first.
+    async fn get_prs(
+        &self,
+        installation_id: u64,
+        keys: &[PrKey],
+    ) -> Result<Vec<ProjectedPr>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=keys.len())
+            .map(|position| format!("?{position}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let parameters = keys
+            .iter()
+            .map(|key| Value::Text(key.to_string()))
+            .collect::<Vec<_>>();
+        let connection = self.connection().await;
+        let mut rows = connection
+            .query(
+                &format!("{} WHERE p.id IN ({placeholders})", select_pr_sql()),
+                parameters,
+            )
+            .await?;
+        let mut found = BTreeMap::new();
+        while let Some(row) = rows.next().await? {
+            let record = pr_from_row(&row)?;
+            found.insert(record.id.clone(), (record, installation_from_row(&row)?));
+        }
+        Ok(keys
+            .iter()
+            .map(|key| match found.get(&key.to_string()) {
+                None => ProjectedPr::Absent,
+                Some((row, owner)) if *owner == installation_id => {
+                    ProjectedPr::Row(Box::new(row.clone()))
+                }
+                Some(_) => ProjectedPr::Foreign,
+            })
+            .collect())
     }
 
     async fn list_prs(
@@ -1168,6 +1231,55 @@ mod tests {
                 .unwrap(),
             ProjectedPr::Row(Box::new(pr(2, 3, 10)))
         );
+    }
+
+    /// The set read answers by position, not by what came back. The keys go
+    /// in an order no `IN` clause need honour, all three answers among them
+    /// and one key asked twice, and each position gets its own key's answer:
+    /// a caller pairs its own list up with this one by index, so an answer
+    /// out of place would be an answer about the wrong pull request. No keys
+    /// is no answers, and no read.
+    #[tokio::test]
+    async fn a_set_read_answers_every_key_at_its_own_position_whatever_order_the_rows_came_back_in()
+    {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store
+            .upsert_repo(&RepoRecord {
+                installation_id: OTHER_INSTALLATION,
+                ..repo(2, 10)
+            })
+            .await
+            .unwrap();
+        store.upsert_pr(&pr(1, 1, 10)).await.unwrap();
+        store.upsert_pr(&pr(1, 4, 10)).await.unwrap();
+        store.upsert_pr(&pr(2, 3, 10)).await.unwrap();
+
+        let answers = store
+            .get_prs(
+                INSTALLATION,
+                &[
+                    PrKey::new(2, 3),
+                    PrKey::new(1, 99),
+                    PrKey::new(1, 4),
+                    PrKey::new(1, 99),
+                    PrKey::new(1, 1),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            answers,
+            vec![
+                ProjectedPr::Foreign,
+                ProjectedPr::Absent,
+                ProjectedPr::Row(Box::new(pr(1, 4, 10))),
+                ProjectedPr::Absent,
+                ProjectedPr::Row(Box::new(pr(1, 1, 10))),
+            ]
+        );
+        assert_eq!(store.get_prs(INSTALLATION, &[]).await.unwrap(), Vec::new());
     }
 
     #[tokio::test]

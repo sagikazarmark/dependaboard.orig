@@ -853,10 +853,11 @@ matching                                                    page of MAX_BATCH_TA
 Bulk action       UI → server fn → Restate ingress
                        the UI names each target by key and the head SHA it saw; the
                        server fn resolves the rest — repository, title, link — from
-                       ProjectionReader::get_pr(installation), refuses a target of
-                       another installation whole, and leaves out one the projection no
-                       longer has: the batch runs over the rest, and the receipt names
-                       the keys left out
+                       ProjectionReader::get_prs(installation), one read for the whole
+                       submission, refuses a target of another installation whole, and
+                       leaves out one the projection no longer has: the batch runs over
+                       the rest, and the receipt names the keys left out in the order
+                       they were submitted
                        POST /restate/send/BulkAction/{batch_id}/run
                      → workflow lists the batch as running: ProjectionWriter::start_batch,
                        stamped with the installation the service serves
@@ -1147,8 +1148,9 @@ pub trait ProjectionWriter: Send + Sync {
     /// Writes the row under the id (repository_id, number) derives, not the one the
     /// record carries, so no caller can store a PR whose id disagrees with its pair.
     async fn upsert_pr(&self, pr: &PrRecord) -> Result<()>;
-    /// The same lookup ProjectionReader's `get_pr` is built on, unscoped: this half
-    /// serves a service that owns every row it names.
+    /// The writers' lookup, unscoped: this half serves a service that owns every row
+    /// it names. ProjectionReader's is a statement of its own — it reads a whole set
+    /// of keys and must tell a foreign row from an absent one.
     async fn get_pr(&self, key: &PrKey) -> Result<Option<PrRecord>>;
     async fn delete_pr(&self, key: &PrKey) -> Result<()>;
     /// Reconciliation: drop rows for this repo not in `live` AND synced before the
@@ -1207,12 +1209,23 @@ pub enum ProjectedPr { Row(Box<PrRecord>), Absent, Foreign }
 /// own tenancy.
 #[async_trait]
 pub trait ProjectionReader: Send + Sync {
-    /// The row `key` names within `installation_id`, told apart three ways so the
-    /// caller need not work out whose the row is to know which it got — a PrRecord
-    /// says nothing of installations, and the repository row it hangs off is what
-    /// does. The writer's `get_pr` is the same lookup, unscoped: the service owns
-    /// every row it names, while this key came from a browser.
-    async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr>;
+    /// The rows `keys` name within `installation_id`, each told apart three ways so
+    /// the caller need not work out whose a row is to know which answer it got — a
+    /// PrRecord says nothing of installations, and the repository row it hangs off is
+    /// what does. The writer's `get_pr` is the same lookup, unscoped and one key at a
+    /// time: the service owns every row it names, while these keys came from a
+    /// browser. The answers align positionally with `keys` — the nth answer is the
+    /// nth key's, whatever order the rows came back in — so a caller pairs the two up
+    /// by position and reports what it leaves out in the order it was asked; a
+    /// repeated key is answered at each of its positions, and no key is no read. The
+    /// plural is the lookup because a batch resolves up to a hundred keys at once and
+    /// the store serialises its reads: a key at a time is a hundred round trips with
+    /// the browser waiting on all of them.
+    async fn get_prs(&self, installation_id: u64, keys: &[PrKey]) -> Result<Vec<ProjectedPr>>;
+    /// `get_prs` for the one key a row read, a per-pull-request sync, or the drawer
+    /// has. Provided in terms of it, so the trait gains no second lookup to keep in
+    /// step and nothing can resolve a key past the one that is there.
+    async fn get_pr(&self, installation_id: u64, key: &PrKey) -> Result<ProjectedPr> { .. }
     /// One keyset page of `installation_id`'s pull requests that `filter` matches,
     /// newest update first, plus how many match in all, from one snapshot (count and
     /// page in one transaction). Another installation's rows are neither listed nor
