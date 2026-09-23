@@ -184,6 +184,20 @@ trait PullRequestEffects {
     ) -> impl Future<Output = HandlerResult<Option<MergeMethod>>> + Send;
 }
 
+/// The name the projection write is journaled under.
+///
+/// A step's name is durable identity: a replay matches a journaled entry by it,
+/// so renaming one lands on a service with invocations already journaled under
+/// the old name, and the step runs a second time. The name is minted here
+/// because the recording fake this object is tested against names it too — and
+/// a fake holding its own copy would go on asserting the old name after a
+/// rename, which is the one thing a test of a journal name must not do.
+const UPSERT_PROJECTION_STEP: &str = "upsert-pr-projection";
+
+/// The name the repository's merge-method read is journaled under; see
+/// [`UPSERT_PROJECTION_STEP`] for why it is a constant.
+const MERGE_METHOD_STEP: &str = "read-repository-merge-method";
+
 struct RestatePullRequest<'a, 'ctx> {
     ctx: &'a ObjectContext<'ctx>,
     github: &'a GithubApiHandle,
@@ -322,7 +336,7 @@ impl PullRequestEffects for RestatePullRequest<'_, '_> {
         let snapshot = snapshot.clone();
         self.ctx
             .run_store_step(
-                "upsert-pr-projection",
+                UPSERT_PROJECTION_STEP,
                 StoreStepKind::Ordinary,
                 move || async move { store.upsert_pr(&snapshot).await },
             )
@@ -349,7 +363,7 @@ impl PullRequestEffects for RestatePullRequest<'_, '_> {
         Ok(self
             .ctx
             .run_store_step(
-                "read-repository-merge-method",
+                MERGE_METHOD_STEP,
                 StoreStepKind::Ordinary,
                 move || async move {
                     repository_merge_method(store.as_ref(), repository_id)
@@ -1051,7 +1065,7 @@ mod tests {
 
         async fn upsert_projection(&mut self, snapshot: &PrRecord) -> HandlerResult<()> {
             self.held_when_projected = Some(self.held());
-            self.store_step("upsert-pr-projection")?;
+            self.store_step(UPSERT_PROJECTION_STEP)?;
             self.store
                 .upsert_pr(snapshot)
                 .await
@@ -1074,7 +1088,7 @@ mod tests {
             &mut self,
             repository_id: u64,
         ) -> HandlerResult<Option<MergeMethod>> {
-            self.store_step("read-repository-merge-method")?;
+            self.store_step(MERGE_METHOD_STEP)?;
             repository_merge_method(&self.store, repository_id)
                 .await
                 .map_err(|error| StoreStepKind::Ordinary.read_failure(&error))
