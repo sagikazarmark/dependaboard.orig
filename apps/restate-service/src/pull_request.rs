@@ -147,23 +147,22 @@ trait PullRequestEffects {
         known_resource: bool,
     ) -> impl Future<Output = HandlerResult<Settled<Option<PrRecord>>>> + Send;
     /// Merges the pull request with `merge_method`, or the configured preference when `None`.
+    /// A mutation takes no `known_resource`: it is reachable only past [`guard_target`],
+    /// which has already proved the object read the pull request.
     fn merge(
         &mut self,
         request: &MergeRequest,
         merge_method: Option<MergeMethod>,
-        known_resource: bool,
     ) -> impl Future<Output = HandlerResult<Settled<Merged>>> + Send;
     /// Posts the `@dependabot` command under the user identity.
     fn post_command(
         &mut self,
         request: &CommandRequest,
-        known_resource: bool,
     ) -> impl Future<Output = HandlerResult<Settled<String>>> + Send;
     /// Asks GitHub to update the pull request's branch from its base.
     fn update_branch(
         &mut self,
         request: &UpdateBranchRequest,
-        known_resource: bool,
     ) -> impl Future<Output = HandlerResult<Settled<String>>> + Send;
     /// Writes the snapshot through to the projection's row.
     fn upsert_projection(
@@ -282,27 +281,25 @@ impl PullRequestEffects for RestatePullRequest<'_, '_> {
         &mut self,
         request: &MergeRequest,
         merge_method: Option<MergeMethod>,
-        known_resource: bool,
     ) -> HandlerResult<Settled<Merged>> {
         self.github_step(
             "merge-pull-request",
             Operation::Merge,
-            known_resource,
+            // `true` here and in the two mutations below: a mutation reaches GitHub only
+            // past `guard_target`, which has already proved the object read the pull
+            // request, so its step is always told the resource is known.
+            true,
             request,
             move |github, request| async move { github.merge(&request, merge_method).await },
         )
         .await
     }
 
-    async fn post_command(
-        &mut self,
-        request: &CommandRequest,
-        known_resource: bool,
-    ) -> HandlerResult<Settled<String>> {
+    async fn post_command(&mut self, request: &CommandRequest) -> HandlerResult<Settled<String>> {
         self.github_step(
             "post-dependabot-command",
             Operation::Comment,
-            known_resource,
+            true,
             request,
             |github, request| async move { github.post_command(&request).await },
         )
@@ -312,12 +309,11 @@ impl PullRequestEffects for RestatePullRequest<'_, '_> {
     async fn update_branch(
         &mut self,
         request: &UpdateBranchRequest,
-        known_resource: bool,
     ) -> HandlerResult<Settled<String>> {
         self.github_step(
             "update-pull-request-branch",
             Operation::UpdateBranch,
-            known_resource,
+            true,
             request,
             |github, request| async move { github.update_branch(&request).await },
         )
@@ -469,9 +465,7 @@ async fn run_merge<E: PullRequestEffects>(
     let merge_method = restate
         .repository_merge_method(request.target.repository_id)
         .await?;
-    let result = restate
-        .merge(&request, merge_method, state.snapshot.is_some())
-        .await?;
+    let result = restate.merge(&request, merge_method).await?;
     let outcome = merge_result(result)?;
     if matches!(outcome, ActionOutcome::Succeeded { .. }) {
         restate
@@ -504,9 +498,7 @@ async fn run_command<E: PullRequestEffects>(
         return Ok(rejected(reason));
     }
 
-    let result = restate
-        .post_command(&request, state.snapshot.is_some())
-        .await?;
+    let result = restate.post_command(&request).await?;
     let outcome = action_result(result)?;
     let log_at = restate.now("command-log-clock").await?;
     state.push_history(ActionLog {
@@ -530,9 +522,7 @@ async fn run_update_branch<E: PullRequestEffects>(
         return Ok(rejected(reason));
     }
 
-    let result = restate
-        .update_branch(&request, state.snapshot.is_some())
-        .await?;
+    let result = restate.update_branch(&request).await?;
     let outcome = action_result(result)?;
     let log_at = restate.now("update-branch-log-clock").await?;
     state.push_history(ActionLog {
@@ -722,8 +712,8 @@ pub(crate) fn close_pull_request<'ctx>(
 /// rejection names both SHAs so the dashboard can show what changed.
 ///
 /// Past the guard the pull request is a known resource — the object read it from GitHub to
-/// get the snapshot — so the mutation's GitHub step is told as much, exactly as `sync`
-/// tells its read. A 404 on the client's verify read then means the pull request has gone
+/// get the snapshot — which is why a mutation's GitHub step takes no flag to say so and is
+/// always told it. A 404 on the client's verify read then means the pull request has gone
 /// since the table showed it, and the target is rejected as not found rather than failed.
 fn guard_target(snapshot: Option<&PrRecord>, target: &PrTarget) -> Result<(), RejectReason> {
     let snapshot = snapshot
@@ -859,6 +849,25 @@ mod tests {
         }
     }
 
+    /// One GitHub step a handler took. `sync`'s read carries what it told the step about
+    /// the pull request being known, because that varies; a mutation has nothing to carry —
+    /// it cannot reach GitHub without passing a guard that proves the object read it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Asked {
+        Read { known_resource: bool },
+        Mutation(Operation),
+    }
+
+    impl Asked {
+        /// The operation the step is, for the message an unscripted one panics with.
+        fn operation(&self) -> Operation {
+            match self {
+                Self::Read { .. } => Operation::Read,
+                Self::Mutation(operation) => *operation,
+            }
+        }
+    }
+
     /// One answer from GitHub, as the step that asked for it settles.
     #[derive(Debug)]
     enum Answer {
@@ -881,8 +890,8 @@ mod tests {
         state: Option<PrState>,
         can_post_commands: bool,
         answers: VecDeque<Answer>,
-        /// Every GitHub step taken, with whether the pull request was a known resource.
-        asked: Vec<(Operation, bool)>,
+        /// Every GitHub step taken, in order.
+        asked: Vec<Asked>,
         /// Every one-way sync sent, in order: the key it went to, what it carried, and
         /// its delay.
         scheduled: Vec<(PrKey, SyncRequest, Option<Duration>)>,
@@ -952,11 +961,12 @@ mod tests {
             self.store.get_pr(&target().key()).await.unwrap()
         }
 
-        fn answer(&mut self, operation: Operation, known_resource: bool) -> Answer {
+        fn answer(&mut self, asked: Asked) -> Answer {
             if self.held_when_asked.is_none() {
                 self.held_when_asked = Some(self.held());
             }
-            self.asked.push((operation, known_resource));
+            let operation = asked.operation();
+            self.asked.push(asked);
             self.answers
                 .pop_front()
                 .unwrap_or_else(|| panic!("the handler asked GitHub to {operation} unscripted"))
@@ -1006,7 +1016,7 @@ mod tests {
             _request: &SyncRequest,
             known_resource: bool,
         ) -> HandlerResult<Settled<Option<PrRecord>>> {
-            match self.answer(Operation::Read, known_resource) {
+            match self.answer(Asked::Read { known_resource }) {
                 Answer::Snapshot(settled) => Ok(settled),
                 other => panic!("the handler asked GitHub for a snapshot; scripted {other:?}"),
             }
@@ -1016,9 +1026,8 @@ mod tests {
             &mut self,
             _request: &MergeRequest,
             _merge_method: Option<MergeMethod>,
-            known_resource: bool,
         ) -> HandlerResult<Settled<Merged>> {
-            match self.answer(Operation::Merge, known_resource) {
+            match self.answer(Asked::Mutation(Operation::Merge)) {
                 Answer::Merge(settled) => Ok(settled),
                 other => panic!("the handler asked GitHub to merge; scripted {other:?}"),
             }
@@ -1027,9 +1036,8 @@ mod tests {
         async fn post_command(
             &mut self,
             _request: &CommandRequest,
-            known_resource: bool,
         ) -> HandlerResult<Settled<String>> {
-            match self.answer(Operation::Comment, known_resource) {
+            match self.answer(Asked::Mutation(Operation::Comment)) {
                 Answer::Action(settled) => Ok(settled),
                 other => panic!("the handler asked GitHub to comment; scripted {other:?}"),
             }
@@ -1038,9 +1046,8 @@ mod tests {
         async fn update_branch(
             &mut self,
             _request: &UpdateBranchRequest,
-            known_resource: bool,
         ) -> HandlerResult<Settled<String>> {
-            match self.answer(Operation::UpdateBranch, known_resource) {
+            match self.answer(Asked::Mutation(Operation::UpdateBranch)) {
                 Answer::Action(settled) => Ok(settled),
                 other => {
                     panic!("the handler asked GitHub to update the branch; scripted {other:?}")
@@ -1118,7 +1125,12 @@ mod tests {
             .unwrap();
 
         assert!(matches!(trailing, SyncOutcome::Synced { .. }));
-        assert_eq!(restate.asked, vec![(Operation::Read, true)]);
+        assert_eq!(
+            restate.asked,
+            vec![Asked::Read {
+                known_resource: true
+            }]
+        );
         assert!(!restate.held().sync_pending);
         assert_eq!(
             restate.scheduled.len(),
@@ -1179,7 +1191,9 @@ mod tests {
         );
         assert_eq!(
             restate.asked,
-            vec![(Operation::Read, true)],
+            vec![Asked::Read {
+                known_resource: true
+            }],
             "the object had a snapshot, so the read is of a known resource"
         );
         assert_eq!(
@@ -1398,7 +1412,7 @@ mod tests {
                 merge_sha: None,
             }
         );
-        assert_eq!(restate.asked, vec![(Operation::Comment, true)]);
+        assert_eq!(restate.asked, vec![Asked::Mutation(Operation::Comment)]);
         let state = restate.state.expect("the object keeps its state");
         assert_eq!(
             state.snapshot,
@@ -1433,7 +1447,10 @@ mod tests {
                 merge_sha: None,
             }
         );
-        assert_eq!(restate.asked, vec![(Operation::UpdateBranch, true)]);
+        assert_eq!(
+            restate.asked,
+            vec![Asked::Mutation(Operation::UpdateBranch)]
+        );
         assert_eq!(
             restate.scheduled,
             vec![(PrKey::new(7, 9), sync_request(), None)],
@@ -1568,7 +1585,7 @@ mod tests {
                 merge_sha: Some(MERGE_SHA.to_owned()),
             }
         );
-        assert_eq!(restate.asked, vec![(Operation::Merge, true)]);
+        assert_eq!(restate.asked, vec![Asked::Mutation(Operation::Merge)]);
         assert_eq!(
             restate.row().await,
             None,
