@@ -4062,6 +4062,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "restate-ext"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "reqwest 0.13.4",
+ "restate-sdk",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "restate-sdk"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

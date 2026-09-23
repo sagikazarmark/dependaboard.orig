@@ -1,0 +1,30 @@
+[package]
+name = "restate-ext"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Project-independent plumbing for restate-sdk services: journaled steps, handler logging, an ingress client, and the fakes to test them"
+
+[dependencies]
+axum = { workspace = true, optional = true }
+bytes.workspace = true
+reqwest.workspace = true
+restate-sdk.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[features]
+# The fakes and assertions for testing code written against this crate: an
+# ingress stand-in, a deterministic clock, a log sink, and the discovery
+# assertion. Off by default, so a service does not carry axum into its binary
+# for them; the crate's own tests reach the module through `cfg(test)`.
+test-support = ["dep:axum"]
+
+[dev-dependencies]
+axum.workspace = true

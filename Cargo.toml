@@ -5,6 +5,7 @@ members = [
   "apps/web",
   "crates/core",
   "crates/github",
+  "crates/restate-ext",
   "crates/store",
 ]
 

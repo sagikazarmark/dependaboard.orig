@@ -25,6 +25,7 @@ let dioxusFreePackages: [String!]! = [
   "dependaboard-store",
   "dependaboard-github",
   "dependaboard-restate",
+  "restate-ext",
 ]
 
 type Ci {
