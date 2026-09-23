@@ -41,7 +41,17 @@ pub(crate) fn filter_sql(
             .map(|repo| bind(Value::Text(repo.clone())))
             .collect::<Vec<_>>()
             .join(", ");
-        clauses.push(format!("(p.owner || '/' || p.repo) IN ({bindings})"));
+        // Named through `repositories`, not through the copy of the name on
+        // `pull_requests`: a rename reaches the repository row on the next
+        // installation sweep, while each pull request keeps the old name
+        // until it is individually re-synced. The sidebar counts this facet
+        // by `repository_id`, so matching by name here would offer a count
+        // whose rows the filter cannot find. Same shape as the installation
+        // scope in `ScopedFilter::new`, and the scope is ANDed alongside, so
+        // a name another installation also uses stays out of the result.
+        clauses.push(format!(
+            "p.repository_id IN (SELECT repository_id FROM repositories WHERE owner || '/' || repo IN ({bindings}))"
+        ));
     }
     if !filter.update_types.is_empty() {
         let bindings = filter
@@ -211,11 +221,14 @@ mod tests {
 
         assert_eq!(
             sql,
-            "WHERE (p.owner || '/' || p.repo) IN (?1) AND (p.updated_at < ?2 OR (p.updated_at = ?2 AND p.id < ?3))"
+            "WHERE p.repository_id IN (SELECT repository_id FROM repositories WHERE owner || '/' || repo IN (?1)) AND (p.updated_at < ?2 OR (p.updated_at = ?2 AND p.id < ?3))"
         );
         assert_eq!(params, [text("acme/api"), Value::Integer(500), text("1#7")]);
     }
 
+    /// The names still come in as `owner/repo` and are still matched whole;
+    /// they are resolved on the `repositories` row rather than on the copy
+    /// the pull request carries, which a rename leaves stale.
     #[test]
     fn repos_match_the_owner_slash_repo_full_name() {
         let filter = PrFilter {
@@ -225,7 +238,10 @@ mod tests {
 
         let (sql, params) = filter_sql(&filter, None, NOW).unwrap();
 
-        assert_eq!(sql, "WHERE (p.owner || '/' || p.repo) IN (?1, ?2)");
+        assert_eq!(
+            sql,
+            "WHERE p.repository_id IN (SELECT repository_id FROM repositories WHERE owner || '/' || repo IN (?1, ?2))"
+        );
         assert_eq!(params, [text("acme/api"), text("acme/web")]);
     }
 
@@ -400,7 +416,7 @@ mod tests {
             sql,
             [
                 r"WHERE (LOWER(p.owner || '/' || p.repo || ' ' || p.title) LIKE ?1 ESCAPE '\' OR EXISTS (SELECT 1 FROM json_each(p.dependencies) d WHERE LOWER(json_extract(d.value, '$.name')) LIKE ?1 ESCAPE '\'))",
-                "(p.owner || '/' || p.repo) IN (?2)",
+                "p.repository_id IN (SELECT repository_id FROM repositories WHERE owner || '/' || repo IN (?2))",
                 "p.update_type IN (?3)",
                 "p.check_status IN (?4)",
                 "EXISTS (SELECT 1 FROM json_each(p.labels) l WHERE l.value = ?5)",

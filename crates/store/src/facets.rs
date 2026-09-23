@@ -462,4 +462,58 @@ mod tests {
             "the facet carries the whole repository row"
         );
     }
+    /// A rename reaches `repositories` on the next installation sweep, but
+    /// each pull request keeps the `owner`/`repo` it was last synced under —
+    /// which, for one whose sync keeps failing, is forever. The sidebar
+    /// counts a repository by id, so the filter must name it by id too;
+    /// otherwise the facet offers a count whose rows nobody can list.
+    #[tokio::test]
+    async fn a_renamed_repository_lists_the_rows_its_facet_still_counts() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        for number in 1..=3 {
+            store.upsert_pr(&pr(1, number, 10)).await.unwrap();
+        }
+        // The sweep renames the repository row alone; the pull request rows
+        // are not re-synced, so they still say acme/repo-1.
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "renamed".to_owned(),
+                ..repo(1, 20)
+            })
+            .await
+            .unwrap();
+        let filter = PrFilter {
+            repos: vec!["acme/renamed".to_owned()],
+            ..Default::default()
+        };
+
+        let summary = store
+            .dashboard_summary(INSTALLATION, &filter)
+            .await
+            .unwrap();
+        let page = store
+            .list_prs(INSTALLATION, &filter, Page::default())
+            .await
+            .unwrap();
+
+        let counted = summary
+            .facets
+            .repositories
+            .iter()
+            .find(|facet| {
+                format!("{}/{}", facet.repository.owner, facet.repository.repo) == "acme/renamed"
+            })
+            .map(|facet| facet.count)
+            .expect("the renamed repository is still in the sidebar");
+        assert_eq!(counted, 3, "the sidebar counts the rename by id");
+        assert_eq!(
+            page.total, counted,
+            "clicking the facet must list what it counted"
+        );
+        assert_eq!(
+            page.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
+    }
 }

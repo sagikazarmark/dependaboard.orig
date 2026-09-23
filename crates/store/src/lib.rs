@@ -1361,7 +1361,7 @@ mod tests {
                 "{} {} ORDER BY p.updated_at DESC, p.id DESC LIMIT ?7",
                 select_pr_sql(),
                 [
-                    "WHERE (p.owner || '/' || p.repo) IN (?1)",
+                    "WHERE p.repository_id IN (SELECT repository_id FROM repositories WHERE owner || '/' || repo IN (?1))",
                     "p.update_type IN (?2)",
                     "EXISTS (SELECT 1 FROM json_each(p.labels) l WHERE l.value = ?3)",
                     "(p.updated_at < ?4 OR (p.updated_at = ?4 AND p.id < ?5))",
