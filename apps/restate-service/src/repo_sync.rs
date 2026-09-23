@@ -23,6 +23,9 @@ use crate::{
 /// against a recording fake without a runtime.
 trait RepoReconcileEffects {
     fn repository_id(&self) -> u64;
+    /// The wall clock, in Unix seconds, journaled under `step` so a replay reads the
+    /// same moment.
+    fn now(&mut self, step: &'static str) -> impl Future<Output = HandlerResult<u64>> + Send;
     fn list_pull_requests(
         &mut self,
     ) -> impl Future<Output = HandlerResult<Vec<SyncRequest>>> + Send;
@@ -67,6 +70,14 @@ struct RestateReconcileEffects<'a, 'ctx> {
 impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
     fn repository_id(&self) -> u64 {
         self.repository_id
+    }
+
+    async fn now(&mut self, step: &'static str) -> HandlerResult<u64> {
+        Ok(self
+            .ctx
+            .run(|| async { Ok(unix_seconds()) })
+            .name(step)
+            .await?)
     }
 
     async fn list_pull_requests(&mut self) -> HandlerResult<Vec<SyncRequest>> {
@@ -152,9 +163,9 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
     }
 }
 
-/// Sweeps every listed pull request, prunes the projection down to the listing under
-/// `reconcile_start` as the fence, then retires the durable state of every pull request
-/// the outbox holds — those pruning removed just now, and any an earlier prune removed
+/// Reads the fence, sweeps every listed pull request, prunes the projection down to the
+/// listing under that fence, then retires the durable state of every pull request the
+/// outbox holds — those pruning removed just now, and any an earlier prune removed
 /// without getting to tell.
 ///
 /// A pull request that fails terminally is logged and remembered rather than propagated,
@@ -164,8 +175,11 @@ impl RepoReconcileEffects for RestateReconcileEffects<'_, '_> {
 async fn run_repo_reconcile<E: RepoReconcileEffects, R: RetirementEffects>(
     restate: &mut E,
     retirements: &mut R,
-    reconcile_start: u64,
 ) -> HandlerResult<usize> {
+    // The reconcile's first act, before the listing: a pull request written while the
+    // listing is in flight is newer than the fence, so the prune the retain runs spares
+    // it.
+    let reconcile_start = restate.now("repo-reconcile-clock").await?;
     let pulls = restate.list_pull_requests().await?;
     let mut failed = Vec::new();
     for request in &pulls {
@@ -252,10 +266,6 @@ impl RepoSync {
     ) -> HandlerResult<()> {
         traced("RepoSync/reconcile", ctx.key(), async {
             let repository = repository.into_inner();
-            let reconcile_start = ctx
-                .run(|| async { Ok(unix_seconds()) })
-                .name("repo-reconcile-clock")
-                .await?;
             let mut restate = RestateReconcileEffects {
                 ctx: &ctx,
                 github: &self.github,
@@ -268,8 +278,7 @@ impl RepoSync {
                 ctx: &ctx,
                 store: &self.store,
             };
-            let pull_requests =
-                run_repo_reconcile(&mut restate, &mut retirements, reconcile_start).await?;
+            let pull_requests = run_repo_reconcile(&mut restate, &mut retirements).await?;
             Ok(format!("synced {pull_requests} pull requests"))
         })
         .await
@@ -345,6 +354,8 @@ mod tests {
         }
     }
 
+    const CLOCK_EPOCH: u64 = 1_700_000_000;
+
     /// Stands in for Restate, GitHub and the store during a repository reconcile or a
     /// commit-status fan-out and records what each asked of them.
     #[derive(Default)]
@@ -364,6 +375,12 @@ mod tests {
         resolved: Vec<String>,
         /// Every sync sent one-way, in order: the key it went to and what it carried.
         sent: Vec<(PrKey, SyncRequest)>,
+        /// How many times the clock has been read; each reading is a second later than
+        /// the last, so what the reconcile did first is visible in what it holds.
+        clock_readings: u64,
+        /// What the clock stood at when the listing was asked for: a fence read before
+        /// it is strictly smaller.
+        clock_when_listed: Option<u64>,
     }
 
     impl RepoReconcileEffects for RecordedRepoSync {
@@ -371,7 +388,14 @@ mod tests {
             7
         }
 
+        async fn now(&mut self, _step: &'static str) -> HandlerResult<u64> {
+            let reading = CLOCK_EPOCH + self.clock_readings;
+            self.clock_readings += 1;
+            Ok(reading)
+        }
+
         async fn list_pull_requests(&mut self) -> HandlerResult<Vec<SyncRequest>> {
+            self.clock_when_listed = Some(CLOCK_EPOCH + self.clock_readings);
             match self.listing_failure.take() {
                 Some(error) => Err(error),
                 None => Ok(self.pulls.clone()),
@@ -473,16 +497,16 @@ mod tests {
         // What the projection queued when it pruned 3 and 9, whether by this run of the
         // retain or by an earlier attempt whose result never reached the journal.
         let mut retirements =
-            RecordedRetirements::queued(&[PrKey::new(7, 3), PrKey::new(7, 9)], Some(900));
+            RecordedRetirements::queued(&[PrKey::new(7, 3), PrKey::new(7, 9)], Some(CLOCK_EPOCH));
 
-        run_repo_reconcile(&mut restate, &mut retirements, 900)
+        run_repo_reconcile(&mut restate, &mut retirements)
             .await
             .unwrap();
 
         assert_eq!(restate.retained, Some(vec![12]));
         assert_eq!(
             restate.retained_under,
-            Some(900),
+            Some(CLOCK_EPOCH),
             "the projection prunes under the sweep's start, the fence the retirements carry"
         );
         assert_eq!(
@@ -491,13 +515,13 @@ mod tests {
                 (
                     PrKey::new(7, 3),
                     ClosedRequest {
-                        synced_before: Some(900)
+                        synced_before: Some(CLOCK_EPOCH)
                     }
                 ),
                 (
                     PrKey::new(7, 9),
                     ClosedRequest {
-                        synced_before: Some(900)
+                        synced_before: Some(CLOCK_EPOCH)
                     }
                 ),
             ],
@@ -505,6 +529,32 @@ mod tests {
              unless it was re-synced since the sweep began"
         );
         assert_eq!(retirements.acknowledged, vec![2]);
+    }
+
+    #[tokio::test]
+    async fn the_reconcile_prunes_under_the_instant_read_before_its_listing() {
+        let mut restate = RecordedRepoSync {
+            pulls: vec![dependabot_pull(12)],
+            ..Default::default()
+        };
+
+        run_repo_reconcile(&mut restate, &mut RecordedRetirements::default())
+            .await
+            .unwrap();
+
+        let fence = restate
+            .retained_under
+            .expect("the retain ran under a fence");
+        let listed = restate
+            .clock_when_listed
+            .expect("the reconcile asked for the listing");
+        assert!(
+            fence < listed,
+            "the fence is read before the listing is asked for, not after it returns: a \
+             pull request opened while the listing was in flight and synced by its own \
+             webhook is newer than a fence read first and is spared, where one read once \
+             the listing returned would take it; {fence} is not earlier than {listed}"
+        );
     }
 
     #[tokio::test]
@@ -523,7 +573,7 @@ mod tests {
         };
         let mut retirements = RecordedRetirements::queued(&[PrKey::new(7, 5)], Some(900));
 
-        let outcome = run_repo_reconcile(&mut restate, &mut retirements, 900).await;
+        let outcome = run_repo_reconcile(&mut restate, &mut retirements).await;
 
         assert_eq!(
             restate.synced,
@@ -554,7 +604,7 @@ mod tests {
         };
         let mut retirements = RecordedRetirements::queued(&[PrKey::new(7, 3)], Some(900));
 
-        let outcome = run_repo_reconcile(&mut restate, &mut retirements, 900).await;
+        let outcome = run_repo_reconcile(&mut restate, &mut retirements).await;
 
         assert!(outcome.is_err());
         assert!(restate.synced.is_empty());
@@ -577,7 +627,7 @@ mod tests {
         };
         let mut retirements = RecordedRetirements::queued(&[PrKey::new(7, 3)], Some(900));
 
-        let outcome = run_repo_reconcile(&mut restate, &mut retirements, 900).await;
+        let outcome = run_repo_reconcile(&mut restate, &mut retirements).await;
 
         assert!(
             outcome.is_err(),
@@ -615,7 +665,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = run_repo_reconcile(&mut restate, &mut RecordedRetirements::default(), 900)
+        let error = run_repo_reconcile(&mut restate, &mut RecordedRetirements::default())
             .await
             .unwrap_err();
 
@@ -633,7 +683,7 @@ mod tests {
             ..Default::default()
         };
 
-        let synced = run_repo_reconcile(&mut restate, &mut RecordedRetirements::default(), 900)
+        let synced = run_repo_reconcile(&mut restate, &mut RecordedRetirements::default())
             .await
             .unwrap();
 
@@ -650,7 +700,7 @@ mod tests {
     async fn an_empty_listing_still_prunes_the_projection() {
         let mut restate = RecordedRepoSync::default();
 
-        run_repo_reconcile(&mut restate, &mut RecordedRetirements::default(), 900)
+        run_repo_reconcile(&mut restate, &mut RecordedRetirements::default())
             .await
             .unwrap();
 

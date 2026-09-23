@@ -327,6 +327,9 @@ async fn run_scheduler_tick<E: SchedulerTickEffects>(
 /// Side effects an installation sweep asks of Restate, GitHub and the store, abstracted
 /// so `run_installation_sync` can be exercised against a recording fake without a runtime.
 trait InstallationSyncEffects {
+    /// The wall clock, in Unix seconds, journaled under `step` so a replay reads the
+    /// same moment.
+    fn now(&mut self, step: &'static str) -> impl Future<Output = HandlerResult<u64>> + Send;
     /// Enumerates every repository the installation grants access to: complete, or an
     /// error. A partial listing must never become the authoritative set.
     fn list_repositories(&mut self) -> impl Future<Output = HandlerResult<Vec<RepoRecord>>> + Send;
@@ -351,6 +354,14 @@ struct RestateSyncEffects<'a, 'ctx> {
 }
 
 impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
+    async fn now(&mut self, step: &'static str) -> HandlerResult<u64> {
+        Ok(self
+            .ctx
+            .run(|| async { Ok(unix_seconds()) })
+            .name(step)
+            .await?)
+    }
+
     async fn list_repositories(&mut self) -> HandlerResult<Vec<RepoRecord>> {
         let github = self.github.clone();
         let repositories = run_github_step(&mut RestateGithubStep {
@@ -398,16 +409,19 @@ impl InstallationSyncEffects for RestateSyncEffects<'_, '_> {
     }
 }
 
-/// Re-enumerates the installation's repositories, makes the projection match under
-/// `reconcile_start` as the fence, retires the durable state of every pull request the
-/// outbox holds — those that left with a repository just now, and any an earlier prune
-/// removed without getting to tell — then fans a reconcile out to each repository that
-/// remains. Resolves to how many were fanned out to.
+/// Reads the fence, re-enumerates the installation's repositories, makes the projection
+/// match under that fence, retires the durable state of every pull request the outbox
+/// holds — those that left with a repository just now, and any an earlier prune removed
+/// without getting to tell — then fans a reconcile out to each repository that remains.
+/// Resolves to how many were fanned out to.
 async fn run_installation_sync<E: InstallationSyncEffects, R: RetirementEffects>(
     restate: &mut E,
     retirements: &mut R,
-    reconcile_start: u64,
 ) -> HandlerResult<usize> {
+    // The sweep's first act, before the listing: a repository or pull request written
+    // while the listing is in flight is newer than the fence, so the prune the replace
+    // runs spares it.
+    let reconcile_start = restate.now("installation-reconcile-clock").await?;
     let repositories = restate.list_repositories().await?;
     restate
         .replace_repositories(&repositories, reconcile_start)
@@ -427,16 +441,9 @@ async fn perform_installation_sync(
     github: &GithubApiHandle,
     store: &Arc<dyn ProjectionWriter>,
 ) -> HandlerResult<usize> {
-    // Read before the listing, and carried across the seam from here: a repository or
-    // pull request written while the listing is in flight is newer than the fence, so the
-    // prune the replace runs spares it.
-    let reconcile_start = ctx
-        .run(|| async { Ok(unix_seconds()) })
-        .name("installation-reconcile-clock")
-        .await?;
     let mut restate = RestateSyncEffects { ctx, github, store };
     let mut retirements = RestateRetirements { ctx, store };
-    run_installation_sync(&mut restate, &mut retirements, reconcile_start).await
+    run_installation_sync(&mut restate, &mut retirements).await
 }
 
 /// Side effects a purge asks of Restate and the store, abstracted so
@@ -785,6 +792,8 @@ mod tests {
         }
     }
 
+    const CLOCK_EPOCH: u64 = 1_700_000_000;
+
     /// Stands in for Restate, GitHub and the store during an installation sweep and
     /// records what the sweep asked of them.
     #[derive(Default)]
@@ -796,10 +805,23 @@ mod tests {
         /// The fence the replace was asked to prune under.
         replaced_under: Option<u64>,
         reconciled: Vec<u64>,
+        /// How many times the clock has been read; each reading is a second later than
+        /// the last, so what the sweep did first is visible in what it holds.
+        clock_readings: u64,
+        /// What the clock stood at when the listing was asked for: a fence read before
+        /// it is strictly smaller.
+        clock_when_listed: Option<u64>,
     }
 
     impl InstallationSyncEffects for RecordedSweep {
+        async fn now(&mut self, _step: &'static str) -> HandlerResult<u64> {
+            let reading = CLOCK_EPOCH + self.clock_readings;
+            self.clock_readings += 1;
+            Ok(reading)
+        }
+
         async fn list_repositories(&mut self) -> HandlerResult<Vec<RepoRecord>> {
+            self.clock_when_listed = Some(CLOCK_EPOCH + self.clock_readings);
             match self.listing_failure.take() {
                 Some(error) => Err(error),
                 None => Ok(self.repositories.clone()),
@@ -841,10 +863,10 @@ mod tests {
         // journal: the sweep cannot tell, and need not.
         let mut retirements = RecordedRetirements::queued(
             &[PrKey::new(8, 1), PrKey::new(8, 4), PrKey::new(12, 2)],
-            Some(1_000),
+            Some(CLOCK_EPOCH),
         );
 
-        let swept = run_installation_sync(&mut restate, &mut retirements, 1_000)
+        let swept = run_installation_sync(&mut restate, &mut retirements)
             .await
             .unwrap();
 
@@ -860,19 +882,19 @@ mod tests {
                 (
                     PrKey::new(8, 1),
                     ClosedRequest {
-                        synced_before: Some(1_000)
+                        synced_before: Some(CLOCK_EPOCH)
                     }
                 ),
                 (
                     PrKey::new(8, 4),
                     ClosedRequest {
-                        synced_before: Some(1_000)
+                        synced_before: Some(CLOCK_EPOCH)
                     }
                 ),
                 (
                     PrKey::new(12, 2),
                     ClosedRequest {
-                        synced_before: Some(1_000)
+                        synced_before: Some(CLOCK_EPOCH)
                     }
                 ),
             ],
@@ -893,33 +915,38 @@ mod tests {
 
     #[tokio::test]
     async fn the_sweep_prunes_under_the_instant_read_before_its_listing() {
-        // The handler reads the clock at 1_000 and then lists. Repository 9 is added to
-        // the installation at 1_020, while the listing is in flight, so its row is newer
-        // than the fence — and the listing may or may not carry it.
+        // Repository 9 is added to the installation twenty seconds in, while the listing
+        // is in flight, so its row is newer than the fence — and the listing may or may
+        // not carry it.
         let mut restate = RecordedSweep {
             repositories: vec![
                 installed_repository(7),
                 RepoRecord {
-                    synced_at: 1_020,
+                    synced_at: CLOCK_EPOCH + 20,
                     ..installed_repository(9)
                 },
             ],
             ..Default::default()
         };
 
-        run_installation_sync(&mut restate, &mut RecordedRetirements::default(), 1_000)
+        run_installation_sync(&mut restate, &mut RecordedRetirements::default())
             .await
             .unwrap();
 
         assert_eq!(restate.replaced, Some(vec![7, 9]));
-        assert_eq!(
-            restate.replaced_under,
-            Some(1_000),
-            "the prune runs under the instant read before the listing, not under the \
-             listing's own stamps"
+        let fence = restate
+            .replaced_under
+            .expect("the replace ran under a fence");
+        let listed = restate
+            .clock_when_listed
+            .expect("the sweep asked for the listing");
+        assert!(
+            fence < listed,
+            "the fence is read before the listing is asked for, not after it returns: \
+             {fence} is not earlier than {listed}"
         );
         assert!(
-            restate.replaced_under < Some(1_020),
+            fence < CLOCK_EPOCH + 20,
             "a repository added while the listing was in flight is newer than the fence, \
              so the prune spares it and the pull requests under it; a fence taken once the \
              listing returned would take them"
@@ -935,7 +962,7 @@ mod tests {
         };
         let mut retirements = RecordedRetirements::queued(&[PrKey::new(8, 1)], Some(1_000));
 
-        let outcome = run_installation_sync(&mut restate, &mut retirements, 1_000).await;
+        let outcome = run_installation_sync(&mut restate, &mut retirements).await;
 
         assert!(
             outcome.is_err(),
@@ -962,7 +989,7 @@ mod tests {
         };
         let mut retirements = RecordedRetirements::queued(&[PrKey::new(8, 1)], Some(1_000));
 
-        let outcome = run_installation_sync(&mut restate, &mut retirements, 1_000).await;
+        let outcome = run_installation_sync(&mut restate, &mut retirements).await;
 
         assert!(outcome.is_err());
         assert_eq!(
