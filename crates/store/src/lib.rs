@@ -1453,6 +1453,63 @@ mod tests {
         assert!(second.next_cursor.is_none());
     }
 
+    /// A page is offered a page after it when a row was found past its limit,
+    /// and not when the rows ran out exactly on it. The fence is the one row
+    /// read past the limit, and the test above cannot stand on it: three rows
+    /// taken two at a time leave a last page one row short, so the read finds
+    /// nothing past the limit whether the count is compared with `>` or with
+    /// `>=`. Four rows taken two at a time land the last page exactly on the
+    /// limit, which is where the two differ — and where `>=` would offer a
+    /// **Load next** that opens on nothing.
+    #[tokio::test]
+    async fn a_last_page_that_exactly_fills_the_limit_says_there_is_nothing_after_it() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        for number in 1..=4 {
+            store.upsert_pr(&pr(1, number, 10)).await.unwrap();
+        }
+        let first = store
+            .list_prs(
+                INSTALLATION,
+                &PrFilter::default(),
+                Page {
+                    limit: 2,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [4, 3]
+        );
+        assert!(
+            first.next_cursor.is_some(),
+            "two rows are left, so there is a page after this one"
+        );
+
+        let second = store
+            .list_prs(
+                INSTALLATION,
+                &PrFilter::default(),
+                Page {
+                    limit: 2,
+                    after: first.next_cursor,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert!(
+            second.next_cursor.is_none(),
+            "the rows ran out on the limit, so nothing follows this page"
+        );
+    }
+
     #[tokio::test]
     async fn keyset_pages_break_equal_updated_at_ties_on_id_without_gaps_or_repeats() {
         let (_directory, store) = test_store().await;
