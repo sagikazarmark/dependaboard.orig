@@ -125,7 +125,7 @@ mod tests {
     use super::*;
     use crate::ui::batch::Followed;
     use crate::ui::dashboard_state::{
-        Answers, CapabilitiesStatus, PageStatus, Selection, SummaryStatus,
+        Answers, CapabilitiesStatus, Connection, PageStatus, Selection, SummaryStatus,
     };
     use crate::ui::test_support::{
         BATCH, FIXTURE_NOW, OTHER_BATCH, grouped_row, loaded_page, loaded_summary,
@@ -235,6 +235,7 @@ mod tests {
             },
             use_signal(|| FIXTURE_NOW),
             use_callback(|_| {}),
+            use_signal(|| Connection::Online),
         );
         use_url_sync(state, detail, followed, onbatch);
         rsx! {}

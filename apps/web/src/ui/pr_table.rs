@@ -91,7 +91,13 @@ pub(crate) fn PrTable(onopen: EventHandler<PrRecord>) -> Element {
                         div { class: "empty-state error-state",
                             strong { "The read model could not be loaded" }
                             code { "{error}" }
-                            Button { size: ButtonSize::Sm, onclick: move |_| state.reload(), "Retry" }
+                            // Not offered to a page the server has refused the
+                            // credentials of: the read would be declined
+                            // without being made, and the banner already says
+                            // to reload the page to sign in again.
+                            if !state.signed_out() {
+                                Button { size: ButtonSize::Sm, onclick: move |_| state.reload(), "Retry" }
+                            }
                         }
                     },
                     PageStatus::Loading => rsx! {
@@ -156,6 +162,7 @@ mod tests {
     use futures_util::FutureExt;
 
     use super::*;
+    use crate::ui::SIGNED_OUT_MESSAGE;
     use crate::ui::dashboard_state::Connection;
     use crate::ui::test_support::{
         DashboardFixture, grouped_row, loaded_page, mount_dashboard, render, serde_row,
@@ -292,6 +299,35 @@ mod tests {
         );
         assert!(failed.contains("Retry"), "{failed}");
         assert!(!failed.contains("Reading the projection"), "{failed}");
+    }
+
+    /// A read that failed because the server refused the credentials is the
+    /// one case where asking again is no use: the retry would be declined
+    /// without being made, so the button is not offered and the banner's
+    /// **Reload** is the only way on. The reason is still named, as it is for
+    /// any other failure.
+    #[test]
+    fn a_failed_table_on_a_signed_out_page_says_why_rather_than_offer_a_retry() {
+        fn Fixture() -> Element {
+            rsx! {
+                DashboardFixture {
+                    page: PageStatus::Failed(SIGNED_OUT_MESSAGE.to_owned()),
+                    connection: Connection::SignedOut,
+                    PrTable { onopen: move |_| {} }
+                }
+            }
+        }
+        let html = render(Fixture);
+
+        assert!(
+            html.contains("The read model could not be loaded"),
+            "{html}"
+        );
+        assert!(html.contains(SIGNED_OUT_MESSAGE), "{html}");
+        assert!(
+            !html.contains(">Retry<"),
+            "a button that would ask nothing is not offered: {html}"
+        );
     }
 
     fn render_empty_state(filtered: bool) -> String {

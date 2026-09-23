@@ -14,7 +14,7 @@ use dioxus::prelude::*;
 use crate::components::toast::{ToastOptions, Toasts, use_toast};
 use crate::ui::batch::{
     ATTACH_TIMEOUT, AttachGateway, BatchOutcome, Followed, Listing, SUBMIT_ATTEMPTS, ServerBatch,
-    ServerFollow, follow_batch, run_batch,
+    ServerFollow, SubmitGateway, follow_batch, run_batch,
 };
 use crate::ui::dashboard_state::{Connection, DashboardState, use_dashboard};
 use crate::ui::format::{relative_time, verdict_tally};
@@ -265,32 +265,61 @@ fn pill(current: &Followed, now: u64) -> (&'static str, String) {
 /// target the server left out is named; a submission Restate never took
 /// leaves the selection as it was, so the user has the rows to try again.
 pub(crate) fn queue_batch(pending: PendingAction, mut host: BatchHost) {
-    let action = pending.action;
-    let targets = pending.targets();
-    let retried_from = pending.retried_from.clone();
     let batch_id = new_batch_id();
-    let followed = Followed::queued(&batch_id, action, &targets, unix_seconds());
+    let followed = Followed::queued(
+        &batch_id,
+        pending.action,
+        &pending.targets(),
+        unix_seconds(),
+    );
     host.take_over(followed.clone(), async move {
-        let mut batch = ServerBatch {
-            follow: ServerFollow {
-                batch_id,
-                state: host.state,
-            },
-            action,
-            targets,
-            retried_from,
-        };
-        let mut reporting = host;
-        let mut accounting = host;
-        let outcome = run_batch(
-            &mut batch,
-            followed,
-            |update| reporting.follow(update.clone()),
-            |receipt| account_for(&pending, &receipt, &mut accounting),
-        )
-        .await;
-        conclude(outcome, &mut host);
+        let mut batch = submission(&pending, batch_id, host.state);
+        run_to_end(&mut batch, &pending, followed, host).await;
     });
+}
+
+/// The gateway `pending` is submitted and followed through: what the browser
+/// asked for, as the server function takes it, under the `batch_id` this page
+/// minted for it.
+fn submission(pending: &PendingAction, batch_id: String, state: DashboardState) -> ServerBatch {
+    ServerBatch {
+        follow: ServerFollow { batch_id, state },
+        action: pending.action,
+        targets: pending.targets(),
+        retried_from: pending.retried_from.clone(),
+    }
+}
+
+/// Submits `followed` through `gateway`, follows it to the end, and makes of
+/// each answer what the page makes of it: every poll is published, the
+/// receipt that says Restate has the batch accounts for `pending`, and the
+/// outcome is concluded.
+///
+/// `effects` is taken by value under a `Copy` bound rather than by `&mut`,
+/// because [`run_batch`] holds two sinks at once — one for each poll, one for
+/// the receipt — and they would be two unique borrows of the same page.
+/// [`BatchHost`] is `Copy` for this reason: it is a bundle of signal handles,
+/// and two handles to one page is what the page is.
+///
+/// The accounting happens the moment Restate has the batch, not when the
+/// batch ends: the rows leave the selection while it runs, which is what
+/// [`queue_batch`] promises, so it cannot be deferred to the end.
+async fn run_to_end<G: SubmitGateway, E: BatchEffects + Copy>(
+    gateway: &mut G,
+    pending: &PendingAction,
+    followed: Followed,
+    mut effects: E,
+) {
+    let mut reporting = effects;
+    let mut accounting = effects;
+    let outcome = run_batch(
+        gateway,
+        followed,
+        |update| reporting.follow(update.clone()),
+        |receipt| account_for(pending, &receipt, &mut accounting),
+    )
+    .await;
+    conclude(outcome, &mut effects);
 }
 
 /// Accounts for `pending` once Restate has the batch it was queued as. Its
@@ -505,6 +534,7 @@ fn completion_notice(progress: &BatchProgress) -> Option<String> {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -517,8 +547,8 @@ mod tests {
     use crate::ui::batch::{BatchGateway, WAITING_NOTICE_AFTER};
     use crate::ui::pr_target;
     use crate::ui::test_support::{
-        BATCH, DashboardFixture, FIXTURE_NOW, followed, grouped_row, half_done_merge,
-        next_or_repeat, render, serde_row,
+        BATCH, DashboardFixture, FIXTURE_NOW, OTHER_BATCH, followed, grouped_row, half_done_merge,
+        mount_dashboard, next_or_repeat, render, serde_row,
     };
 
     #[test]
@@ -1513,6 +1543,116 @@ mod tests {
         }
     }
 
+    /// A batch gateway whose submission is scripted as well as its polls:
+    /// what Restate answers the first submit with, and then what its progress
+    /// says each time it is asked.
+    struct ScriptedSubmit {
+        submits: VecDeque<Result<BatchReceipt, Fault>>,
+        progress: VecDeque<Result<Option<BatchProgress>, Fault>>,
+    }
+
+    impl ScriptedSubmit {
+        fn new(
+            submits: impl IntoIterator<Item = Result<BatchReceipt, Fault>>,
+            progress: impl IntoIterator<Item = BatchProgress>,
+        ) -> Self {
+            Self {
+                submits: submits.into_iter().collect(),
+                progress: progress.into_iter().map(|it| Ok(Some(it))).collect(),
+            }
+        }
+
+        /// Restate never took the batch: it answers every submission with
+        /// `submits`, and has no progress to show for it either.
+        fn never_taken(submits: impl IntoIterator<Item = Result<BatchReceipt, Fault>>) -> Self {
+            Self {
+                submits: submits.into_iter().collect(),
+                progress: VecDeque::from([Ok(None)]),
+            }
+        }
+    }
+
+    impl BatchGateway for ScriptedSubmit {
+        async fn progress(&mut self) -> Result<Option<BatchProgress>, Fault> {
+            next_or_repeat(&mut self.progress)
+        }
+
+        async fn tick(&mut self) {}
+
+        fn now(&self) -> u64 {
+            FIXTURE_NOW
+        }
+    }
+
+    impl SubmitGateway for ScriptedSubmit {
+        async fn submit(&mut self) -> Result<BatchReceipt, Fault> {
+            next_or_repeat(&mut self.submits)
+        }
+    }
+
+    /// A [`RecordedPage`] two handles can be held to at once, which is what
+    /// [`run_to_end`] asks of a page: [`run_batch`] holds one sink for the
+    /// polls and another for the receipt, and `BatchHost` satisfies it by
+    /// being `Copy` — a bundle of signals, where two handles to one page is
+    /// what the page is. This is the same thing for a recorder.
+    #[derive(Clone, Copy)]
+    struct Recording<'a>(&'a RefCell<RecordedPage>);
+
+    impl BatchEffects for Recording<'_> {
+        fn announce(&mut self, notice: Notice) {
+            self.0.borrow_mut().announce(notice);
+        }
+
+        fn following(&self) -> Option<Followed> {
+            self.0.borrow().following()
+        }
+
+        fn follow(&mut self, followed: Followed) {
+            self.0.borrow_mut().follow(followed);
+        }
+
+        fn stand_down(&mut self) {
+            self.0.borrow_mut().stand_down();
+        }
+
+        fn queue(&mut self, pending: PendingAction) {
+            self.0.borrow_mut().queue(pending);
+        }
+
+        fn deselect(&mut self, rows: &[PrRecord]) {
+            self.0.borrow_mut().deselect(rows);
+        }
+
+        fn reload(&mut self) {
+            self.0.borrow_mut().reload();
+        }
+
+        fn signed_out(&mut self) {
+            self.0.borrow_mut().signed_out();
+        }
+    }
+
+    /// The two rows a queued batch is made of here, and the batch they are
+    /// queued as.
+    fn both_rows() -> PendingAction {
+        PendingAction {
+            action: BulkActionKind::Merge,
+            rows: vec![grouped_row(), serde_row()],
+            retried_from: None,
+        }
+    }
+
+    fn queued(pending: &PendingAction) -> Followed {
+        Followed::queued("batch-1", pending.action, &pending.targets(), FIXTURE_NOW)
+    }
+
+    fn merged() -> BatchProgress {
+        finished(ActionOutcome::Succeeded {
+            detail: "merged".to_owned(),
+            merge_sha: None,
+        })
+    }
+
     /// A batch followed by id alone that was already over by the time the
     /// follow reached it — Restate's first answer is the finished progress,
     /// and it was never once seen running — is shown as it stands and left
@@ -1542,6 +1682,155 @@ mod tests {
             "the drawer shows the batch as it stands"
         );
         assert!(!page.stood_down, "the follow stands on the finished batch");
+    }
+
+    /// What the browser asked for, as the server function takes it. The
+    /// gateway is built by reshuffling a [`PendingAction`] into the shape
+    /// [`ServerBatch`] holds, which is the one piece of a queued batch that
+    /// is neither a decision nor a call — and so the one piece the tests
+    /// below, which are handed a gateway, would otherwise leave out.
+    #[test]
+    fn a_queued_batch_is_submitted_as_the_rows_the_user_picked() {
+        let (dom, state) = mount_dashboard();
+
+        dom.in_runtime(|| {
+            let pending = PendingAction {
+                retried_from: Some(OTHER_BATCH.to_owned()),
+                ..both_rows()
+            };
+
+            let batch = submission(&pending, BATCH.to_owned(), state);
+
+            assert_eq!(batch.follow.batch_id, BATCH);
+            assert_eq!(batch.action, BulkActionKind::Merge);
+            assert_eq!(
+                batch.targets,
+                vec![pr_target(&grouped_row()), pr_target(&serde_row())],
+                "one target per row, in the order the user picked them"
+            );
+            assert_eq!(
+                batch.retried_from.as_deref(),
+                Some(OTHER_BATCH),
+                "the batch this one retries rides along"
+            );
+        });
+    }
+
+    /// The whole of a queued batch, from the submission to the announcement.
+    /// Each half of this is already asserted on its own — what `run_batch`
+    /// does with a receipt that leaves a target out, and what `account_for`
+    /// makes of one — and the two were never asserted together, because the
+    /// only thing that joined them was a closure inside a spawn, and the
+    /// mounted harness can only drive a page the credentials were refused of.
+    ///
+    /// The order is the point. A target the server left out is named when
+    /// Restate takes the batch, and its rows leave the selection then — while
+    /// the batch runs, not when it ends — and the batch is announced after.
+    #[tokio::test]
+    async fn a_target_the_server_left_out_is_named_and_deselected_before_the_batch_is_announced() {
+        let pending = both_rows();
+        let receipt = BatchReceipt {
+            left_out: vec![pr_target(&serde_row()).key()],
+        };
+        let mut gateway = ScriptedSubmit::new([Ok(receipt)], [merged()]);
+        let page = RefCell::new(RecordedPage::default());
+
+        run_to_end(&mut gateway, &pending, queued(&pending), Recording(&page)).await;
+
+        let page = page.into_inner();
+        assert_eq!(
+            page.deselected,
+            vec![grouped_row(), serde_row()],
+            "the queued row and the left-out one both leave the selection"
+        );
+        assert_eq!(
+            page.notices,
+            vec![
+                Notice::Warning("Left out of the batch: acme/web#12 is no longer open.".to_owned()),
+                Notice::Success("Batch complete".to_owned()),
+            ],
+            "named when Restate took the batch, announced when it ended"
+        );
+        assert_eq!(page.reloads, 1);
+    }
+
+    /// A batch that ran to the end with nothing left out: the rows leave the
+    /// selection, the batch is announced once, and the page reloads once so
+    /// it shows what the batch changed.
+    #[tokio::test]
+    async fn a_batch_queued_and_followed_to_the_end_is_announced_once_and_reloads_the_page_once() {
+        let pending = both_rows();
+        let mut gateway =
+            ScriptedSubmit::new([Ok(BatchReceipt::default())], [half_done_merge(), merged()]);
+        let page = RefCell::new(RecordedPage::default());
+
+        run_to_end(&mut gateway, &pending, queued(&pending), Recording(&page)).await;
+
+        let page = page.into_inner();
+        assert_eq!(page.deselected, vec![grouped_row(), serde_row()]);
+        assert_eq!(
+            page.notices,
+            vec![Notice::Success("Batch complete".to_owned())]
+        );
+        assert_eq!(page.reloads, 1);
+        assert!(!page.stood_down, "the follow stands on the finished batch");
+    }
+
+    /// A submission Restate never took leaves the selection as it was, so the
+    /// user still has the rows to try again. [`queue_batch`] promises exactly
+    /// this and nothing asserted it: the deselection rides on the receipt,
+    /// and a batch that was never taken has none, so the promise is kept by
+    /// `run_batch` not calling the sink at all.
+    #[tokio::test]
+    async fn a_submission_restate_never_took_leaves_the_selection_to_try_again() {
+        let pending = both_rows();
+        let mut gateway =
+            ScriptedSubmit::never_taken([Err(Fault::Refused("Restate is unavailable".to_owned()))]);
+        let page = RefCell::new(RecordedPage::default());
+
+        run_to_end(&mut gateway, &pending, queued(&pending), Recording(&page)).await;
+
+        let page = page.into_inner();
+        assert!(
+            page.deselected.is_empty(),
+            "the rows are still the user's to try again: {:?}",
+            page.deselected
+        );
+        assert_eq!(
+            page.notices,
+            vec![Notice::Error(
+                "Batch was not submitted after 5 attempts: Restate is unavailable".to_owned()
+            )]
+        );
+        assert!(page.stood_down);
+        assert_eq!(page.reloads, 0);
+    }
+
+    /// A round trip lost after Restate took the batch: the submission is
+    /// answered with a failure, Restate's own progress says it has the batch
+    /// after all, and it has already finished. The batch is accounted for on
+    /// that progress rather than on a receipt, and announced once — the one
+    /// path where the accounting and the conclusion happen without a poll
+    /// between them.
+    #[tokio::test]
+    async fn a_batch_restate_had_already_finished_is_accounted_for_and_announced_once() {
+        let pending = both_rows();
+        let mut gateway = ScriptedSubmit::new([Err(Fault::Unreachable)], [merged()]);
+        let page = RefCell::new(RecordedPage::default());
+
+        run_to_end(&mut gateway, &pending, queued(&pending), Recording(&page)).await;
+
+        let page = page.into_inner();
+        assert_eq!(
+            page.deselected,
+            vec![grouped_row(), serde_row()],
+            "a batch Restate is running is a batch whose rows have left the selection"
+        );
+        assert_eq!(
+            page.notices,
+            vec![Notice::Success("Batch complete".to_owned())]
+        );
+        assert_eq!(page.reloads, 1);
     }
 
     /// The same follow over a batch that was still running when it reached

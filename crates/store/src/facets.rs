@@ -9,7 +9,7 @@ use dependaboard_core::{FacetCounts, LabelFacet, PrFilter, RepoFacet};
 use libsql::Value;
 
 use crate::{
-    ScopedFilter, StoreError,
+    REPO_EXTRA_INDEX, ScopedFilter, StoreError,
     filter::{Facet, without_facet},
     integer, repo_columns, repo_from_row, stored_enum, unsigned,
 };
@@ -107,7 +107,7 @@ async fn repository_facets(
         .await?;
     let mut facets = Vec::new();
     while let Some(row) = rows.next().await? {
-        let count = unsigned(row.get::<i64>(6)?)?;
+        let count = unsigned(row.get::<i64>(REPO_EXTRA_INDEX)?)?;
         facets.push(RepoFacet {
             repository: repo_from_row(row)?,
             count,
@@ -240,8 +240,14 @@ mod tests {
     }
 
     /// Four pull requests over two repositories, differing in check, update
-    /// type, and labels, so every facet has something to hide and something
-    /// to keep.
+    /// type, and labels, so a facet counted within the filters below has
+    /// something to hide and something to keep.
+    ///
+    /// It differs in the values of each dimension, not in how each dimension
+    /// partitions the rows: under every filter these tests apply, the
+    /// update-type facet is left with a single group. That is enough for what
+    /// the tests below assert and not enough to say a facet groups by the
+    /// column it names, which is [`crosscut_fixture`]'s job.
     async fn facet_fixture() -> (TempDir, LibSqlPrStore) {
         let (directory, store) = test_store().await;
         store.upsert_repo(&repo(1, 10)).await.unwrap();
@@ -267,6 +273,181 @@ mod tests {
             store.upsert_pr(&record).await.unwrap();
         }
         (directory, store)
+    }
+
+    /// Six pull requests whose four dimensions cut them into a different
+    /// number of groups each — checks into two, update types into three,
+    /// repositories into two of unequal size, labels into two — so a facet
+    /// that groups by a column it does not name answers with the wrong
+    /// number of groups.
+    ///
+    /// [`facet_fixture`] cannot say this, and that is why this one exists.
+    /// Under every filter its tests apply, the update-type facet collapses to
+    /// a single group, and with one group `GROUP BY` any column answers the
+    /// same — so the types statement could group by `p.check_status` and stay
+    /// green. Each dimension here also keeps a count multiset the others
+    /// cannot imitate, because a wrong `GROUP BY` leaves SQLite free to fill
+    /// the selected column from any row of each group: the values it returns
+    /// are real ones, and only the shape of the answer gives it away.
+    async fn crosscut_fixture() -> (TempDir, LibSqlPrStore) {
+        let (directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        store.upsert_repo(&repo(2, 10)).await.unwrap();
+        for (repository_id, number, check_status, update_type, label) in [
+            (1, 1, CheckStatus::Success, UpdateType::Minor, "beta"),
+            (1, 2, CheckStatus::Success, UpdateType::Minor, "beta"),
+            (1, 3, CheckStatus::Success, UpdateType::Minor, "beta"),
+            (1, 4, CheckStatus::Success, UpdateType::Major, "beta"),
+            (1, 5, CheckStatus::Failure, UpdateType::Major, "alpha"),
+            (2, 6, CheckStatus::Failure, UpdateType::Patch, "alpha"),
+        ] {
+            let mut record = pr(repository_id, number, 10);
+            record.check_status = check_status;
+            record.update_type = update_type;
+            record.labels = vec![label.to_owned()];
+            store.upsert_pr(&record).await.unwrap();
+        }
+        (directory, store)
+    }
+
+    /// The counts of [`crosscut_fixture`] as they stand under no filter at
+    /// all, which is what every facet must answer with whenever the only
+    /// value chosen is its own.
+    fn crosscut_labels(summary: &DashboardSummary) -> Vec<(&str, u64)> {
+        summary
+            .facets
+            .labels
+            .iter()
+            .map(|facet| (facet.label.as_str(), facet.count))
+            .collect()
+    }
+
+    fn crosscut_repositories(summary: &DashboardSummary) -> Vec<(&str, u64)> {
+        summary
+            .facets
+            .repositories
+            .iter()
+            .map(|facet| (facet.repository.repo.as_str(), facet.count))
+            .collect()
+    }
+
+    /// Each facet counts the column it names. The four statements pair a
+    /// [`Facet`] with the SQL that groups it by hand, and nothing ties the
+    /// two together, so a statement grouped by its neighbour's column still
+    /// compiles and still answers with values of the right type.
+    #[tokio::test]
+    async fn every_facet_groups_by_the_column_it_names() {
+        let (_directory, store) = crosscut_fixture().await;
+
+        let summary = store
+            .dashboard_summary(INSTALLATION, &PrFilter::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.facets.checks,
+            BTreeMap::from([(CheckStatus::Success, 4), (CheckStatus::Failure, 2)]),
+            "the check facet must count check_status"
+        );
+        assert_eq!(
+            summary.facets.update_types,
+            BTreeMap::from([
+                (UpdateType::Minor, 3),
+                (UpdateType::Major, 2),
+                (UpdateType::Patch, 1),
+            ]),
+            "the update type facet must count update_type"
+        );
+        assert_eq!(
+            crosscut_labels(&summary),
+            [("beta", 4), ("alpha", 2)],
+            "the label facet must count the labels"
+        );
+        assert_eq!(
+            crosscut_repositories(&summary),
+            [("repo-1", 5), ("repo-2", 1)],
+            "the repository facet must count repository_id"
+        );
+    }
+
+    /// Choosing a value narrows the rows and every other facet, never the
+    /// facet it was chosen in — the sidebar has to keep offering the values
+    /// that would widen the view, or a user who picks one can never get back
+    /// to the rest. The rule is kept by one [`without_facet`] call per
+    /// statement, so it is asserted once per statement: a facet that forgot
+    /// it would answer with its own selection alone, which reads as a
+    /// plausible count and not as an error.
+    #[tokio::test]
+    async fn choosing_a_value_never_narrows_the_facet_it_was_chosen_in() {
+        let (_directory, store) = crosscut_fixture().await;
+
+        let checks = store
+            .dashboard_summary(
+                INSTALLATION,
+                &PrFilter {
+                    check_statuses: vec![CheckStatus::Failure],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            checks.facets.checks,
+            BTreeMap::from([(CheckStatus::Success, 4), (CheckStatus::Failure, 2)]),
+            "the checks facet was narrowed by its own selection"
+        );
+
+        let types = store
+            .dashboard_summary(
+                INSTALLATION,
+                &PrFilter {
+                    update_types: vec![UpdateType::Major],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            types.facets.update_types,
+            BTreeMap::from([
+                (UpdateType::Minor, 3),
+                (UpdateType::Major, 2),
+                (UpdateType::Patch, 1),
+            ]),
+            "the update types facet was narrowed by its own selection"
+        );
+
+        let labels = store
+            .dashboard_summary(
+                INSTALLATION,
+                &PrFilter {
+                    labels: vec!["alpha".to_owned()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crosscut_labels(&labels),
+            [("beta", 4), ("alpha", 2)],
+            "the labels facet was narrowed by its own selection"
+        );
+
+        let repositories = store
+            .dashboard_summary(
+                INSTALLATION,
+                &PrFilter {
+                    repos: vec!["acme/repo-2".to_owned()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crosscut_repositories(&repositories),
+            [("repo-1", 5), ("repo-2", 1)],
+            "the repositories facet was narrowed by its own selection"
+        );
     }
 
     #[tokio::test]

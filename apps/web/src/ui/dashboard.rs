@@ -7,7 +7,6 @@
 
 use dependaboard_core::{Page, PrRecord, unix_seconds};
 use dioxus::core::Task;
-use dioxus::logger::tracing;
 use dioxus::prelude::*;
 
 use crate::api::{load_capabilities, load_dashboard, load_signed_in_user, load_summary};
@@ -17,7 +16,8 @@ use crate::ui::active_batch::{ActiveBatch, BatchHost, attach_batch, queue_batch}
 use crate::ui::batch::Followed;
 use crate::ui::confirm_modal::ConfirmModal;
 use crate::ui::dashboard_state::{
-    Answers, CapabilitiesStatus, DashboardState, PageStatus, Selection, SummaryStatus,
+    Answers, CapabilitiesStatus, Connection, DashboardState, PageStatus, Selection, SummaryStatus,
+    guarded_by,
 };
 use crate::ui::detail_drawer::{OpenDetail, OpenPr};
 use crate::ui::live::{use_clock, use_live_refresh, use_visibility};
@@ -64,37 +64,39 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
     // is up, since it stops with the polls when the page is signed out.
     let now = use_signal(unix_seconds);
 
+    // The page's line to the server, held here rather than inside
+    // `DashboardState::provide` because the reads below are made before the
+    // state is: every one of them goes through `guarded_by`, so a resource
+    // re-fired by a filter the user changed, by **Load next**, or by
+    // `DashboardState::reload`, is refused on a signed-out page as a call
+    // through the state would be — and a 401 one of them meets raises the
+    // banner where it was met.
+    let connection = use_signal(|| Connection::Online);
     let mut rows = use_resource(move || {
         let filter = filter();
         let page = Page {
             after: cursor(),
             ..Page::default()
         };
-        async move { load_dashboard(filter, page).await }
+        async move { guarded_by(connection, || load_dashboard(filter, page)).await }
     });
     let mut summary = use_resource(move || {
         let filter = filter();
-        async move { load_summary(filter).await }
+        async move { guarded_by(connection, || load_summary(filter)).await }
     });
-    let page = use_memo(move || PageStatus::from_resource(rows.read().as_ref()));
-    let summary_status = use_memo(move || SummaryStatus::from_resource(summary.read().as_ref()));
+    let page = use_memo(move || PageStatus::from_faulted(rows.read().as_ref()));
+    let summary_status = use_memo(move || SummaryStatus::from_faulted(summary.read().as_ref()));
     // Who the server let the page in as. Asked once, since the identity does
     // not change under an open page; a page the server has stopped letting
     // in is told so by the polls, not by asking this again.
-    let mut signed_in = use_resource(|| async {
-        load_signed_in_user().await.inspect_err(|error| {
-            tracing::debug!(%error, "who is signed in could not be read");
-        })
-    });
+    let mut signed_in =
+        use_resource(move || async move { guarded_by(connection, load_signed_in_user).await });
     // What the service can do. Asked once too: it is settled when the service
     // starts, and a running service does not change its mind.
-    let mut capabilities = use_resource(|| async {
-        load_capabilities().await.inspect_err(|error| {
-            tracing::debug!(%error, "what the service can do could not be read");
-        })
-    });
+    let mut capabilities =
+        use_resource(move || async move { guarded_by(connection, load_capabilities).await });
     let capabilities_status =
-        use_memo(move || CapabilitiesStatus::from_resource(capabilities.read().as_ref()));
+        use_memo(move || CapabilitiesStatus::from_faulted(capabilities.read().as_ref()));
     // The resources keep their last answer while the next is in flight, so a
     // reload leaves the rows standing until the fresh ones land. The name and
     // the capabilities are asked again only if they were never answered: a
@@ -121,6 +123,7 @@ pub(crate) fn Dashboard(dark: Signal<bool>) -> Element {
         },
         now,
         reload,
+        connection,
     );
     let host = BatchHost {
         followed,

@@ -12,11 +12,11 @@ use dioxus::prelude::*;
 use crate::api::{load_pr_projection, load_pr_status};
 use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
-use crate::ui::dashboard_state::{DashboardState, use_dashboard};
+use crate::ui::dashboard_state::{DashboardState, Remote, use_dashboard};
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
 use crate::ui::pr_sync::{ServerSync, SyncFailure, sync_pr};
 use crate::ui::side_panel::SidePanel;
-use crate::ui::{Fault, PendingAction, user_facing};
+use crate::ui::{Fault, PendingAction};
 
 /// The pull request `key` names as the read model has it, `None` once it is
 /// no longer in the dashboard, read on the page whose line to the server
@@ -94,21 +94,17 @@ pub(crate) fn OpenDetail(
         let Some(OpenPr::Loading(key)) = &*detail.read() else {
             return;
         };
+        let asked = OpenPr::Loading(key.clone());
         let key = key.clone();
         spawn(async move {
-            let row = read_row(state, key.clone()).await;
-            // The user may have opened another pull request, or moved on,
-            // while the row was in flight; then it is not theirs to see.
-            if *detail.peek() != Some(OpenPr::Loading(key.clone())) {
-                return;
+            let answer = read_row(state, key.clone()).await;
+            if let Err(fault) = &answer {
+                tracing::warn!(%fault, %key, "the linked pull request could not be read");
             }
-            detail.set(match row {
-                Ok(row) => row.map(OpenPr::from),
-                Err(fault) => {
-                    tracing::warn!(%fault, %key, "the linked pull request could not be read");
-                    None
-                }
-            });
+            let outcome = settled(detail.peek().as_ref(), &asked, answer);
+            if let Settled::Becomes(next) = outcome {
+                detail.set(next);
+            }
         });
     });
     // Runs when the page lands, not when the drawer changes: the open pull
@@ -130,24 +126,16 @@ pub(crate) fn OpenDetail(
             Followed::AsIs => {}
             Followed::Replaced(row) => detail.set(Some(OpenPr::Loaded(row))),
             Followed::Unknown(last) => {
-                let asked = OpenPr::Loaded(last.clone());
+                let asked = OpenPr::Loaded(last);
                 spawn(async move {
-                    let key = last.key();
+                    let key = asked.key();
                     let answer = read_row(state, key.clone()).await;
-                    // The answer is for the drawer as it was when it asked. The
-                    // user may have opened another pull request meanwhile, or
-                    // closed it; or a later page may have replaced the row
-                    // already, and an answer read before that is the older one.
-                    if detail.peek().as_ref() != Some(&asked) {
-                        return;
+                    if let Err(fault) = &answer {
+                        tracing::warn!(%fault, %key, "the open pull request could not be read again");
                     }
-                    match answer {
-                        Ok(Some(row)) if row != *last => detail.set(Some(OpenPr::from(row))),
-                        Ok(Some(_)) => {}
-                        Ok(None) => detail.set(Some(OpenPr::Gone(last))),
-                        Err(fault) => {
-                            tracing::warn!(%fault, %key, "the open pull request could not be read again");
-                        }
+                    let outcome = settled(detail.peek().as_ref(), &asked, answer);
+                    if let Settled::Becomes(next) = outcome {
+                        detail.set(next);
                     }
                 });
             }
@@ -202,6 +190,50 @@ fn follow(open: &OpenPr, page: &DashboardPage) -> Followed {
     }
 }
 
+/// What an answer to a read of one pull request's row makes of the drawer.
+#[derive(Clone, Debug, PartialEq)]
+enum Settled {
+    /// Nothing. The answer is not this drawer's to apply any more, or it says
+    /// nothing the drawer does not already show.
+    Stands,
+    /// The drawer becomes this: a row, or nothing at all, which closes it.
+    Becomes(Option<OpenPr>),
+}
+
+/// What `answer` makes of the drawer, given what it was when the read went
+/// out and what it is now.
+///
+/// The drawer reads a row in two places — for a pull request a link named by
+/// key alone, and again for one the page has stopped showing — and both must
+/// first ask whether the answer is still theirs: the user may have opened
+/// another pull request meanwhile, or closed the drawer, or a later page may
+/// have replaced the row already, and an answer read before that is the older
+/// one. That question was spelled once per reader and asked of nothing; it is
+/// asked here, once, for both.
+///
+/// The two readers are told apart by what `asked` had: a link's read has a
+/// key and no row, so whatever comes back is what the drawer opens on and a
+/// failure leaves it with nothing to open. A reader that already has a row
+/// keeps it when the read fails, and gives the pull request up for gone only
+/// when the read model answers that it has none.
+fn settled(
+    open: Option<&OpenPr>,
+    asked: &OpenPr,
+    answer: Result<Option<PrRecord>, Fault>,
+) -> Settled {
+    if open != Some(asked) {
+        return Settled::Stands;
+    }
+    match (asked.row(), answer) {
+        (None, Ok(row)) => Settled::Becomes(row.map(OpenPr::from)),
+        (None, Err(_)) => Settled::Becomes(None),
+        (Some(last), Ok(Some(row))) if row != *last => Settled::Becomes(Some(OpenPr::from(row))),
+        (Some(_), Ok(Some(_))) => Settled::Stands,
+        (Some(last), Ok(None)) => Settled::Becomes(Some(OpenPr::Gone(Box::new(last.clone())))),
+        (Some(_), Err(_)) => Settled::Stands,
+    }
+}
+
 /// What the user reads when the drawer's **Sync** fell short of the row:
 /// whether Restate was asked at all, and why it ended there.
 fn sync_message(failure: &SyncFailure) -> String {
@@ -248,7 +280,11 @@ pub(crate) fn DetailDrawer(
     // change under one drawer, which is keyed by it.
     let status = use_resource(use_reactive(
         (&row.synced_at, &gone),
-        move |(_synced_at, _gone)| load_pr_status(sync_repository_id, sync_number),
+        move |(_synced_at, _gone)| async move {
+            state
+                .guarded(|| load_pr_status(sync_repository_id, sync_number))
+                .await
+        },
     ));
     let durable_state = DurableStatus::from_resource(status.read().as_ref());
     let subject = row.clone();
@@ -391,12 +427,18 @@ enum DurableStatus {
 }
 
 impl DurableStatus {
-    fn from_resource(resource: Option<&Result<Option<PrState>, ServerFnError>>) -> Self {
-        match resource {
-            None => Self::Loading,
-            Some(Err(error)) => Self::Failed(user_facing(error)),
-            Some(Ok(None)) => Self::Gone,
-            Some(Ok(Some(state))) => Self::Present(Box::new(state.clone())),
+    /// What a resource's answer means, read through [`Remote`] so that the
+    /// two arms this shares with every other read of the read model — nothing
+    /// yet is loading, a fault is its words — are written once. The two arms
+    /// that are this drawer's own stay here, because `Gone` is not
+    /// `Loaded(None)` to anyone reading it: it is the object holding nothing
+    /// after the pull request closed and its state was retired.
+    fn from_resource(resource: Option<&Result<Option<PrState>, Fault>>) -> Self {
+        match Remote::from_faulted(resource) {
+            Remote::Loading => Self::Loading,
+            Remote::Failed(error) => Self::Failed(error),
+            Remote::Loaded(None) => Self::Gone,
+            Remote::Loaded(Some(state)) => Self::Present(Box::new(state)),
         }
     }
 }
@@ -613,6 +655,7 @@ mod tests {
             },
             use_signal(|| FIXTURE_NOW),
             use_callback(|_| {}),
+            use_signal(|| Connection::Online),
         );
         rsx! {
             OpenDetail { detail, now: FIXTURE_NOW, onaction: move |_| {}, onsync: move |_| {} }
@@ -674,6 +717,99 @@ mod tests {
         assert_eq!(
             follow(&OpenPr::Loading(PrKey::new(7, 9)), &page),
             Followed::AsIs
+        );
+    }
+
+    /// A link names a pull request by key alone, and the drawer opens on
+    /// whatever the read model answers: its row, or nothing — a stale link,
+    /// or a pull request closed since it was made, opens no drawer, and so
+    /// does a read that failed, since there is nothing yet to show.
+    #[test]
+    fn a_linked_pull_request_opens_on_its_row_and_opens_nothing_when_there_is_none() {
+        let asked = OpenPr::Loading(grouped_row().key());
+
+        assert_eq!(
+            settled(Some(&asked), &asked, Ok(Some(grouped_row()))),
+            Settled::Becomes(Some(OpenPr::from(grouped_row())))
+        );
+        assert_eq!(
+            settled(Some(&asked), &asked, Ok(None)),
+            Settled::Becomes(None),
+            "a link to a pull request the read model has not got opens nothing"
+        );
+        assert_eq!(
+            settled(Some(&asked), &asked, Err(Fault::SignedOut)),
+            Settled::Becomes(None),
+            "a read that failed leaves a drawer that never had a row with none"
+        );
+    }
+
+    /// A row the page stopped showing is asked about, and the answer is the
+    /// drawer's next word on it: a row that moved replaces the one it had, a
+    /// row that has not is no news, and a pull request the read model no
+    /// longer has is given up for gone on the row the drawer last saw — which
+    /// is what lets the drawer say *which* pull request is no longer open.
+    /// A read that failed changes nothing: the drawer has a row to keep
+    /// showing, and a failure is not the read model saying the row has gone.
+    #[test]
+    fn a_pull_request_the_read_model_no_longer_has_is_given_up_for_gone_on_its_last_row() {
+        let last = grouped_row();
+        let asked = OpenPr::Loaded(Box::new(last.clone()));
+
+        let mut moved = last.clone();
+        moved.head_sha = "f00d1e".to_owned();
+        assert_eq!(
+            settled(Some(&asked), &asked, Ok(Some(moved.clone()))),
+            Settled::Becomes(Some(OpenPr::from(moved)))
+        );
+        assert_eq!(
+            settled(Some(&asked), &asked, Ok(Some(last.clone()))),
+            Settled::Stands,
+            "the row the drawer already shows is no news"
+        );
+        assert_eq!(
+            settled(Some(&asked), &asked, Ok(None)),
+            Settled::Becomes(Some(OpenPr::Gone(Box::new(last)))),
+            "gone, on the row it last saw"
+        );
+        assert_eq!(
+            settled(Some(&asked), &asked, Err(Fault::Unreachable)),
+            Settled::Stands,
+            "a read that failed is not the read model saying the row has gone"
+        );
+    }
+
+    /// An answer is applied only to the drawer that asked for it. A read is
+    /// in flight for as long as the server takes, and in that time the user
+    /// can open another pull request, close the drawer, or have a page land
+    /// that replaces the row — and then the answer is the older word, or
+    /// nobody's.
+    #[test]
+    fn an_answer_for_a_pull_request_the_drawer_has_since_moved_off_is_ignored() {
+        let asked = OpenPr::Loaded(Box::new(grouped_row()));
+        let answer = || Ok(Some(off_page_row()));
+
+        assert_eq!(
+            settled(Some(&OpenPr::from(serde_row())), &asked, answer()),
+            Settled::Stands,
+            "another pull request is open now"
+        );
+        assert_eq!(
+            settled(None, &asked, answer()),
+            Settled::Stands,
+            "the drawer was closed while the read was in flight"
+        );
+        assert_eq!(
+            settled(Some(&OpenPr::from(off_page_row())), &asked, answer()),
+            Settled::Stands,
+            "a page landed first and replaced the row the read was for"
+        );
+
+        let linked = OpenPr::Loading(grouped_row().key());
+        assert_eq!(
+            settled(Some(&OpenPr::from(serde_row())), &linked, answer()),
+            Settled::Stands,
+            "a link's read is the drawer's only while the drawer is still waiting on it"
         );
     }
 

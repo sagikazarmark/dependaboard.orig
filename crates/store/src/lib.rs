@@ -1,4 +1,6 @@
-use std::{collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap, env, path::Path, str::FromStr, sync::Arc, sync::LazyLock, time::Duration,
+};
 
 use async_trait::async_trait;
 use dependaboard_core::{
@@ -350,54 +352,56 @@ impl ProjectionWriter for LibSqlPrStore {
         let labels = serde_json::to_string(&pr.labels)?;
         // Derived, not taken from the record: see the trait's doc comment.
         let id = pr.key().to_string();
+        // Named one by one, and exhaustively, so a column the record gains
+        // stops compiling here rather than going quietly unwritten. The read
+        // side has this already — `pr_from_row` builds the struct, so it
+        // cannot miss a field and still compile — and this is its other half.
+        // The two `_`s are the fields serialised into the locals above, whose
+        // names they would otherwise shadow.
+        let PrRecord {
+            id: _,
+            repository_id,
+            owner,
+            repo,
+            number,
+            title,
+            html_url,
+            dependency,
+            from_version,
+            to_version,
+            dependencies: _,
+            update_type,
+            head_sha,
+            check_status,
+            mergeable,
+            labels: _,
+            created_at,
+            updated_at,
+            synced_at,
+        } = pr;
         connection
             .execute(
-                r#"INSERT INTO pull_requests (
-                    id, repository_id, owner, repo, number, title, html_url, dependency,
-                    from_version, to_version, dependencies, update_type, head_sha,
-                    check_status, mergeable, labels, created_at, updated_at, synced_at
-                ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                    ?14, ?15, ?16, ?17, ?18, ?19
-                ) ON CONFLICT(id) DO UPDATE SET
-                    repository_id = excluded.repository_id,
-                    owner = excluded.owner,
-                    repo = excluded.repo,
-                    number = excluded.number,
-                    title = excluded.title,
-                    html_url = excluded.html_url,
-                    dependency = excluded.dependency,
-                    from_version = excluded.from_version,
-                    to_version = excluded.to_version,
-                    dependencies = excluded.dependencies,
-                    update_type = excluded.update_type,
-                    head_sha = excluded.head_sha,
-                    check_status = excluded.check_status,
-                    mergeable = excluded.mergeable,
-                    labels = excluded.labels,
-                    created_at = excluded.created_at,
-                    updated_at = excluded.updated_at,
-                    synced_at = excluded.synced_at"#,
+                upsert_pr_sql(),
                 vec![
                     Value::Text(id),
-                    integer(pr.repository_id)?,
-                    Value::Text(pr.owner.clone()),
-                    Value::Text(pr.repo.clone()),
-                    integer(pr.number)?,
-                    Value::Text(pr.title.clone()),
-                    Value::Text(pr.html_url.clone()),
-                    option_text(pr.dependency.clone()),
-                    option_text(pr.from_version.clone()),
-                    option_text(pr.to_version.clone()),
+                    integer(*repository_id)?,
+                    Value::Text(owner.clone()),
+                    Value::Text(repo.clone()),
+                    integer(*number)?,
+                    Value::Text(title.clone()),
+                    Value::Text(html_url.clone()),
+                    option_text(dependency.clone()),
+                    option_text(from_version.clone()),
+                    option_text(to_version.clone()),
                     Value::Text(dependencies),
-                    Value::Text(pr.update_type.to_string()),
-                    Value::Text(pr.head_sha.clone()),
-                    Value::Text(pr.check_status.to_string()),
-                    Value::Text(pr.mergeable.to_string()),
+                    Value::Text(update_type.to_string()),
+                    Value::Text(head_sha.clone()),
+                    Value::Text(check_status.to_string()),
+                    Value::Text(mergeable.to_string()),
                     Value::Text(labels),
-                    integer(pr.created_at)?,
-                    integer(pr.updated_at)?,
-                    integer(pr.synced_at)?,
+                    integer(*created_at)?,
+                    integer(*updated_at)?,
+                    integer(*synced_at)?,
                 ],
             )
             .await?;
@@ -897,14 +901,88 @@ impl ProjectionReader for LibSqlPrStore {
     }
 }
 
+/// The columns of `pull_requests`, in the order the projection writes them and
+/// reads them back. Minted from one list rather than written out per
+/// statement, so a column the record gains cannot reach the insert and miss
+/// the rewrite, or reach both and miss the projection a reader decodes — the
+/// argument [`repo_columns`] makes for the other table, with four statements
+/// to keep in step here instead of two.
+///
+/// The order is the decoder's: [`pr_from_row`] reads `0..PR_COLUMNS.len()`
+/// straight through, so an entry's place here is the index that reads it.
+const PR_COLUMNS: [&str; 19] = [
+    "id",
+    "repository_id",
+    "owner",
+    "repo",
+    "number",
+    "title",
+    "html_url",
+    "dependency",
+    "from_version",
+    "to_version",
+    "dependencies",
+    "update_type",
+    "head_sha",
+    "check_status",
+    "mergeable",
+    "labels",
+    "created_at",
+    "updated_at",
+    "synced_at",
+];
+
+/// Where [`select_pr_sql`] puts the installation it joins in: past the pull
+/// request's own columns, so its index is the roster's length rather than a
+/// literal in the middle that every column after it has to be counted around.
+const PR_INSTALLATION_INDEX: i32 = PR_COLUMNS.len() as i32;
+
+/// [`PR_COLUMNS`] under `alias`, for the statements that name the table.
+fn pr_columns(alias: &str) -> String {
+    PR_COLUMNS
+        .map(|column| format!("{alias}{column}"))
+        .join(", ")
+}
+
+/// The projection's write for one pull request: insert it, or rewrite every
+/// column but the one it is keyed by. Rendered from [`PR_COLUMNS`] so the
+/// three forms a column takes in this statement — its name, its placeholder,
+/// and its `excluded` assignment — are one list, and the parameter vector the
+/// caller binds is the only thing left to keep in step by hand.
+fn upsert_pr_sql() -> &'static str {
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        let columns = PR_COLUMNS.join(", ");
+        let placeholders = (1..=PR_COLUMNS.len())
+            .map(|position| format!("?{position}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // `id` is the conflict target, so it is the one column a rewrite
+        // leaves alone — and the one value derived rather than taken from the
+        // record, which is why it could never be rewritten from `excluded`.
+        let rewrite = PR_COLUMNS
+            .iter()
+            .filter(|column| **column != "id")
+            .map(|column| format!("{column} = excluded.{column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "INSERT INTO pull_requests ({columns}) VALUES ({placeholders}) \
+             ON CONFLICT(id) DO UPDATE SET {rewrite}"
+        )
+    });
+    &SQL
+}
+
 fn select_pr_sql() -> &'static str {
-    r#"SELECT
-        p.id, p.repository_id, r.installation_id, p.owner, p.repo, p.number,
-        p.title, p.html_url, p.dependency, p.from_version, p.to_version,
-        p.dependencies, p.update_type, p.head_sha, p.check_status, p.mergeable,
-        p.labels, p.created_at, p.updated_at, p.synced_at
-       FROM pull_requests p
-       JOIN repositories r ON r.repository_id = p.repository_id"#
+    static SQL: LazyLock<String> = LazyLock::new(|| {
+        format!(
+            "SELECT {}, r.installation_id \
+             FROM pull_requests p \
+             JOIN repositories r ON r.repository_id = p.repository_id",
+            pr_columns("p.")
+        )
+    });
+    &SQL
 }
 
 /// The dashboard's total for a [`ScopedFilter`]'s clause.
@@ -923,43 +1001,45 @@ fn page_sql(scoped: &mut ScopedFilter, limit: u64) -> Result<String, StoreError>
     ))
 }
 
-/// The pull request's own columns of a [`select_pr_sql`] row; column 2, the
-/// installation joined in from `repositories`, is [`installation_from_row`]'s.
+/// The pull request's own columns of a [`select_pr_sql`] row, which are
+/// [`PR_COLUMNS`] in order; the installation joined in past them is
+/// [`installation_from_row`]'s.
 fn pr_from_row(row: &Row) -> Result<PrRecord, StoreError> {
     Ok(PrRecord {
         id: row.get(0)?,
         repository_id: unsigned(row.get::<i64>(1)?)?,
-        owner: row.get(3)?,
-        repo: row.get(4)?,
-        number: unsigned(row.get::<i64>(5)?)?,
-        title: row.get(6)?,
-        html_url: row.get(7)?,
-        dependency: row.get(8)?,
-        from_version: row.get(9)?,
-        to_version: row.get(10)?,
-        dependencies: serde_json::from_str(&row.get::<String>(11)?)?,
-        update_type: stored_enum(row.get(12)?)?,
-        head_sha: row.get(13)?,
-        check_status: stored_enum(row.get(14)?)?,
+        owner: row.get(2)?,
+        repo: row.get(3)?,
+        number: unsigned(row.get::<i64>(4)?)?,
+        title: row.get(5)?,
+        html_url: row.get(6)?,
+        dependency: row.get(7)?,
+        from_version: row.get(8)?,
+        to_version: row.get(9)?,
+        dependencies: serde_json::from_str(&row.get::<String>(10)?)?,
+        update_type: stored_enum(row.get(11)?)?,
+        head_sha: row.get(12)?,
+        check_status: stored_enum(row.get(13)?)?,
         // The column is nullable and was once written verbatim from GitHub, so
         // NULL and any unrecognised legacy text deliberately fold into Unknown
         // rather than surfacing as CorruptEnum.
         mergeable: row
-            .get::<Option<String>>(15)?
+            .get::<Option<String>>(14)?
             .as_deref()
             .map_or(Mergeable::Unknown, Mergeable::from_github_state),
-        labels: serde_json::from_str(&row.get::<String>(16)?)?,
-        created_at: unsigned(row.get::<i64>(17)?)?,
-        updated_at: unsigned(row.get::<i64>(18)?)?,
-        synced_at: unsigned(row.get::<i64>(19)?)?,
+        labels: serde_json::from_str(&row.get::<String>(15)?)?,
+        created_at: unsigned(row.get::<i64>(16)?)?,
+        updated_at: unsigned(row.get::<i64>(17)?)?,
+        synced_at: unsigned(row.get::<i64>(18)?)?,
     })
 }
 
 /// The installation of the repository a [`select_pr_sql`] row's pull request
-/// hangs off, joined in as column 2. The pull request's own columns hold no
+/// hangs off, joined in past the pull request's own columns at
+/// [`PR_INSTALLATION_INDEX`]. The pull request's own columns hold no
 /// installation: the repository row is what says whose it is.
 fn installation_from_row(row: &Row) -> Result<u64, StoreError> {
-    unsigned(row.get::<i64>(2)?)
+    unsigned(row.get::<i64>(PR_INSTALLATION_INDEX)?)
 }
 
 /// Drains the rows of a [`select_pr_sql`] query, in the order the database
@@ -984,17 +1064,25 @@ fn stored_enum<T: FromStr>(value: String) -> Result<T, StoreError> {
 /// `"r."` for one that binds it beside another. Minted from one list rather
 /// than written out per statement, so a column the mapper gains cannot reach
 /// one reader's `SELECT` and miss the other's.
+/// The columns of `repositories`, in the order [`repo_from_row`] reads them.
+pub(crate) const REPO_COLUMNS: [&str; 6] = [
+    "repository_id",
+    "installation_id",
+    "owner",
+    "repo",
+    "merge_method",
+    "synced_at",
+];
+
+/// Where a statement that appends a column of its own to [`REPO_COLUMNS`]
+/// finds it: past the repository's own, so its index is the roster's length.
+/// The repository facet appends a count that way.
+pub(crate) const REPO_EXTRA_INDEX: i32 = REPO_COLUMNS.len() as i32;
+
 pub(crate) fn repo_columns(alias: &str) -> String {
-    [
-        "repository_id",
-        "installation_id",
-        "owner",
-        "repo",
-        "merge_method",
-        "synced_at",
-    ]
-    .map(|column| format!("{alias}{column}"))
-    .join(", ")
+    REPO_COLUMNS
+        .map(|column| format!("{alias}{column}"))
+        .join(", ")
 }
 
 fn select_repo_sql() -> String {
@@ -1300,6 +1388,154 @@ mod tests {
         assert_eq!(store.get_prs(INSTALLATION, &[]).await.unwrap(), Vec::new());
     }
 
+    /// The roster the statements are minted from and the table the migrations
+    /// build name the same columns. A migration that adds one the roster never
+    /// learns of is a column nothing writes and nothing reads; a roster entry
+    /// the table has not got is a statement SQLite refuses, which every other
+    /// test here would already be shouting about. This is the direction
+    /// nothing else covers: the migrations are only ever compared with each
+    /// other (`migrations::tests`), so a column added to the schema alone is
+    /// silent everywhere.
+    ///
+    /// By name and not by position: a later `ALTER TABLE ... ADD COLUMN`
+    /// appends physically wherever SQLite likes, while the roster's order is
+    /// the decoder's, and the two have no reason to agree.
+    #[tokio::test]
+    async fn the_roster_names_exactly_the_columns_the_pull_requests_table_has() {
+        let (_directory, store) = test_store().await;
+        let connection = store.connection().await;
+
+        let mut declared = Vec::new();
+        let mut rows = connection
+            .query("PRAGMA table_info(pull_requests)", ())
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            declared.push(row.get::<String>(1).unwrap());
+        }
+        declared.sort_unstable();
+
+        let mut rostered = PR_COLUMNS.map(str::to_owned).to_vec();
+        rostered.sort_unstable();
+
+        assert_eq!(declared, rostered);
+    }
+
+    /// One pull request whose every field of a given type holds a value no
+    /// other field of that type holds, so no two columns can trade places and
+    /// come back looking right. `generation` picks a second, wholly different
+    /// set of values for the same pull request, for the write that has to go
+    /// through `ON CONFLICT ... DO UPDATE SET` rather than through the insert.
+    ///
+    /// The integers are the ones to watch: `repository_id`, `number` and the
+    /// three stamps are stored side by side and read back by position, so
+    /// equal values there are what would let a swap pass unseen.
+    fn distinctly_valued_pr(generation: u64) -> PrRecord {
+        let tag = |what: &str| format!("{what}-{generation}");
+        PrRecord {
+            id: PrKey::new(41, 53).to_string(),
+            repository_id: 41,
+            owner: tag("owner"),
+            repo: tag("repo"),
+            number: 53,
+            title: tag("title"),
+            html_url: tag("html-url"),
+            dependency: Some(tag("dependency")),
+            from_version: Some(tag("from-version")),
+            to_version: Some(tag("to-version")),
+            dependencies: vec![DependencyUpdate {
+                name: tag("grouped-name"),
+                from_version: Some(tag("grouped-from")),
+                to_version: Some(tag("grouped-to")),
+                update_type: UpdateType::Patch,
+            }],
+            update_type: if generation == 1 {
+                UpdateType::Major
+            } else {
+                UpdateType::Patch
+            },
+            head_sha: tag("head-sha"),
+            check_status: if generation == 1 {
+                CheckStatus::Failure
+            } else {
+                CheckStatus::Pending
+            },
+            mergeable: if generation == 1 {
+                Mergeable::Behind
+            } else {
+                Mergeable::Draft
+            },
+            labels: vec![tag("label")],
+            created_at: 60 + generation,
+            updated_at: 70 + generation,
+            synced_at: 80 + generation,
+        }
+    }
+
+    /// Every column the projection keeps for a pull request goes to its own
+    /// place and comes back from it: through the insert, through the
+    /// `excluded` rewrite a second write of the same key takes, and through
+    /// each of the four reads that decode a row.
+    ///
+    /// The second write is the half nothing else covers. The column list, the
+    /// placeholders, the `excluded` assignments, the parameter vector and the
+    /// decoder are five hand-written statements of one order, and only the
+    /// first write is exercised anywhere: a row written once and read back
+    /// says nothing about the eighteen `x = excluded.x` lines that carry every
+    /// write after it. Drop `synced_at` from them and staleness never
+    /// refreshes; drop `head_sha` and a check webhook stops finding the pull
+    /// request at the head it just reported.
+    #[tokio::test]
+    async fn every_column_of_a_pull_request_survives_a_write_a_rewrite_and_each_read_path() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(41, 10)).await.unwrap();
+
+        for generation in 1..=2 {
+            let written = distinctly_valued_pr(generation);
+            let key = written.key();
+
+            store.upsert_pr(&written).await.unwrap();
+
+            assert_eq!(
+                LibSqlPrStore::get_pr(&store, &key).await.unwrap().as_ref(),
+                Some(&written),
+                "the writer's own lookup, generation {generation}"
+            );
+            assert_eq!(
+                ProjectionReader::get_pr(&store, INSTALLATION, &key)
+                    .await
+                    .unwrap(),
+                ProjectedPr::Row(Box::new(written.clone())),
+                "the reader's lookup, generation {generation}"
+            );
+            assert_eq!(
+                store
+                    .get_prs(INSTALLATION, std::slice::from_ref(&key))
+                    .await
+                    .unwrap(),
+                vec![ProjectedPr::Row(Box::new(written.clone()))],
+                "the set read, generation {generation}"
+            );
+            assert_eq!(
+                store
+                    .list_prs(INSTALLATION, &PrFilter::default(), Page::default())
+                    .await
+                    .unwrap()
+                    .rows,
+                vec![written.clone()],
+                "the dashboard's page, generation {generation}"
+            );
+            assert_eq!(
+                store
+                    .prs_for_sha(written.repository_id, &written.head_sha)
+                    .await
+                    .unwrap(),
+                vec![written.clone()],
+                "the head lookup, generation {generation}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn upsert_and_keyset_page_round_trip() {
         let (_directory, store) = test_store().await;
@@ -1336,6 +1572,63 @@ mod tests {
             .unwrap();
         assert_eq!(second.rows[0].number, 1);
         assert!(second.next_cursor.is_none());
+    }
+
+    /// A page is offered a page after it when a row was found past its limit,
+    /// and not when the rows ran out exactly on it. The fence is the one row
+    /// read past the limit, and the test above cannot stand on it: three rows
+    /// taken two at a time leave a last page one row short, so the read finds
+    /// nothing past the limit whether the count is compared with `>` or with
+    /// `>=`. Four rows taken two at a time land the last page exactly on the
+    /// limit, which is where the two differ — and where `>=` would offer a
+    /// **Load next** that opens on nothing.
+    #[tokio::test]
+    async fn a_last_page_that_exactly_fills_the_limit_says_there_is_nothing_after_it() {
+        let (_directory, store) = test_store().await;
+        store.upsert_repo(&repo(1, 10)).await.unwrap();
+        for number in 1..=4 {
+            store.upsert_pr(&pr(1, number, 10)).await.unwrap();
+        }
+        let first = store
+            .list_prs(
+                INSTALLATION,
+                &PrFilter::default(),
+                Page {
+                    limit: 2,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [4, 3]
+        );
+        assert!(
+            first.next_cursor.is_some(),
+            "two rows are left, so there is a page after this one"
+        );
+
+        let second = store
+            .list_prs(
+                INSTALLATION,
+                &PrFilter::default(),
+                Page {
+                    limit: 2,
+                    after: first.next_cursor,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            second.rows.iter().map(|pr| pr.number).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert!(
+            second.next_cursor.is_none(),
+            "the rows ran out on the limit, so nothing follows this page"
+        );
     }
 
     #[tokio::test]

@@ -242,6 +242,11 @@ pub(crate) fn DashboardFixture(
                 *reloads.write() += 1;
             }
         }),
+        // The line the state is given, rather than one put there afterwards:
+        // the reads a real page makes are built on it before the state is, so
+        // a fixture that set it later would be a fixture whose resources had
+        // already gone out.
+        use_signal(|| connection),
     );
     use_hook(move || {
         if syncing {
@@ -250,6 +255,10 @@ pub(crate) fn DashboardFixture(
         if let Some(answered) = refreshed_at {
             state.poll_answered(answered);
         }
+        // Again, because a poll that was answered puts the line back up: a
+        // fixture that wants an age on the rows *and* a refused credential is
+        // asking for what a page has after a 401 met by some other call, and
+        // the refusal is the later of the two.
         if connection != Connection::Online {
             state.poll_missed(connection);
         }
@@ -278,6 +287,7 @@ pub(crate) fn mount_dashboard() -> (VirtualDom, DashboardState) {
             },
             use_signal(|| FIXTURE_NOW),
             use_callback(|()| {}),
+            use_signal(|| Connection::Online),
         );
         rsx! {}
     }

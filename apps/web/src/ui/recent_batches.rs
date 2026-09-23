@@ -40,9 +40,9 @@ pub(crate) fn RecentBatchesDrawer(
     let mut limit = use_signal(|| BATCH_PAGE);
     let batches = use_resource(move || {
         let limit = limit();
-        async move { load_recent_batches(limit).await }
+        async move { state.guarded(|| load_recent_batches(limit)).await }
     });
-    let status = BatchesStatus::from_resource(batches.read().as_ref());
+    let status = BatchesStatus::from_faulted(batches.read().as_ref());
     // A page that came back full may have older batches behind it; a short
     // one is the whole record.
     let may_have_older = limit() < MAX_RECENT_BATCHES

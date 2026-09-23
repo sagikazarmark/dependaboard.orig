@@ -42,7 +42,13 @@ pub(crate) fn Sidebar(open: Signal<bool>) -> Element {
                     div { class: "empty-state error-state sidebar-state",
                         strong { "The facets could not be loaded" }
                         code { "{error}" }
-                        Button { size: ButtonSize::Sm, onclick: move |_| state.reload(), "Retry" }
+                        // Not offered to a page the server has refused the
+                        // credentials of: the read would be declined without
+                        // being made, and the banner already says to reload
+                        // the page to sign in again.
+                        if !state.signed_out() {
+                            Button { size: ButtonSize::Sm, onclick: move |_| state.reload(), "Retry" }
+                        }
                     }
                 },
                 SummaryStatus::Loading => rsx! {
@@ -110,7 +116,8 @@ mod tests {
     use dependaboard_core::PrFilter;
 
     use super::*;
-    use crate::ui::dashboard_state::SummaryStatus;
+    use crate::ui::SIGNED_OUT_MESSAGE;
+    use crate::ui::dashboard_state::{Connection, SummaryStatus};
     use crate::ui::test_support::{DashboardFixture, loaded_summary, render};
 
     #[test]
@@ -206,5 +213,31 @@ mod tests {
         assert!(!html.contains("<code>0</code>"), "{html}");
         assert!(!html.contains(r#"class="facet"#), "{html}");
         assert!(!html.contains("repo-filter"), "{html}");
+    }
+
+    /// The one failure a retry cannot clear is the server refusing the
+    /// credentials: the read would be declined without being made, so the
+    /// sidebar names the reason and leaves the way on to the banner, which
+    /// asks for the reload that signs the page in again.
+    #[test]
+    fn a_failed_sidebar_on_a_signed_out_page_says_why_rather_than_offer_a_retry() {
+        fn Fixture() -> Element {
+            let open = use_signal(|| true);
+            rsx! {
+                DashboardFixture {
+                    summary: SummaryStatus::Failed(SIGNED_OUT_MESSAGE.to_owned()),
+                    connection: Connection::SignedOut,
+                    Sidebar { open }
+                }
+            }
+        }
+        let html = render(Fixture);
+
+        assert!(html.contains("The facets could not be loaded"), "{html}");
+        assert!(html.contains(SIGNED_OUT_MESSAGE), "{html}");
+        assert!(
+            !html.contains(">Retry<"),
+            "a button that would ask nothing is not offered: {html}"
+        );
     }
 }
