@@ -975,11 +975,15 @@ deliveries and carry no key; they are minted fresh per click and dedup by other 
 `issue_comment`, kinds GitHub adds later) with a 2xx before Restate is involved, since
 the only thing the invocation would do is drop the event. The two tables are named by one
 type, `dependaboard_core::DeliveryKind`, which is what a forwarded delivery carries its
-kind as. That closes one half of the drift: dispatch matches the type exhaustively, so a
-kind given a variant and left unhandled there does not compile. The other half is still a
-decision the edge makes alone — its match is over `octoevents::EventKind`, every kind
-GitHub sends, so a routed kind the edge acknowledges rather than forwards is caught only
-by a test, not by the compiler. Both sites carry a comment saying which half is which.
+kind as. Both halves match it exhaustively: dispatch on the kind it is handed, and the
+edge on the kind it converts the delivery to before it decides rather than after, so a
+kind given a variant and left unhandled at either end does not compile. The wildcard did
+not disappear — it answers the one variant that stands for every kind we do not route,
+and it is the type that asks for that arm, not a comment. What the compiler cannot tell
+is a forward from an arm that acknowledges, so a test walks the six routed kinds and
+insists none of them stops at the edge. Converting first costs a string allocated for
+each delivery the edge then ignores, which is nothing beside the HMAC it has already
+verified.
 `DeliveryKind` also has a fallback variant for kinds it does not name: the edge and the
 service are deployed separately, so during a rollout the edge may forward a kind the
 dispatcher has never heard of, and it must be ignored as before rather than failing the

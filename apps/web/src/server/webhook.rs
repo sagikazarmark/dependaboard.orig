@@ -108,14 +108,17 @@ enum RoutingError {
 /// Decides what the edge does with a verified delivery: forward it, reduced
 /// to the routing fields `WebhookIngress` dispatches on, or acknowledge it.
 ///
-/// The kinds matched here are the edge's copy of the dispatcher's routing
-/// table. The dispatcher's half of the pair is exhaustive over
-/// `dependaboard_core::DeliveryKind`, so a kind it routes cannot go unanswered
-/// there; this half is a match over `octoevents::EventKind`, whose ~60 variants
-/// are all the kinds GitHub sends, so it is still a choice this file makes alone.
-/// A kind given a `DeliveryKind` variant and a dispatch arm but no arm here is
-/// acknowledged at the edge and never reaches Restate, and nothing but a test
-/// says so.
+/// The delivery's kind is converted to `dependaboard_core::DeliveryKind`
+/// before it is matched, so this half of the routing table is exhaustive over
+/// the same type as the dispatcher's: a kind given a variant there and no arm
+/// here fails to compile instead of being quietly acknowledged. The
+/// `DeliveryKind::Other(_)` arm is the kinds we do not route — `ping`, `push`,
+/// and the ~69 others GitHub sends — and it is there because the type demands
+/// an arm for the variant, not because a comment asks for one.
+///
+/// Converting first allocates a `String` for every delivery we then ignore,
+/// which matching on `octoevents::EventKind` first avoided. It is nothing
+/// beside the HMAC verification each delivery has already paid for.
 ///
 /// The envelope already carries the installation and repository probe, so only
 /// the per-event fields — PR number, head SHA, and the PRs a check belongs to —
@@ -133,14 +136,17 @@ fn route_delivery(envelope: &Envelope) -> Result<Disposition, RoutingError> {
             .as_ref()
             .ok_or(RoutingError::MissingRepository)
     };
-    let (number, sha, pull_requests, repository) = match envelope.meta.kind {
-        EventKind::Installation | EventKind::InstallationRepositories => {
+    // `EventKind::as_str` is lossless — its unknown variant carries the wire
+    // string — so nothing is lost by deciding on the delivery kind instead.
+    let kind = DeliveryKind::from(envelope.meta.kind.as_str());
+    let (number, sha, pull_requests, repository) = match kind {
+        DeliveryKind::Installation | DeliveryKind::InstallationRepositories => {
             if envelope.meta.installation_id.is_none() {
                 return Err(RoutingError::MissingInstallation);
             }
             (None, None, Vec::new(), envelope.meta.repository.as_ref())
         }
-        EventKind::PullRequest => {
+        DeliveryKind::PullRequest => {
             let payload: PullRequestRouting = parse_payload(envelope)?;
             (
                 Some(payload.pull_request.number),
@@ -149,17 +155,17 @@ fn route_delivery(envelope: &Envelope) -> Result<Disposition, RoutingError> {
                 Some(repository_required()?),
             )
         }
-        EventKind::CheckRun => {
+        DeliveryKind::CheckRun => {
             let payload: CheckRunRouting = parse_payload(envelope)?;
             let (sha, numbers) = payload.check_run.into_routing();
             (None, Some(sha), numbers, Some(repository_required()?))
         }
-        EventKind::CheckSuite => {
+        DeliveryKind::CheckSuite => {
             let payload: CheckSuiteRouting = parse_payload(envelope)?;
             let (sha, numbers) = payload.check_suite.into_routing();
             (None, Some(sha), numbers, Some(repository_required()?))
         }
-        EventKind::Status => {
+        DeliveryKind::Status => {
             let payload: StatusRouting = parse_payload(envelope)?;
             (
                 None,
@@ -168,10 +174,10 @@ fn route_delivery(envelope: &Envelope) -> Result<Disposition, RoutingError> {
                 Some(repository_required()?),
             )
         }
-        _ => return Ok(Disposition::Acknowledge),
+        DeliveryKind::Other(_) => return Ok(Disposition::Acknowledge),
     };
     Ok(Disposition::Forward(Box::new(WebhookEvent {
-        event: DeliveryKind::from(envelope.meta.kind.as_str()),
+        event: kind,
         action: envelope
             .meta
             .action
@@ -539,6 +545,30 @@ mod tests {
             )),
             RoutingError::MissingRepository
         ));
+    }
+
+    #[test]
+    fn every_kind_the_edge_names_is_forwarded_or_refused_but_never_acknowledged() {
+        // The match is exhaustive over `DeliveryKind`, so a routed kind cannot
+        // go unanswered here — but the compiler cannot tell a forward from an
+        // arm that answers with `Acknowledge`, which would drop deliveries the
+        // dispatcher routes. A bare envelope of each routed kind is either
+        // forwarded or refused for the routing fields its payload lacks.
+        for kind in [
+            DeliveryKind::PullRequest,
+            DeliveryKind::CheckSuite,
+            DeliveryKind::CheckRun,
+            DeliveryKind::Status,
+            DeliveryKind::Installation,
+            DeliveryKind::InstallationRepositories,
+        ] {
+            let bare = envelope(kind.as_str(), None, true, &serde_json::json!({}));
+            match route_delivery(&bare) {
+                Ok(Disposition::Forward(event)) => assert_eq!(event.event, kind),
+                Err(RoutingError::Payload(_)) => {}
+                answered => panic!("{kind} should not be acknowledged at the edge: {answered:?}"),
+            }
+        }
     }
 
     #[test]
