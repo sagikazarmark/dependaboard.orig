@@ -81,8 +81,12 @@ pub(crate) fn StatusBar(#[props(default)] user: Option<String>) -> Element {
 
 #[cfg(all(test, feature = "server"))]
 mod tests {
+    use dioxus::core::consume_context_from_scope;
+    use futures_util::FutureExt;
+
     use super::*;
-    use crate::ui::dashboard_state::SummaryStatus;
+    use crate::ui::Fault;
+    use crate::ui::dashboard_state::{DashboardState, SummaryStatus};
     use crate::ui::test_support::{DashboardFixture, FIXTURE_NOW, loaded_summary, render};
 
     #[test]
@@ -233,5 +237,74 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("<span>signed out</span>"), "{out}");
+    }
+
+    /// The banner is the page's word on its line to the server, and any call
+    /// the page made can put it up — not the live refresh's poll alone. The
+    /// global **Sync** and **Select all N matching** ask through
+    /// [`DashboardState::guarded`], as their own tests pin, and a call it
+    /// made that came back 401 signs the page out where the refusal was met:
+    /// the banner is over the page before the next poll is due, which on a
+    /// hidden tab is never. Nothing has been polled here — no refresh is
+    /// dated — so the banner is the refused call's doing and nothing else's.
+    #[test]
+    fn a_call_the_server_refuses_raises_the_banner_with_no_poll_taken() {
+        /// Where the page's state is left for the test to make a call on.
+        #[derive(Clone, Copy)]
+        struct Asking(Signal<Option<DashboardState>>);
+
+        fn Page() -> Element {
+            use_context_provider(|| Asking(Signal::new(None)));
+            rsx! {
+                DashboardFixture { Banner {} }
+            }
+        }
+
+        #[component]
+        fn Banner() -> Element {
+            let state = use_dashboard();
+            let mut asking = use_context::<Asking>();
+            use_hook(move || asking.0.set(Some(state)));
+            rsx! {
+                ConnectionBanner {}
+                StatusBar {}
+            }
+        }
+
+        let mut dom = VirtualDom::new(Page);
+        dom.rebuild_in_place();
+        let online = dioxus::ssr::render(&dom);
+        assert!(!online.contains("connection-banner"), "{online}");
+
+        let state = dom.in_runtime(|| {
+            consume_context_from_scope::<Asking>(ScopeId::APP)
+                .expect("the page keeps the state a call is made on")
+                .0
+                .read()
+                .expect("the banner was mounted")
+        });
+        let refused = dom.in_runtime(|| {
+            state
+                .guarded(|| async {
+                    Err::<(), _>(ServerFnError::ServerError {
+                        message: "HTTP 401: authentication required".to_owned(),
+                        code: 401,
+                        details: None,
+                    })
+                })
+                .now_or_never()
+        });
+        assert_eq!(refused, Some(Err(Fault::SignedOut)));
+        assert_eq!(
+            dom.in_runtime(|| state.refreshed_at()),
+            None,
+            "no poll was ever answered"
+        );
+
+        dom.render_immediate_to_vec();
+        let html = dioxus::ssr::render(&dom);
+        assert!(html.contains("no longer signed in"), "{html}");
+        assert!(html.contains("Reload</button>"), "{html}");
+        assert!(html.contains("<span>signed out</span>"), "{html}");
     }
 }

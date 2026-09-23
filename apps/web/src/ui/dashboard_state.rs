@@ -78,8 +78,9 @@ pub(crate) struct Answers {
     pub(crate) capabilities: ReadSignal<CapabilitiesStatus>,
 }
 
-/// The dashboard's line to the read model, as the live refresh's polls find
-/// it.
+/// The dashboard's line to the read model, as the calls the page makes find
+/// it: the live refresh's polls for the most part, and any other call for a
+/// refusal of the credentials, which is definitive whoever met it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Connection {
     /// The polls are being answered: the rows are being kept current.
@@ -148,7 +149,7 @@ pub(crate) struct DashboardState {
     /// Whether a manual sync is in flight: asked for, and not yet seen to
     /// reach the pull requests.
     syncing: Signal<bool>,
-    /// The line to the server, as the live refresh's polls last found it.
+    /// The line to the server, as the page's calls last found it.
     connection: Signal<Connection>,
     /// When a poll was last answered, in Unix seconds; `None` before the
     /// first. The age of the rows on screen once the line is down.
@@ -241,17 +242,18 @@ impl DashboardState {
         }
     }
 
-    /// The line to the server, as the polls last found it. Reading it in a
-    /// component subscribes the component to its changes.
+    /// The line to the server, as the page's calls last found it. Reading it
+    /// in a component subscribes the component to its changes.
     pub(crate) fn connection(&self) -> Connection {
         *self.connection.read()
     }
 
     /// Whether the server has refused the credentials the page holds, as any
-    /// poll found. Nothing that would ask the server is done on a page that
-    /// is: the answer would be the same refusal, and a credential prompt for
-    /// it, until the page is reloaded. [`guarded`](Self::guarded) is how a
-    /// call keeps to that.
+    /// call the page made found — a poll, a sync, a selection. Nothing that
+    /// would ask the server is done on a page that is: the answer would be
+    /// the same refusal, and a credential prompt for it, until the page is
+    /// reloaded. [`guarded`](Self::guarded) is how a call keeps to that, and
+    /// is also what sets this.
     pub(crate) fn signed_out(&self) -> bool {
         self.connection() == Connection::SignedOut
     }
@@ -264,14 +266,27 @@ impl DashboardState {
     /// [`logged_fault`] does. The gateways that follow a batch, submit one,
     /// or sync a pull request from a page all go through here, so the rule
     /// about a signed-out page is written once for them.
-    pub(crate) async fn guarded<T, Fut>(self, call: impl FnOnce() -> Fut) -> Result<T, Fault>
+    ///
+    /// A call that was made and refused the credentials is the page's line to
+    /// the server, not that call's alone: the server was reached and said the
+    /// credentials are no longer good, which the next call would be told the
+    /// same. So the refusal is recorded here, where it was met, rather than
+    /// waited on from the next poll — up to ten seconds away with the tab
+    /// showing, and further while it is hidden. The banner goes up from
+    /// whichever call meets the 401 first, and every call after it is refused
+    /// without being made.
+    pub(crate) async fn guarded<T, Fut>(mut self, call: impl FnOnce() -> Fut) -> Result<T, Fault>
     where
         Fut: Future<Output = Result<T, ServerFnError>>,
     {
         if self.signed_out() {
             return Err(Fault::SignedOut);
         }
-        call().await.map_err(|error| logged_fault(&error))
+        let answer = call().await.map_err(|error| logged_fault(&error));
+        if answer.as_ref().err() == Some(&Fault::SignedOut) {
+            self.set_connection(Connection::SignedOut);
+        }
+        answer
     }
 
     /// When a poll was last answered, in Unix seconds; `None` before the
@@ -290,7 +305,9 @@ impl DashboardState {
 
     /// A poll got no answer, and what it got instead says the line is
     /// `connection`: the live refresh's count of misses, or — from any poll,
-    /// a batch follow's included — the server refusing the credentials.
+    /// a batch follow's included — the server refusing the credentials. A
+    /// call that is not a poll has its refusal recorded by
+    /// [`guarded`](Self::guarded) itself.
     pub(crate) fn poll_missed(&mut self, connection: Connection) {
         self.set_connection(connection);
     }
@@ -692,6 +709,54 @@ mod tests {
                     "The read model is unavailable".to_owned()
                 ))),
                 "a call that fails is read for what it says about the line"
+            );
+            assert_eq!(
+                state.connection(),
+                Connection::Online,
+                "a component that would not answer is not the credentials being refused"
+            );
+        });
+    }
+
+    /// A call the page made and the server refused is the page's own word on
+    /// its line to the server, not the caller's alone: the server was
+    /// reached and said the credentials are no longer good, which is as true
+    /// of a sync or a selection as of a poll. So the refusal is recorded
+    /// where it was met — the banner goes up from that call — and the calls
+    /// after it are refused without being made.
+    #[test]
+    fn a_call_the_server_refuses_signs_the_page_out_where_it_was_met() {
+        let (dom, state) = mount();
+
+        dom.in_runtime(|| {
+            let calls = Cell::new(0);
+            let call = || {
+                calls.set(calls.get() + 1);
+                async {
+                    Err::<&str, _>(ServerFnError::ServerError {
+                        message: "HTTP 401: authentication required".to_owned(),
+                        code: 401,
+                        details: None,
+                    })
+                }
+            };
+
+            assert!(!state.signed_out());
+            let refused = state.guarded(&call).now_or_never();
+            assert_eq!(refused, Some(Err(Fault::SignedOut)));
+            assert_eq!(calls.get(), 1, "the call was made");
+            assert_eq!(
+                state.connection(),
+                Connection::SignedOut,
+                "the refusal the call met is the page's line to the server"
+            );
+
+            let refused_again = state.guarded(&call).now_or_never();
+            assert_eq!(refused_again, Some(Err(Fault::SignedOut)));
+            assert_eq!(
+                calls.get(),
+                1,
+                "the call after it is refused without being made"
             );
         });
     }

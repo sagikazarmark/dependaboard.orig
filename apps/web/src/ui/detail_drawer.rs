@@ -12,7 +12,7 @@ use dioxus::prelude::*;
 use crate::api::{load_pr_projection, load_pr_status};
 use crate::components::button::{Button, ButtonSize};
 use crate::components::loading::{Loading, LoadingSize};
-use crate::ui::dashboard_state::{Connection, DashboardState, use_dashboard};
+use crate::ui::dashboard_state::{DashboardState, use_dashboard};
 use crate::ui::format::{relative_time, status_class, status_label, update_class, version_label};
 use crate::ui::pr_sync::{ServerSync, SyncFailure, sync_pr};
 use crate::ui::side_panel::SidePanel;
@@ -237,7 +237,7 @@ pub(crate) fn DetailDrawer(
     onsync: EventHandler<Result<Option<PrRecord>, String>>,
 ) -> Element {
     let stale = row.is_stale(now);
-    let mut state = use_dashboard();
+    let state = use_dashboard();
     let mut syncing = use_signal(|| false);
     let mut sync_queued = use_signal(|| false);
     let sync_repository_id = row.repository_id;
@@ -328,11 +328,12 @@ pub(crate) fn DetailDrawer(
                                 syncing.set(false);
                                 sync_queued.set(false);
                                 // A refusal of the credentials is the page's
-                                // word, not the sync's: the banner goes up, and
-                                // the live refresh asks nothing more.
-                                if outcome.as_ref().is_err_and(SyncFailure::signed_out) {
-                                    state.poll_missed(Connection::SignedOut);
-                                }
+                                // word, not the sync's, and [`ServerSync`]
+                                // asks through the page's guard, which
+                                // records the refusal where it met it: the
+                                // banner is already up, and the live refresh
+                                // asks nothing more.
+                                //
                                 // The row the sync returns replaces the
                                 // drawer's, which re-reads the durable state.
                                 onsync.call(outcome.map_err(|failure| sync_message(&failure)));
@@ -457,8 +458,8 @@ mod tests {
 
     use super::*;
     use crate::ui::dashboard_state::{
-        Answers, CapabilitiesStatus, DashboardState, PageStatus, REBASE_UNAVAILABLE, Selection,
-        SummaryStatus,
+        Answers, CapabilitiesStatus, Connection, DashboardState, PageStatus, REBASE_UNAVAILABLE,
+        Selection, SummaryStatus,
     };
     use crate::ui::test_support::{
         DashboardFixture, FIXTURE_NOW, grouped_row, loaded_page, mount_dashboard, off_page_row,

@@ -280,11 +280,12 @@ pub(crate) fn use_clock(mut now: Signal<u64>, visible: ReadSignal<bool>, state: 
 /// reloads the rows, which is what clears a read that failed in the gap.
 ///
 /// A refusal of the credentials ends the refresh. [`Refresh`] says to stop
-/// once its own poll was refused; and a step that would reach the server is
-/// not taken once the state says the page is signed out on any poll's word —
-/// a batch being followed asks every second, so its poll is often the one
-/// refused first. Either way the answer would be another refusal, and
-/// another credential prompt. The reload the banner asks for starts it over.
+/// once its own poll was refused; and no step is taken once the state says
+/// the page is signed out on some other call's word — a batch being followed
+/// asks every second, so its poll is often the one refused first, and the
+/// global **Sync** or **Select all matching** can be. Either way the answer
+/// would be another refusal, and another credential prompt. The reload the
+/// banner asks for starts it over.
 pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bool>) {
     use_future(move || async move {
         let mut refresh = Refresh::new();
@@ -296,6 +297,13 @@ pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bo
                 // so do not pass its guard; the rule has to be kept for
                 // them here.
                 Step::Reload if state.signed_out() => break,
+                // The page was already signed out before this poll was due —
+                // on another call's word, a followed batch's poll asking every
+                // second, say — so there is nothing left to poll for: the
+                // guard would hand this poll the refusal without asking, and
+                // the banner is already up. Asked before the guard is, so that
+                // the arm below is only ever a poll that was made.
+                Step::Poll if state.signed_out() => break,
                 Step::Poll => match state.guarded(load_projection_revision).await {
                     Ok(revision) => {
                         let moved = refresh.observe(revision);
@@ -307,13 +315,13 @@ pub(crate) fn use_live_refresh(mut state: DashboardState, visible: ReadSignal<bo
                         }
                         state.poll_answered(unix_seconds());
                     }
-                    // The guard refused without asking: the page was already
-                    // signed out on another poll's word — a followed batch's,
-                    // which asks every second — and there is nothing left to
-                    // poll for. A 401 to a poll that was made is a miss like
-                    // any other here, and ends the refresh a tick later at
-                    // [`Step::Stop`], after it has put the banner up.
-                    Err(Fault::SignedOut) if state.signed_out() => break,
+                    // A 401 to a poll that was made is a miss like any other
+                    // here. The guard has already put the banner up — the
+                    // refusal is the page's line to the server, whichever call
+                    // met it — and the miss is what tells the refresh itself,
+                    // which ends it a tick later at [`Step::Stop`]. Breaking
+                    // here instead would leave the refresh with no refusal of
+                    // its own, and [`Step::Stop`] reachable only from a test.
                     Err(fault) => {
                         tracing::debug!(%fault, "the projection's revision could not be read");
                         state.poll_missed(refresh.miss(&fault));
@@ -653,14 +661,15 @@ mod mounted_tests {
         })
     }
 
-    /// A page the server has already refused — a followed batch's poll met
-    /// the 401 first, say — is not polled at all: the poll goes through the
-    /// page's guard, which hands it the refusal without entering the server
-    /// function, and the refresh ends there rather than prompt for
-    /// credentials every interval. A poll that was made would have been
-    /// answered — in a test, by the request extension it cannot find —
-    /// counted as the first miss, and put the line back online, so the line
-    /// left as the refusal set it is the call counter at zero.
+    /// A page the server has already refused — a followed batch's poll, or
+    /// the global **Sync**, met the 401 first — is not polled at all: the
+    /// refresh reads the page's line before each poll it would make and ends
+    /// there, rather than prompt for credentials every interval; the page's
+    /// guard would hand the poll the refusal in any case. A poll that was
+    /// made would have been answered — in a test, by the request extension
+    /// it cannot find — counted as the first miss, and put the line back
+    /// online, so the line left as the refusal set it is the call counter at
+    /// zero.
     #[tokio::test]
     async fn a_signed_out_page_is_not_polled_and_ends_the_refresh() {
         let mut dom = VirtualDom::new(Polling);
