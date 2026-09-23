@@ -878,6 +878,13 @@ mod tests {
         let listed = restate
             .clock_when_listed
             .expect("the sweep asked for the listing");
+        assert_eq!(
+            fence, CLOCK_EPOCH,
+            "the fence is the clock reading itself, not merely some value below the \
+             listing: anything earlier than the rows prunes nothing at all, and a sweep \
+             that prunes nothing leaves every repository the App has lost in the \
+             projection, with its pull requests never retired"
+        );
         assert!(
             fence < listed,
             "the fence is read before the listing is asked for, not after it returns: \

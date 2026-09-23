@@ -1035,28 +1035,42 @@ mod tests {
 
     #[tokio::test]
     async fn progress_is_published_as_each_target_settles_not_once_the_round_is_over() {
-        // Three repositories merge in one round; the dashboard must see them land one by one.
-        let request = request(
-            BulkActionKind::Merge,
-            vec![pull(7, 1), pull(8, 1), pull(9, 1)],
-        );
-        let mut restate = RecordedBulkAction::default();
+        // Three repositories, one round, for each of the three actions. What a
+        // user watches while a batch runs is this sequence: a target that has
+        // settled must be published as it settles, not held until its round is
+        // over or — worse — until the batch is. Asserted per action because
+        // each arm does its own publishing, so an arm that forgot would leave
+        // its targets spinning while the other two behaved.
+        fn settled_per_publish(published: &[BatchProgress]) -> Vec<u64> {
+            published
+                .iter()
+                .map(|progress| progress.succeeded + progress.rejected + progress.failed)
+                .collect()
+        }
 
-        let (_, published) = run(&mut restate, &request).await;
+        for (kind, expected) in [
+            // A round starts, then each target lands.
+            (BulkActionKind::Merge, vec![0, 0, 1, 2, 3]),
+            (BulkActionKind::UpdateBranch, vec![0, 0, 1, 2, 3]),
+            // Rebase goes one at a time, so each target is published twice:
+            // once as it starts running, once as its verdict lands.
+            (BulkActionKind::Rebase, vec![0, 0, 1, 1, 2, 2, 3]),
+        ] {
+            let request = request(kind, vec![pull(7, 1), pull(8, 1), pull(9, 1)]);
+            let mut restate = RecordedBulkAction::default();
 
-        let settled_per_publish = published
-            .iter()
-            .map(|progress| progress.succeeded + progress.rejected + progress.failed)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            settled_per_publish,
-            vec![0, 0, 1, 2, 3],
-            "queued, the round running, then one more settled per publish"
-        );
-        assert!(
-            published.last().is_some_and(|progress| progress.completed),
-            "the last publish is the finished batch"
-        );
+            let (_, published) = run(&mut restate, &request).await;
+
+            assert_eq!(
+                settled_per_publish(&published),
+                expected,
+                "{kind} publishes as each target settles"
+            );
+            assert!(
+                published.last().is_some_and(|progress| progress.completed),
+                "{kind}: the last publish is the finished batch"
+            );
+        }
     }
 
     /// Restate forgets the workflow after its retention; the projection is where the
@@ -1242,15 +1256,30 @@ mod tests {
 
     #[test]
     fn the_completion_line_lists_every_column() {
-        let targets = [pull(7, 1), pull(7, 2), pull(7, 3)];
+        // A distinct count per column, because the three are read off one line
+        // by an operator and mean different things — GitHub or a guard said no,
+        // against the round trip dying — so a line that transposed two of them
+        // would send that operator after the wrong fault. Equal counts cannot
+        // say which column is which.
+        let targets = [
+            pull(7, 1),
+            pull(7, 2),
+            pull(7, 3),
+            pull(7, 4),
+            pull(7, 5),
+            pull(7, 6),
+        ];
         let mut progress = BatchProgress::queued("batch-1", BulkActionKind::Merge, &targets);
         progress.record(&targets[0].key(), merged());
-        progress.record(&targets[1].key(), forbidden());
-        progress.record_failure(&targets[2].key(), "boom");
+        for rejected in &targets[1..4] {
+            progress.record(&rejected.key(), forbidden());
+        }
+        progress.record_failure(&targets[4].key(), "boom");
+        progress.record_failure(&targets[5].key(), "boom");
 
         assert_eq!(
             Json::from(progress).outcome(),
-            "1 succeeded, 1 rejected, 1 failed of 3 targets"
+            "1 succeeded, 3 rejected, 2 failed of 6 targets"
         );
     }
 

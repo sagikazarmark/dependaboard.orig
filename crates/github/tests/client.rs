@@ -565,10 +565,21 @@ fn snapshot_query() -> MockBuilder {
         })))
 }
 
-/// A connection page holding `nodes`; `next` is the cursor of the page after it, if any.
+/// A connection page holding `nodes`; `next` is the cursor of the page after
+/// it, if any.
+///
+/// A last page still carries an `endCursor`: GitHub answers with the last
+/// node's cursor whether or not anything follows it, and says whether anything
+/// does in `hasNextPage` alone. So a reader that went by the cursor's presence
+/// would ask for a page that is not there — and would keep asking, since that
+/// page would carry a cursor too. Writing the last page the way GitHub writes
+/// it is what lets a test see the difference.
 fn page(nodes: Vec<Value>, next: Option<&str>) -> Value {
     json!({
-        "pageInfo": { "hasNextPage": next.is_some(), "endCursor": next },
+        "pageInfo": {
+            "hasNextPage": next.is_some(),
+            "endCursor": next.unwrap_or("cursor-of-the-last-node"),
+        },
         "nodes": nodes,
     })
 }
@@ -717,8 +728,23 @@ async fn check_contexts_are_read_across_pages_until_the_last_one() {
     pull["commits"]["nodes"][0]["commit"]["statusCheckRollup"] =
         json!({ "contexts": page(passing, Some("cursor-100")) });
     mount_snapshot(&server, pull).await;
-    // The one still-running check hides on the second page.
+    // Another hundred that pass, so the walk has to follow a cursor it was
+    // handed by a page it had already followed to.
+    let more: Vec<Value> = (0..100)
+        .map(|_| check_run("COMPLETED", Some("SUCCESS")))
+        .collect();
     check_page_query("CheckContextsPage", "cursor-100")
+        .respond_with(ok_json(commit_response(json!({
+            "statusCheckRollup": { "contexts": page(more, Some("cursor-200")) }
+        }))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The one still-running check hides on the third page. Two pages are not
+    // enough to find it: a walk that stops after the first cursor it follows
+    // rolls this pull request up green, and a green pull request is one a
+    // bulk merge takes.
+    check_page_query("CheckContextsPage", "cursor-200")
         .respond_with(ok_json(commit_response(json!({
             "statusCheckRollup": {
                 "contexts": page(vec![check_run("IN_PROGRESS", None)], None)
@@ -735,7 +761,7 @@ async fn check_contexts_are_read_across_pages_until_the_last_one() {
         .expect("an open Dependabot pull request is projected");
 
     assert_eq!(record.check_status, CheckStatus::Pending);
-    assert_eq!(api_request_count(&server).await, 2);
+    assert_eq!(api_request_count(&server).await, 3);
     server.verify().await;
 }
 
@@ -753,8 +779,23 @@ async fn check_suites_are_read_across_pages_until_the_last_one() {
     ));
     pull["commits"]["nodes"][0]["commit"]["checkSuites"] = page(passing, Some("cursor-100"));
     mount_snapshot(&server, pull).await;
-    // The workflow that never started hides on the second page.
+    // Another hundred that pass, so the walk has to follow a cursor handed to
+    // it by a page it had already followed to.
+    let more: Vec<Value> = (0..100)
+        .map(|_| check_suite("COMPLETED", Some("SUCCESS")))
+        .collect();
     check_page_query("CheckSuitesPage", "cursor-100")
+        .respond_with(ok_json(commit_response(json!({
+            "checkSuites": page(more, Some("cursor-200"))
+        }))))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The workflow that never started hides on the third page — the one
+    // signal check suites are queried for at all. Two pages are not enough to
+    // find it, and a walk that stops after the first cursor it follows rolls
+    // this pull request up green.
+    check_page_query("CheckSuitesPage", "cursor-200")
         .respond_with(ok_json(commit_response(json!({
             "checkSuites": page(vec![check_suite("COMPLETED", Some("STARTUP_FAILURE"))], None)
         }))))
@@ -769,7 +810,7 @@ async fn check_suites_are_read_across_pages_until_the_last_one() {
         .expect("an open Dependabot pull request is projected");
 
     assert_eq!(record.check_status, CheckStatus::Failure);
-    assert_eq!(api_request_count(&server).await, 2);
+    assert_eq!(api_request_count(&server).await, 3);
     server.verify().await;
 }
 
